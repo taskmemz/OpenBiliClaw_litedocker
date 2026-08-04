@@ -565,3 +565,84 @@ export async function favoriteStatus(bvid) {
 export async function fetchFavorites(limit = 50, offset = 0) {
   return requestJson(`/favorites?limit=${limit}&offset=${offset}`);
 }
+
+// ── Init ────────────────────────────────────────────────────
+export async function fetchInitStatus() {
+  return requestJson("/init-status");
+}
+
+export async function startInit(sources = null) {
+  const body = {};
+  if (Array.isArray(sources) && sources.length > 0) {
+    body.sources = sources;
+  }
+  return requestJson("/init", json(body));
+}
+
+export async function cancelInit() {
+  return requestJson("/init/cancel", { method: "POST" });
+}
+
+// ── Config probes ───────────────────────────────────────────
+export async function probeConfigService(kind, config) {
+  return requestJson("/config/probe-service", json({ kind, config }));
+}
+
+// ── Autostart ───────────────────────────────────────────────
+export async function fetchAutostartStatus() {
+  return requestJson("/autostart-status");
+}
+
+export async function applyAutostart(enabled) {
+  return requestJson("/autostart/apply", json({ enabled }));
+}
+
+// ── Update ──────────────────────────────────────────────────
+export async function fetchUpdateStatus() {
+  return requestJson("/update-status");
+}
+
+export async function checkUpdate() {
+  return requestJson("/update/check", { method: "POST" });
+}
+
+export async function applyUpdate() {
+  return requestJson("/update/apply", { method: "POST", timeoutMs: 120_000 });
+}
+
+// ── Cookie Management (for standalone client) ───────────────
+export async function submitBilibiliCookie(cookie) {
+  return requestJson("/bilibili/cookie", json({ cookie, source: "web" }));
+}
+
+export async function submitDouyinCookie(cookie) {
+  return requestJson("/sources/dy/cookie", json({ cookie, source: "web" }));
+}
+
+export async function submitXCookie(cookie) {
+  return requestJson("/sources/x/cookie", json({ cookie, source: "web" }));
+}
+
+// ── Sources Status ──────────────────────────────────────────
+export async function fetchSourcesStatus() {
+  return requestJson("/sources/status");
+}
+
+export async function fetchCredentials() {
+  return requestJson("/sources/credentials");
+}
+
+// ── Auth Admin ──────────────────────────────────────────────
+export async function authAdminSetPassword(enabled, password = "") {
+  const body = { enabled };
+  if (password) body.password = password;
+  const res = await fetch(`${BASE_URL}/auth/admin`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", [CSRF_HEADER]: "1" },
+    body: JSON.stringify(body),
+  });
+  let data = null;
+  try { data = await res.json(); } catch { data = null; }
+  return { ok: res.ok && Boolean(data?.ok), status: res.status, data };
+}

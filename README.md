@@ -19,6 +19,18 @@
 
 </div>
 
+> ## ⚠️ 修改声明
+>
+> 本仓库为 **OpenBiliClaw 的轻量化魔改版**（基于上游 `main` 分支二次开发），并非官方原版。与原版相比的主要差异：
+>
+> - **移除 Ollama sidecar**：默认不再内置 bge-m3 本地 embedding 服务，镜像更小、启动更快；需自行配置云端 embedding API Key 或手动接入 Ollama
+> - **适配服务器端部署**：Docker Compose 精简（保留可选 TLS 反代 profile），支持通过宿主机 HTTP 代理出网
+> - **新增独立设置页**（移动端 Web「设置」Tab）：无需浏览器插件即可手动粘贴 B 站/抖音/X Cookie、管理初始化/配置/自启动/更新/密码门禁
+> - **附带 Electron 桌面壳**（`packaging/desktop-app/`），可将 Web UI 打包为桌面应用
+> - 降级（LLM 不可用）状态下放行 Cookie 同步接口
+>
+> 功能、接口与官方版可能存在差异，请以本仓库代码为准。上游项目：[github.com/whiteguo233/OpenBiliClaw](https://github.com/whiteguo233/OpenBiliClaw)。
+
 ## 10 秒看懂 OpenBiliClaw
 
 一个纯本地、私有、开源的自进化跨平台内容发现 Agent：从你的跨平台使用、反馈和对话中持续深化心理画像，带着对你的理解主动去 B 站、小红书、抖音、YouTube、X、知乎、Reddit、Bangumi 等来源找内容。

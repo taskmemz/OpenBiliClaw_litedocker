@@ -21,6 +21,7 @@ import {
 import { initProfileView, onStreamEvent as profileStreamEvent } from "./views/profile.js";
 import { initChatView, onStreamEvent as chatStreamEvent, toggleMessages, loadNotifications } from "./views/chat.js";
 import { initWatchLaterView, initFavoritesView } from "./views/saved.js";
+import { initSettingsView } from "./views/settings.js";
 import { createDialogFocusController } from "./saved-sync-runtime.js";
 
 // ── DOM refs ─────────────────────────────────────────────────
@@ -250,6 +251,7 @@ const TABS = [
   { id: "favorites", icon: "⭐", label: "收藏" },
   { id: "profile", icon: "\u{1F9E0}", label: "\u753B\u50CF" },
   { id: "chat", icon: "\u{1F4AC}", label: "\u5BF9\u8BDD" },
+  { id: "settings", icon: "\u2699\uFE0F", label: "\u8BBE\u7F6E" },
 ];
 
 function renderTabBar() {
@@ -294,6 +296,7 @@ function initActiveView() {
   else if (id === "favorites") initFavoritesView(views.favorites);
   else if (id === "profile") initProfileView(views.profile);
   else if (id === "chat") initChatView(views.chat);
+  else if (id === "settings") initSettingsView(views.settings);
 }
 
 /**

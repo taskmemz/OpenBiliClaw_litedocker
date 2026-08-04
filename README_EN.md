@@ -17,6 +17,18 @@
 
 </div>
 
+> ## ⚠️ Modification Notice
+>
+> This repository is a **lightweight fork of OpenBiliClaw** (derived from the upstream `main` branch), not the official release. Key differences from upstream:
+>
+> - **Ollama sidecar removed**: no bundled bge-m3 local embedding service — smaller image, faster startup; configure a cloud embedding API key or wire up Ollama manually
+> - **Server deployment friendly**: slimmed-down Docker Compose (optional TLS reverse-proxy profile kept), outbound traffic can route through a host HTTP proxy
+> - **Standalone settings page** (mobile web "Settings" tab): paste Bilibili / Douyin / X cookies manually, manage init / config / autostart / update / password gate — no browser extension required
+> - **Electron desktop shell** under `packaging/desktop-app/` to package the web UI as a desktop app
+> - Cookie-sync endpoints are allowed through while the backend is in degraded (LLM-unavailable) mode
+>
+> Features and API behavior may differ from the official version; this repo's code is authoritative. Upstream: [github.com/whiteguo233/OpenBiliClaw](https://github.com/whiteguo233/OpenBiliClaw).
+
 ## OpenBiliClaw in 10 Seconds
 
 A local-first AI discovery agent that learns your taste across Bilibili, Xiaohongshu (RedNote), Douyin (Chinese TikTok), YouTube, X, Zhihu, Reddit, Bangumi, and the open web — without handing your profile to another platform.

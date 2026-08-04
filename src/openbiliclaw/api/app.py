@@ -2157,6 +2157,8 @@ def create_app(
             or (path.startswith("/api/sources/") and path.endswith("/verify"))
             or path == "/api/embedding/repair"
             or path.startswith("/api/auth")
+            # Cookie sync — no LLM dependency; safe to accept while degraded
+            or path in ("/api/bilibili/cookie", "/api/sources/dy/cookie", "/api/sources/x/cookie")
             # Keep every browser recovery shell loadable. Their static assets
             # do not depend on the LLM registry, and the desktop/setup forms
             # use the allowed config endpoints above to repair the blocking

@@ -1,37 +1,4 @@
 services:
-  # Ollama sidecar — embedding service so users don't need Ollama on their
-  # host. This image BAKES bge-m3 (~1.1GB) at build time and its entrypoint
-  # seeds it into the store before serving, so the container reaches
-  # embedding-ready with ZERO network pull (offline / China-network friendly).
-  # The daemon runs on the internal Docker network at http://ollama:11434;
-  # the backend's [llm.embedding] is seeded to point here on first bootstrap.
-  #
-  # Disable this entire block by removing it (and the depends_on +
-  # OPENBILICLAW_SEED_OLLAMA_DEFAULTS env in the backend service) if
-  # you'd rather run an embedding API key from a cloud provider — see
-  # docs/docker-deployment.md.
-  ollama:
-    build:
-      context: .
-      dockerfile: docker/ollama-bundled.Dockerfile
-    container_name: openbiliclaw-ollama
-    volumes:
-      - openbiliclaw_ollama:/root/.ollama
-    # No custom entrypoint / runtime pull: the bundled image self-seeds the
-    # baked model on start. Set OPENBILICLAW_OLLAMA_ALLOW_PULL=1 to opt into a
-    # network pull if the baked seed is ever missing/corrupt (default: fail
-    # loud via the healthcheck instead of silently degrading).
-    healthcheck:
-      # Healthy = daemon up AND bge-m3 is locally available. With the baked
-      # seed this greens up in seconds; start_period stays generous only for
-      # the opt-in runtime-pull fallback.
-      test: ["CMD-SHELL", "ollama list 2>/dev/null | grep -q '^bge-m3'"]
-      interval: 30s
-      timeout: 10s
-      retries: 6
-      start_period: 300s
-    restart: unless-stopped
-
   openbiliclaw-backend:
     build:
       context: .
@@ -44,30 +11,12 @@ services:
       #   docker buildx build --platform linux/amd64,linux/arm64 \
       #     -t openbiliclaw-backend:vX.Y.Z .
     container_name: openbiliclaw-backend
-    depends_on:
-      # service_started (not service_healthy) on purpose: the sidecar is
-      # only "healthy" once bge-m3 finished downloading (~1.1GB). If that
-      # first pull fails or crawls on a slow network, a service_healthy
-      # gate would keep the backend from EVER starting — the user gets a
-      # dead install with no UI to see why. Instead the backend boots
-      # immediately; the /setup/ wizard and init prereq checks surface
-      # "embedding not ready yet" until the pull completes.
-      ollama:
-        condition: service_started
     environment:
       OPENBILICLAW_PROJECT_ROOT: /app/runtime
       OPENBILICLAW_CONFIG_TEMPLATE: /app/config.example.toml
       OPENBILICLAW_PROXY_HOST: ${OPENBILICLAW_PROXY_HOST:-host.docker.internal}
       OPENBILICLAW_PROXY_PORT: ${OPENBILICLAW_PROXY_PORT:-7897}
       OPENBILICLAW_PROXY_TIMEOUT: ${OPENBILICLAW_PROXY_TIMEOUT:-1.0}
-      # On first config bootstrap, seed [llm.ollama] base_url and
-      # [llm.embedding] to point at the bundled sidecar above. Lets
-      # Docker users have local embedding out of the box, even if they
-      # later pick OpenAI / Claude / etc for chat. Existing config.toml
-      # is never overwritten.
-      OPENBILICLAW_SEED_OLLAMA_DEFAULTS: "1"
-      OPENBILICLAW_OLLAMA_BASE_URL: "http://ollama:11434/v1"
-      OPENBILICLAW_EMBEDDING_MODEL: "bge-m3"
       # OPENBILICLAW_XHS_SIDECAR_URL: http://xhs-sidecar:5556  # sidecar removed — extension extracts metadata from DOM
     command:
       - python
@@ -80,10 +29,7 @@ services:
       - --port
       - "8420"
     # ``host.docker.internal`` resolves the host machine from inside
-    # the container. Used by:
-    #   - HTTP proxy auto-detect (OPENBILICLAW_PROXY_HOST)
-    #   - any user that picks "use my host's Ollama instead of the
-    #     bundled sidecar" by overriding OPENBILICLAW_OLLAMA_BASE_URL
+    # the container. Used by HTTP proxy auto-detect (OPENBILICLAW_PROXY_HOST).
     # Required on Linux Docker; auto-provided by Docker Desktop on
     # Mac / Windows. The ``host-gateway`` magic value tells the engine
     # to inject the right address per platform.
@@ -156,9 +102,6 @@ volumes:
   openbiliclaw_config:
   openbiliclaw_data:
   openbiliclaw_logs:
-  # Persists ollama models across container recreations so users don't
-  # have to re-pull bge-m3 on every rebuild.
-  openbiliclaw_ollama:
   # Holds the TLS certificate chain (ca.crt/ca.key, srv.crt/srv.key, ca.crl).
   # Auto-generated on first startup when empty; persists across rebuilds.
   # Explicit name prevents compose from adding the project-name prefix.
