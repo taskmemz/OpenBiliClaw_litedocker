@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 import pytest
 
 from openbiliclaw.discovery.engine import DiscoveredContent
+from openbiliclaw.discovery.eval_payload import decode_sparse_evaluation_json
 
 # ---------------------------------------------------------------------------
 # 1. Migration on an existing v0.3.17-shape database
@@ -195,11 +196,13 @@ async def test_evaluator_propagates_llm_franchise_key_through_to_db(
             self.calls += 1
             # Inspect user_input to figure out the input order so the
             # response array order matches.
-            input_data = json.loads(
-                user_input.split("<content_batch>", 1)[1].rsplit("</content_batch>", 1)[0]
+            input_batch = decode_sparse_evaluation_json(
+                user_input.split("<content_batch>", 1)[1]
+                .rsplit("</content_batch>", 1)[0]
+                .strip()
             )
             payload = []
-            for item in input_data:
+            for local_id, item in zip(input_batch.local_ids, input_batch.items, strict=True):
                 title = str(item["title"])
                 # Hand-tag franchises based on title — simulates what a
                 # real LLM would do. Only matched IPs get a franchise_key;
@@ -212,6 +215,7 @@ async def test_evaluator_propagates_llm_franchise_key_through_to_db(
                     franchise = ""
                 payload.append(
                     {
+                        "id": local_id,
                         "score": 0.78,
                         "reason": "fake reason",
                         "topic_group": "游戏",
@@ -262,6 +266,7 @@ async def test_evaluator_propagates_llm_franchise_key_through_to_db(
         contents[0],
         profile_digest=engine._evaluation_profile_digest(profile),
         negative_digest=engine._negative_examples_digest(None),
+        source_context="test",
     )
     cached = engine._eval_cache[cache_key]
     assert len(cached) == 5
@@ -312,18 +317,21 @@ async def test_evaluate_content_batch_default_size_45_uses_single_llm_call(
             reasoning_effort: str | None = None,
         ) -> object:
             self.call_count += 1
-            input_data = json.loads(
-                user_input.split("<content_batch>", 1)[1].rsplit("</content_batch>", 1)[0]
+            input_batch = decode_sparse_evaluation_json(
+                user_input.split("<content_batch>", 1)[1]
+                .rsplit("</content_batch>", 1)[0]
+                .strip()
             )
             payload = [
                 {
+                    "id": local_id,
                     "score": 0.5,
                     "reason": "ok",
                     "topic_group": "test",
                     "style_key": "deep_dive",
                     "franchise_key": "",
                 }
-                for _ in input_data
+                for local_id in input_batch.local_ids
             ]
 
             async def _coro() -> _Resp:

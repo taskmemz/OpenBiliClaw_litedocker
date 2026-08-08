@@ -1967,6 +1967,47 @@ async def test_soul_engine_passes_satisfaction_flag_to_preference_analyzer(
     assert engine_off._preference_analyzer.satisfaction_filter_enabled is False
 
 
+def test_soul_engine_threads_task_scoped_prompt_views_to_each_analyzer(tmp_path: Path) -> None:
+    memory = MemoryManager(tmp_path)
+    memory.initialize()
+
+    default_engine = SoulEngine(llm=FakeRegistry("{}"), memory=memory)
+    assert default_engine._preference_prompt_view == "legacy"
+    assert default_engine._awareness_prompt_view == "compact-v1"
+    assert default_engine._insight_prompt_view == "legacy"
+    assert default_engine._awareness_analyzer.plain_prompt_view == "legacy"
+    assert default_engine._awareness_analyzer.confusions_prompt_view == "compact-v1"
+    assert default_engine._insight_analyzer.cognition_prompt_view == "legacy"
+    assert default_engine._preference_analyzer.cognition_prompt_view == "legacy"
+
+    split_engine = SoulEngine(
+        llm=FakeRegistry("{}"),
+        memory=memory,
+        preference_prompt_view="compact-v1",
+        awareness_prompt_view="legacy",
+        insight_prompt_view="compact-v1",
+    )
+    assert split_engine._preference_prompt_view == "compact-v1"
+    assert split_engine._awareness_prompt_view == "legacy"
+    assert split_engine._insight_prompt_view == "compact-v1"
+    assert split_engine._awareness_analyzer.plain_prompt_view == "legacy"
+    assert split_engine._awareness_analyzer.confusions_prompt_view == "legacy"
+    assert split_engine._insight_analyzer.cognition_prompt_view == "compact-v1"
+    assert split_engine._preference_analyzer.cognition_prompt_view == "compact-v1"
+
+    for field_name in (
+        "preference_prompt_view",
+        "awareness_prompt_view",
+        "insight_prompt_view",
+    ):
+        with pytest.raises(ValueError, match="compact-v1"):
+            SoulEngine(
+                llm=FakeRegistry("{}"),
+                memory=memory,
+                **{field_name: "future"},
+            )
+
+
 # --- profile overrides overlay (Task 4) -----------------------------------
 
 
@@ -2002,6 +2043,23 @@ async def test_get_profile_applies_overrides_get_raw_does_not(tmp_path: Path) ->
     raw = await engine.get_raw_profile()
     assert "务实" in effective.core.core_traits
     assert "务实" not in raw.core.core_traits
+
+
+@pytest.mark.asyncio
+async def test_get_profile_overlays_flat_dislike_before_soul_rebuild(tmp_path: Path) -> None:
+    memory = MemoryManager(tmp_path)
+    memory.initialize()
+    engine = SoulEngine(llm=FakeRegistry("{}"), memory=memory)
+    _seed_soul(memory, _overlay_profile(dislikes=("营销号",)))
+    preference = memory.get_layer("preference")
+    preference.data["disliked_topics"] = ["运动康复"]
+    preference.save()
+
+    effective = await engine.get_profile()
+    raw = await engine.get_raw_profile()
+
+    assert effective.preferences.disliked_topics == ["营销号", "运动康复"]
+    assert raw.preferences.disliked_topics == ["营销号"]
 
 
 @pytest.mark.asyncio

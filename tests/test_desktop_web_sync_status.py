@@ -101,6 +101,52 @@ def test_desktop_apply_runtime_status_renders_sync_chip() -> None:
     assert "renderAccountSyncStatus(" in apply_fn.group("body")
 
 
+def test_desktop_refreshes_source_status_after_credential_sync_events() -> None:
+    """Credential sync events must invalidate the dashboard's source snapshot."""
+    app_js = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text(encoding="utf-8")
+
+    refresh_events = re.search(
+        r"const SOURCE_STATUS_REFRESH_EVENTS = new Set\(\[(?P<body>.*?)\]\);",
+        app_js,
+        flags=re.S,
+    )
+    assert refresh_events is not None, "desktop source-status refresh event set not found"
+    for event_type in (
+        "bilibili_cookie_synced",
+        "douyin_cookie_synced",
+        "x_cookie_synced",
+        "reddit_cookie_synced",
+    ):
+        assert f'"{event_type}"' in refresh_events.group("body")
+
+    handler = re.search(
+        r"function handleRuntimeEvent\(event\) \{(?P<body>.*?)\n    \}",
+        app_js,
+        flags=re.S,
+    )
+    assert handler is not None, "desktop handleRuntimeEvent not found"
+    assert "SOURCE_STATUS_REFRESH_EVENTS.has(event.type)" in handler.group("body")
+    assert "void renderSourcesStatus();" in handler.group("body")
+
+
+def test_desktop_source_status_poll_keeps_dashboard_current() -> None:
+    """The visible-page fallback must run even while source settings are closed."""
+    app_js = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text(encoding="utf-8")
+
+    poll = re.search(
+        r"// Login happens outside this page.*?"
+        r"setInterval\(\(\) => \{(?P<body>.*?)\n    \}, 30000\);",
+        app_js,
+        flags=re.S,
+    )
+    assert poll is not None, "desktop source-status fallback poll not found"
+    body = poll.group("body")
+    assert "if (document.hidden) return;" in body
+    assert "void renderSourcesStatus();" in body
+    assert "sourceStatusList" not in body
+    assert "offsetParent" not in body
+
+
 def test_desktop_sync_error_chip_uses_readable_theme_foreground() -> None:
     """The generic sync error must remain readable outside the dark hero panel."""
     app_css = Path("src/openbiliclaw/web/desktop/assets/css/app.css").read_text(encoding="utf-8")

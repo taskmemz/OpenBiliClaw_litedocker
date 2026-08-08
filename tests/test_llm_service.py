@@ -110,6 +110,20 @@ class FakeMemoryManager:
         return self.core_prompt
 
 
+class FakeSplitMemoryManager:
+    """Memory double exposing the stable/volatile split API (real manager shape)."""
+
+    def __init__(self, stable: str, volatile: str) -> None:
+        self.stable = stable
+        self.volatile = volatile
+
+    def render_core_memory_blocks(self) -> tuple[str, str]:
+        return self.stable, self.volatile
+
+    def render_core_memory_prompt(self) -> str:
+        return "\n\n".join(part for part in (self.stable, self.volatile) if part)
+
+
 def _safe_llm_failure_message(exc: BaseException) -> str:
     helper = getattr(llm_base, "safe_llm_failure_message", None)
     assert helper is not None, "safe_llm_failure_message() is not implemented"
@@ -593,6 +607,32 @@ async def test_complete_with_core_memory_injects_core_memory() -> None:
 
 
 @pytest.mark.asyncio
+async def test_complete_with_core_memory_splits_stable_into_system_volatile_into_user() -> None:
+    # Stable identity/preference stays in the system prefix (prompt-cache safe);
+    # the volatile awareness/insight block moves to the user message, ahead of the
+    # turn content (most-stable-first ordering).
+    registry = FakeRegistry(LLMResponse(content="ok", provider="openai"))
+    memory = FakeSplitMemoryManager(
+        stable="## 用户画像\nportrait",
+        volatile="## 近期观察\n- [2026-03-08] 更专注",
+    )
+    service = LLMService(registry=registry, memory=memory)  # type: ignore[arg-type]
+
+    await service.complete_with_core_memory(
+        system_instruction="你是内容评估助手。",
+        user_input="请评估这个视频。",
+    )
+
+    system_content = str(registry.calls[0][0]["content"])
+    user_content = str(registry.calls[0][1]["content"])
+    assert "## 用户画像" in system_content
+    assert "## 近期观察" not in system_content
+    assert "## 近期观察" in user_content
+    assert user_content.endswith("请评估这个视频。")
+    assert user_content.index("## 近期观察") < user_content.index("请评估这个视频。")
+
+
+@pytest.mark.asyncio
 async def test_complete_with_core_memory_can_skip_core_memory_for_cacheable_eval() -> None:
     registry = FakeRegistry(LLMResponse(content="ok", provider="openai"))
     memory = FakeMemoryManager(core_prompt="## 用户画像\nportrait")
@@ -758,10 +798,20 @@ def test_resolve_priority_longest_prefix_wins() -> None:
 
 def test_route_bucket_for_caller_covers_actual_callers() -> None:
     assert LLMService._route_bucket_for_caller("soul.profile_builder") == "soul"
+    assert LLMService._route_bucket_for_caller("soul.preference") == "soul"
+    assert LLMService._route_bucket_for_caller("pool_purge.llm_agent") == "soul"
+    assert LLMService._route_bucket_for_caller("api.sentiment") == "soul"
     assert LLMService._route_bucket_for_caller("discovery.search.query") == "discovery"
     assert LLMService._route_bucket_for_caller("discovery.keyword_planner") == "discovery"
     assert LLMService._route_bucket_for_caller("discovery.keyword_inspiration") == "discovery"
+    assert LLMService._route_bucket_for_caller("discovery.x.keyword_gen") == "discovery"
+    assert LLMService._route_bucket_for_caller("discovery.douyin.keyword_gen") == "discovery"
+    assert (
+        LLMService._route_bucket_for_caller("runtime.bilibili_extension_search.queries")
+        == "discovery"
+    )
     assert LLMService._route_bucket_for_caller("discovery.evaluate_batch") == "evaluation"
+    assert LLMService._route_bucket_for_caller("recommendation.evaluate_batch") == "evaluation"
     assert LLMService._route_bucket_for_caller("recommendation.write_batch") == "recommendation"
     assert (
         LLMService._route_bucket_for_caller("recommendation.write_expression") == "recommendation"

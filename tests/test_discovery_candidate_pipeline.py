@@ -51,7 +51,25 @@ class _ScoringLLM:
                 "caller": caller,
             }
         )
-        return _Response(json.dumps(self.payload, ensure_ascii=False))
+        candidate_block = user_input.split("<content_batch>", 1)[1].split("</content_batch>", 1)[0]
+        decoded = json.loads(candidate_block.strip())
+        if isinstance(decoded, dict):
+            request_items = decoded.get("items", [])
+            assert isinstance(request_items, list)
+            payload = [
+                {
+                    **{
+                        key: value
+                        for key, value in self.payload[index].items()
+                        if key not in {"bvid", "content_id"}
+                    },
+                    "id": str(index),
+                }
+                for index in range(len(request_items))
+            ]
+        else:
+            payload = self.payload
+        return _Response(json.dumps(payload, ensure_ascii=False))
 
 
 class _FailingEvalEngine:
@@ -698,10 +716,12 @@ async def test_pipeline_e2e_dedupes_text_first_description_before_llm(
         )[0]
         .strip()
     )
-    items = json.loads(batch_json)
-    assert items[0]["source_platform"] == "zhihu"
-    assert items[0]["body_text"] == summary
-    assert items[0]["description"] == ""
+    envelope = json.loads(batch_json)
+    assert envelope["defaults"]["source_platform"] == "zhihu"
+    item = envelope["items"][0]
+    assert item["body_text"] == summary
+    assert "description" not in item
+    assert "answer:dedupe-e2e" not in batch_json
 
 
 @pytest.mark.asyncio
@@ -1302,6 +1322,138 @@ async def test_pipeline_accumulates_eval_batch_until_minimum_or_timeout(
 
 
 @pytest.mark.asyncio
+async def test_token_diet_e2e_coalesces_evaluates_caches_and_admits(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "token-diet-e2e.db")
+    db.initialize()
+    db.enqueue_discovery_candidates(
+        [
+            DiscoveryCandidateWrite(
+                candidate_key=f"bilibili:BVDIET{index}",
+                source_platform="bilibili",
+                source_strategy="search",
+                bvid=f"BVDIET{index}",
+                content_id=f"BVDIET{index}",
+                title=f"Diet candidate {index}",
+            )
+            for index in range(3)
+        ]
+    )
+    llm = _ScoringLLM(
+        [
+            {
+                "content_id": "BVDIET0",
+                "score": 0.82,
+                "reason": "  " + ("高分内部诊断" * 8),
+                "topic_group": "工程",
+                "style_key": "deep_focus",
+            },
+            {
+                "content_id": "BVDIET1",
+                "score": 0.71,
+                "reason": "有效高分诊断",
+                "topic_group": "工程",
+                "style_key": "hands_on",
+            },
+            {
+                "content_id": "BVDIET2",
+                "score": 0.40,
+                "reason": "模型错误生成的低分理由",
+                "topic_group": "噪声",
+                "style_key": "quick_scan",
+            },
+        ]
+    )
+    engine = ContentDiscoveryEngine(llm_service=llm, database=db, eval_prefilter_mode="off")
+    now = 1000.0
+    pipeline = DiscoveryCandidatePipeline(
+        database=db,
+        discovery_engine=engine,
+        pool_target_count=30,
+        min_eval_batch_size=8,
+        max_eval_wait_seconds=60,
+        time_fn=lambda: now,
+    )
+    profile = _build_profile()
+
+    waiting = await pipeline.drain_pending(profile=profile, batch_size=30)
+    assert waiting == {"evaluated": 0, "cached": 0, "rejected": 0, "waiting": 3}
+    assert llm.calls == []
+
+    now += 61
+    completed = await pipeline.drain_pending(profile=profile, batch_size=30)
+
+    assert completed == {"evaluated": 3, "cached": 2, "rejected": 1}
+    assert len(llm.calls) == 1
+    assert len(engine._eval_cache) == 3  # noqa: SLF001
+    rows = db.conn.execute(
+        "SELECT content_id, relevance_reason, status FROM discovery_candidates ORDER BY content_id"
+    ).fetchall()
+    assert len(str(rows[0]["relevance_reason"])) == 30
+    assert rows[1]["relevance_reason"] == "有效高分诊断"
+    assert rows[2]["relevance_reason"] == ""
+    assert [row["status"] for row in rows] == ["cached", "cached", "rejected_low_score"]
+    assert db.conn.execute("SELECT COUNT(*) FROM content_cache").fetchone()[0] == 2
+
+    # A semantically identical replay reaches the in-memory evaluator cache,
+    # including the already-normalized reason, without another provider call.
+    replay = [
+        DiscoveredContent(
+            bvid=f"BVDIET{index}",
+            content_id=f"BVDIET{index}",
+            title=f"Diet candidate {index}",
+            source_platform="bilibili",
+            source_strategy="search",
+        )
+        for index in range(3)
+    ]
+    assert await engine.evaluate_content_batch(
+        replay,
+        profile,
+        source_context="mixed",
+        batch_size=3,
+    ) == [0.82, 0.71, 0.4]
+    assert len(llm.calls) == 1
+    assert replay[2].relevance_reason == ""
+
+
+def test_claim_ready_batch_honors_minimum_or_timeout(tmp_path: Path) -> None:
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    db.enqueue_discovery_candidates(
+        [
+            DiscoveryCandidateWrite(
+                candidate_key=f"bilibili:BVCLAIMWAIT{i}",
+                source_platform="bilibili",
+                source_strategy="search",
+                content_id=f"BVCLAIMWAIT{i}",
+                title=f"Claim wait {i}",
+            )
+            for i in range(3)
+        ]
+    )
+    now = 1000.0
+    pipeline = DiscoveryCandidatePipeline(
+        database=db,
+        discovery_engine=_BatchRecordingEvalEngine(),  # type: ignore[arg-type]
+        pool_target_count=30,
+        min_eval_batch_size=8,
+        max_eval_wait_seconds=60,
+        time_fn=lambda: now,
+    )
+
+    assert pipeline.claim_ready_batch(limit=30) is None
+    assert pipeline.eval_ready_in_seconds(limit=30) == pytest.approx(60.0)
+
+    now += 61
+    claim = pipeline.claim_ready_batch(limit=30)
+
+    assert claim is not None
+    assert len(claim.rows) == 3
+
+
+@pytest.mark.asyncio
 async def test_pipeline_runs_eval_immediately_when_minimum_batch_is_ready(
     tmp_path: Path,
 ) -> None:
@@ -1681,6 +1833,41 @@ def test_pipeline_target_zero_still_bounds_enqueued_candidates(tmp_path: Path) -
     assert {row["eval_error"] for row in rows if row["status"] == "trimmed_capacity"} == {
         "source_raw_ceiling:xiaohongshu"
     }
+
+
+def test_pipeline_retires_keyword_when_every_returned_identity_is_known(tmp_path: Path) -> None:
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    db.insert_pending_keywords("bilibili", ["重复热榜词"], "digest")
+    [claimed] = db.claim_keywords("bilibili", 1)
+    db.mark_keyword_used(int(claimed["id"]))
+    pipeline = DiscoveryCandidatePipeline(
+        database=db,
+        discovery_engine=object(),  # type: ignore[arg-type]
+        pool_target_count=30,
+    )
+    original = DiscoveredContent(
+        content_id="BVKNOWN",
+        title="Known",
+        source_platform="bilibili",
+        source_strategy="search",
+    )
+    assert pipeline.enqueue_candidates([original], source_context="search") == 1
+    duplicate = DiscoveredContent(
+        content_id="BVKNOWN",
+        title="Known again",
+        source_platform="bilibili",
+        source_strategy="search",
+        source_keyword_id=int(claimed["id"]),
+    )
+
+    assert pipeline.enqueue_candidates([duplicate], source_context="search") == 0
+    row = db.conn.execute(
+        "SELECT status, used_at FROM discovery_keywords WHERE id=?",
+        (int(claimed["id"]),),
+    ).fetchone()
+    assert row["status"] == "expired"
+    assert row["used_at"] is not None
 
 
 @pytest.mark.asyncio

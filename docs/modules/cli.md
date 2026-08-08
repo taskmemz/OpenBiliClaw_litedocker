@@ -94,6 +94,9 @@ server-owned binding、context preview 与卡片 action 不改变 CLI 的既有�
 配置概览会直接显示「停止后台 LLM 请求」是否启用、「浏览器断开后暂停」是否启用和当前宽限秒数、「开机自启动」配置 / 系统注册状态、海外网络模式与自定义代理地址，以及默认关闭的「收藏自动同步」解析状态，方便确认实际网络路由和 `[saved_sync].auto_sync_enabled` 是否已经写入后端配置。
 推荐引擎构造同样读取 `[discovery]` 的 `keyframe_max_frames`、`keyframe_fetch_limit`、
 `danmaku_fetch_limit` 和 `danmaku_max_chars`；手动 `recommend` 的预热范围与 daemon/API 使用同一配置。
+CLI 组合根也会把 `[scheduler].copy_ready_target_count` 规范为
+`min(max(copy_ready_target_count, 0), max(pool_target_count, 0))` 后注入推荐引擎，与 API 和
+OpenClaw 的文案水位语义一致；显式设为 `0` 时保留 legacy drain-all 回滚行为。
 
 ```bash
 $ openbiliclaw config-show
@@ -595,7 +598,7 @@ $ openbiliclaw questions
 
 ### `openbiliclaw profile-consolidate`
 
-用 LLM 整理合并画像里重复的喜欢 / 讨厌主题。兴趣标签和避雷主题会不断积累措辞变体（「智能体开发」vs「智能体开发与实现」），把进入 prompt 的 top-64 名额挤占掉；本命令按「规则合并 → embedding 聚类 → LLM 裁决 → 校验执行 → active 库存归档」流水线做同义合并，默认整理 likes 权重 top-512 + 全量避雷主题。后台默认每 12 小时自动跑一轮（见 `[scheduler].profile_consolidation_*`），本命令用于手动触发与预览。
+用 LLM 整理合并画像里重复的喜欢 / 讨厌主题。兴趣标签和避雷主题会不断积累措辞变体（「智能体开发」vs「智能体开发与实现」），把进入内容 prompt 的 top-48 名额挤占掉；本命令按「规则合并 → embedding 聚类 → LLM 裁决 → 校验执行 → active 库存归档」流水线做同义合并，默认整理 likes 权重 top-512 + 全量避雷主题。后台默认每 12 小时自动跑一轮（见 `[scheduler].profile_consolidation_*`），本命令用于手动触发与预览。
 
 ```bash
 $ openbiliclaw profile-consolidate            # dry-run：只打印建议
@@ -615,6 +618,7 @@ $ openbiliclaw profile-consolidate --revert 20260612-031500   # 按 run_id 回�
 - `--full` 与 `--migrate-categories` 互斥；推荐先 `--migrate-categories --apply`，再 `--full --apply`
 - active likes 超过 `profile_consolidation_like_target_upper` 时，定时整理会自动临时开 full boundary，并按 `upper -> soft` 水位压力降低 likes embedding 聚类阈值（CLI 输出 `likes 动态聚类阈值`）；合并后仍超上限时，会把低权重且非用户保护的长尾兴趣归档到 `archived_interests`
 - dry-run 会显示预计归档数量和库存说明；`--apply` 写入后 run record 可同时回滚 active / archived inventory
+- `--apply` 在 LLM 裁决后会重新核对完整 preference revision；若同期偏好分析写入了新证据，本轮放弃全部旧快照结果、不写 run/state，并由下一 tick 重试
 - 避雷主题只合真同义、严禁向上泛化（canonical 不得比成员更宽泛）
 - 用户在画像编辑里手动 remove/add 的条目会随改名同步（rename map 穿透 overrides），不会被合并「借尸还魂」
 - 回滚会把被回滚的合并对记入 no-merge 记忆，下一轮定时整理不会重做同一合并
@@ -697,6 +701,8 @@ YouTube 导入依赖浏览器插件在用户已登录的 `https://www.youtube.co
 知乎导入复用 `bootstrap_events` 任务。后端入队 `zhihu_tasks(type="bootstrap_events")`，插件在用户已登录的 `https://www.zhihu.com` 页面里读取最近浏览、收藏夹条目、个人动态点赞和个人动态收藏，以任务结果回写 `/api/sources/zhihu/task-result`。`init --yes-zhihu` 会把同一批任务结果转换为统一事件并加入 `analyze_events()` / `build_initial_profile()`，同时把 `[sources.zhihu].enabled=true` 写回配置。`fetch-zhihu` 默认仍只打印 smoke 计数；需要把本次抓取写入 memory 可显式加 `--write-memory`，需要写入后立即重建画像可加 `--rebuild-profile`。非交互式终端默认跳过知乎，`OPENBILICLAW_NO_ZHIHU=1` 会压过 `--yes-zhihu`。后台会复用 6 小时内近期知乎 `bootstrap_events` 任务；动态点赞和动态收藏各自独立使用单分支上限，不共享额度。
 
 Reddit 导入也复用 `bootstrap_events` 任务。后端入队 `reddit_tasks(type="bootstrap_events")`，插件在用户已登录的 `https://www.reddit.com` 页面里先读取 `/api/me.json` 识别当前用户，再读取 saved、upvoted 和 subscribed subreddit，同步回写 `/api/sources/reddit/task-result`。`init --yes-reddit` 会把 saved → `favorite`、upvoted → `like`、subscribed → `follow` 的统一事件加入 `analyze_events()` / `build_initial_profile()`，同时把 `[sources.reddit].enabled=true` 写回配置；Reddit 可以作为唯一初始化来源，只要真实拉到至少一条信号。后台会复用 6 小时内近期 Reddit `bootstrap_events` 任务；三个分支各自独立使用单分支上限 300。
+
+上述五个扩展账号来源在 CLI 行为保持不变；共享 enqueue 核心同时供 runtime 使用。完整画像已存在、引导初始化不在运行且扩展 runtime-stream 在线时，runtime 默认每 24 小时按全局串行 round-robin 重新入队一个已启用来源；这不是无浏览器账号同步，离线时不会创建任务。周期与逐源覆盖项见 [配置模块](config.md)。
 
 Bangumi 初始化不依赖插件或登录态。`init --yes-bangumi --bangumi-username <name>` 会通过官方匿名 API 读取该用户名的公开收藏，转换为统一事件后纳入 `analyze_events()` / `build_initial_profile()`，并写回 `[sources.bangumi].enabled=true` 与用户名。`init --yes-bangumi --bangumi-token <token>` 走个人令牌通道：令牌先经 `GET /v0/me` 实测校验（被拒绝时当场退出并指引到 https://next.bgm.tv/demo/access-token 重新生成），解析出的用户名覆盖显式填写值（不一致时提示），随后带 Bearer 读取该账号收藏（含私密行）；校验通过的令牌与用户名一并写回 `[sources.bangumi]`。令牌与显式用户名皆缺时，init 会回退浏览器扩展自动识别的账号（扩展在已登录的 bgm.tv 页面读取公开 `CHOBITS_UID` + 导航 `/user/<username>` 链接并上报后端持久化；优先级：令牌 `/v0/me` > 显式用户名 > 扩展上报用户名），命中时输出"使用浏览器扩展识别到的账号"。Bangumi 作为唯一来源时三者至少满足一个（报错文案："提供 --bangumi-token（推荐，自动识别当前用户）或 --bangumi-username（公开用户名），或先在浏览器登录 bgm.tv 让扩展自动识别"）；与其它画像来源混用但全部缺失时，初始化会明确警告并只启用后续 Bangumi discovery。匿名路径私有收藏不可见，`updated_at` 不作为收藏行为时间。
 
@@ -1011,6 +1017,8 @@ $ openbiliclaw import-youtube ~/Downloads/takeout.zip --dry-run
 
 读取当前画像并触发一次内容发现。默认跑 Bilibili 的全部策略并将结果写入 `content_cache`，支持通过 `--source` 切换到 xiaohongshu 关键词生产流程、douyin discovery、知乎插件 discovery、Reddit discovery 或 Bangumi 官方 API discovery，或通过 `--strategy` 限定只跑部分 Bilibili 策略。知乎正式流程会复用 runtime `ZhihuDiscoveryProducer`，按配置页 / `config.toml` 的 `[sources.zhihu].source_modes` 入队 search / hot / feed / creator / related 任务并进入统一待评估池；Reddit 正式流程复用 `RedditDiscoveryProducer`，默认用 `[sources.reddit].backend="rdt"` 的 rdt-cli 登录态命令后端，按 `source_modes` 抓 search / hot / subreddit / related 候选，命令后端不可用时自动 fallback 到 OpenBiliClaw 插件任务；Bangumi 正式流程复用 `BangumiDiscoveryProducer`，按 `[sources.bangumi].source_modes`、subject types、分支预算、cursor 与 cooldown 直连官方匿名 API。Reddit、知乎和 Bangumi 候选都只写 `discovery_candidates`，评估由后台统一 evaluator 处理。
 
+手动 `discover` 是一次性进程，其 candidate pipeline 固定 `eval_min_batch_size=1`、`eval_max_wait_seconds=0`，立即 drain 本次已入队候选；只有常驻 API daemon 才读取 `[scheduler]` 的默认 15 / 90 秒聚合策略。这样 CLI 不会在退出时遗失只存在内存里的凑批等待状态。
+
 ```bash
 # 默认：Bilibili 全策略
 $ openbiliclaw discover
@@ -1030,7 +1038,7 @@ $ openbiliclaw discover --source xiaohongshu
 生产摘要
   入队关键词数: 5
   尝试关键词数: 5
-  今日预算: 30
+  今日预算: 20
   节流开关: 4 小时节流
 
 # 忽略 4 小时节流
@@ -1105,7 +1113,7 @@ $ openbiliclaw discover-douyin \
 
 `discover-douyin` 的 `--source` 只接受 `search` / `hot` / `feed`；不传时默认三者都跑。`--keyword` 不传时从 Soul 画像兴趣生成搜索词；`hot` 会自动取 hot board 热词，不需要手动传关键词；`feed` 直接从抖音首页推荐流召回，不需要关键词。
 
-xiaohongshu 渠道并不直接抓取内容，而是调用 `XhsTaskProducer.produce_if_due()` 将 Soul 画像改写成关键词写入 `xhs_tasks` 表，由浏览器扩展的后台调度器在隐藏 Tab 中抓取。若返回 `throttled` 可加 `--force` 重试；若返回 `no_profile` 需先执行 `openbiliclaw init`。
+xiaohongshu 渠道并不直接抓取内容，而是调用 `XhsTaskProducer.produce_if_due()` 将 Soul 画像改写成关键词写入 `xhs_tasks` 表，由浏览器扩展的后台调度器在隐藏 Tab 中抓取。新配置默认每日搜索预算 20、producer 间隔 20 分钟；pending + in-progress 搜索任务达到 5 条时返回 `backlog`，不会继续生成关键词。若返回 `throttled` 可加 `--force` 跳过本次 producer 时间闸，但 `--force` 不会绕过积压门、每日预算、领取端 ±25% 抖动或平台风控冷却；若返回 `no_profile` 需先执行 `openbiliclaw init`。
 
 ### `openbiliclaw discover-zhihu`
 

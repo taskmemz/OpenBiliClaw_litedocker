@@ -199,6 +199,69 @@ async def test_producer_skips_keyword_generation_during_platform_cooldown(
 
 
 @pytest.mark.asyncio
+async def test_producer_skips_generation_when_search_backlog_is_full(
+    queue: XhsTaskQueue,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    async def fake_keywords(_llm: Any, _profile: Any, *, count: int) -> list[str]:
+        nonlocal called
+        called = True
+        return [f"new-{index}" for index in range(count)]
+
+    monkeypatch.setattr(
+        "openbiliclaw.runtime.xhs_producer.generate_xhs_keywords",
+        fake_keywords,
+    )
+    for index in range(5):
+        queue.enqueue("search", {"keyword": f"queued-{index}"})
+    producer = XhsTaskProducer(
+        task_queue=queue,
+        soul_engine=_FakeSoulEngine(_profile_with_interests()),
+        llm_service=_FakeLLMService(),
+        min_interval_minutes=0,
+    )
+
+    result = await producer.produce_if_due()
+
+    assert result == {"enqueued": 0, "attempted": 0, "reason": "backlog"}
+    assert called is False
+    assert queue.active_task_count("search") == 5
+
+
+@pytest.mark.asyncio
+async def test_producer_only_fills_available_backlog_slots(
+    queue: XhsTaskQueue,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_counts: list[int] = []
+
+    async def fake_keywords(_llm: Any, _profile: Any, *, count: int) -> list[str]:
+        requested_counts.append(count)
+        return [f"new-{index}" for index in range(count)]
+
+    monkeypatch.setattr(
+        "openbiliclaw.runtime.xhs_producer.generate_xhs_keywords",
+        fake_keywords,
+    )
+    for index in range(4):
+        queue.enqueue("search", {"keyword": f"queued-{index}"})
+    producer = XhsTaskProducer(
+        task_queue=queue,
+        soul_engine=_FakeSoulEngine(_profile_with_interests()),
+        llm_service=_FakeLLMService(),
+        min_interval_minutes=0,
+    )
+
+    result = await producer.produce_if_due()
+
+    assert requested_counts == [1]
+    assert result == {"enqueued": 1, "attempted": 1, "reason": "ok"}
+    assert queue.active_task_count("search") == 5
+
+
+@pytest.mark.asyncio
 async def test_producer_handles_empty_keywords(
     queue: XhsTaskQueue,
     monkeypatch: pytest.MonkeyPatch,

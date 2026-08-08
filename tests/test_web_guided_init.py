@@ -319,6 +319,21 @@ def test_setup_wizard_guard_resumes_running_and_initialized_states_on_load() -> 
     assert "showInitCompletion(status)" in guard
 
 
+def test_setup_wizard_guard_reattaches_to_embedding_pull_on_load() -> None:
+    """A packaged desktop may be downloading bge-m3 before guided init starts.
+
+    The first status response must attach the wizard's polling loop to that
+    process-global progress; otherwise the user has to click the init CTA just
+    to make the download percentage move.
+    """
+    setup_html = Path("src/openbiliclaw/web/setup/index.html").read_text(encoding="utf-8")
+    guard = setup_html.split("(async function guard()", 1)[1]
+    assert "embeddingPullProgressView(status).active" in guard
+    assert "scheduleInitPoll" in guard
+    poller = setup_html.split("async function pollInitStatus()", 1)[1]
+    assert "embeddingPullProgressView(status).active" in poller
+
+
 def test_setup_wizard_allows_saved_api_key_to_be_reused_without_reentry() -> None:
     """PUT /api/config only touches fields present in the payload, so an empty
     key field on a provider with a persisted key must not block step 0."""

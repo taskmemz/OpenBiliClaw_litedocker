@@ -41,6 +41,11 @@ from openbiliclaw.discovery.inspiration import (
     _normalize_match_text,
     derive_inspiration_axis_id,
 )
+from openbiliclaw.discovery.prefilter_audit import (
+    PREFILTER_AUDIT_MAX_ROWS,
+    PREFILTER_AUDIT_RETENTION_DAYS,
+    validate_prefilter_storage_record,
+)
 from openbiliclaw.published_time import normalize_published_time
 from openbiliclaw.saved_sync.identity import (
     canonical_source_platform,
@@ -741,6 +746,28 @@ def _normalized_keyword_text(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().casefold())
 
 
+def _keyword_matches_blocked_terms(value: object, blocked_terms: Sequence[str]) -> bool:
+    """Conservatively match a keyword against current topic exclusions."""
+    keyword = _normalized_keyword_text(value)
+    if not keyword:
+        return False
+    ascii_keyword = f" {re.sub(r'[^0-9a-z]+', ' ', keyword).strip()} "
+    compact_keyword = re.sub(r"[\W_]+", "", keyword)
+    for raw_term in blocked_terms:
+        term = _normalized_keyword_text(raw_term)
+        if not term:
+            continue
+        if term.isascii():
+            ascii_term = re.sub(r"[^0-9a-z]+", " ", term).strip()
+            if ascii_term and f" {ascii_term} " in ascii_keyword:
+                return True
+            continue
+        compact_term = re.sub(r"[\W_]+", "", term)
+        if compact_term and compact_term in compact_keyword:
+            return True
+    return False
+
+
 def _display_interest_label(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
 
@@ -1116,6 +1143,36 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_usage_timestamp ON llm_usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_provider ON llm_usage(provider, model);
+
+-- Phase 2 evaluator prefilter evidence. This table intentionally contains no
+-- title, URL, author, prompt, profile text, or provider response. The shadow
+-- decision is written before LLM I/O and joined to the eventual raw evaluator
+-- score by ``decision_id``. Retention is enforced on every insert.
+CREATE TABLE IF NOT EXISTS evaluator_prefilter_shadow_audit (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id              TEXT NOT NULL UNIQUE,
+    candidate_hash           TEXT NOT NULL,
+    platform_class           TEXT NOT NULL,
+    context_class            TEXT NOT NULL,
+    similarity               REAL,
+    threshold                REAL NOT NULL,
+    explore                  INTEGER NOT NULL DEFAULT 0,
+    embedding_namespace      TEXT NOT NULL,
+    profile_digest           TEXT NOT NULL,
+    would_filter             INTEGER NOT NULL DEFAULT 0,
+    embedding_status         TEXT NOT NULL,
+    fail_open                INTEGER NOT NULL DEFAULT 0,
+    explicit_strong_interest INTEGER NOT NULL DEFAULT 0,
+    llm_score                REAL,
+    admission_threshold      REAL,
+    admission_result         INTEGER,
+    created_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at             TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_prefilter_shadow_created
+    ON evaluator_prefilter_shadow_audit(created_at, id);
+CREATE INDEX IF NOT EXISTS idx_prefilter_shadow_platform_context
+    ON evaluator_prefilter_shadow_audit(platform_class, context_class, created_at);
 
 -- v0.3.174+ (cognitive profile pipeline Phase 0): append-only audit ledger
 -- for profile write points. One row per profile-mutating action, recorded
@@ -3542,6 +3599,196 @@ class Database:
         )
         return cursor.lastrowid or 0
 
+    # ------------------------------------------------------------------
+    # Evaluator embedding-prefilter shadow audit
+    # ------------------------------------------------------------------
+
+    def record_prefilter_shadow_decisions(
+        self,
+        decisions: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Persist privacy-safe shadow decisions and enforce bounded retention.
+
+        Callers treat this observer as best effort. Raising is intentional: the
+        discovery engine catches any telemetry/storage error and keeps the
+        candidate on the LLM path, while the incomplete evidence prevents the
+        enforce gate from passing silently.
+        """
+
+        params: list[tuple[Any, ...]] = []
+        for decision in decisions:
+            validate_prefilter_storage_record(decision)
+            params.append(
+                (
+                    str(decision["decision_id"]),
+                    str(decision["candidate_hash"]),
+                    str(decision["platform_class"]),
+                    str(decision["context_class"]),
+                    (None if decision.get("similarity") is None else float(decision["similarity"])),
+                    float(decision["threshold"]),
+                    1 if bool(decision["explore"]) else 0,
+                    str(decision["embedding_namespace"]),
+                    str(decision["profile_digest"]),
+                    1 if bool(decision["would_filter"]) else 0,
+                    str(decision["embedding_status"]),
+                    1 if bool(decision["fail_open"]) else 0,
+                    1 if bool(decision["explicit_strong_interest"]) else 0,
+                )
+            )
+        if not params:
+            return 0
+
+        connection = self.conn
+        changes_before = connection.total_changes
+        self._execute_many_write(
+            """
+            INSERT OR IGNORE INTO evaluator_prefilter_shadow_audit (
+                decision_id,
+                candidate_hash,
+                platform_class,
+                context_class,
+                similarity,
+                threshold,
+                explore,
+                embedding_namespace,
+                profile_digest,
+                would_filter,
+                embedding_status,
+                fail_open,
+                explicit_strong_interest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            params,
+        )
+        inserted = max(0, connection.total_changes - changes_before)
+        self._execute_write(
+            """
+            DELETE FROM evaluator_prefilter_shadow_audit
+            WHERE created_at < datetime('now', ?)
+            """,
+            (f"-{PREFILTER_AUDIT_RETENTION_DAYS} days",),
+        )
+        self._execute_write(
+            """
+            DELETE FROM evaluator_prefilter_shadow_audit
+            WHERE id IN (
+                SELECT id
+                FROM evaluator_prefilter_shadow_audit
+                ORDER BY created_at DESC, id DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (PREFILTER_AUDIT_MAX_ROWS,),
+        )
+        return inserted
+
+    def complete_prefilter_shadow_decisions(
+        self,
+        outcomes: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Join eventual raw LLM scores and admission-threshold results."""
+
+        params: list[tuple[Any, ...]] = []
+        for outcome in outcomes:
+            decision_id = str(outcome.get("decision_id") or "")
+            if re.fullmatch(r"[0-9a-f]{32}", decision_id) is None:
+                raise ValueError("prefilter audit outcome decision_id must be random hex")
+            llm_score = float(outcome["llm_score"])
+            admission_threshold = float(outcome["admission_threshold"])
+            admission_result = outcome.get("admission_result")
+            if not math.isfinite(llm_score) or not 0.0 <= llm_score <= 1.0:
+                raise ValueError("prefilter audit LLM score must be finite in [0, 1]")
+            if not math.isfinite(admission_threshold) or not 0.0 <= admission_threshold <= 1.0:
+                raise ValueError("prefilter audit admission threshold must be finite in [0, 1]")
+            if not isinstance(admission_result, bool):
+                raise ValueError("prefilter audit admission result must be boolean")
+            if admission_result != (llm_score >= admission_threshold):
+                raise ValueError("prefilter audit admission result disagrees with score threshold")
+            params.append(
+                (
+                    llm_score,
+                    admission_threshold,
+                    1 if admission_result else 0,
+                    decision_id,
+                )
+            )
+        if not params:
+            return 0
+        connection = self.conn
+        changes_before = connection.total_changes
+        self._execute_many_write(
+            """
+            UPDATE evaluator_prefilter_shadow_audit
+            SET llm_score = ?,
+                admission_threshold = ?,
+                admission_result = ?,
+                completed_at = CURRENT_TIMESTAMP
+            WHERE decision_id = ?
+              AND completed_at IS NULL
+            """,
+            params,
+        )
+        return max(0, connection.total_changes - changes_before)
+
+    def query_prefilter_shadow_audit(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return retained privacy-safe rows for the pure §6.4 gate."""
+
+        sql = """
+            SELECT decision_id,
+                   candidate_hash,
+                   platform_class,
+                   context_class,
+                   similarity,
+                   threshold,
+                   explore,
+                   embedding_namespace,
+                   profile_digest,
+                   would_filter,
+                   embedding_status,
+                   fail_open,
+                   explicit_strong_interest,
+                   llm_score,
+                   admission_threshold,
+                   admission_result,
+                   created_at,
+                   completed_at
+            FROM evaluator_prefilter_shadow_audit
+            ORDER BY id ASC
+        """
+        params: tuple[Any, ...] = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (max(0, int(limit)),)
+        return [dict(row) for row in self.conn.execute(sql, params).fetchall()]
+
+    def prefilter_shadow_audit_counts(self) -> dict[str, int]:
+        """Return the retained and score-joinable sample sizes."""
+
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE
+                       WHEN completed_at IS NOT NULL
+                        AND llm_score IS NOT NULL
+                        AND admission_threshold IS NOT NULL
+                        AND admission_result IS NOT NULL
+                       THEN 1 ELSE 0 END) AS joined,
+                   SUM(CASE WHEN completed_at IS NULL THEN 1 ELSE 0 END) AS incomplete
+            FROM evaluator_prefilter_shadow_audit
+            """
+        ).fetchone()
+        if row is None:
+            return {"total": 0, "joined": 0, "incomplete": 0}
+        return {
+            "total": int(row["total"] or 0),
+            "joined": int(row["joined"] or 0),
+            "incomplete": int(row["incomplete"] or 0),
+        }
+
     def query_llm_usage_by_day(
         self,
         *,
@@ -5899,9 +6146,14 @@ class Database:
     ) -> dict[str, int]:
         """Return pool inventory split by immediately servable and pending rows.
 
-        ``available`` is the public "可换" count. ``raw`` is broad fresh
-        material before readiness gates. ``pending`` is counted independently:
-        recently viewed rows are unavailable, but they are not pending.
+        ``available`` is the public "可换" count after the per-topic display
+        window. ``copy_ready`` applies every serve gate but intentionally does
+        not apply that ranking-diversity window: deeper ready rows become
+        available as the current topic head is consumed, so treating them as
+        missing copy would make a watermark drain same-topic backlog without
+        increasing ``available``. ``raw`` is broad fresh material before
+        readiness gates. ``pending`` is counted independently: recently viewed
+        rows are unavailable, but they are not pending.
         """
         self._ensure_fresh_read()
         admission_sql, admission_params = self._pool_admission_sql()
@@ -5979,11 +6231,21 @@ class Database:
         evaluated_pending_count = int(status_counts.get("evaluated", 0))
         discovery_pending_count = pending_eval_count + evaluated_pending_count
 
-        return {
-            "available": self.count_pool_candidates(
+        available = self.count_pool_candidates(
+            xhs_self_nickname=xhs_self_nickname,
+            _viewed_content_keys=viewed_content_keys,
+        )
+        copy_ready = len(
+            self._load_available_pool_candidate_rows_on(
+                self.conn,
+                max_per_topic_group=0,
                 xhs_self_nickname=xhs_self_nickname,
                 _viewed_content_keys=viewed_content_keys,
-            ),
+            )
+        )
+        return {
+            "available": available,
+            "copy_ready": copy_ready,
             "raw": raw_count + discovery_pending_count,
             "pending": pending_count + discovery_pending_count,
             "admitted_pending_copy": len(
@@ -6930,6 +7192,7 @@ class Database:
         available_before = 0
         raw_before = 0
         protected_ids: set[str] = set()
+        recovery_budget = 0
         lock_wait_ms = 0.0
         recovery_ms = 0.0
         stale_trim_ms = 0.0
@@ -6965,14 +7228,22 @@ class Database:
                 str(row["bvid"]) for row in before_rows[: min(len(before_rows), clean_target)]
             }
             recovered_ids: list[str] = []
-            if recover_suppressed:
+            # Suppressed rows do not count as raw material until restored. Never
+            # restore through an already-exhausted raw ceiling: doing so used to
+            # alternate forever with the next batch's capacity trim while the
+            # frontend-visible availability remained unchanged.
+            recovery_budget = min(
+                mutation_budget,
+                max(0, clean_raw_ceiling - raw_before),
+            )
+            if recover_suppressed and recovery_budget > 0:
                 phase_started = time.perf_counter()
                 recovered_ids = self._recover_suppressed_pool_inventory_on(
                     conn,
                     deficit=max(0, clean_target - available_before),
                     source_share_quotas=clean_source_quotas,
                     xhs_self_nickname=xhs_self_nickname,
-                    max_restore=mutation_budget,
+                    max_restore=recovery_budget,
                     _viewed_content_keys=viewed_content_keys,
                 )
                 recovery_ms = (time.perf_counter() - phase_started) * 1000.0
@@ -7179,6 +7450,15 @@ class Database:
             commit_started = time.perf_counter()
             conn.commit()
             write_ms += (time.perf_counter() - commit_started) * 1000.0
+            recovery_can_continue = (
+                recover_suppressed
+                and len(after_rows) < clean_target
+                and raw_after < clean_raw_ceiling
+                and (
+                    (recovery_budget == 0 and raw_after < raw_before)
+                    or (recovery_budget > 0 and len(recovered_ids) >= recovery_budget)
+                )
+            )
             result = PoolMaintenanceResult(
                 available_before=available_before,
                 available_after=len(after_rows),
@@ -7203,11 +7483,7 @@ class Database:
                 mutation_count=(
                     len(recovered_ids) + len(all_content_victims) + len(raw_plan.candidate_ids)
                 ),
-                has_more=(
-                    omitted_mutations > 0
-                    or raw_after > clean_raw_ceiling
-                    or (len(after_rows) < clean_target and len(recovered_ids) >= mutation_budget)
-                ),
+                has_more=(omitted_mutations > 0 or recovery_can_continue),
                 lock_wait_ms=lock_wait_ms,
                 recovery_ms=recovery_ms,
                 stale_trim_ms=stale_trim_ms,
@@ -7218,10 +7494,10 @@ class Database:
                 write_ms=write_ms,
                 total_ms=(time.perf_counter() - total_started) * 1000.0,
             )
-            if result.untrimmed_raw_excess > 0:
-                logger.error(
-                    "pool maintenance retained protected/token-owned raw excess: %s",
-                    result.untrimmed_raw_excess,
+            if full_raw_plan.untrimmed_excess > 0:
+                logger.warning(
+                    "pool maintenance cannot trim protected/token-owned raw excess: %s",
+                    full_raw_plan.untrimmed_excess,
                 )
             return result
         except Exception as exc:
@@ -8579,7 +8855,12 @@ class Database:
                 COALESCE(c.content_url, '') AS content_url,
                 COALESCE(c.source_platform, '') AS source_platform,
                 COALESCE(c.content_type, 'video') AS content_type,
+                COALESCE(c.description, '') AS description,
                 COALESCE(c.body_text, '') AS body_text,
+                COALESCE(c.tags, '[]') AS tags,
+                COALESCE(c.topic_key, '') AS topic_key,
+                COALESCE(c.topic_group, '') AS topic_group,
+                COALESCE(c.pool_topic_label, '') AS pool_topic_label,
                 COALESCE(c.published_at, '') AS published_at,
                 COALESCE(c.published_label, '') AS published_label,
                 COALESCE(c.franchise_key, '') AS franchise_key,
@@ -8645,7 +8926,15 @@ class Database:
                 r.bvid,
                 r.expression,
                 r.confidence,
+                r.topic,
                 c.title,
+                COALESCE(c.description, '') AS description,
+                COALESCE(c.body_text, '') AS body_text,
+                COALESCE(c.up_name, '') AS up_name,
+                COALESCE(c.tags, '[]') AS tags,
+                COALESCE(c.topic_key, '') AS topic_key,
+                COALESCE(c.topic_group, '') AS topic_group,
+                COALESCE(c.pool_topic_label, '') AS pool_topic_label,
                 c.notification_sent,
                 c.notified_at
             FROM recommendations AS r
@@ -10280,6 +10569,27 @@ class Database:
         ).fetchone()
         return int(row["n"]) if row is not None else 0
 
+    def count_pending_keywords_all_digests(
+        self,
+        platform: str,
+        *,
+        keyword_kind: str = "regular",
+    ) -> int:
+        """Return reconciled ``pending`` inventory regardless of source digest."""
+        kind = _normalize_keyword_kind(keyword_kind)
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM discovery_keywords
+            WHERE platform = ?
+              AND keyword_kind = ?
+              AND status = 'pending'
+            """,
+            (platform.strip(), kind),
+        ).fetchone()
+        return int(row["n"]) if row is not None else 0
+
     def claim_keywords(
         self,
         platform: str,
@@ -10468,15 +10778,19 @@ class Database:
         window_hours: float,
         *,
         keyword_kind: str = "regular",
+        include_pending: bool = False,
     ) -> list[str]:
-        """Return recent in-flight + used keywords for dedup, newest first.
+        """Return recent in-flight + consumed keywords for dedup, newest first.
 
         Includes ``claimed`` / ``executing`` (in-flight, so the planner does
         not regenerate a word a fetch is about to consume) and ``used``
-        (recently searched) within the rolling window. Capped at
-        ``window_size`` and bounded to the last ``window_hours``. History is
-        scoped by keyword pool so regular search and planner-backed explore do
-        not suppress or recycle each other's queries.
+        (recently searched) within the rolling window. With ``include_pending``
+        enabled, retained cross-digest inventory also participates in exact /
+        family novelty checks before the next generation call. A zero-yield
+        ``used`` word retired to ``expired`` keeps its ``used_at`` and remains
+        in this cooldown history. Capped at ``window_size`` and bounded to the
+        last ``window_hours``. History is scoped by keyword pool so regular
+        search and planner-backed explore do not suppress each other's queries.
         """
         from datetime import UTC, datetime, timedelta
 
@@ -10494,12 +10808,16 @@ class Database:
             FROM discovery_keywords
             WHERE platform = ?
               AND keyword_kind = ?
-              AND status IN ('claimed', 'executing', 'used')
+              AND (
+                    status IN ('claimed', 'executing', 'used')
+                    OR (? = 1 AND status = 'pending')
+                    OR (status = 'expired' AND used_at IS NOT NULL)
+                  )
               AND COALESCE(used_at, executing_at, claimed_at, created_at) >= ?
             ORDER BY COALESCE(used_at, executing_at, claimed_at, created_at) DESC, id DESC
             LIMIT ?
             """,
-            (platform.strip(), kind, cutoff, cap),
+            (platform.strip(), kind, int(include_pending), cutoff, cap),
         ).fetchall()
         return [str(row["keyword"]) for row in rows]
 
@@ -10510,6 +10828,7 @@ class Database:
         profile_kw_digest: str,
         *,
         keyword_kind: str = "regular",
+        min_age_hours: float = 0.0,
     ) -> int:
         """Recycle the oldest ``used`` keywords back to ``pending``.
 
@@ -10524,8 +10843,13 @@ class Database:
         recycle_n = max(0, int(n))
         if recycle_n <= 0:
             return 0
+        from datetime import UTC, datetime, timedelta
+
         digest = profile_kw_digest.strip()
         kind = _normalize_keyword_kind(keyword_kind)
+        cutoff = (datetime.now(UTC) - timedelta(hours=max(0.0, min_age_hours))).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
         self._ensure_fresh_read()
         conn = self.open_connection()
         try:
@@ -10537,9 +10861,11 @@ class Database:
                 WHERE platform = ?
                   AND keyword_kind = ?
                   AND status = 'used'
+                  AND used_at IS NOT NULL
+                  AND used_at <= ?
                 ORDER BY used_at ASC, id ASC
                 """,
-                (platform.strip(), kind),
+                (platform.strip(), kind, cutoff),
             ).fetchall()
             recycled = 0
             for row in candidates:
@@ -10600,6 +10926,114 @@ class Database:
             (platform.strip(), current_digest.strip()),
         )
         return int(cursor.rowcount or 0)
+
+    def reconcile_pending_keyword_digests(
+        self,
+        platform: str,
+        current_digest: str,
+        *,
+        grace_hours: float,
+        max_pending: int,
+        blocked_terms: Sequence[str],
+        keyword_kind: str = "regular",
+    ) -> dict[str, int]:
+        """Atomically retain bounded, recent, safe cross-digest inventory.
+
+        Rows keep their original profile digest and generation provenance.
+        Only ``pending`` rows in the selected keyword pool participate;
+        claimed/executing/terminal rows and the explore pool are untouched.
+        The return value is aggregate-only so callers can log reconciliation
+        without exposing keyword or profile text.
+        """
+        from datetime import timedelta
+
+        platform_key = platform.strip()
+        digest = current_digest.strip()
+        kind = _normalize_keyword_kind(keyword_kind)
+        cap = max(0, int(max_pending))
+        grace = max(0.0, float(grace_hours))
+        cutoff = (datetime.now(UTC) - timedelta(hours=grace)).strftime("%Y-%m-%d %H:%M:%S")
+        blocked = tuple(str(term).strip() for term in blocked_terms if str(term).strip())
+        ledger = {
+            "current": 0,
+            "reused": 0,
+            "expired_aged": 0,
+            "expired_blocked": 0,
+            "expired_excess": 0,
+        }
+
+        self._ensure_fresh_read()
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT id, keyword, profile_kw_digest, created_at
+                FROM discovery_keywords
+                WHERE platform = ?
+                  AND keyword_kind = ?
+                  AND status = 'pending'
+                ORDER BY created_at DESC, id DESC
+                """,
+                (platform_key, kind),
+            ).fetchall()
+
+            current_rows = [row for row in rows if str(row["profile_kw_digest"]) == digest]
+            stale_rows = [row for row in rows if str(row["profile_kw_digest"]) != digest]
+            expired_ids: list[int] = []
+            kept_keys: set[str] = set()
+
+            for row in current_rows:
+                keyword_key = _normalized_keyword_text(row["keyword"])
+                if ledger["current"] >= cap:
+                    ledger["expired_excess"] += 1
+                    expired_ids.append(int(row["id"]))
+                    continue
+                ledger["current"] += 1
+                if keyword_key:
+                    kept_keys.add(keyword_key)
+
+            for row in stale_rows:
+                keyword = str(row["keyword"])
+                keyword_key = _normalized_keyword_text(keyword)
+                created_at = str(row["created_at"] or "")
+                if grace <= 0.0 or not created_at or created_at <= cutoff:
+                    ledger["expired_aged"] += 1
+                    expired_ids.append(int(row["id"]))
+                elif _keyword_matches_blocked_terms(keyword, blocked):
+                    ledger["expired_blocked"] += 1
+                    expired_ids.append(int(row["id"]))
+                elif ledger["current"] + ledger["reused"] >= cap or (
+                    keyword_key and keyword_key in kept_keys
+                ):
+                    ledger["expired_excess"] += 1
+                    expired_ids.append(int(row["id"]))
+                else:
+                    ledger["reused"] += 1
+                    if keyword_key:
+                        kept_keys.add(keyword_key)
+
+            if expired_ids:
+                placeholders = ", ".join("?" for _ in expired_ids)
+                conn.execute(
+                    f"""
+                    UPDATE discovery_keywords
+                    SET status = 'expired'
+                    WHERE id IN ({placeholders})
+                      AND platform = ?
+                      AND keyword_kind = ?
+                      AND status = 'pending'
+                    """,
+                    (*expired_ids, platform_key, kind),
+                )
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return ledger
 
     def purge_archived_keywords(
         self,
@@ -11998,6 +12432,32 @@ class Database:
               AND used_at <= ?
             """,
             (platform.strip(), cutoff),
+        )
+        return int(cursor.rowcount or 0)
+
+    def retire_duplicate_only_keywords(self, keyword_ids: Sequence[int]) -> int:
+        """Retire searches whose returned candidates were all already known.
+
+        Candidate prefiltering is the earliest point where the system knows a
+        successful platform fetch added no new identity. Persist that signal
+        immediately instead of waiting for the generic zero-yield age floor.
+        ``used_at`` is retained/filled so the word stays in cooldown history and
+        cannot be regenerated by the same stable-profile plan.
+        """
+        ids = sorted({int(item) for item in keyword_ids if int(item) > 0})
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        cursor = self._execute_write(
+            f"""
+            UPDATE discovery_keywords
+            SET status = 'expired',
+                used_at = COALESCE(used_at, CURRENT_TIMESTAMP)
+            WHERE id IN ({placeholders})
+              AND status IN ('claimed', 'executing', 'used')
+              AND yield_count = 0
+            """,
+            ids,
         )
         return int(cursor.rowcount or 0)
 

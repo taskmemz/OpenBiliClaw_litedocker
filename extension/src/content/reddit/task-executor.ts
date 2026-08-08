@@ -130,27 +130,68 @@ function postIdFromRedditUrl(value: string): string {
   return match?.[1] ?? "";
 }
 
+function commentIdFromRedditUrl(value: string): string {
+  const match = value.match(/\/comments\/[^/?#]+\/[^/?#]+\/([^/?#]+)/i);
+  return match?.[1] ?? "";
+}
+
+function resolveThingId(
+  values: unknown[],
+  expectedPrefix: "t1" | "t3",
+): { id: string; invalid: boolean } {
+  for (const value of values) {
+    const normalized = str(value);
+    if (!normalized) continue;
+    const prefixed = normalized.match(/^(t[13])_(.*)$/i);
+    if (!prefixed) return { id: normalized, invalid: false };
+    const id = prefixed[2] ?? "";
+    if (prefixed[1]?.toLowerCase() !== expectedPrefix || !id) {
+      return { id: "", invalid: true };
+    }
+    return { id, invalid: false };
+  }
+  return { id: "", invalid: false };
+}
+
 export function normalizeRedditListingChild(
   raw: unknown,
   context: RedditNormalizeContext,
 ): RedditTaskItem | null {
   const child = asRecord(raw);
   const data = asRecord(child.data ?? raw);
-  const kind = str(child.kind) || str(data.kind) || str(data.name).slice(0, 2);
-  const id = str(data.id) || str(data.post_id) || postIdFromRedditUrl(str(data.permalink));
-  const name = str(data.name) || (id ? `${kind === "t1" ? "t1" : "t3"}_${id}` : "");
+  const rawName = str(data.name);
+  const kind = (str(child.kind) || str(data.kind) || rawName.slice(0, 2)).toLowerCase();
+  const explicitType = str(data.content_type ?? data.type).toLowerCase();
   const contentType: "post" | "comment" =
-    kind === "t1" || name.startsWith("t1_") || (!!str(data.body) && !str(data.title))
+    explicitType === "comment" ||
+    explicitType === "reply" ||
+    kind === "t1" ||
+    rawName.toLowerCase().startsWith("t1_") ||
+    (!!str(data.body) && !str(data.title))
       ? "comment"
       : "post";
   const permalink = str(data.permalink);
   const url = absoluteRedditUrl(permalink || str(data.url));
+  const expectedPrefix = contentType === "comment" ? "t1" : "t3";
+  const idResolution = resolveThingId(
+    contentType === "comment"
+      ? [data.comment_id, rawName, data.id]
+      : [data.post_id, rawName, data.id],
+    expectedPrefix,
+  );
+  if (idResolution.invalid) return null;
+  const id =
+    idResolution.id ||
+    (contentType === "comment"
+      ? commentIdFromRedditUrl(permalink || url)
+      : postIdFromRedditUrl(permalink || url));
+  const name = id ? `${expectedPrefix}_${id}` : "";
   const title =
     str(data.title) ||
     str(data.link_title) ||
     str(data.body).slice(0, 80) ||
     str(data.selftext).slice(0, 80);
-  if (!id && !url) return null;
+  if (!id) return null;
   if (!title && !url) return null;
 
   const item: RedditTaskItem = {
@@ -262,12 +303,12 @@ async function fetchCurrentRedditUsername(timeoutMs: number): Promise<string> {
   return username;
 }
 
-function normalizeRedditSubredditChild(raw: unknown): RedditTaskItem | null {
+export function normalizeRedditSubredditChild(raw: unknown): RedditTaskItem | null {
   const child = asRecord(raw);
   const data = asRecord(child.data ?? raw);
   const displayName = str(data.display_name) || str(data.display_name_prefixed).replace(/^r\//i, "");
   const title = str(data.title) || (displayName ? `r/${displayName}` : "");
-  if (!displayName && !title) return null;
+  if (!displayName) return null;
   const url = absoluteRedditUrl(str(data.url) || (displayName ? `/r/${displayName}/` : ""));
   const item: RedditTaskItem = {
     scope: "reddit_subscribed",

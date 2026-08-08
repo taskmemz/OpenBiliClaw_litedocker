@@ -1,0 +1,201 @@
+{
+  "events": [
+    {
+      "id": 101,
+      "event_type": "favorite",
+      "created_at": "2026-08-01 09:00:00",
+      "title": "从零搭建可靠的异步任务系统",
+      "url": "https://www.bilibili.com/video/BV1ASYNC",
+      "context": "在 B 站收藏了《从零搭建可靠的异步任务系统》,作者:系统实验室",
+      "inferred_satisfaction": "positive",
+      "satisfaction_reason": "favorite classifier: explicit strong positive",
+      "metadata": "{\"source_platform\":\"bilibili\",\"bvid\":\"BV1ASYNC\",\"up_name\":\"系统实验室\",\"signal_strength\":0.95,\"folder\":\"稍后实践\",\"unknown_semantic_label\":\"长期工程项目\",\"event_namespace\":\"browser-extension\",\"ingest_idempotency_key\":\"favorite:BV1ASYNC:101\",\"raw_dom\":\"<main><section>收藏页面中重复出现的按钮、导航、推荐列表和可访问性属性</section></main>\",\"browser_context\":\"tab=17; frame=0; selector=#app .video-card .favorite-button\"}"
+    },
+    {
+      "id": 102,
+      "event_type": "feedback",
+      "created_at": "2026-08-01 09:12:00",
+      "title": "三分钟暴富秘籍",
+      "url": "https://example.invalid/recommendation/102",
+      "context": "对推荐《三分钟暴富秘籍》点了不喜欢,备注:标题夸张且没有证据",
+      "inferred_satisfaction": "negative",
+      "metadata": {
+        "source_platform": "bilibili",
+        "content_id": "BV1DISLIKE",
+        "feedback_type": "dislike",
+        "reaction": "thumbs_down",
+        "feedback_note": "标题夸张且没有证据",
+        "recommendation_id": 812,
+        "signal_strength": 1.0,
+        "projection_owner": "recommendation-feedback-v2",
+        "classifier_reason": "explicit negative route"
+      }
+    },
+    {
+      "id": 103,
+      "event_type": "feedback",
+      "created_at": "2026-08-01 09:20:00",
+      "title": "城市步行路线观察",
+      "context": "给《城市步行路线观察》补充备注:路线不错,但旁白有点吵",
+      "inferred_satisfaction": "neutral",
+      "metadata": {
+        "source_platform": "xiaohongshu",
+        "note_id": "xhs-note-103",
+        "feedback_type": "comment",
+        "comment_kind": "comment",
+        "comment_text": "路线不错,但旁白有点吵",
+        "signal_strength": 0.75,
+        "unknown_semantic_mood": "有保留的认可",
+        "page_html": "<article>笔记正文、侧栏、评论和页面导航的完整快照</article>"
+      }
+    },
+    {
+      "id": 104,
+      "event_type": "like",
+      "created_at": "2026-08-01 09:31:00",
+      "title": "新模型发布会速览",
+      "url": "https://www.bilibili.com/video/BV1UNDO",
+      "context": "在 B 站点赞了《新模型发布会速览》",
+      "inferred_satisfaction": "positive",
+      "metadata": {
+        "source_platform": "bilibili",
+        "bvid": "BV1UNDO",
+        "retracted": true,
+        "retracted_action": "like",
+        "signal_strength": 0.2,
+        "timestamp": 1785557460000,
+        "projection_namespace": "positive-fold-v1"
+      }
+    },
+    {
+      "id": 105,
+      "event_type": "favorite",
+      "created_at": "2026-08-01 10:00:00",
+      "title": "手冲咖啡萃取变量笔记",
+      "url": "https://www.xiaohongshu.com/explore/xhs-note-105",
+      "context": "在小红书收藏了《手冲咖啡萃取变量笔记》,作者:豆子老师",
+      "inferred_satisfaction": "positive",
+      "metadata": {
+        "source_platform": "xiaohongshu",
+        "content_id": "xhs-note-105",
+        "author": "豆子老师",
+        "signal_strength": 0.9,
+        "collection_name": "周末实验",
+        "browser_state": "active_tab=xhs; viewport=1440x900; scroll_y=1733"
+      }
+    },
+    {
+      "id": 106,
+      "event_type": "view",
+      "created_at": "2026-08-01 10:30:00",
+      "title": "操作系统调度器源码讲解",
+      "url": "https://www.youtube.com/watch?v=scheduler106",
+      "context": "在 YouTube 观看《操作系统调度器源码讲解》42 分钟,接近完播",
+      "inferred_satisfaction": "positive",
+      "metadata": {
+        "source_platform": "youtube",
+        "video_id": "scheduler106",
+        "author": "Kernel Notes",
+        "watch_seconds": 2520,
+        "video_duration_seconds": 2700,
+        "completion_ratio": 0.9333,
+        "signal_strength": 0.88,
+        "playback_speed": 1.25,
+        "dom_snapshot": "video controls transcript recommendations comments navigation footer"
+      }
+    },
+    {
+      "id": 107,
+      "event_type": "search",
+      "created_at": "2026-08-01 11:00:00",
+      "title": "搜索: 分布式任务幂等重试",
+      "context": "在 B 站搜索“分布式任务幂等重试”",
+      "inferred_satisfaction": "neutral",
+      "search_query": "分布式任务幂等重试",
+      "metadata": {
+        "source_platform": "bilibili",
+        "query": "分布式任务幂等重试",
+        "result_count": 42,
+        "signal_strength": 0.5,
+        "idempotency_key": "search:107"
+      }
+    },
+    {
+      "id": 108,
+      "event_type": "dialogue",
+      "created_at": "2026-08-01 11:15:00",
+      "title": "关于学习节奏的对话",
+      "context": "用户主动说明最近想把零散教程整理成可以长期复用的项目",
+      "inferred_satisfaction": "positive",
+      "user_message": "我不是只想追新工具,更想把它们整理成能长期复用的项目。",
+      "metadata": {
+        "source_platform": "openbiliclaw",
+        "conversation_topic": "长期项目与学习节奏",
+        "signal_strength": 0.85,
+        "unknown_semantic_commitment": "明确的长期目标",
+        "raw_html": "<div class=chat><p>完整聊天窗口和历史消息的页面快照</p></div>"
+      }
+    },
+    {
+      "id": 109,
+      "event_type": "click",
+      "created_at": "2026-08-01 11:30:00",
+      "url": "https://example.com/sole-identity/109",
+      "inferred_satisfaction": "unknown",
+      "metadata": "{broken metadata payload that still carries opaque producer context ........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................"
+    }
+  ],
+  "preference": {
+    "version": 17,
+    "created_at": "2026-06-01T00:00:00Z",
+    "updated_at": "2026-08-01T11:35:00Z",
+    "interests": [
+      {"name": "分布式系统", "category": "科技", "weight": 0.96, "state": "active", "first_seen": "2026-06-01", "last_seen": "2026-08-01", "evidence_count": 23, "source": "favorite"},
+      {"name": "异步任务", "category": "科技", "weight": 0.93, "state": "active", "first_seen": "2026-06-03", "last_seen": "2026-08-01", "evidence_count": 18, "source": "favorite"},
+      {"name": "操作系统", "category": "科技", "weight": 0.89, "state": "active", "first_seen": "2026-06-10", "last_seen": "2026-08-01", "evidence_count": 12, "source": "view"},
+      {"name": "长期项目", "category": "成长", "weight": 0.87, "state": "active", "first_seen": "2026-07-01", "last_seen": "2026-08-01", "evidence_count": 9, "source": "dialogue"},
+      {"name": "手冲咖啡", "category": "生活", "weight": 0.71, "state": "trial", "first_seen": "2026-07-20", "last_seen": "2026-08-01", "evidence_count": 3, "source": "favorite"},
+      {"name": "过期实验标签", "category": "其他", "weight": 0.2, "state": "archived", "first_seen": "2026-06-01", "last_seen": "2026-06-02", "evidence_count": 1, "source": "view"}
+    ],
+    "style": {"preferred_duration": "long", "preferred_pace": "moderate", "quality_sensitivity": 0.9, "humor_preference": 0.4, "depth_preference": 0.92},
+    "context": {"weekday_patterns": "工作日上午偏工具资讯,夜间偏长教程", "weekend_patterns": "周末做项目和生活实验", "time_of_day_patterns": "晚间深度观看", "session_type": "深度钻研型"},
+    "exploration_openness": 0.67,
+    "disliked_topics": ["三分钟暴富", "无证据标题党", "伪科普", "重复搬运", "过度营销", "只讲结论不讲过程"],
+    "favorite_up_users": ["系统实验室", "Kernel Notes", "豆子老师"],
+    "cognitive_style": ["偏好结构化拆解", "需要可验证证据", "会把新知识放进长期项目"],
+    "source_platform_mix": {"bilibili": 0.55, "youtube": 0.25, "xiaohongshu": 0.15, "openbiliclaw": 0.05},
+    "speculative_interests": [
+      {"domain": "可靠性工程", "reason": "异步任务和幂等搜索连续出现", "state": "active", "created_at": "2026-08-01"},
+      {"domain": "陈旧猜测", "reason": "仅一次误触", "state": "archived", "created_at": "2026-06-01"}
+    ],
+    "_init_cognition_context": {"awareness_candidates": ["初始化临时观察"], "insight_candidates": ["初始化临时假设"]}
+  },
+  "soul_profile": {
+    "version": 2,
+    "created_at": "2026-06-01T00:00:00Z",
+    "updated_at": "2026-08-01T11:35:00Z",
+    "personality_portrait": "一个会把新知识放进长期工程实践中验证的人,既重视结构和证据,也会用咖啡、城市漫步等轻内容调节节奏。",
+    "core": {"core_traits": ["理性", "自驱", "耐心"], "deep_needs": ["掌控感", "持续成长"], "mbti": {"type": "INTJ", "confidence": 0.72, "dimensions": {}, "inferred_from": ["长期项目对话"], "updated_at": "2026-08-01"}},
+    "values_layer": {"values": ["真实", "可验证", "长期主义"], "motivational_drivers": ["把复杂系统变得可理解"], "updated_at": "2026-08-01"},
+    "interest": {
+      "likes": [
+        {"domain": "科技", "weight": 0.96, "specifics": [{"name": "分布式系统", "weight": 0.96}, {"name": "异步任务", "weight": 0.93}, {"name": "操作系统", "weight": 0.89}], "first_seen": "2026-06-01", "last_seen": "2026-08-01", "source": "preference projection", "state": "active", "evidence_count": 53},
+        {"domain": "成长", "weight": 0.87, "specifics": [{"name": "长期项目", "weight": 0.87}], "first_seen": "2026-07-01", "last_seen": "2026-08-01", "source": "preference projection", "state": "active", "evidence_count": 9},
+        {"domain": "生活", "weight": 0.71, "specifics": [{"name": "手冲咖啡", "weight": 0.71}], "first_seen": "2026-07-20", "last_seen": "2026-08-01", "source": "preference projection", "state": "trial", "evidence_count": 3}
+      ],
+      "dislikes": [{"domain": "三分钟暴富", "weight": 0.95}, {"domain": "无证据标题党", "weight": 0.95}, {"domain": "伪科普", "weight": 0.9}],
+      "favorite_up_users": ["系统实验室", "Kernel Notes", "豆子老师"]
+    },
+    "role": {"life_stage": "稳定积累阶段", "current_phase": "正在把零散学习转成可复用项目", "updated_at": "2026-08-01"},
+    "surface": {"cognitive_style": ["偏好结构化拆解", "需要可验证证据"], "style": {"preferred_duration": "long", "preferred_pace": "moderate", "quality_sensitivity": 0.9, "humor_preference": 0.4, "depth_preference": 0.92}, "context": {"weekday_patterns": "工作日上午偏工具资讯,夜间偏长教程", "weekend_patterns": "周末做项目和生活实验", "time_of_day_patterns": "晚间深度观看", "session_type": "深度钻研型"}, "exploration_openness": 0.67},
+    "source_platform_mix": {"bilibili": 0.55, "youtube": 0.25, "xiaohongshu": 0.15, "openbiliclaw": 0.05},
+    "recent_awareness": [
+      {"date": "2026-07-31", "observation": "最近从泛泛追新转向验证具体工作流。", "trend": "更关注长期复用。", "emotion_guess": "希望获得稳定掌控感。", "note_id": "note-a", "source_event_ids": [90, 94], "source_event_ids_approximate": false, "created_at": "2026-07-31T12:00:00Z"},
+      {"date": "2026-08-01", "observation": "深度技术内容和生活实验交替出现。", "trend": "主动调节信息密度。", "emotion_guess": "保持专注同时避免疲劳。", "note_id": "note-b", "source_event_ids": [101, 105, 106], "source_event_ids_approximate": false, "created_at": "2026-08-01T12:00:00Z"}
+    ],
+    "active_insights": [
+      {"hypothesis": "用户可能更在意工具能否进入长期项目,而不是单纯追新。", "evidence": ["收藏异步任务教程", "主动搜索幂等重试", "对话明确长期项目目标"], "confidence": 0.82, "validated": true, "user_verdict": "confirmed", "created_at": "2026-07-31"},
+      {"hypothesis": "用户可能用可操作的生活实验作为高密度学习后的节奏切换。", "evidence": ["收藏手冲咖啡变量笔记", "技术长视频后出现生活内容"], "confidence": 0.64, "validated": false, "user_verdict": "", "created_at": "2026-08-01"}
+    ]
+  }
+}

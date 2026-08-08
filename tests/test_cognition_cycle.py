@@ -577,6 +577,278 @@ async def test_insight_cursor_processes_only_new_notes_with_existing_context(
     assert state["last_insight_awareness_index"] == 5
 
 
+def test_insight_prompt_context_is_bounded_and_keeps_recent_judged_rows() -> None:
+    from openbiliclaw.soul.cognition_cycle import (
+        _INSIGHT_CONTEXT_JUDGED_RESERVE,
+        _INSIGHT_CONTEXT_RECENT_RESERVE,
+        _INSIGHT_CONTEXT_TOTAL_CAP,
+        _select_insight_prompt_context,
+    )
+    from openbiliclaw.soul.profile import InsightHypothesis
+
+    insights = [
+        InsightHypothesis(
+            hypothesis=f"topic-{i}",
+            validated=i < 25,
+            user_verdict="confirmed" if i < 25 else "",
+        )
+        for i in range(80)
+    ]
+
+    selected = _select_insight_prompt_context(insights)
+    selected_again = _select_insight_prompt_context(insights)
+    selected_indices = [insights.index(item) for item in selected]
+
+    assert len(selected) == _INSIGHT_CONTEXT_TOTAL_CAP
+    assert selected_again == selected
+    assert selected_indices == sorted(selected_indices)
+    assert set(range(25 - _INSIGHT_CONTEXT_JUDGED_RESERVE, 25)) <= set(selected_indices)
+    assert set(range(80 - _INSIGHT_CONTEXT_RECENT_RESERVE, 80)) <= set(selected_indices)
+
+
+def test_insight_prompt_context_recovers_old_currently_relevant_hypothesis() -> None:
+    from openbiliclaw.soul.cognition_cycle import _select_insight_prompt_context
+    from openbiliclaw.soul.profile import AwarenessNote, InsightHypothesis
+
+    insights = [
+        InsightHypothesis(hypothesis=f"unrelated-domain-{index}", confidence=0.1)
+        for index in range(100)
+    ]
+    relevant = InsightHypothesis(
+        hypothesis="持续比较 AI 编程助手的效率差异",
+        evidence=["留意不同助手完成同一代码任务的速度"],
+        confidence=0.6,
+    )
+    insights[3] = relevant
+
+    selected = _select_insight_prompt_context(
+        insights,
+        awareness_notes=[AwarenessNote(observation="今天连续观看 AI 编程助手效率横向测评")],
+    )
+
+    assert relevant in selected
+    assert len(selected) <= 40
+
+
+def test_insight_prompt_context_keeps_old_high_quality_hypothesis() -> None:
+    from openbiliclaw.soul.cognition_cycle import _select_insight_prompt_context
+    from openbiliclaw.soul.profile import InsightHypothesis
+
+    insights = [
+        InsightHypothesis(hypothesis=f"ordinary-topic-{index}", confidence=0.0)
+        for index in range(100)
+    ]
+    important = InsightHypothesis(
+        hypothesis="long-standing-supported-pattern",
+        evidence=["first independent signal", "second independent signal", "third signal"],
+        confidence=0.99,
+    )
+    insights[2] = important
+
+    selected = _select_insight_prompt_context(insights)
+
+    assert important in selected
+
+
+def test_insight_prompt_context_groups_only_same_state_near_duplicates() -> None:
+    from openbiliclaw.soul.cognition_cycle import _select_insight_prompt_context
+    from openbiliclaw.soul.profile import InsightHypothesis
+
+    repeated = [InsightHypothesis(hypothesis="反复比较 AI 工具", confidence=0.5) for _ in range(30)]
+    distinct = [
+        InsightHypothesis(hypothesis=f"independent-theme-{index}", confidence=0.5)
+        for index in range(30)
+    ]
+
+    selected = _select_insight_prompt_context([*repeated, *distinct])
+
+    assert sum(item.hypothesis == "反复比较 AI 工具" for item in selected) == 1
+    assert {item.hypothesis for item in distinct} <= {item.hypothesis for item in selected}
+    assert len(selected) == 31
+
+
+def test_insight_prompt_context_preserves_conflicting_semantic_states() -> None:
+    from openbiliclaw.soul.cognition_cycle import _select_insight_prompt_context
+    from openbiliclaw.soul.profile import InsightHypothesis
+
+    insights = [
+        InsightHypothesis(
+            hypothesis="更喜欢结构化教程",
+            validated=True,
+            user_verdict="confirmed",
+        ),
+        InsightHypothesis(hypothesis="更喜欢结构化教程", user_verdict="rejected"),
+        InsightHypothesis(hypothesis="更喜欢结构化教程"),
+    ]
+
+    selected = _select_insight_prompt_context(insights)
+
+    assert selected == insights
+
+
+def test_insight_prompt_context_ignores_empty_rows_and_nonfinite_confidence() -> None:
+    from openbiliclaw.soul.cognition_cycle import _select_insight_prompt_context
+    from openbiliclaw.soul.profile import InsightHypothesis
+
+    valid = InsightHypothesis(
+        hypothesis="usable-hypothesis",
+        evidence=["usable-evidence"],
+        confidence=float("nan"),
+    )
+    insights = [
+        InsightHypothesis(hypothesis=""),
+        InsightHypothesis(hypothesis="   ", evidence=[]),
+        valid,
+    ]
+
+    assert _select_insight_prompt_context(insights) == [valid]
+
+
+@pytest.mark.asyncio
+async def test_insight_prompt_window_does_not_truncate_persisted_merge_history(
+    tmp_path: Path,
+) -> None:
+    from openbiliclaw.soul.cognition_cycle import (
+        _INSIGHT_CONTEXT_RECENT_RESERVE,
+        _INSIGHT_CONTEXT_TOTAL_CAP,
+    )
+
+    memory = _seed_memory(tmp_path, event_count=0)
+    _set_awareness_notes(memory, 1)
+    original = [
+        {
+            "hypothesis": f"历史假设{i}",
+            "evidence": [f"证据{i}"],
+            "confidence": 0.5,
+            "validated": False,
+            "created_at": "2026-06-01",
+            "user_verdict": "",
+        }
+        for i in range(60)
+    ]
+    memory.get_layer("insight").update("hypotheses", original)
+    rec = _RecordingInsightAnalyzer()
+    cycle = CognitionCycle(
+        memory=memory,
+        awareness_analyzer=_FlakyAwarenessAnalyzer(fail_first_n=0, succeed_payload=[]),  # type: ignore[arg-type]
+        insight_analyzer=rec,  # type: ignore[arg-type]
+        min_interval_seconds=60,
+    )
+
+    state: dict[str, Any] = {}
+    added = await cycle._run_insight(state)  # noqa: SLF001
+
+    assert added == 1
+    assert len(rec.calls[0]["existing"]) == _INSIGHT_CONTEXT_TOTAL_CAP
+    assert {f"历史假设{i}" for i in range(60 - _INSIGHT_CONTEXT_RECENT_RESERVE, 60)} <= set(
+        rec.calls[0]["existing"]
+    )
+    persisted = memory.get_layer("insight").data["hypotheses"]
+    assert isinstance(persisted, list)
+    assert len(persisted) == 61
+    assert persisted[0]["hypothesis"] == "历史假设0"
+    assert persisted[-1]["hypothesis"] == "hyp-1"
+
+
+@pytest.mark.asyncio
+async def test_insight_runtime_passes_current_awareness_to_weighted_selector(
+    tmp_path: Path,
+) -> None:
+    memory = _seed_memory(tmp_path, event_count=0)
+    memory.get_layer("awareness").update(
+        "notes",
+        [
+            {
+                "date": "2026-08-06",
+                "observation": "今天连续观看 AI 编程助手效率横向测评",
+                "trend": "",
+                "emotion_guess": "",
+            }
+        ],
+    )
+    original = [
+        {
+            "hypothesis": f"unrelated-domain-{index}",
+            "evidence": [],
+            "confidence": 0.1,
+            "validated": False,
+            "created_at": "2026-06-01",
+            "user_verdict": "",
+        }
+        for index in range(80)
+    ]
+    original[3] = {
+        "hypothesis": "持续比较 AI 编程助手的效率差异",
+        "evidence": ["留意不同助手完成同一代码任务的速度"],
+        "confidence": 0.6,
+        "validated": False,
+        "created_at": "2026-06-01",
+        "user_verdict": "",
+    }
+    memory.get_layer("insight").update("hypotheses", original)
+    rec = _RecordingInsightAnalyzer()
+    cycle = CognitionCycle(
+        memory=memory,
+        awareness_analyzer=_FlakyAwarenessAnalyzer(fail_first_n=0, succeed_payload=[]),  # type: ignore[arg-type]
+        insight_analyzer=rec,  # type: ignore[arg-type]
+        min_interval_seconds=60,
+    )
+
+    await cycle._run_insight({})  # noqa: SLF001
+
+    assert "持续比较 AI 编程助手的效率差异" in rec.calls[0]["existing"]
+    persisted = memory.get_layer("insight").data["hypotheses"]
+    assert len(persisted) == 81
+    assert persisted[3]["hypothesis"] == "持续比较 AI 编程助手的效率差异"
+
+
+@pytest.mark.asyncio
+async def test_insight_runtime_falls_back_to_fixed_bounded_view(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openbiliclaw.soul.cognition_cycle as cognition_cycle_module
+    from openbiliclaw.soul.cognition_cycle import _INSIGHT_CONTEXT_RECENT_CAP
+
+    memory = _seed_memory(tmp_path, event_count=0)
+    _set_awareness_notes(memory, 1)
+    original = [
+        {
+            "hypothesis": f"fallback-history-{index}",
+            "evidence": [],
+            "confidence": 0.1,
+            "validated": False,
+            "created_at": "2026-06-01",
+            "user_verdict": "",
+        }
+        for index in range(60)
+    ]
+    memory.get_layer("insight").update("hypotheses", original)
+
+    def _raise_selector(*_args: object, **_kwargs: object) -> list[Any]:
+        raise ValueError("simulated malformed legacy insight")
+
+    monkeypatch.setattr(
+        cognition_cycle_module,
+        "_select_insight_prompt_context",
+        _raise_selector,
+    )
+    rec = _RecordingInsightAnalyzer()
+    cycle = CognitionCycle(
+        memory=memory,
+        awareness_analyzer=_FlakyAwarenessAnalyzer(fail_first_n=0, succeed_payload=[]),  # type: ignore[arg-type]
+        insight_analyzer=rec,  # type: ignore[arg-type]
+        min_interval_seconds=60,
+    )
+
+    await cycle._run_insight({})  # noqa: SLF001
+
+    assert rec.calls[0]["existing"] == [
+        f"fallback-history-{index}" for index in range(60 - _INSIGHT_CONTEXT_RECENT_CAP, 60)
+    ]
+    assert len(memory.get_layer("insight").data["hypotheses"]) == 61
+
+
 # ---------------------------------------------------------------------------
 # Phase 5 / Task 9: early trigger, single-flight, atomic state, watermark
 # ---------------------------------------------------------------------------

@@ -10,6 +10,8 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
+from openbiliclaw.llm.task_options import without_core_memory_kwargs
+
 if TYPE_CHECKING:
     from openbiliclaw.discovery.engine import DiscoveredContent
 
@@ -79,12 +81,14 @@ async def extract_content_from_page(
     )
 
     try:
-        response = await llm_service.complete_structured_task(
+        complete_structured = llm_service.complete_structured_task
+        response = await complete_structured(
             system_instruction=_EXTRACTION_SYSTEM_PROMPT,
             user_input=user_prompt,
             temperature=0.3,
             max_tokens=4096,
             caller=f"sources.{source_platform}.extract",
+            **without_core_memory_kwargs(complete_structured),
         )
     except Exception:
         logger.exception("LLM extraction failed for %s page", source_platform)

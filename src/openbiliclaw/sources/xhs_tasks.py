@@ -11,11 +11,13 @@ a nightly scheduler enqueues one creator task per subscription.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qs, urlparse
 
 if TYPE_CHECKING:
     from openbiliclaw.storage.database import Database
@@ -23,6 +25,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 XHS_RATE_LIMIT_COOLDOWN_SECONDS = 60 * 60
+XHS_RATE_LIMIT_MAX_COOLDOWN_SECONDS = 24 * 60 * 60
+XHS_TASK_INTERVAL_JITTER_RATIO = 0.25
 _XHS_RUNTIME_STATE_ROW_ID = 1
 _XHS_PACED_TASK_TYPES = frozenset({"search", "creator"})
 
@@ -43,6 +47,9 @@ XHS_BOOTSTRAP_SCOPE_LABELS = {
     "liked": "点赞",
     "xhs_history": "浏览记录",
 }
+
+_DEFAULT_BOOTSTRAP_SCOPES = ("saved", "liked", "xhs_history")
+_DEFAULT_BOOTSTRAP_MAX_ITEMS_PER_SCOPE = 300
 
 _RECENT_TASK_STATUSES = ("pending", "in_progress", "completed", "failed")
 
@@ -79,6 +86,27 @@ def _remaining_seconds(until: datetime | None, now: datetime) -> int:
     return int(seconds) if seconds.is_integer() else int(seconds) + 1
 
 
+def _jittered_interval_seconds(
+    target_seconds: int,
+    *,
+    task_id: str,
+    jitter_ratio: float,
+) -> int:
+    """Return a stable per-task interval around the configured target."""
+    target = max(0, int(target_seconds))
+    ratio = min(0.9, max(0.0, float(jitter_ratio)))
+    if target == 0 or ratio == 0:
+        return target
+    digest = hashlib.blake2b(
+        task_id.encode("utf-8"),
+        digest_size=8,
+        person=b"xhs-pace",
+    ).digest()
+    unit = int.from_bytes(digest, "big") / ((1 << 64) - 1)
+    factor = (1.0 - ratio) + (2.0 * ratio * unit)
+    return max(1, round(target * factor))
+
+
 def _note_key(note: dict[str, Any]) -> str:
     scope = str(note.get("scope", "")).strip()
     note_id = str(note.get("note_id", "")).strip()
@@ -92,9 +120,117 @@ def _has_publication_value(value: Any) -> bool:
     return value is not None and (not isinstance(value, str) or bool(value.strip()))
 
 
+def _xhs_note_url_identity(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return ""
+    if parsed.scheme != "https" or parsed.hostname != "www.xiaohongshu.com":
+        return ""
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 2:
+        return ""
+    if parts[0] == "explore" or parts[0] == "search_result":
+        return parts[-1]
+    if len(parts) >= 3 and parts[:2] == ["discovery", "item"]:
+        return parts[-1]
+    return ""
+
+
+def _xhs_url_token(value: Any) -> str:
+    if not _xhs_note_url_identity(value):
+        return ""
+    try:
+        parsed = urlparse(str(value))
+        tokens = parse_qs(parsed.query, keep_blank_values=False).get("xsec_token", [])
+    except ValueError:
+        return ""
+    return str(tokens[0]).strip() if tokens else ""
+
+
+def _enrich_xhs_access_token(existing: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    """Upgrade one admitted note from a bare URL to its first tokenized URL."""
+    existing_url = existing.get("url")
+    incoming_url = incoming.get("url")
+    existing_identity = _xhs_note_url_identity(existing_url)
+    incoming_identity = _xhs_note_url_identity(incoming_url)
+    if not incoming_identity or (existing_identity and existing_identity != incoming_identity):
+        return False
+    existing_note_id = existing.get("note_id")
+    incoming_note_id = incoming.get("note_id")
+    expected_identity = (existing_note_id.strip() if isinstance(existing_note_id, str) else "") or (
+        incoming_note_id.strip() if isinstance(incoming_note_id, str) else ""
+    )
+    if expected_identity and incoming_identity != expected_identity:
+        return False
+
+    existing_raw_token = existing.get("xsec_token")
+    incoming_raw_token = incoming.get("xsec_token")
+    existing_field_token = existing_raw_token.strip() if isinstance(existing_raw_token, str) else ""
+    existing_url_token = _xhs_url_token(existing_url)
+    existing_token = existing_field_token or existing_url_token
+    incoming_field_token = incoming_raw_token.strip() if isinstance(incoming_raw_token, str) else ""
+    incoming_url_token = _xhs_url_token(incoming_url)
+    incoming_token = incoming_field_token or incoming_url_token
+    if not incoming_token or (existing_token and existing_token != incoming_token):
+        return False
+
+    enriched = False
+    if not existing_field_token:
+        existing["xsec_token"] = incoming_token
+        enriched = True
+    if not existing_url_token and incoming_url_token:
+        existing["url"] = incoming_url
+        enriched = True
+    return enriched
+
+
 def xhs_bootstrap_note_key(note: dict[str, Any]) -> str:
     """Return the stable cross-task identity key for one bootstrap note."""
     return _note_key(note)
+
+
+def _bootstrap_result_policy(
+    task_type: object,
+    payload_json: object,
+) -> tuple[frozenset[str] | None, int | None]:
+    """Return immutable bootstrap scopes and per-scope cap stored on one task."""
+    if str(task_type or "").strip() != "bootstrap_profile":
+        return None, None
+
+    payload: dict[str, Any] = {}
+    if isinstance(payload_json, str) and payload_json:
+        try:
+            parsed = json.loads(payload_json)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            payload = parsed
+
+    raw_limit = payload.get(
+        "max_items_per_scope",
+        _DEFAULT_BOOTSTRAP_MAX_ITEMS_PER_SCOPE,
+    )
+    if isinstance(raw_limit, bool):
+        max_items_per_scope = _DEFAULT_BOOTSTRAP_MAX_ITEMS_PER_SCOPE
+    else:
+        try:
+            max_items_per_scope = max(1, int(raw_limit))
+        except (TypeError, ValueError, OverflowError):
+            max_items_per_scope = _DEFAULT_BOOTSTRAP_MAX_ITEMS_PER_SCOPE
+
+    raw_scopes = payload.get("scopes")
+    scopes: list[str] = []
+    if isinstance(raw_scopes, list):
+        for value in raw_scopes:
+            scope = str(value).strip() if isinstance(value, str) else ""
+            if scope in XHS_BOOTSTRAP_SCOPE_EVENT_TYPES and scope not in scopes:
+                scopes.append(scope)
+    if not scopes:
+        scopes = list(_DEFAULT_BOOTSTRAP_SCOPES)
+    return frozenset(scopes), max_items_per_scope
 
 
 def _merge_result_payload(
@@ -104,6 +240,8 @@ def _merge_result_payload(
     notes: list[dict[str, Any]] | None = None,
     scope_counts: dict[str, Any] | None = None,
     debug: dict[str, Any] | None = None,
+    allowed_scopes: frozenset[str] | None = None,
+    max_items_per_scope: int | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     merged_urls: list[str] = []
     seen_urls: set[str] = set()
@@ -116,15 +254,39 @@ def _merge_result_payload(
     merged_notes: list[dict[str, Any]] = []
     seen_notes: set[str] = set()
     notes_by_key: dict[str, dict[str, Any]] = {}
+    admitted_scope_counts: dict[str, int] = {}
+
+    def scope_is_allowed(note: dict[str, Any]) -> bool:
+        if allowed_scopes is None:
+            return True
+        scope = str(note.get("scope", "")).strip()
+        return scope in allowed_scopes
+
+    def scope_has_capacity(note: dict[str, Any]) -> bool:
+        if max_items_per_scope is None:
+            return True
+        scope = str(note.get("scope", "")).strip()
+        return admitted_scope_counts.get(scope, 0) < max_items_per_scope
+
+    def record_scope(note: dict[str, Any]) -> None:
+        scope = str(note.get("scope", "")).strip()
+        admitted_scope_counts[scope] = admitted_scope_counts.get(scope, 0) + 1
+
     for note in current.get("notes") or []:
         if not isinstance(note, dict):
             continue
         key = _note_key(note)
-        if not key or key in seen_notes:
+        if (
+            not key
+            or key in seen_notes
+            or not scope_is_allowed(note)
+            or not scope_has_capacity(note)
+        ):
             continue
         seen_notes.add(key)
         merged_notes.append(note)
         notes_by_key[key] = note
+        record_scope(note)
 
     added_notes: list[dict[str, Any]] = []
     enriched_notes_by_key: dict[str, dict[str, Any]] = {}
@@ -132,11 +294,11 @@ def _merge_result_payload(
         if not isinstance(note, dict):
             continue
         key = _note_key(note)
-        if not key:
+        if not key or not scope_is_allowed(note):
             continue
         if key in seen_notes:
             existing = notes_by_key[key]
-            enriched = False
+            enriched = _enrich_xhs_access_token(existing, note)
             for field in ("published_at", "published_label"):
                 if not _has_publication_value(existing.get(field)) and _has_publication_value(
                     note.get(field)
@@ -146,10 +308,23 @@ def _merge_result_payload(
             if enriched:
                 enriched_notes_by_key[key] = dict(existing)
             continue
+        if not scope_has_capacity(note):
+            continue
         seen_notes.add(key)
         merged_notes.append(note)
         notes_by_key[key] = note
         added_notes.append(note)
+        record_scope(note)
+
+    if allowed_scopes is not None:
+        merged_urls = []
+        seen_urls = set()
+        for note in merged_notes:
+            note_url = note.get("url")
+            if not isinstance(note_url, str) or not note_url or note_url in seen_urls:
+                continue
+            seen_urls.add(note_url)
+            merged_urls.append(note_url)
 
     merged: dict[str, Any] = {"urls": merged_urls}
     if merged_notes:
@@ -157,15 +332,30 @@ def _merge_result_payload(
 
     merged_counts: dict[str, Any] = {}
     existing_counts = current.get("scope_counts")
-    if isinstance(existing_counts, dict):
-        merged_counts.update(existing_counts)
-    if isinstance(scope_counts, dict):
-        for scope, count in scope_counts.items():
-            current_count = merged_counts.get(scope, 0)
-            if isinstance(current_count, int) and isinstance(count, int):
-                merged_counts[scope] = max(current_count, count)
-            else:
-                merged_counts[scope] = count
+    if allowed_scopes is None:
+        if isinstance(existing_counts, dict):
+            merged_counts.update(existing_counts)
+        if isinstance(scope_counts, dict):
+            for scope, count in scope_counts.items():
+                current_count = merged_counts.get(scope, 0)
+                if isinstance(current_count, int) and isinstance(count, int):
+                    merged_counts[scope] = max(current_count, count)
+                else:
+                    merged_counts[scope] = count
+    else:
+        for reported_counts in (existing_counts, scope_counts):
+            if not isinstance(reported_counts, dict):
+                continue
+            for scope, count in reported_counts.items():
+                if (
+                    not isinstance(scope, str)
+                    or scope not in allowed_scopes
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                ):
+                    continue
+                current_count = merged_counts.get(scope, 0)
+                merged_counts[scope] = max(current_count, max(0, count))
     note_counts: dict[str, int] = {}
     for note in merged_notes:
         scope = str(note.get("scope", "")).strip()
@@ -176,6 +366,10 @@ def _merge_result_payload(
         merged_counts[scope] = (
             max(reported_count, note_count) if isinstance(reported_count, int) else note_count
         )
+    if max_items_per_scope is not None:
+        for scope, count in list(merged_counts.items()):
+            if isinstance(count, int) and not isinstance(count, bool):
+                merged_counts[scope] = min(max(0, count), max_items_per_scope)
     if merged_counts:
         merged["scope_counts"] = merged_counts
 
@@ -271,6 +465,7 @@ class XhsTaskQueue:
                 next_claim_at   TIMESTAMP,
                 cooldown_until  TIMESTAMP,
                 cooldown_reason TEXT NOT NULL DEFAULT '',
+                rate_limit_strikes INTEGER NOT NULL DEFAULT 0,
                 updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             INSERT OR IGNORE INTO xhs_task_runtime_state(singleton)
@@ -282,7 +477,16 @@ class XhsTaskQueue:
         }
         if "claimed_at" not in columns:
             self._db.conn.execute("ALTER TABLE xhs_tasks ADD COLUMN claimed_at TIMESTAMP")
-            self._db.conn.commit()
+        runtime_columns = {
+            str(row["name"])
+            for row in self._db.conn.execute("PRAGMA table_info(xhs_task_runtime_state)").fetchall()
+        }
+        if "rate_limit_strikes" not in runtime_columns:
+            self._db.conn.execute(
+                "ALTER TABLE xhs_task_runtime_state "
+                "ADD COLUMN rate_limit_strikes INTEGER NOT NULL DEFAULT 0"
+            )
+        self._db.conn.commit()
 
     def enqueue(
         self,
@@ -316,9 +520,11 @@ class XhsTaskQueue:
         ``daily_budget <= 0`` disables the per-day cap; runtime producers are
         then controlled by source deficits and their per-run throttles.
         """
+        conn = self._db.conn
+        participating_in_transaction = bool(conn.in_transaction)
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         if daily_budget > 0:
-            count_today = self._db.conn.execute(
+            count_today = conn.execute(
                 "SELECT COUNT(*) FROM xhs_tasks WHERE type = ? AND created_at >= ?",
                 (task_type, today),
             ).fetchone()[0]
@@ -337,19 +543,33 @@ class XhsTaskQueue:
             return None
 
         task_id = str(uuid.uuid4())
-        self._db.conn.execute(
+        conn.execute(
             "INSERT INTO xhs_tasks (id, type, payload_json) VALUES (?, ?, ?)",
             (task_id, task_type, json.dumps(payload, ensure_ascii=False)),
         )
-        self._db.conn.commit()
+        if not participating_in_transaction:
+            conn.commit()
         return task_id
+
+    def active_task_count(self, task_type: str) -> int:
+        """Return pending and in-progress task count for one task type."""
+        row = self._db.conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM xhs_tasks
+            WHERE type = ? AND status IN ('pending', 'in_progress')
+            """,
+            (task_type,),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
 
     def runtime_state(self, *, now: datetime | None = None) -> dict[str, Any]:
         """Return persisted pacing and risk-control state for diagnostics."""
         current = _utc_now(now)
         row = self._db.conn.execute(
             """
-            SELECT next_claim_at, cooldown_until, cooldown_reason, updated_at
+            SELECT next_claim_at, cooldown_until, cooldown_reason,
+                   rate_limit_strikes, updated_at
             FROM xhs_task_runtime_state
             WHERE singleton = ?
             """,
@@ -363,6 +583,7 @@ class XhsTaskQueue:
                 "cooldown_until": "",
                 "next_claim_at": "",
                 "cooldown_reason": "",
+                "rate_limit_strikes": 0,
                 "updated_at": "",
             }
         next_claim_at = _parse_sqlite_timestamp(row["next_claim_at"])
@@ -378,6 +599,7 @@ class XhsTaskQueue:
             "cooldown_until": str(row["cooldown_until"] or ""),
             "next_claim_at": str(row["next_claim_at"] or ""),
             "cooldown_reason": str(row["cooldown_reason"] or ""),
+            "rate_limit_strikes": max(0, int(row["rate_limit_strikes"] or 0)),
             "updated_at": str(row["updated_at"] or ""),
         }
 
@@ -395,22 +617,25 @@ class XhsTaskQueue:
         scope_counts: dict[str, Any] | None = None,
         debug: dict[str, Any] | None = None,
         cooldown_seconds: int = XHS_RATE_LIMIT_COOLDOWN_SECONDS,
+        max_cooldown_seconds: int = XHS_RATE_LIMIT_MAX_COOLDOWN_SECONDS,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Persist a platform-wide cooldown and optionally fail its task.
 
         The state lives outside an individual task so it survives backend and
-        MV3 service-worker restarts. Repeated reports can only extend the
-        cooldown; they never shorten an existing safety window.
+        MV3 service-worker restarts. Separate risk episodes back off
+        exponentially; duplicate reports inside one active cooldown share the
+        same strike and can only extend, never shorten, its safety window.
         """
         current = _utc_now(now)
-        requested_until = current + timedelta(seconds=max(1, int(cooldown_seconds)))
+        base_cooldown = max(1, int(cooldown_seconds))
+        max_cooldown = max(base_cooldown, int(max_cooldown_seconds))
         conn = self._db.open_connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
             state = conn.execute(
                 """
-                SELECT next_claim_at, cooldown_until
+                SELECT next_claim_at, cooldown_until, rate_limit_strikes
                 FROM xhs_task_runtime_state
                 WHERE singleton = ?
                 """,
@@ -419,6 +644,17 @@ class XhsTaskQueue:
             existing_cooldown = (
                 _parse_sqlite_timestamp(state["cooldown_until"]) if state is not None else None
             )
+            existing_strikes = max(
+                0,
+                int(state["rate_limit_strikes"] or 0) if state is not None else 0,
+            )
+            if _remaining_seconds(existing_cooldown, current) > 0:
+                strike_count = max(1, existing_strikes)
+            else:
+                strike_count = existing_strikes + 1
+            exponent = min(30, max(0, strike_count - 1))
+            applied_cooldown = min(max_cooldown, base_cooldown * (1 << exponent))
+            requested_until = current + timedelta(seconds=applied_cooldown)
             effective_until = max(
                 requested_until,
                 existing_cooldown or requested_until,
@@ -434,13 +670,14 @@ class XhsTaskQueue:
                 """
                 INSERT INTO xhs_task_runtime_state(
                     singleton, next_claim_at, cooldown_until,
-                    cooldown_reason, updated_at
+                    cooldown_reason, rate_limit_strikes, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(singleton) DO UPDATE SET
                     next_claim_at = excluded.next_claim_at,
                     cooldown_until = excluded.cooldown_until,
                     cooldown_reason = excluded.cooldown_reason,
+                    rate_limit_strikes = excluded.rate_limit_strikes,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -448,13 +685,14 @@ class XhsTaskQueue:
                     _format_sqlite_timestamp(effective_next_claim),
                     _format_sqlite_timestamp(effective_until),
                     str(error or "xhs_rate_limited")[:128],
+                    strike_count,
                     _format_sqlite_timestamp(current),
                 ),
             )
 
             if task_id:
                 row = conn.execute(
-                    "SELECT status, result_json FROM xhs_tasks WHERE id = ?",
+                    "SELECT type, payload_json, status, result_json FROM xhs_tasks WHERE id = ?",
                     (task_id,),
                 ).fetchone()
                 current_result: dict[str, Any] = {}
@@ -471,16 +709,22 @@ class XhsTaskQueue:
                     str(row["status"] or "").strip() not in {"completed", "failed"}
                     and not staged_terminal_status(current_result)
                 ):
+                    allowed_scopes, max_items_per_scope = _bootstrap_result_policy(
+                        row["type"], row["payload_json"]
+                    )
                     merged, _added, _enriched = _merge_result_payload(
                         current_result,
                         urls=urls,
                         notes=notes,
                         scope_counts=scope_counts,
                         debug=debug,
+                        allowed_scopes=allowed_scopes,
+                        max_items_per_scope=max_items_per_scope,
                     )
                     merged["error"] = str(error or "xhs_rate_limited")
                     merged["rate_limited"] = True
                     merged["cooldown_until"] = _format_sqlite_timestamp(effective_until)
+                    merged["rate_limit_strikes"] = strike_count
                     conn.execute(
                         """
                         UPDATE xhs_tasks
@@ -503,9 +747,12 @@ class XhsTaskQueue:
         finally:
             conn.close()
         logger.warning(
-            "xhs task circuit breaker opened: task_id=%s reason=%s cooldown_until=%s",
+            "xhs task circuit breaker opened: task_id=%s reason=%s strikes=%d "
+            "cooldown_seconds=%d cooldown_until=%s",
             task_id or "-",
             str(error or "xhs_rate_limited")[:128],
+            strike_count,
+            applied_cooldown,
             _format_sqlite_timestamp(effective_until),
         )
         return self.runtime_state(now=current)
@@ -515,6 +762,7 @@ class XhsTaskQueue:
         only_ids: set[str] | None = None,
         *,
         min_interval_seconds: int = 0,
+        jitter_ratio: float = XHS_TASK_INTERVAL_JITTER_RATIO,
         now: datetime | None = None,
     ) -> dict[str, Any] | None:
         """Claim and return the oldest runnable task, or None.
@@ -584,7 +832,12 @@ class XhsTaskQueue:
             )
             interval_seconds = max(0, int(min_interval_seconds))
             if task_type in _XHS_PACED_TASK_TYPES and interval_seconds > 0:
-                next_claim_at = current + timedelta(seconds=interval_seconds)
+                paced_seconds = _jittered_interval_seconds(
+                    interval_seconds,
+                    task_id=task_id,
+                    jitter_ratio=jitter_ratio,
+                )
+                next_claim_at = current + timedelta(seconds=paced_seconds)
                 conn.execute(
                     """
                     UPDATE xhs_task_runtime_state
@@ -652,6 +905,15 @@ class XhsTaskQueue:
             return None
         return dict(row)
 
+    def _result_policy(self, task_id: str) -> tuple[frozenset[str] | None, int | None]:
+        row = self._db.conn.execute(
+            "SELECT type, payload_json FROM xhs_tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None, None
+        return _bootstrap_result_policy(row["type"], row["payload_json"])
+
     def complete(
         self,
         task_id: str,
@@ -662,22 +924,27 @@ class XhsTaskQueue:
         debug: dict[str, Any] | None = None,
     ) -> None:
         """Mark a task as completed with optional result payload details."""
-        result_payload: dict[str, Any] = {"urls": urls or []}
-        if notes is not None:
-            result_payload["notes"] = notes
-        if scope_counts is not None:
-            result_payload["scope_counts"] = scope_counts
-        if debug is not None:
-            result_payload["debug"] = debug
+        allowed_scopes, max_items_per_scope = self._result_policy(task_id)
+        result_payload, _added, _enriched = _merge_result_payload(
+            {},
+            urls=urls,
+            notes=notes,
+            scope_counts=scope_counts,
+            debug=debug,
+            allowed_scopes=allowed_scopes,
+            max_items_per_scope=max_items_per_scope,
+        )
         from openbiliclaw.sources.task_result_protocol import mutate_unstaged_result
 
-        mutate_unstaged_result(
+        mutated, _canonical = mutate_unstaged_result(
             self._db,
             table="xhs_tasks",
             task_id=task_id,
             mutate=lambda _current: result_payload,
             terminal_status="completed",
         )
+        if mutated:
+            self._reset_rate_limit_strikes_after_success(task_id)
 
     def merge_result(
         self,
@@ -718,6 +985,7 @@ class XhsTaskQueue:
 
         added_notes: list[dict[str, Any]] = []
         enriched_notes: list[dict[str, Any]] = []
+        allowed_scopes, max_items_per_scope = self._result_policy(task_id)
 
         def mutate(current: dict[str, Any]) -> dict[str, Any]:
             nonlocal added_notes, enriched_notes
@@ -727,6 +995,8 @@ class XhsTaskQueue:
                 notes=notes,
                 scope_counts=scope_counts,
                 debug=debug,
+                allowed_scopes=allowed_scopes,
+                max_items_per_scope=max_items_per_scope,
             )
             return merged
 
@@ -737,6 +1007,8 @@ class XhsTaskQueue:
             mutate=mutate,
             terminal_status="completed" if complete else None,
         )
+        if complete and mutated:
+            self._reset_rate_limit_strikes_after_success(task_id)
         return (added_notes, enriched_notes) if mutated else ([], [])
 
     def stage_final_result(
@@ -752,6 +1024,8 @@ class XhsTaskQueue:
         """Stage the immutable canonical result before downstream projection."""
         from openbiliclaw.sources.task_result_protocol import stage_terminal_result
 
+        allowed_scopes, max_items_per_scope = self._result_policy(task_id)
+
         def merge(current: dict[str, Any]) -> dict[str, Any]:
             merged, _added, _enriched = _merge_result_payload(
                 current,
@@ -759,6 +1033,8 @@ class XhsTaskQueue:
                 notes=notes,
                 scope_counts=scope_counts,
                 debug=debug,
+                allowed_scopes=allowed_scopes,
+                max_items_per_scope=max_items_per_scope,
             )
             return merged
 
@@ -774,7 +1050,78 @@ class XhsTaskQueue:
         """Mark a staged canonical result complete without replacing it."""
         from openbiliclaw.sources.task_result_protocol import complete_staged_result
 
-        return complete_staged_result(self._db, table="xhs_tasks", task_id=task_id)
+        completed = complete_staged_result(self._db, table="xhs_tasks", task_id=task_id)
+        if completed:
+            self._reset_rate_limit_strikes_after_success(task_id)
+        return completed
+
+    def _reset_rate_limit_strikes_after_success(self, task_id: str) -> bool:
+        """Clear expired risk backoff after a successful paced task."""
+        current = _utc_now()
+        conn = self._db.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            task = conn.execute(
+                "SELECT type, status FROM xhs_tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None or (
+                str(task["type"] or "") not in _XHS_PACED_TASK_TYPES
+                or str(task["status"] or "") != "completed"
+            ):
+                conn.commit()
+                return False
+            state = conn.execute(
+                """
+                SELECT cooldown_until, rate_limit_strikes
+                FROM xhs_task_runtime_state
+                WHERE singleton = ?
+                """,
+                (_XHS_RUNTIME_STATE_ROW_ID,),
+            ).fetchone()
+            cooldown_until = (
+                _parse_sqlite_timestamp(state["cooldown_until"]) if state is not None else None
+            )
+            if _remaining_seconds(cooldown_until, current) > 0:
+                # A different in-flight task may have opened the breaker before
+                # this success arrived. Never let that late result cancel an
+                # active safety window.
+                conn.commit()
+                return False
+            strikes = int(state["rate_limit_strikes"] or 0) if state is not None else 0
+            if strikes <= 0:
+                conn.commit()
+                return False
+            conn.execute(
+                """
+                UPDATE xhs_task_runtime_state
+                SET cooldown_until = NULL,
+                    cooldown_reason = '',
+                    rate_limit_strikes = 0,
+                    updated_at = ?
+                WHERE singleton = ?
+                """,
+                (
+                    _format_sqlite_timestamp(current),
+                    _XHS_RUNTIME_STATE_ROW_ID,
+                ),
+            )
+            conn.commit()
+            logger.info("xhs task circuit breaker reset after successful task: %s", task_id)
+            return True
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            # Completion is already durable by the time this best-effort reset
+            # runs. Keeping an old strike is safer than turning a successful
+            # callback into a 5xx that cannot roll the terminal task back.
+            logger.exception(
+                "xhs task circuit breaker reset failed after successful task: %s",
+                task_id,
+            )
+            return False
+        finally:
+            conn.close()
 
     def fail(
         self,

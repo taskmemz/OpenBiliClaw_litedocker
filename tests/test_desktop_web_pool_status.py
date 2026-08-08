@@ -302,26 +302,27 @@ def test_desktop_pool_update_does_not_replace_recommendation_list() -> None:
     runtime emits ``refresh.pool_updated`` / ``recommendation.reshuffled``,
     otherwise locally appended ("加载更多") cards get wiped out by the latest
     top window from ``/api/recommendations``. This mirrors the recommend.js +
-    popup.js behaviour (fix 79042ce). ``config_reloaded`` still hydrates through
-    the broad-reload path; ``init_completed`` hydrates only after
+    popup.js behaviour (fix 79042ce). ``config_reloaded`` still hydrates after
+    the accepted config-apply terminal state; ``init_completed`` hydrates only after
     ``refreshInitStatus`` observes the initialized transition, avoiding duplicate
     fetches/toasts. Pool/header counts keep updating via the unconditional
     ``applyRuntimeStatus`` call.
     """
     app_js = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text(encoding="utf-8")
 
-    match = re.search(
-        r"if \(\[(?P<events>[^\]]*)\]\.includes\(event\.type\)\) \{(?P<body>.*?)\n      \}",
-        app_js,
-        flags=re.S,
-    )
-    assert match is not None, "desktop hydration trigger line not found"
-    trigger = f"{match.group('events')}\n{match.group('body')}"
-    assert "scheduleBackendHydration();" in match.group("body")
-    assert "refresh.pool_updated" not in trigger
-    assert "recommendation.reshuffled" not in trigger
-    assert "config_reloaded" in trigger
-    assert "init_completed" not in trigger
+    handle_runtime = _function_body(app_js, "handleRuntimeEvent")
+    apply_status = _function_body(app_js, "applyConfigApplyStatus")
+    safe_hydration = _function_body(app_js, "scheduleSettingsHydrationIfSafe")
+
+    # Runtime events no longer hydrate directly: an accepted config terminal
+    # state goes through the draft/editor guard first. Pool and reshuffle events
+    # never enter that config-apply path, so they cannot replace the list.
+    assert "scheduleBackendHydration();" not in handle_runtime
+    assert 'event.type === "config_reloaded" && !configApplyEventAccepted' in handle_runtime
+    assert "scheduleSettingsHydrationIfSafe();" in apply_status
+    assert "scheduleBackendHydration();" in safe_hydration
+    assert "refresh.pool_updated" not in apply_status
+    assert "recommendation.reshuffled" not in apply_status
 
 
 def test_desktop_failed_recommendation_read_schedules_empty_only_recovery() -> None:

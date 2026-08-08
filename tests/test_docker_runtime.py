@@ -353,7 +353,7 @@ def test_docker_runtime_root_survives_a_version_rollback(
     config_path = runtime_root / "config.toml"
     config_path.write_text(
         config_path.read_text(encoding="utf-8").replace(
-            "[scheduler]", "[scheduler]\nsource_incremental_hours = 24", 1
+            "[scheduler]", "[scheduler]\nfuture_scheduler_field = 24", 1
         ),
         encoding="utf-8",
     )
@@ -363,5 +363,5 @@ def test_docker_runtime_root_survives_a_version_rollback(
         config = load_config()
 
     assert config.scheduler.enabled is True, "known siblings keep working"
-    assert "source_incremental_hours" in caplog.text
+    assert "future_scheduler_field" in caplog.text
     assert "scheduler" in caplog.text

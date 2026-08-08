@@ -2971,6 +2971,7 @@ class TestDatabase:
 
             assert db.count_pool_readiness() == {
                 "available": 1,
+                "copy_ready": 1,
                 "raw": 3,
                 "pending": 1,
                 "admitted_pending_copy": 1,
@@ -2978,6 +2979,96 @@ class TestDatabase:
                 "evaluated_pending": 0,
             }
 
+            db.close()
+
+    def test_copy_ready_count_is_not_reduced_by_topic_display_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "test.db")
+            db.initialize()
+            for index in range(5):
+                _seed_visible(
+                    db,
+                    f"BVSAME_TOPIC_{index}",
+                    title=f"same topic {index}",
+                    topic_group="same-topic",
+                )
+
+            readiness = db.count_pool_readiness()
+
+            assert readiness["available"] == 3
+            assert readiness["copy_ready"] == 5
+            db.close()
+
+    def test_copy_ready_budget_excludes_nonservable_pool_rows(self) -> None:
+        """Only fresh, unseen rows may consume ready or pending-copy budget."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "test.db")
+            db.initialize()
+
+            _seed_visible(db, "BVACTIVE_READY", topic_group="active-ready")
+            db.cache_content(
+                "BVACTIVE_PENDING",
+                title="active pending copy",
+                source="search",
+                relevance_score=0.9,
+                style_key="tutorial",
+                topic_group="active-pending",
+            )
+
+            excluded_bvids: list[str] = []
+            for suffix, status in (
+                ("STALE", "stale"),
+                ("SUPPRESSED", "suppressed"),
+                ("PURGED", "purged_by_dislike"),
+            ):
+                ready_bvid = f"BV{suffix}_READY"
+                pending_bvid = f"BV{suffix}_PENDING"
+                _seed_visible(db, ready_bvid, topic_group=f"{suffix}-ready")
+                db.cache_content(
+                    pending_bvid,
+                    title=f"{suffix} pending copy",
+                    source="search",
+                    relevance_score=0.9,
+                    style_key="tutorial",
+                    topic_group=f"{suffix}-pending",
+                )
+                db.conn.execute(
+                    "UPDATE content_cache SET pool_status = ? WHERE bvid IN (?, ?)",
+                    (status, ready_bvid, pending_bvid),
+                )
+                excluded_bvids.extend((ready_bvid, pending_bvid))
+
+            for suffix, has_copy in (("VIEWED_READY", True), ("VIEWED_PENDING", False)):
+                bvid = f"BV{suffix}"
+                if has_copy:
+                    _seed_visible(db, bvid, topic_group=suffix)
+                else:
+                    db.cache_content(
+                        bvid,
+                        title=suffix,
+                        source="search",
+                        relevance_score=0.9,
+                        style_key="tutorial",
+                        topic_group=suffix,
+                    )
+                db.insert_event(
+                    "view",
+                    title=suffix,
+                    url=f"https://www.bilibili.com/video/{bvid}",
+                    metadata={"bvid": bvid},
+                )
+                excluded_bvids.append(bvid)
+
+            readiness = db.count_pool_readiness()
+            pending_rows = db.get_pool_candidates_needing_copy(limit=20)
+
+            assert readiness["available"] == 1
+            assert readiness["copy_ready"] == 1
+            assert readiness["admitted_pending_copy"] == 1
+            assert [row["bvid"] for row in pending_rows] == ["BVACTIVE_PENDING"]
+            assert all(
+                bvid not in {str(row["bvid"]) for row in pending_rows} for bvid in excluded_bvids
+            )
             db.close()
 
     def test_pool_serve_snapshot_materializes_seen_ledger_once(self) -> None:
@@ -4237,7 +4328,15 @@ class TestDatabase:
             db.initialize()
 
             db.cache_content("BVLOW", title="普通内容", up_name="普通UP", source="search")
-            db.cache_content("BVHIGH", title="高置信内容", up_name="高能UP", source="trending")
+            db.cache_content(
+                "BVHIGH",
+                title="高置信内容",
+                up_name="高能UP",
+                source="trending",
+                topic_group="运动康复",
+                pool_topic_label="身体训练",
+                tags=["久坐", "拉伸"],
+            )
             low_id = db.insert_recommendation("BVLOW", confidence=0.7, presented=0)
             high_id = db.insert_recommendation("BVHIGH", confidence=0.91, presented=0)
 
@@ -4246,6 +4345,9 @@ class TestDatabase:
             assert candidate is not None
             assert candidate["id"] == high_id
             assert candidate["bvid"] == "BVHIGH"
+            assert candidate["topic_group"] == "运动康复"
+            assert candidate["pool_topic_label"] == "身体训练"
+            assert json.loads(candidate["tags"]) == ["久坐", "拉伸"]
 
             db.mark_notification_sent("BVHIGH")
 

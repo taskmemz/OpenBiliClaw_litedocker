@@ -12,6 +12,7 @@ from typing import Any
 
 from openbiliclaw.llm.json_utils import DEFAULT_STRUCTURED_MAX_TOKENS, parse_llm_json_tolerant
 from openbiliclaw.llm.prompts import build_category_mapping_prompt
+from openbiliclaw.llm.task_options import without_core_memory_kwargs
 from openbiliclaw.soul.consolidator import (
     _CHANGELOG_FILENAME,
     _RUNS_DIRNAME,
@@ -138,12 +139,16 @@ class CategoryMigrator:
         messages = build_category_mapping_prompt(categories=prompt_categories)
         if self._llm_service is None:
             return {}
+        # Pure taxonomy canonicalization: map raw category labels (+ tag counts) to
+        # the canonical vocabulary. No user-specific judgment, so the profile/core
+        # memory is irrelevant — opt out of the default injection.
         response = await self._llm_service.complete_structured_task(
             system_instruction=messages[0]["content"],
             user_input=messages[1]["content"],
             temperature=0.2,
             max_tokens=DEFAULT_STRUCTURED_MAX_TOKENS,
             caller="soul.category_migration",
+            **without_core_memory_kwargs(self._llm_service.complete_structured_task),
         )
         parsed = parse_llm_json_tolerant(response.content)
         if not isinstance(parsed, dict):

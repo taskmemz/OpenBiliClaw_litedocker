@@ -645,6 +645,7 @@ class InspirationKeywordPipeline:
             "query_kind": query_kind,
             "platforms": list(platforms),
             "selected_secondary_interests": [],
+            "realized_secondary_interests": [],
             "brainstorm_branches": [],
             "grounding_records": [],
             "grounding_ledger": {},
@@ -718,12 +719,6 @@ class InspirationKeywordPipeline:
             selected_interests = self._selected_inspiration_interests(profile, coverage_snapshot)
         else:
             selected_interests = list(seed_interests)
-        self._record_inspiration_interest_selection(
-            selected_interests,
-            digest=digest,
-            query_kind=query_kind,
-            selection_scope=selection_scope,
-        )
         report["selected_secondary_interests"] = [
             {
                 "interest_id": item.interest_id,
@@ -828,6 +823,19 @@ class InspirationKeywordPipeline:
             allowed = {self._match_text(label) for label in allowed_interest_labels}
             candidates = [c for c in candidates if self._match_text(c.interest) in allowed]
 
+        # Every regular inspiration candidate must also remain attached to one
+        # of this round's selected interests. Beyond the label clamp, reject an
+        # affirmative conflict where the core concept names a *different*
+        # known profile interest but does not name its claimed source interest.
+        # This catches attribution drift such as a candidate labelled
+        # ``Overlord 故事`` whose core is actually ``无职转生 B站下架`` without
+        # requiring broad semantic interest merging.
+        candidates, source_interest_rejects = self._filter_source_interest_drift(
+            profile,
+            selected_interests,
+            candidates,
+        )
+
         max_keywords = int(self._inspiration_params.max_keywords_per_platform)
         materialized, materialize_telemetry = materialize_platform_keywords(
             candidates,
@@ -835,6 +843,9 @@ class InspirationKeywordPipeline:
             axes=[*existing_axes, *new_axes],
             max_keywords_per_platform=max_keywords,
         )
+        hard_gate_rejects = materialize_telemetry.get("hard_gate_rejects")
+        if isinstance(hard_gate_rejects, list):
+            hard_gate_rejects.extend(source_interest_rejects)
         pipeline_materialize_telemetry: dict[str, object] = {
             **materialize_telemetry,
             "parse_salvaged": bool(llm_telemetry.get("parse_salvaged")),
@@ -953,6 +964,47 @@ class InspirationKeywordPipeline:
                 else query_kind
             )
             metadata_by_platform[platform][item.keyword] = metadata
+
+        # Apply the same recent-query family guard used by persistence before
+        # reporting or recording realized interests. Preview and production
+        # therefore agree, and a suffix-only replay does not falsely cool down
+        # an interest that produced no usable keyword this round.
+        for platform, words in keywords_by_platform.items():
+            keyword_kind = (
+                keyword_kind_by_platform.get(platform, query_kind)
+                if keyword_kind_by_platform is not None
+                else query_kind
+            )
+            novel_words = self._host._novel_keywords(
+                platform,
+                words,
+                keyword_kind=keyword_kind,
+            )
+            keywords_by_platform[platform] = novel_words
+            metadata_by_platform[platform] = {
+                word: metadata_by_platform[platform][word]
+                for word in novel_words
+                if word in metadata_by_platform[platform]
+            }
+
+        realized_interest_keys = {
+            self._match_text(metadata.get("source_interest"))
+            for platform_metadata in metadata_by_platform.values()
+            for metadata in platform_metadata.values()
+            if self._match_text(metadata.get("source_interest"))
+        }
+        realized_interests = [
+            interest
+            for interest in selected_interests
+            if self._match_text(interest.label) in realized_interest_keys
+        ]
+        self._record_inspiration_interest_selection(
+            realized_interests,
+            digest=digest,
+            query_kind=query_kind,
+            selection_scope=selection_scope,
+        )
+        report["realized_secondary_interests"] = [interest.label for interest in realized_interests]
         report["platform_keywords"] = keywords_by_platform
         report["rejected_reasons"] = {
             platform: [
@@ -991,6 +1043,68 @@ class InspirationKeywordPipeline:
             if inserted > 0:
                 ledger[platform] = inserted
         return ledger, report
+
+    @classmethod
+    def _filter_source_interest_drift(
+        cls,
+        profile: SoulProfile,
+        selected_interests: Sequence[SecondaryInterest],
+        candidates: Sequence[MaterializeCandidate],
+    ) -> tuple[list[MaterializeCandidate], list[dict[str, object]]]:
+        """Reject candidates affirmatively anchored to another profile interest."""
+
+        selected = {cls._match_text(item.label) for item in selected_interests if item.label}
+        profile_interests = build_like_secondary_interest_window(
+            profile,
+            coverage_snapshot={},
+            max_interests=256,
+        )
+        anchors = [
+            (item.label, cls._interest_anchor_key(item.label))
+            for item in profile_interests
+            if cls._interest_anchor_key(item.label)
+        ]
+        kept: list[MaterializeCandidate] = []
+        rejected: list[dict[str, object]] = []
+        for candidate in candidates:
+            claimed_match = cls._match_text(candidate.interest)
+            claimed_anchor = cls._interest_anchor_key(candidate.interest)
+            core_anchor = cls._interest_anchor_key(candidate.core_concept)
+            reason = ""
+            conflicting_interest = ""
+            if claimed_match not in selected:
+                reason = "unselected_source_interest"
+            elif core_anchor:
+                for label, anchor in anchors:
+                    if cls._match_text(label) == claimed_match:
+                        continue
+                    # Nested labels are often aliases at different granularity;
+                    # interest consolidation owns those, not this guard.
+                    if anchor in claimed_anchor or claimed_anchor in anchor:
+                        continue
+                    if anchor in core_anchor and claimed_anchor not in core_anchor:
+                        reason = "source_interest_mismatch"
+                        conflicting_interest = label
+                        break
+            if reason:
+                rejected.append(
+                    {
+                        "keyword": " ".join(
+                            part for part in (candidate.core_concept, candidate.decoration) if part
+                        ).strip(),
+                        "platform": candidate.platform,
+                        "reason": reason,
+                        "source_interest": candidate.interest,
+                        "conflicting_interest": conflicting_interest,
+                    }
+                )
+                continue
+            kept.append(candidate)
+        return kept, rejected
+
+    @staticmethod
+    def _interest_anchor_key(value: object) -> str:
+        return re.sub(r"[\W_]+", "", str(value or "").strip().casefold())
 
     async def preview_inspiration_keywords(
         self,

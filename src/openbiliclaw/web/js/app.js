@@ -19,7 +19,13 @@ import {
   onStreamEvent as recStreamEvent,
 } from "./views/recommend.js";
 import { initProfileView, onStreamEvent as profileStreamEvent } from "./views/profile.js";
-import { initChatView, onStreamEvent as chatStreamEvent, toggleMessages, loadNotifications } from "./views/chat.js";
+import {
+  initChatView,
+  onStreamEvent as chatStreamEvent,
+  toggleMessages,
+  loadNotifications,
+  refreshPendingConfirmations as refreshChatPendingConfirmations,
+} from "./views/chat.js";
 import { initWatchLaterView, initFavoritesView } from "./views/saved.js";
 import { initSettingsView } from "./views/settings.js";
 import { createDialogFocusController } from "./saved-sync-runtime.js";
@@ -259,12 +265,20 @@ function renderTabBar() {
   $tabBar.setAttribute("role", "tablist");
   for (const tab of TABS) {
     const isActive = state.activeTab === tab.id;
+    const pendingCount = tab.id === "chat"
+      ? Math.max(0, Number(state.pendingConfirmationCount) || 0)
+      : 0;
+    const visibleCount = pendingCount > 99 ? "99+" : String(pendingCount);
     const el = document.createElement("button");
     el.className = `tab-item${isActive ? " active" : ""}`;
     el.setAttribute("role", "tab");
     el.setAttribute("aria-selected", String(isActive));
+    el.setAttribute(
+      "aria-label",
+      pendingCount > 0 ? `${tab.label}，${pendingCount} 条待聊确认` : tab.label,
+    );
     el.tabIndex = isActive ? 0 : -1;
-    el.innerHTML = `<span class="tab-icon" aria-hidden="true">${tab.icon}</span><span class="tab-label">${tab.label}</span>`;
+    el.innerHTML = `<span class="tab-icon" aria-hidden="true">${tab.icon}</span><span class="tab-count-badge" aria-hidden="true" data-count="${pendingCount}"${pendingCount > 0 ? "" : " hidden"}>${visibleCount}</span><span class="tab-label">${tab.label}</span>`;
     el.addEventListener("click", () => navigateToTab(tab.id));
     el.addEventListener("keydown", (e) => {
       let target = null;
@@ -325,9 +339,10 @@ const stream = createStreamClient({
   onConnect() {
     patchState({ online: true });
     recStreamConnect();
+    void refreshChatPendingConfirmations({ renderNow: false });
   },
   onDisconnect() {
-    patchState({ online: false });
+    patchState({ online: false, pendingConfirmationCount: 0 });
   },
   onEvent(payload) {
     patchState({ runtimeEvent: payload });
@@ -342,7 +357,7 @@ subscribe((_state, changed) => {
   if ("online" in changed || "degraded" in changed || "degradedReason" in changed || "messages" in changed) {
     renderStatusBar();
   }
-  if ("activeTab" in changed) {
+  if ("activeTab" in changed || "pendingConfirmationCount" in changed) {
     renderTabBar();
   }
 });
@@ -379,6 +394,7 @@ async function startApp() {
 
   stream.connect();
   loadNotifications(); // eagerly load badge count on all tabs
+  void refreshChatPendingConfirmations({ renderNow: false });
 
   if (!_appStarted) {
     _appStarted = true;

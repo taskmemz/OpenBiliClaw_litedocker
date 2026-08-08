@@ -16,6 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from openbiliclaw.storage.database import Database
@@ -46,6 +47,15 @@ class RecordingMemoryManager:
 
     def save_source_bootstrap_state(self, state: dict[str, object]) -> None:
         self._source_bootstrap_state = dict(state)
+
+    def update_source_bootstrap_state(
+        self,
+        mutator: Callable[[dict[str, object]], dict[str, object] | None],
+    ) -> dict[str, object]:
+        state = dict(self._source_bootstrap_state)
+        result = mutator(state)
+        self._source_bootstrap_state = state if result is None else result
+        return dict(self._source_bootstrap_state)
 
 
 class RecordingProfilePipeline:
@@ -94,23 +104,44 @@ class _XhsScoringLLM:
         caller: str = "",
         reasoning_effort: str | None = None,
     ) -> object:
+        candidate_block = (
+            user_input.split("<content_batch>", 1)[1]
+            .split(
+                "</content_batch>",
+                1,
+            )[0]
+            .strip()
+        )
+        candidate_envelope = json.loads(candidate_block)
+        assert isinstance(candidate_envelope, dict)
+        candidate_items = candidate_envelope.get("items")
+        assert isinstance(candidate_items, list)
+        local_ids = [
+            str(item["id"])
+            for item in candidate_items
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ]
         self.calls.append(
             {
                 "system_instruction": system_instruction,
                 "user_input": user_input,
                 "caller": caller,
+                "candidate_block": candidate_block,
+                "candidate_envelope": candidate_envelope,
+                "returned_ids": local_ids,
             }
         )
         return _Response(
             json.dumps(
                 [
                     {
-                        "content_id": self.content_id,
+                        "id": local_id,
                         "score": self.score,
                         "reason": "fit" if self.score >= 0.60 else "new direction",
                         "topic_group": "生活方式",
                         "style_key": "story_doc",
                     }
+                    for local_id in local_ids
                 ],
                 ensure_ascii=False,
             )
@@ -266,6 +297,25 @@ class TestXhsObservedUrls:
         assert response.status_code == 200
         body = response.json()
         assert body["accepted"] == 1  # the discovery/item URL, not the junk one
+
+    def test_urls_branch_accepts_search_result_note_variant(
+        self,
+        app_client: TestClient,
+    ) -> None:
+        note = "0123456789abcdef01234567"
+        response = app_client.post(
+            "/api/sources/xhs/observed-urls",
+            json={
+                "urls": [
+                    f"https://www.xiaohongshu.com/search_result/{note}?xsec_token=Z",
+                    "https://www.xiaohongshu.com/search_result?keyword=not-a-note",
+                ],
+                "page_type": "search",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["accepted"] == 1
 
     def test_stores_observations_in_db(self, app_client: TestClient, tmp_path: Path) -> None:
         from openbiliclaw.storage.database import Database
@@ -432,9 +482,30 @@ class TestXhsObservedUrls:
         assert row["topic_group"] == "生活方式"
         assert row["style_key"] == "story_immersion"
         assert row["relevance_score"] == 0.88
-        user_input = str(llm.calls[0]["user_input"])
-        assert '"source_platform": "xiaohongshu"' in user_input
-        assert '"content_type": "note"' in user_input
+        call = llm.calls[0]
+        candidate_block = str(call["candidate_block"])
+        assert "\n" not in candidate_block
+        assert llm.content_id not in candidate_block
+        assert "https://" not in candidate_block
+        assert call["returned_ids"] == ["0"]
+        assert call["candidate_envelope"] == {
+            "defaults": {
+                "content_type": "note",
+                "mode": "normal",
+                "source_platform": "xiaohongshu",
+            },
+            "items": [
+                {
+                    "author": "Creator",
+                    "id": "0",
+                    "title": "小红书 E2E Note",
+                }
+            ],
+        }
+        system_instruction = str(call["system_instruction"])
+        assert "原样带回输入里的 id" in system_instruction
+        assert "bvid" not in system_instruction
+        assert "content_id" not in system_instruction
 
     def test_observed_note_low_relevance_score_is_rejected_before_content_cache(
         self,
@@ -1089,6 +1160,101 @@ class TestXhsTaskResults:
         assert candidate is not None
         assert candidate["published_at"] == "2026-07-08T06:30:00Z"
         assert candidate["published_label"] == "3小时前"
+
+    def test_xhs_bootstrap_partial_and_final_share_one_scope_cap(
+        self,
+        xhs_task_client: tuple[TestClient, Database, RecordingMemoryManager],
+    ) -> None:
+        import json
+
+        from openbiliclaw.sources.xhs_tasks import XhsTaskQueue
+
+        app_client, db, memory = xhs_task_client
+        queue = XhsTaskQueue(db)
+        assert queue.enqueue(
+            "bootstrap_profile",
+            {"scopes": ["saved", "liked"], "max_items_per_scope": 2},
+        )
+        task = queue.next_pending()
+        assert task is not None
+
+        def note(scope: str, note_id: str) -> dict[str, str]:
+            return {
+                "scope": scope,
+                "title": note_id,
+                "url": f"https://www.xiaohongshu.com/explore/{note_id}",
+                "note_id": note_id,
+            }
+
+        partial_saved = [note("saved", f"saved-partial-{index}") for index in range(2)]
+        overflow_saved = [note("saved", f"saved-final-{index}") for index in range(2)]
+        final_liked = [note("liked", f"liked-final-{index}") for index in range(2)]
+        unrequested = [
+            note("xhs_history", "history-final"),
+            note("unknown", "unknown-final"),
+        ]
+
+        partial = app_client.post(
+            "/api/sources/xhs/task-result",
+            json={
+                "task_id": task["id"],
+                "status": "partial",
+                "urls": [item["url"] for item in partial_saved],
+                "notes": partial_saved,
+                "scope_counts": {"saved": 2, "liked": 0},
+            },
+        )
+        assert partial.status_code == 200
+
+        final = app_client.post(
+            "/api/sources/xhs/task-result",
+            json={
+                "task_id": task["id"],
+                "status": "ok",
+                "urls": [item["url"] for item in [*overflow_saved, *final_liked, *unrequested]],
+                "notes": [*overflow_saved, *final_liked, *unrequested],
+                "scope_counts": {
+                    "saved": 2,
+                    "liked": 2,
+                    "xhs_history": "999",
+                    "unknown": 1,
+                },
+            },
+        )
+        assert final.status_code == 200
+
+        row = db.conn.execute(
+            "SELECT status, result_json FROM xhs_tasks WHERE id=?",
+            (task["id"],),
+        ).fetchone()
+        assert row["status"] == "completed"
+        result = json.loads(row["result_json"])
+        assert [item["note_id"] for item in result["notes"]] == [
+            "saved-partial-0",
+            "saved-partial-1",
+            "liked-final-0",
+            "liked-final-1",
+        ]
+        assert result["scope_counts"] == {"saved": 2, "liked": 2}
+        assert result["urls"] == [
+            *(item["url"] for item in partial_saved),
+            *(item["url"] for item in final_liked),
+        ]
+        assert len(memory.events) == 4
+
+        replay = app_client.post(
+            "/api/sources/xhs/task-result",
+            json={
+                "task_id": task["id"],
+                "status": "ok",
+                "urls": [item["url"] for item in overflow_saved],
+                "notes": overflow_saved,
+                "scope_counts": {"saved": 2, "liked": 0},
+            },
+        )
+        assert replay.status_code == 200
+        assert replay.json() == {"ok": True, "ignored": True}
+        assert len(memory.events) == 4
 
     def test_xhs_bootstrap_empty_result_preserves_scope_counts(
         self,

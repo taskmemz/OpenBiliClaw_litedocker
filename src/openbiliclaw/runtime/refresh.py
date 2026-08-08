@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -35,7 +36,7 @@ from openbiliclaw.soul.speculator import (
 from openbiliclaw.sources.platforms import source_family as _source_family
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping
+    from collections.abc import Awaitable, Callable
 
     from openbiliclaw.runtime.image_fetch import ImageFetchCoordinator
     from openbiliclaw.runtime.task_registry import BackgroundTaskRegistry
@@ -117,6 +118,33 @@ def _call_accepts_limit(fn: Any) -> bool:
     return "limit" in signature.parameters or any(
         param.kind is inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
     )
+
+
+def _producer_supply_progress_count(result: object) -> int:
+    """Count concrete progress from one platform producer result.
+
+    Candidate-pipeline producers expose ``enqueued``/``inserted``.  Those
+    fields are authoritative when present because ``discovered`` may include
+    rows that were all rejected as durable duplicates.  Task-backed producers
+    (Bilibili/XHS) also use ``enqueued`` to report newly scheduled browser
+    work.  Legacy direct producers fall back to ``cached`` or ``discovered``.
+    """
+
+    if not isinstance(result, Mapping):
+        return 0
+    for key in ("enqueued", "inserted"):
+        if key in result:
+            try:
+                return max(0, int(result.get(key, 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+    for key in ("cached", "discovered"):
+        if key in result:
+            try:
+                return max(0, int(result.get(key, 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+    return 0
 
 
 def _call_accepts_strategy_limits(fn: Any) -> bool:
@@ -409,8 +437,24 @@ class ContinuousRefreshController:
     # the flag is on. Constructed in ``api/runtime_context.py``; ``None`` (tests
     # / flag off) → the B站 search keeps its legacy self-generating path.
     keyword_fetch: Any | None = None
+    # Extension-online account bootstrap refresh.  This loop has its own
+    # direct presence/profile/init gates and must not inherit the LLM gate.
+    source_incremental_sync: Any | None = None
     _manual_refresh_task: asyncio.Task[None] | None = None
     _discovery_drain_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
+    # Periodic producer loops and demand-driven candidate supply can wake the
+    # same platform at the same instant.  Keep one lock per source so duplicate
+    # same-source fetches are skipped without serializing unrelated platforms.
+    _producer_tick_locks: dict[str, asyncio.Lock] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _candidate_supply_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock,
         init=False,
         repr=False,
@@ -994,6 +1038,8 @@ class ContinuousRefreshController:
             return result.available_before >= self.pool_target_count
         self._last_pool_maintenance_succeeded = True
         self._update_llm_inventory_state(result.available_after)
+        if int(getattr(result, "mutation_count", 0) or 0) > 0:
+            self.notify_expression_copy_pending("pool_maintenance")
         return result.at_target
 
     @staticmethod
@@ -1182,6 +1228,15 @@ class ContinuousRefreshController:
         candidate = self.database.get_notification_candidate(min_confidence=0.82)
         if candidate is None:
             return None
+        from openbiliclaw.recommendation.exclusion import filter_recommendation_rows
+
+        disliked_phrases = self._load_disliked_topic_phrases()
+        if not filter_recommendation_rows(
+            [candidate],
+            disliked_phrases,
+            restore_on_total_fuzzy_match=False,
+        ):
+            return None
         return {
             "recommendation_id": int(candidate["id"]),
             "bvid": str(candidate.get("bvid", "")),
@@ -1274,7 +1329,10 @@ class ContinuousRefreshController:
             try:
                 return [str(item).strip().lower() for item in getter() if str(item).strip()]
             except Exception:
-                return []
+                logger.warning(
+                    "effective dislike read failed; falling back to flat preference",
+                    exc_info=True,
+                )
         try:
             layer = self.memory_manager.get_layer("preference")
         except Exception:
@@ -1290,6 +1348,7 @@ class ContinuousRefreshController:
     def mark_delight_sent(self, bvid: str) -> None:
         """Persist delight notification delivery markers."""
         self.database.mark_delight_notified(bvid)
+        self.notify_expression_copy_pending("delight_consumed")
         now = self._now().isoformat()
         self._update_discovery_runtime_state(
             lambda state: state.update({"last_delight_notification_at": now})
@@ -1302,10 +1361,22 @@ class ContinuousRefreshController:
             marker(bvid)
         else:
             self.database.mark_delight_notified(bvid)
+        self.notify_expression_copy_pending("delight_seen")
         now = self._now().isoformat()
         self._update_discovery_runtime_state(
             lambda state: state.update({"last_delight_notification_at": now})
         )
+
+    def notify_expression_copy_pending(self, reason: str) -> None:
+        """Wake the runtime-owned copy coordinator without doing inline LLM work."""
+
+        notify = getattr(self.expression_copy_coordinator, "notify", None)
+        if not callable(notify):
+            return
+        try:
+            notify(str(reason))
+        except Exception:
+            logger.warning("expression-copy runtime notification failed", exc_info=True)
 
     async def prepare_delight_candidates(self) -> int:
         """Warm ready-to-push delight candidates even when no refresh runs."""
@@ -1350,6 +1421,8 @@ class ContinuousRefreshController:
         or UI paths that just consumed the visible pool.
         """
         normalized = self._normalize_replenishment_reason(reason)
+        if normalized == "feedback":
+            self.notify_expression_copy_pending("feedback")
         if force:
             return await self.trigger_manual_refresh(reason=normalized)
         queued = self._queue_replenishment_reason(normalized)
@@ -1359,6 +1432,121 @@ class ContinuousRefreshController:
             "reason": normalized,
             "refresh": queued,
         }
+
+    async def supply_candidates_once(self, *, reason: str) -> dict[str, object]:
+        """Run one demand-driven, quota-aware candidate supply wave.
+
+        The candidate evaluator calls this when it has no raw work while the
+        visible pool is below target.  Wake every configured platform producer
+        with its own source deficit, then run the established Bilibili refresh
+        plan.  The returned productivity contract is based on durable inserts
+        or newly queued source work, never on the fact that a strategy merely
+        executed.
+        """
+
+        if not self._llm_work_allowed():
+            return {
+                "refreshed": False,
+                "strategies": [],
+                "reason": "llm_paused",
+                "supply_progress_count": 0,
+                "supply_productive": False,
+            }
+        if self._candidate_supply_lock.locked():
+            return {
+                "refreshed": False,
+                "strategies": [],
+                "reason": "candidate_supply_in_flight",
+                "supply_progress_count": 0,
+                "supply_productive": False,
+            }
+
+        async with self._candidate_supply_lock:
+            await self.request_replenishment(reason=reason)
+            producer_results = await self._run_deficit_producers_once()
+            producer_progress = sum(
+                _producer_supply_progress_count(result) for result in producer_results.values()
+            )
+            try:
+                refresh_result = await self.refresh_if_needed()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if producer_progress <= 0:
+                    raise
+                logger.warning(
+                    "candidate supply Bilibili refresh failed after other sources "
+                    "made progress: %s",
+                    exc,
+                )
+                refresh_result = {
+                    "refreshed": False,
+                    "strategies": [],
+                    "reason": "refresh_failed_after_producer_progress",
+                    "refresh_error": str(exc),
+                }
+
+            raw_refresh_progress = refresh_result.get("supply_inserted_count", 0)
+            if isinstance(raw_refresh_progress, int | float | str):
+                try:
+                    refresh_progress = max(0, int(raw_refresh_progress or 0))
+                except ValueError:
+                    refresh_progress = 0
+            else:
+                refresh_progress = 0
+            supply_progress = producer_progress + refresh_progress
+            return {
+                **refresh_result,
+                "producer_results": producer_results,
+                "supply_progress_count": supply_progress,
+                "supply_productive": supply_progress > 0,
+            }
+
+    async def _run_deficit_producers_once(self) -> dict[str, dict[str, object]]:
+        """Wake all platform producers once and retain per-source diagnostics."""
+
+        tickers = {
+            "bilibili": self._tick_bilibili_producer,
+            "xiaohongshu": self._tick_xhs_producer,
+            "douyin": self._tick_douyin_producer,
+            "youtube": self._tick_youtube_producer,
+            "twitter": self._tick_x_producer,
+            "zhihu": self._tick_zhihu_producer,
+            "reddit": self._tick_reddit_producer,
+            "bangumi": self._tick_bangumi_producer,
+        }
+        raw_results = await asyncio.gather(
+            *(ticker() for ticker in tickers.values()),
+            return_exceptions=True,
+        )
+        results: dict[str, dict[str, object]] = {}
+        for (source, _ticker), raw_result in zip(
+            tickers.items(),
+            raw_results,
+            strict=True,
+        ):
+            if isinstance(raw_result, asyncio.CancelledError):
+                raise raw_result
+            if isinstance(raw_result, BaseException):
+                logger.warning(
+                    "candidate supply producer failed: source=%s error=%s",
+                    source,
+                    raw_result,
+                )
+                results[source] = {
+                    "source_family": source,
+                    "reason": "error",
+                    "error": str(raw_result),
+                }
+                continue
+            if isinstance(raw_result, Mapping):
+                results[source] = dict(raw_result)
+            else:
+                results[source] = {
+                    "source_family": source,
+                    "reason": "no_result",
+                }
+        return results
 
     async def _safe_precompute_pool_copy(self, *, profile: Any) -> int:
         """Run ``precompute_pool_copy`` swallowing any exception.
@@ -1450,6 +1638,7 @@ class ContinuousRefreshController:
             ├─ _loop_bangumi_producer()  60s   Bangumi official-API discovery when under quota
             ├─ _loop_proactive_push()    60s   delight + interest probe
             ├─ _loop_keyword_planner()  120s   P1.6 — merged keyword generation (flag-gated)
+            ├─ _loop_source_incremental_sync() 60s  extension account refresh
             ├─ _loop_image_cache_cleanup() 6h  prune consumed+unsaved covers
             └─ _loop_cover_prefetch()    60s   cache fresh-token covers (XHS)
         """
@@ -1496,6 +1685,8 @@ class ContinuousRefreshController:
             asyncio.create_task(self._loop_image_cache_cleanup()),
             asyncio.create_task(self._loop_cover_prefetch()),
         ]
+        if self.source_incremental_sync is not None:
+            tasks.append(asyncio.create_task(self._loop_source_incremental_sync()))
         try:
             await asyncio.gather(*tasks)
         finally:
@@ -1508,6 +1699,21 @@ class ContinuousRefreshController:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _loop_source_incremental_sync(self) -> None:
+        """Poll the extension-online account refresh scheduler independently.
+
+        The scheduler performs its own scheduler-enabled, presence, profile,
+        and guided-init checks.  In particular, this loop never calls
+        ``_llm_work_allowed``: periodic account collection is not LLM work.
+        """
+        scheduler = self.source_incremental_sync
+        if scheduler is None:
+            return
+        while True:
+            with suppress(Exception):
+                await scheduler.tick()
+            await asyncio.sleep(self.check_interval_seconds)
 
     async def _loop_refresh(self) -> None:
         """Discovery refresh — fills the candidate pool."""
@@ -1936,153 +2142,107 @@ class ContinuousRefreshController:
                 logger.info("cover prefetch: cached %d new covers", cached)
             await asyncio.sleep(_COVER_PREFETCH_INTERVAL_SECONDS)
 
-    async def _tick_xhs_producer(self) -> None:
+    async def _tick_platform_producer(
+        self,
+        *,
+        source_family: str,
+        producer: Any | None,
+        require_initialized: bool = True,
+    ) -> dict[str, object]:
+        """Run one source producer without overlapping another tick for that source."""
+
+        if producer is None:
+            return {"source_family": source_family, "reason": "not_configured"}
+        if require_initialized and not self._is_initialized():
+            return {"source_family": source_family, "reason": "not_initialized"}
+
+        lock = self._producer_tick_locks.setdefault(source_family, asyncio.Lock())
+        if lock.locked():
+            return {"source_family": source_family, "reason": "in_flight"}
+
+        async with lock:
+            # Re-read after acquiring the source lock: another completed tick
+            # may have filled the quota between the caller's wake and now.
+            deficit = self._source_deficit(source_family)
+            if deficit <= 0:
+                return {"source_family": source_family, "reason": "quota_satisfied"}
+            produce_fn = getattr(producer, "produce_if_due", None)
+            if not callable(produce_fn):
+                return {"source_family": source_family, "reason": "not_callable"}
+            limit = max(1, min(deficit, self.discovery_limit))
+            if _call_accepts_limit(produce_fn):
+                raw_result = await produce_fn(limit=limit)
+            else:
+                raw_result = await produce_fn()
+            result = dict(raw_result) if isinstance(raw_result, Mapping) else {}
+            result.setdefault("source_family", source_family)
+            result.setdefault("requested_limit", limit)
+            return result
+
+    async def _tick_xhs_producer(self) -> dict[str, object]:
         """Invoke the xhs search task producer if one is configured."""
-        producer = self.xhs_producer
-        if producer is None:
-            return
-        deficit = self._source_deficit("xiaohongshu")
-        if deficit <= 0:
-            return
-        limit = max(1, min(deficit, self.discovery_limit))
-        produce_fn = getattr(producer, "produce_if_due", None)
-        if not callable(produce_fn):
-            return
-        if _call_accepts_limit(produce_fn):
-            await produce_fn(limit=limit)
-        else:
-            await produce_fn()
 
-    async def _tick_bilibili_producer(self) -> None:
+        return await self._tick_platform_producer(
+            source_family="xiaohongshu",
+            producer=self.xhs_producer,
+            require_initialized=False,
+        )
+
+    async def _tick_bilibili_producer(self) -> dict[str, object]:
         """Invoke the Bili extension fallback producer if Bilibili is under quota."""
-        producer = self.bilibili_producer
-        if producer is None:
-            return
-        if not self._is_initialized():
-            return
-        deficit = self._source_deficit("bilibili")
-        if deficit <= 0:
-            return
-        produce_fn = getattr(producer, "produce_if_due", None)
-        if not callable(produce_fn):
-            return
-        limit = max(1, min(deficit, self.discovery_limit))
-        if _call_accepts_limit(produce_fn):
-            await produce_fn(limit=limit)
-        else:
-            await produce_fn()
 
-    async def _tick_douyin_producer(self) -> None:
+        return await self._tick_platform_producer(
+            source_family="bilibili",
+            producer=self.bilibili_producer,
+        )
+
+    async def _tick_douyin_producer(self) -> dict[str, object]:
         """Invoke the Douyin discovery producer if Douyin is under quota."""
-        producer = self.douyin_producer
-        if producer is None:
-            return
-        if not self._is_initialized():
-            return
-        deficit = self._source_deficit("douyin")
-        if deficit <= 0:
-            return
-        produce_fn = getattr(producer, "produce_if_due", None)
-        if not callable(produce_fn):
-            return
-        limit = max(1, min(deficit, self.discovery_limit))
-        if _call_accepts_limit(produce_fn):
-            await produce_fn(limit=limit)
-        else:
-            await produce_fn()
 
-    async def _tick_youtube_producer(self) -> None:
+        return await self._tick_platform_producer(
+            source_family="douyin",
+            producer=self.douyin_producer,
+        )
+
+    async def _tick_youtube_producer(self) -> dict[str, object]:
         """Invoke the YouTube discovery producer if YouTube is under quota."""
-        producer = self.youtube_producer
-        if producer is None:
-            return
-        if not self._is_initialized():
-            return
-        deficit = self._source_deficit("youtube")
-        if deficit <= 0:
-            return
-        produce_fn = getattr(producer, "produce_if_due", None)
-        if not callable(produce_fn):
-            return
-        limit = max(1, min(deficit, self.discovery_limit))
-        if _call_accepts_limit(produce_fn):
-            await produce_fn(limit=limit)
-        else:
-            await produce_fn()
 
-    async def _tick_x_producer(self) -> None:
+        return await self._tick_platform_producer(
+            source_family="youtube",
+            producer=self.youtube_producer,
+        )
+
+    async def _tick_x_producer(self) -> dict[str, object]:
         """Invoke the X (Twitter) discovery producer if X is under quota."""
-        producer = self.x_producer
-        if producer is None:
-            return
-        if not self._is_initialized():
-            return
-        deficit = self._source_deficit("twitter")
-        if deficit <= 0:
-            return
-        produce_fn = getattr(producer, "produce_if_due", None)
-        if not callable(produce_fn):
-            return
-        limit = max(1, min(deficit, self.discovery_limit))
-        if _call_accepts_limit(produce_fn):
-            await produce_fn(limit=limit)
-        else:
-            await produce_fn()
 
-    async def _tick_zhihu_producer(self) -> None:
+        return await self._tick_platform_producer(
+            source_family="twitter",
+            producer=self.x_producer,
+        )
+
+    async def _tick_zhihu_producer(self) -> dict[str, object]:
         """Invoke the Zhihu discovery producer if Zhihu is under quota."""
-        producer = self.zhihu_producer
-        if producer is None:
-            return
-        if not self._is_initialized():
-            return
-        deficit = self._source_deficit("zhihu")
-        if deficit <= 0:
-            return
-        produce_fn = getattr(producer, "produce_if_due", None)
-        if not callable(produce_fn):
-            return
-        limit = max(1, min(deficit, self.discovery_limit))
-        if _call_accepts_limit(produce_fn):
-            await produce_fn(limit=limit)
-        else:
-            await produce_fn()
 
-    async def _tick_reddit_producer(self) -> None:
+        return await self._tick_platform_producer(
+            source_family="zhihu",
+            producer=self.zhihu_producer,
+        )
+
+    async def _tick_reddit_producer(self) -> dict[str, object]:
         """Invoke the Reddit discovery producer if Reddit is under quota."""
-        producer = self.reddit_producer
-        if producer is None:
-            return
-        if not self._is_initialized():
-            return
-        deficit = self._source_deficit("reddit")
-        if deficit <= 0:
-            return
-        produce_fn = getattr(producer, "produce_if_due", None)
-        if not callable(produce_fn):
-            return
-        limit = max(1, min(deficit, self.discovery_limit))
-        if _call_accepts_limit(produce_fn):
-            await produce_fn(limit=limit)
-        else:
-            await produce_fn()
 
-    async def _tick_bangumi_producer(self) -> None:
+        return await self._tick_platform_producer(
+            source_family="reddit",
+            producer=self.reddit_producer,
+        )
+
+    async def _tick_bangumi_producer(self) -> dict[str, object]:
         """Invoke Bangumi discovery when its source-family quota has a deficit."""
-        producer = self.bangumi_producer
-        if producer is None or not self._is_initialized():
-            return
-        deficit = self._source_deficit("bangumi")
-        if deficit <= 0:
-            return
-        produce_fn = getattr(producer, "produce_if_due", None)
-        if not callable(produce_fn):
-            return
-        limit = max(1, min(deficit, self.discovery_limit))
-        if _call_accepts_limit(produce_fn):
-            await produce_fn(limit=limit)
-        else:
-            await produce_fn()
+
+        return await self._tick_platform_producer(
+            source_family="bangumi",
+            producer=self.bangumi_producer,
+        )
 
     async def _tick_soul_pipeline(self) -> None:
         """Invoke ProfileUpdatePipeline.tick() if the soul engine exposes one.
@@ -2237,6 +2397,7 @@ class ContinuousRefreshController:
 
     async def refresh_after_feedback(self) -> dict[str, object]:
         """Compatibility shim: feedback marks demand, scheduler refreshes later."""
+        self.notify_expression_copy_pending("feedback")
         return self._queue_replenishment_reason("feedback")
 
     async def refresh_after_init(self) -> dict[str, object]:
@@ -2690,7 +2851,8 @@ class ContinuousRefreshController:
             runtime_updates["last_explore_refresh_at"] = now
         after_pool_counts = self._pool_readiness_counts()
         after_pool_count = after_pool_counts["available"]
-        runtime_updates["last_discovered_count"] = len(all_discovered) + pipeline_discovered_count
+        supply_inserted_count = len(all_discovered) + pipeline_discovered_count
+        runtime_updates["last_discovered_count"] = supply_inserted_count
         runtime_updates["last_replenished_count"] = max(0, after_pool_count - before_pool_count)
         if replenished_topics:
             runtime_updates["recent_pool_topics"] = self._dedupe_topics(replenished_topics)[:3]
@@ -2723,6 +2885,8 @@ class ContinuousRefreshController:
             "strategies": flattened_strategies,
             "reason": reason,
             "recommendation_count": 0,
+            "supply_inserted_count": supply_inserted_count,
+            "supply_productive": supply_inserted_count > 0,
         }
 
     async def _publish_pool_status_if_changed(self) -> None:

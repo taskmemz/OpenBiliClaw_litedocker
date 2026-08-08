@@ -1,7 +1,7 @@
 """Soul-driven xhs search task producer.
 
 Runs on the same loop as the continuous refresh controller. Once per
-throttle window (default 3 minutes) it:
+throttle window (default 20 minutes) it:
   1. Reads the current SoulProfile
   2. Asks an LLM to rewrite interest tags into xhs-flavored keywords
   3. Enqueues one ``search`` task per keyword into ``XhsTaskQueue``
@@ -37,13 +37,15 @@ class XhsTaskProducer:
       ``0`` disables the daily cap
     - ``min_interval_minutes`` — enforced here by inspecting the newest
       task's ``created_at`` before running
+    - ``max_active_search_tasks`` — bounds pending + in-progress search
+      backlog before any keyword is claimed or generated
     """
 
     task_queue: XhsTaskQueue
     soul_engine: Any
     llm_service: LLMService
     enabled: bool = True
-    daily_budget: int = 0
+    daily_budget: int = 20
     # Unified keyword planner fetch coordinator (P1.7). When wired AND the flag
     # is on, the producer claims words from the keyword store, enqueues one xhs
     # search task per word carrying its ``source_keyword_id``, and marks the word
@@ -52,16 +54,13 @@ class XhsTaskProducer:
     # (``ok=False``) rolls the word back to ``pending``. ``None`` (default / flag
     # off) → legacy self-generated, lifecycle-free enqueue.
     keyword_fetch: Any | None = None
-    # Calibration history: 4h → 1h in v0.3.53+ after production logs
-    # (2026-05-05) showed the producer firing once per 43-minute session —
-    # the 4-hour throttle left the XHS pool effectively static while the user
-    # kept reshuffling. 2026-07-26: the unit changed from hours to minutes and
-    # the value to 5, aligning every source on one replenishment cadence; the
-    # hour granularity could not express anything between "1 hour" and "off".
-    # Per-run size is still bounded by ``[scheduler].discovery_limit`` and
-    # ``daily_budget``, so a shorter gap widens cadence, not batch size.
-    min_interval_minutes: int = 3
+    # XHS navigation is browser-driven and more sensitive to repetitive search
+    # patterns than direct source APIs. Keep keyword production aligned with
+    # the 20-minute claim target; task claims add their own persisted ±25%
+    # jitter so these two guards do not create a mechanical fixed cadence.
+    min_interval_minutes: int = 20
     keywords_per_cycle: int = 5
+    max_active_search_tasks: int = 5
     _last_skip_reason: str = field(default="", init=False)
 
     async def produce_if_due(
@@ -91,12 +90,20 @@ class XhsTaskProducer:
         if self.task_queue.cooldown_remaining_seconds() > 0:
             return self._skip("rate_limited")
 
+        active_search_tasks = self.task_queue.active_task_count("search")
+        backlog_slots = self.keywords_per_cycle
+        if self.max_active_search_tasks > 0:
+            backlog_slots = max(0, self.max_active_search_tasks - active_search_tasks)
+            if backlog_slots == 0:
+                return self._skip("backlog")
+
         if not self._is_due():
             return self._skip("throttled")
 
         keyword_count = min(
             self.keywords_per_cycle,
             max(1, int(limit or self.keywords_per_cycle)),
+            backlog_slots,
         )
 
         # Unified keyword planner fetch path (P1.7, flag-gated). Takes priority
@@ -232,6 +239,7 @@ class XhsTaskProducer:
         # drowning the log in identical-reason WARNINGs. Reasons:
         #   disabled       — explicitly turned off in config
         #   rate_limited   — the extension observed XHS security verification
+        #   backlog        — pending/in-progress search queue reached its cap
         #   throttled      — last enqueue within ``min_interval_minutes``
         #   no_profile     — soul profile not built yet (init window)
         #   no_keywords    — LLM keyword generation returned 0 items

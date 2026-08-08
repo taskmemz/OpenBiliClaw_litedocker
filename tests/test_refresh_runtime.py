@@ -589,6 +589,14 @@ class _FakeEventHub:
         self.events.append(event)
 
 
+class _ExpressionCopyNotifySpy:
+    def __init__(self) -> None:
+        self.reasons: list[str] = []
+
+    def notify(self, reason: str) -> None:
+        self.reasons.append(reason)
+
+
 _LOOP_BODY_ATTRS = [
     ("_loop_refresh", ("_on_profile_ready_if_first_time", "refresh_if_needed")),
     ("_loop_pool_precompute", ("_drain_pool_precompute_backlog",)),
@@ -1044,6 +1052,33 @@ def test_load_disliked_topic_phrases_reads_effective_dislikes() -> None:
     assert controller._load_disliked_topic_phrases() == ["营销号", "标题党"]
 
 
+def test_get_pending_notification_blocks_structured_disliked_topic() -> None:
+    class _NotificationDatabase(_FakeDatabase):
+        def get_notification_candidate(
+            self,
+            *,
+            min_confidence: float = 0.82,
+        ) -> dict[str, object] | None:
+            assert min_confidence == 0.82
+            return {
+                "id": 7,
+                "bvid": "BV1REHAB",
+                "title": "办公室久坐舒展指南",
+                "expression": "一套具体动作。",
+                "topic_group": "运动康复",
+            }
+
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=_NotificationDatabase([]),
+        soul_engine=_FakeSoulEngine(disliked=["运动康复"]),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+    )
+
+    assert controller.get_pending_notification() is None
+
+
 def test_get_pending_delight_skips_effective_disliked_candidate() -> None:
     candidate = {
         "bvid": "BV1MKT",
@@ -1070,6 +1105,45 @@ def test_get_pending_delight_skips_effective_disliked_candidate() -> None:
         recommendation_engine=_FakeRecommendationEngine(),
     )
     assert allowed.get_pending_delight() is not None
+
+
+def test_delight_consumption_notifies_expression_copy_refill() -> None:
+    coordinator = _ExpressionCopyNotifySpy()
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=_FakeDatabase([]),
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        expression_copy_coordinator=coordinator,
+    )
+
+    controller.mark_delight_sent("BVDELIGHT_SENT")
+    controller.mark_delight_seen("BVDELIGHT_SEEN")
+
+    assert coordinator.reasons == ["delight_consumed", "delight_seen"]
+
+
+def test_pool_maintenance_mutation_notifies_expression_copy_refill() -> None:
+    coordinator = _ExpressionCopyNotifySpy()
+    database = _FakeDatabase([], pool_count=10)
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=database,
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        expression_copy_coordinator=coordinator,
+        pool_target_count=10,
+    )
+    result = database.maintain_pool_inventory(
+        target=10,
+        raw_ceiling=20,
+        source_share_quotas={"bilibili": 10},
+    )
+
+    assert controller._record_pool_maintenance_result(replace(result, mutation_count=1)) is True
+    assert coordinator.reasons == ["pool_maintenance"]
 
 
 def test_runtime_status_reports_pool_readiness_counts() -> None:
@@ -1920,7 +1994,27 @@ async def test_candidate_eval_rate_limit_releases_claims_for_recovery_with_real_
             self.calls += 1
             if self.calls == 1:
                 raise LLMRateLimitError("provider 429 rate limit")
-            return _StructuredResponse(json.dumps(self.payload, ensure_ascii=False))
+            candidate_block = user_input.split("<content_batch>", 1)[1].split(
+                "</content_batch>", 1
+            )[0]
+            decoded = json.loads(candidate_block.strip())
+            if isinstance(decoded, dict):
+                request_items = decoded.get("items", [])
+                assert isinstance(request_items, list)
+                payload = [
+                    {
+                        **{
+                            key: value
+                            for key, value in self.payload[index].items()
+                            if key not in {"bvid", "content_id"}
+                        },
+                        "id": str(index),
+                    }
+                    for index in range(len(request_items))
+                ]
+            else:
+                payload = self.payload
+            return _StructuredResponse(json.dumps(payload, ensure_ascii=False))
 
     database = Database(tmp_path / "candidate-eval-rate-limit-e2e.db")
     database.initialize()
@@ -2142,7 +2236,7 @@ async def test_run_refresh_plan_uses_supply_loop_when_pipeline_supports_it() -> 
         pool_target_count=30,
     )
 
-    await controller._run_refresh_plan(
+    result = await controller._run_refresh_plan(
         state=_FakeMemoryManager().load_discovery_runtime_state(),
         profile={"profile": "ok"},
         plan=[(["search", "explore"], 10)],
@@ -2152,6 +2246,40 @@ async def test_run_refresh_plan_uses_supply_loop_when_pipeline_supports_it() -> 
     assert pipeline.supply_calls
     assert pipeline.supply_calls[0]["target_pending"] == pipeline.drain_calls[0]["batch_size"]
     assert pipeline.supply_calls[0]["strategies"] == ["search", "explore"]
+    assert result["supply_inserted_count"] == 6
+    assert result["supply_productive"] is True
+
+
+async def test_refresh_attempt_with_only_duplicate_supply_is_not_productive() -> None:
+    class DuplicateOnlySupplyPipeline:
+        last_admitted_items: list[object] = []
+
+        async def ensure_pending_supply(self, **_kwargs: object) -> dict[str, int]:
+            return {"inserted": 0, "pending_eval": 0, "evaluating": 0, "attempts": 3}
+
+        async def drain_pending(self, **_kwargs: object) -> dict[str, int]:
+            return {"evaluated": 0, "cached": 0, "rejected": 0}
+
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=_FakeDatabase([], pool_count=20, source_counts={"bilibili": 12}),
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        discovery_candidate_pipeline=DuplicateOnlySupplyPipeline(),
+        pool_target_count=30,
+    )
+
+    result = await controller._run_refresh_plan(
+        state=_FakeMemoryManager().load_discovery_runtime_state(),
+        profile={"profile": "ok"},
+        plan=[(["search", "related_chain"], 10)],
+        reason="test",
+    )
+
+    assert result["refreshed"] is True
+    assert result["supply_inserted_count"] == 0
+    assert result["supply_productive"] is False
 
 
 async def test_run_refresh_plan_respects_candidate_eval_batch_floor() -> None:
@@ -3227,6 +3355,86 @@ async def test_refresh_replenishes_when_raw_ceiling_is_full_but_available_pool_i
     assert discovery.calls[0][1] == ["search", "related_chain", "trending", "explore"]
 
 
+async def test_candidate_supply_wakes_all_under_quota_platform_producers() -> None:
+    xhs = _FakeXhsProducer()
+    douyin = _FakeDouyinProducer()
+    discovery = _FakeDiscoveryEngine()
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=_FakeDatabase(
+            [],
+            pool_count=30,
+            source_available_counts={
+                "bilibili": 30,
+                "xiaohongshu": 0,
+                "douyin": 0,
+            },
+            source_raw_counts={
+                "bilibili": 30,
+                "xiaohongshu": 0,
+                "douyin": 0,
+            },
+        ),
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=discovery,
+        recommendation_engine=_FakeRecommendationEngine(),
+        xhs_producer=xhs,
+        douyin_producer=douyin,
+        pool_target_count=90,
+        pool_source_shares={"bilibili": 1, "xiaohongshu": 1, "douyin": 1},
+        discovery_limit=30,
+    )
+
+    result = await controller.supply_candidates_once(reason="candidate_supply")
+
+    assert xhs.calls == [30]
+    assert douyin.calls == [30]
+    assert discovery.calls == []
+    assert result["refreshed"] is False
+    assert result["supply_progress_count"] == 4
+    assert result["supply_productive"] is True
+
+
+async def test_periodic_and_demand_ticks_do_not_duplicate_same_source_fetch() -> None:
+    class BlockingProducer:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def produce_if_due(self, *, limit: int | None = None) -> dict[str, object]:
+            self.calls += 1
+            self.started.set()
+            await self.release.wait()
+            return {"enqueued": 1, "reason": "ok"}
+
+    producer = BlockingProducer()
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=_FakeDatabase(
+            [],
+            pool_count=0,
+            source_available_counts={"xiaohongshu": 0},
+            source_raw_counts={"xiaohongshu": 0},
+        ),
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        xhs_producer=producer,
+        pool_target_count=30,
+        pool_source_shares={"xiaohongshu": 1},
+    )
+
+    first = asyncio.create_task(controller._tick_xhs_producer())
+    await producer.started.wait()
+    overlapping = await controller._tick_xhs_producer()
+    producer.release.set()
+    await first
+
+    assert producer.calls == 1
+    assert overlapping["reason"] == "in_flight"
+
+
 async def test_under_share_non_bili_producer_runs_even_when_global_pool_is_full() -> None:
     # Pool-share fairness spec (2026-07-20, invariant 2 / Goal 1): xhs owns 1/9
     # of a 100-slot target (≈11) but sits at 0. Even though the global pool is
@@ -4260,6 +4468,77 @@ async def test_run_forever_drives_pipeline_tick_and_refresh() -> None:
     )
 
 
+async def test_source_incremental_loop_is_not_behind_the_llm_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = 0
+
+    class Scheduler:
+        async def tick(self) -> None:
+            nonlocal ticks
+            ticks += 1
+
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=_FakeDatabase(events=[]),
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        source_incremental_sync=Scheduler(),
+        check_interval_seconds=60,
+    )
+
+    def _must_not_be_called() -> bool:
+        raise AssertionError("source incremental loop must not consult the LLM gate")
+
+    controller._llm_work_allowed = _must_not_be_called  # type: ignore[method-assign]
+
+    async def _cancel_sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", _cancel_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await controller._loop_source_incremental_sync()
+
+    assert ticks == 1
+
+
+async def test_run_forever_owns_one_source_incremental_loop() -> None:
+    started = 0
+    ready = asyncio.Event()
+    release = asyncio.Event()
+
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=_FakeDatabase(events=[]),
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        source_incremental_sync=object(),
+        check_interval_seconds=3600,
+    )
+    controller.run_startup_maintenance = lambda: None  # type: ignore[method-assign]
+    controller._llm_work_allowed = lambda: False  # type: ignore[method-assign]
+
+    async def _source_loop() -> None:
+        nonlocal started
+        started += 1
+        ready.set()
+        await release.wait()
+
+    controller._loop_source_incremental_sync = _source_loop  # type: ignore[method-assign]
+    task = asyncio.create_task(controller.run_forever())
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=0.5)
+        assert started == 1
+    finally:
+        release.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
 async def test_run_forever_startup_order_repairs_before_llm_and_background_tasks() -> None:
     calls: list[str] = []
     candidate_started = asyncio.Event()
@@ -4829,15 +5108,35 @@ async def test_refresh_after_event_ingest_queues_without_running_discovery() -> 
 
 
 async def test_refresh_after_feedback_skips_when_scheduler_disabled() -> None:
+    coordinator = _ExpressionCopyNotifySpy()
     controller = _controller_with_gate(
         scheduler_config=SimpleNamespace(enabled=False, pause_on_extension_disconnect=False),
     )
+    controller.expression_copy_coordinator = coordinator
 
     result = await controller.refresh_after_feedback()
 
     assert result["refreshed"] is False
     assert result["reason"] == "queued"
     assert result["queued_reason"] == "feedback"
+    assert coordinator.reasons == ["feedback"]
+
+
+async def test_public_feedback_replenishment_notifies_expression_copy() -> None:
+    coordinator = _ExpressionCopyNotifySpy()
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=_FakeDatabase([]),
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        expression_copy_coordinator=coordinator,
+    )
+
+    result = await controller.request_replenishment(reason="feedback")
+
+    assert result["state"] == "queued"
+    assert coordinator.reasons == ["feedback"]
 
 
 async def test_force_refresh_consumes_queued_replenishment_reasons() -> None:

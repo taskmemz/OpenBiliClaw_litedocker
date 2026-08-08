@@ -1,7 +1,9 @@
 /**
  * MAIN-world script — observes xhs's own fetch/XHR responses to learn
  * ``(note_id, xsec_token)`` pairs and postMessages them to the isolated
- * content script.
+ * content script. For the search endpoint it also emits the same minimal
+ * public card metadata that the DOM collector reports, allowing hidden
+ * discovery tabs to work even when XHS skips mounting its virtualized grid.
  *
  * Why MAIN world? Content scripts run in an isolated JS context, so
  * overriding ``window.fetch`` there doesn't intercept the page's own
@@ -9,13 +11,19 @@
  * wrap the same ``fetch`` / ``XMLHttpRequest`` objects the xhs React
  * app uses.
  *
- * What we do NOT do: mutate requests, fingerprint the user, or
- * exfiltrate anything other than ``(id, xsec_token)`` pairs that xhs
- * would willingly hand to any authenticated session.
+ * What we do NOT do: mutate requests, fingerprint the user, or expose raw
+ * responses. Only token pairs and normalized public search-card fields leave
+ * MAIN world.
  *
  * The isolated content script listens via ``window.addEventListener
  * ("message", ...)`` and filters by ``source: "obc-xhs-sniffer"``.
  */
+
+import {
+  extractXhsSearchResponseNotes,
+  isXhsSearchApiUrl,
+  type XhsSearchResponseNote,
+} from "../shared/xhs-search-response.ts";
 
 interface TokenPair {
   note_id: string;
@@ -23,6 +31,8 @@ interface TokenPair {
 }
 
 const POST_MESSAGE_SOURCE = "obc-xhs-sniffer";
+const REPLAY_REQUEST_SOURCE = "obc-xhs-search-replay-request";
+let latestSearchNotes: XhsSearchResponseNote[] = [];
 
 const NOTE_ID_KEYS = ["note_id", "noteId", "id"] as const;
 const TOKEN_KEYS = ["xsec_token", "xsecToken"] as const;
@@ -81,9 +91,9 @@ export function extractTokenPairs(payload: unknown): TokenPair[] {
   return out;
 }
 
-function emit(pairs: TokenPair[]): void {
-  if (pairs.length === 0) return;
-  window.postMessage({ source: POST_MESSAGE_SOURCE, pairs }, "*");
+function emit(pairs: TokenPair[], searchNotes?: XhsSearchResponseNote[]): void {
+  if (pairs.length === 0 && searchNotes === undefined) return;
+  window.postMessage({ source: POST_MESSAGE_SOURCE, pairs, search_notes: searchNotes }, "*");
 }
 
 function isXhsApiUrl(url: string): boolean {
@@ -102,6 +112,16 @@ async function parseResponseSafely(res: Response): Promise<unknown> {
   } catch {
     return null;
   }
+}
+
+function handleApiPayload(url: string, payload: unknown): void {
+  const pairs = extractTokenPairs(payload);
+  if (isXhsSearchApiUrl(url)) {
+    latestSearchNotes = extractXhsSearchResponseNotes(payload);
+    emit(pairs, latestSearchNotes);
+    return;
+  }
+  emit(pairs);
 }
 
 type TaggedXhr = XMLHttpRequest & { __obcXhsUrl?: string };
@@ -128,7 +148,7 @@ function installSniffer(): void {
             : input.url;
       if (url && isXhsApiUrl(url)) {
         void parseResponseSafely(response).then((json) => {
-          if (json !== null) emit(extractTokenPairs(json));
+          if (json !== null) handleApiPayload(url, json);
         });
       }
     } catch {
@@ -172,10 +192,10 @@ function installSniffer(): void {
             const text = this.responseText;
             if (text) {
               const json = JSON.parse(text);
-              emit(extractTokenPairs(json));
+              handleApiPayload(url, json);
             }
           } else if (this.responseType === "json") {
-            emit(extractTokenPairs(this.response));
+            handleApiPayload(url, this.response);
           }
         } catch {
           // swallow
@@ -184,6 +204,13 @@ function installSniffer(): void {
     }
     return originalSend.call(this, body ?? null);
   };
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    const data = event.data as { source?: string } | null;
+    if (data?.source !== REPLAY_REQUEST_SOURCE) return;
+    emit([], latestSearchNotes);
+  });
 
   console.debug("[OpenBiliClaw] xhs token sniffer installed (MAIN world)");
 }

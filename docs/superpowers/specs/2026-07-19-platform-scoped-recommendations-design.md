@@ -95,6 +95,10 @@ strict_platform_candidates(platform)
 已知平台按现有 `sourceFilterDefinitions` 顺序排列；其它值按稳定字典序排列。若当前
 Tab 因配置热更新或库存变化不再存在，则回退到“全部”。
 
+配置快照（`/api/config`）与库存快照并行读取；前者偶发失败时按有界退避重试
+（1s / 2s / 4s / 8s），成功后 Tab 并集收敛——已启用但零库存的平台不会因一次
+瞬断而永久缺席。
+
 每个 Tab 显示：
 
 ```text

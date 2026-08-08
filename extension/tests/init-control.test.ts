@@ -25,6 +25,7 @@ import {
   INIT_SOURCE_OPTIONS,
   initStartButtonState,
   isInitTerminal,
+  shouldAttachEmbeddingPullProgress,
   shouldAttachRunningInitProgress,
 } from "../popup/popup-init-control.js";
 
@@ -132,6 +133,33 @@ test("embedding checklist row carries pull progress + repair action", () => {
   assert.equal(emb?.pull.active, true);
   assert.equal(emb?.pull.pct, 10);
   assert.equal(emb?.repair.repairable, true);
+});
+
+test("boot re-attach recognizes an embedding pull before guided init starts", () => {
+  const pulling = statusWith({
+    prerequisites: {
+      embedding_required: true,
+      embedding_ready: false,
+      embedding_check: "repairing",
+      embedding_repair_running: true,
+      embedding_repair_completed: 12,
+      embedding_repair_total: 100,
+    },
+  });
+  assert.equal(shouldAttachEmbeddingPullProgress(pulling), true);
+  assert.equal(
+    shouldAttachEmbeddingPullProgress(
+      statusWith({
+        prerequisites: {
+          embedding_required: true,
+          embedding_ready: false,
+          embedding_check: "model_missing",
+        },
+      }),
+    ),
+    false,
+  );
+  assert.equal(shouldAttachEmbeddingPullProgress(statusWith()), false);
 });
 
 test("hardPrereqsSatisfied is false until both bilibili and llm are ready", () => {

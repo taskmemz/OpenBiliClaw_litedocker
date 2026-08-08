@@ -31,10 +31,13 @@ import {
 } from "./xhs/bootstrap.js";
 import { attachCoverData } from "./xhs/cover-harvest.js";
 import { registerTaskExecutor } from "./xhs/task-executor.js";
+import { NOTE_ANCHOR_SELECTOR } from "./xhs/selectors.ts";
 import { installNativeSaveExecutor } from "./native-save/runtime.ts";
 import { saveXiaohongshu, verifyXiaohongshu } from "./native-save/xiaohongshu.ts";
 import { buildEventFromXhsAction, isXhsAction } from "./xhs/action-event.ts";
 import type { BehaviorEvent } from "../shared/types.js";
+import type { XhsSearchResponseNote } from "../shared/xhs-search-response.js";
+import { recordXhsSearchResponseNotes } from "./xhs/search-response-buffer.js";
 
 startCollector(xiaohongshuAdapter);
 registerTaskExecutor();
@@ -45,8 +48,9 @@ installNativeSaveExecutor("xiaohongshu", saveXiaohongshu, verifyXiaohongshu);
 //
 // The MAIN-world script at `dist/main/xhs-token-sniffer.js` wraps xhs's
 // own fetch/XHR and postMessages `(note_id, xsec_token)` pairs it finds
-// in API responses. We buffer them here and POST to the backend so the
-// `_backfill_xhs_tokens` path can upgrade cached bare URLs to
+// in API responses. Search responses additionally carry normalized public
+// card metadata for the background task executor. We buffer tokens here and
+// POST to the backend so the `_backfill_xhs_tokens` path can upgrade cached bare URLs to
 // tokenized ones. Without this, search-page-sourced notes stay bare
 // forever and clicking them hits xhs's 300031 access-denied wall.
 // Debounce is short (250 ms) because background task-executor tabs often
@@ -86,15 +90,23 @@ function scheduleTokenFlush(): void {
 
 window.addEventListener("message", (event) => {
   if (event.source !== window) return;
-  const data = event.data as { source?: string; pairs?: TokenPair[] } | null;
+  const data = event.data as {
+    source?: string;
+    pairs?: TokenPair[];
+    search_notes?: XhsSearchResponseNote[];
+  } | null;
   if (!data || data.source !== "obc-xhs-sniffer") return;
-  if (!Array.isArray(data.pairs) || data.pairs.length === 0) return;
-  for (const pair of data.pairs) {
-    if (pair?.note_id && pair?.xsec_token) {
-      tokenBuffer.set(pair.note_id, pair.xsec_token);
-    }
+  if (Array.isArray(data.search_notes)) {
+    recordXhsSearchResponseNotes(data.search_notes);
   }
-  scheduleTokenFlush();
+  if (Array.isArray(data.pairs) && data.pairs.length > 0) {
+    for (const pair of data.pairs) {
+      if (pair?.note_id && pair?.xsec_token) {
+        tokenBuffer.set(pair.note_id, pair.xsec_token);
+      }
+    }
+    scheduleTokenFlush();
+  }
 });
 
 // ── Action tap bridge (isolated world receiver) ─────────────────────
@@ -133,10 +145,9 @@ document.addEventListener("visibilitychange", () => {
 const PASSIVE_SCROLL_DEBOUNCE_MS = 500;
 const PASSIVE_TOLERANCE_BELOW_PX = 400;
 const PASSIVE_MAX_URLS_PER_BATCH = 20;
-const PASSIVE_ANCHOR_SELECTOR = [
-  'a[href*="/explore/"]',
-  'a[href*="/discovery/item/"]',
-].join(",");
+// Keep passive browsing and background task collection on the same route set.
+// In particular, search cards now use /search_result/{note_id} on some rollouts.
+const PASSIVE_ANCHOR_SELECTOR = NOTE_ANCHOR_SELECTOR;
 
 const reportedUrls = new Set<string>();
 
@@ -163,7 +174,11 @@ function snapshotAnchors(): AnchorLike[] {
  */
 function selfNoteAnchor(): AnchorLike | null {
   const { pathname, search } = window.location;
-  if (!pathname.startsWith("/explore/") && !pathname.startsWith("/discovery/item/")) {
+  if (
+    !pathname.startsWith("/explore/") &&
+    !pathname.startsWith("/discovery/item/") &&
+    !pathname.startsWith("/search_result/")
+  ) {
     return null;
   }
   const params = new URLSearchParams(search);

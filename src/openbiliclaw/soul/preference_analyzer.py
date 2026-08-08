@@ -17,6 +17,7 @@ from openbiliclaw.llm.prompts import build_preference_analysis_prompt
 from openbiliclaw.llm.service import LLMServiceError, is_llm_rate_limit_error
 from openbiliclaw.llm.task_options import call_accepts_keyword, without_core_memory_kwargs
 from openbiliclaw.soul.event_filters import filter_events_by_satisfaction
+from openbiliclaw.soul.event_prompt_views import normalize_cognition_input_view
 from openbiliclaw.soul.taxonomy import SupportsEmbed, resolve_category
 
 if TYPE_CHECKING:
@@ -133,12 +134,14 @@ class PreferenceAnalyzer:
     compact_title_chars: int = 180
     compact_context_chars: int = 600
     compact_metadata_value_chars: int = 300
+    cognition_prompt_view: str = "legacy"
 
     def __post_init__(self) -> None:
         if not hasattr(self.registry, "complete_structured_task"):
             raise TypeError(
                 "PreferenceAnalyzer requires a service with complete_structured_task()."
             )
+        self.cognition_prompt_view = normalize_cognition_input_view(self.cognition_prompt_view)
 
     @staticmethod
     async def _emit_progress(callback: ProgressCallback | None, done: int, total: int) -> None:
@@ -193,22 +196,21 @@ class PreferenceAnalyzer:
             existing_preference=existing_preference,
             awareness_notes=awareness_notes,
             active_insights=active_insights,
+            input_view=self.cognition_prompt_view,
         )
         prompt_chars = self._prompt_char_count(whole_batch_prompt)
         should_chunk_by_budget = self.max_prompt_chars > 0 and prompt_chars > self.max_prompt_chars
         if should_chunk_by_budget:
-            initial_chunk_size = (
-                event_chunk_size
-                if event_chunk_size > 0
-                else self._estimate_budget_chunk_size(
-                    event_count=len(events),
-                    prompt_chars=prompt_chars,
-                )
+            planned_chunks = self._plan_fitting_independent_chunks(
+                events=events,
+                awareness_notes=awareness_notes,
+                active_insights=active_insights,
             )
             return await self._analyze_events_chunked(
                 events=events,
                 existing_preference=existing_preference,
-                chunk_size=initial_chunk_size,
+                chunk_size=max((len(chunk) for chunk in planned_chunks), default=1),
+                planned_chunks=planned_chunks,
                 progress_callback=progress_callback,
                 awareness_notes=awareness_notes,
                 active_insights=active_insights,
@@ -280,6 +282,7 @@ class PreferenceAnalyzer:
             existing_preference=existing_preference,
             awareness_notes=awareness_notes,
             active_insights=active_insights,
+            input_view=self.cognition_prompt_view,
         )
         try:
             response = await self._complete_cacheable_preference_task(
@@ -341,13 +344,83 @@ class PreferenceAnalyzer:
             self.max_prompt_chars <= 0 or self._prompt_char_count(messages) <= self.max_prompt_chars
         )
 
-    def _estimate_budget_chunk_size(self, *, event_count: int, prompt_chars: int) -> int:
-        if event_count <= 0:
+    def _largest_fitting_independent_chunk_size(
+        self,
+        *,
+        events: list[dict[str, object]],
+        awareness_notes: list[dict[str, object]] | None,
+        active_insights: list[dict[str, object]] | None,
+    ) -> int:
+        """Return the largest prefix that fits the actual independent-call shape.
+
+        Automatic budget fallback ultimately sends chunks with an empty
+        ``existing_preference`` and merges their outputs into the stored
+        preference locally. Estimating chunk size from the oversized whole
+        prompt therefore over-counted the stored preference on every chunk and
+        could turn one fitting independent call into several needless calls.
+        Prompt size is monotonic for event prefixes, so a deterministic binary
+        search finds the largest fitting prefix in O(log n) renders.
+        """
+        if not events:
             return 1
-        if self.max_prompt_chars <= 0 or prompt_chars <= self.max_prompt_chars:
-            return max(1, event_count)
-        estimated = event_count * self.max_prompt_chars // max(prompt_chars, 1)
-        return max(1, min(event_count, estimated))
+        if self.max_prompt_chars <= 0:
+            return len(events)
+
+        def _prefix_fits(event_count: int) -> bool:
+            messages = build_preference_analysis_prompt(
+                events=events[:event_count],
+                existing_preference={},
+                awareness_notes=awareness_notes,
+                active_insights=active_insights,
+                input_view=self.cognition_prompt_view,
+            )
+            return self._prompt_fits_budget(messages)
+
+        if _prefix_fits(len(events)):
+            return len(events)
+        if not _prefix_fits(1):
+            # The resilient chunk path owns single-event compaction/skipping.
+            return 1
+
+        low = 1
+        high = len(events) - 1
+        while low < high:
+            midpoint = (low + high + 1) // 2
+            if _prefix_fits(midpoint):
+                low = midpoint
+            else:
+                high = midpoint - 1
+        return low
+
+    def _plan_fitting_independent_chunks(
+        self,
+        *,
+        events: list[dict[str, object]],
+        awareness_notes: list[dict[str, object]] | None,
+        active_insights: list[dict[str, object]] | None,
+    ) -> list[list[dict[str, object]]]:
+        """Greedily pack each automatic chunk against its exact prompt shape.
+
+        Event payload sizes can be highly skewed. Reusing the first prefix's
+        width for the whole batch makes a later large event trigger recursive
+        splitting and can strand adjacent small events in separate calls. A
+        fresh largest-prefix search at each offset keeps every multi-event
+        top-level chunk within budget and leaves only an individually oversized
+        event to the existing compaction recovery path.
+        """
+        chunks: list[list[dict[str, object]]] = []
+        offset = 0
+        while offset < len(events):
+            remaining = events[offset:]
+            chunk_size = self._largest_fitting_independent_chunk_size(
+                events=remaining,
+                awareness_notes=awareness_notes,
+                active_insights=active_insights,
+            )
+            chunk = remaining[: max(1, chunk_size)]
+            chunks.append(chunk)
+            offset += len(chunk)
+        return chunks
 
     @staticmethod
     def _is_context_overflow_error(exc: PreferenceAnalysisError) -> bool:
@@ -437,6 +510,7 @@ class PreferenceAnalyzer:
         events: list[dict[str, object]],
         existing_preference: dict[str, object],
         chunk_size: int,
+        planned_chunks: list[list[dict[str, object]]] | None = None,
         progress_callback: ProgressCallback | None = None,
         awareness_notes: list[dict[str, object]] | None = None,
         active_insights: list[dict[str, object]] | None = None,
@@ -445,9 +519,13 @@ class PreferenceAnalyzer:
         import asyncio as _asyncio
 
         chunk_size = max(1, chunk_size)
-        chunks = [events[i : i + chunk_size] for i in range(0, len(events), chunk_size)]
+        chunks = (
+            [list(chunk) for chunk in planned_chunks]
+            if planned_chunks is not None
+            else [events[i : i + chunk_size] for i in range(0, len(events), chunk_size)]
+        )
         logger.info(
-            "analyze_events chunked: total_events=%d chunks=%d chunk_size=%d",
+            "analyze_events chunked: total_events=%d chunks=%d max_chunk_size=%d",
             len(events),
             len(chunks),
             chunk_size,
@@ -467,6 +545,7 @@ class PreferenceAnalyzer:
                 existing_preference={},
                 awareness_notes=awareness_notes,
                 active_insights=active_insights,
+                input_view=self.cognition_prompt_view,
             )
             response: LLMResponse | None = None
             max_tokens = PREFERENCE_CHUNK_MAX_TOKENS
@@ -552,6 +631,7 @@ class PreferenceAnalyzer:
                 existing_preference={},
                 awareness_notes=awareness_notes,
                 active_insights=active_insights,
+                input_view=self.cognition_prompt_view,
             )
             if not self._prompt_fits_budget(safe_messages):
                 logger.warning(
@@ -585,6 +665,7 @@ class PreferenceAnalyzer:
                     existing_preference={},
                     awareness_notes=awareness_notes,
                     active_insights=active_insights,
+                    input_view=self.cognition_prompt_view,
                 )
                 if not self._prompt_fits_budget(compact_messages):
                     logger.warning(
@@ -615,6 +696,7 @@ class PreferenceAnalyzer:
                 existing_preference={},
                 awareness_notes=awareness_notes,
                 active_insights=active_insights,
+                input_view=self.cognition_prompt_view,
             )
             if not self._prompt_fits_budget(messages):
                 return await _split_or_compact_chunk(chunk)

@@ -22,6 +22,7 @@ import {
   type XhsNoteMetadata,
   type XhsSelfInfo,
 } from "../src/content/xhs/passive.ts";
+import { NOTE_ANCHOR_SELECTOR } from "../src/content/xhs/selectors.ts";
 
 const VIEWPORT: ViewportRect = { top: 0, bottom: 800, height: 800 };
 
@@ -96,6 +97,12 @@ test("classifyXhsPageType identifies search / explore / profile / other", () => 
     "search",
   );
   assert.equal(
+    classifyXhsPageType(
+      "https://www.xiaohongshu.com/search_result/69dea966000000001a0280ad",
+    ),
+    "note",
+  );
+  assert.equal(
     classifyXhsPageType("https://www.xiaohongshu.com/user/profile/abc"),
     "profile",
   );
@@ -146,6 +153,25 @@ test("extractXhsNoteUrl keeps discovery/item variant", () => {
   assert.equal(
     url,
     "https://www.xiaohongshu.com/discovery/item/abc123?xsec_token=YY",
+  );
+});
+
+test("search-result note links stay aligned across selector and URL parser", () => {
+  const noteId = "69dea966000000001a0280ad";
+  assert.match(NOTE_ANCHOR_SELECTOR, /\/search_result\//);
+  assert.equal(
+    extractXhsNoteUrl(
+      `/search_result/${noteId}?xsec_token=SEARCH_TOKEN&keyword=private-query`,
+      "https://www.xiaohongshu.com/search_result?keyword=private-query",
+    ),
+    `https://www.xiaohongshu.com/search_result/${noteId}?xsec_token=SEARCH_TOKEN`,
+  );
+  assert.equal(
+    extractXhsNoteUrl(
+      "/search_result?keyword=private-query",
+      "https://www.xiaohongshu.com/",
+    ),
+    null,
   );
 });
 

@@ -58,6 +58,7 @@ import {
   INIT_RUNNING_HINT,
   INIT_SOURCE_OPTIONS,
   INIT_SOURCE_LOGIN_HINT,
+  shouldAttachEmbeddingPullProgress,
   shouldAttachRunningInitProgress,
   stalenessView,
 } from "./popup-init-control.js";
@@ -165,11 +166,13 @@ const {
   executeCardAction,
   executePendingConfirmationOpen,
   isCardTurn,
+  isDialogueReplyTurn,
   isTerminalCardTurn,
   isQuestionTurn,
   normalizeContextPreview,
   readContextSelection,
   replyQuoteMarkup,
+  renderMarkdown,
   renderPendingListMarkup,
   renderTurnMarkup,
   selectDialogueTurns,
@@ -418,6 +421,7 @@ offlineBackendPoller = createOfflineBackendPoller({
       setHint("后端连上了，正在刷新。", "success");
     }
     scheduleRecommendationsRefresh({ delayMs: 0 });
+    scheduleDialogueConfirmationRefresh();
     void maybeShowEmbeddingBanner();
   },
 });
@@ -754,6 +758,7 @@ const savedTaskRuntimes = {
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     for (const runtime of Object.values(savedTaskRuntimes)) runtime.coordinator.resumeAll();
+    scheduleDialogueConfirmationRefresh();
   }
 });
 window.addEventListener("pagehide", () => {
@@ -1727,12 +1732,43 @@ async function handleCancelInitClick() {
   }
 }
 
+function renderEmbeddingPullStatus(status) {
+  renderInitPanelIdle();
+  _renderInitChecklist(status, _readSelectedInitSources());
+}
+
+async function pollEmbeddingPullProgress() {
+  let status;
+  try {
+    status = await fetchInitStatus();
+  } catch {
+    clearInitPolling();
+    initPollTimer = setTimeout(() => void pollEmbeddingPullProgress(), 3000);
+    return;
+  }
+  if (status?.running || status?.initialized) {
+    renderInitProgress(status);
+    if (status.running) {
+      _startInitProgressPoll();
+    } else {
+      clearInitPolling();
+    }
+    return;
+  }
+  renderEmbeddingPullStatus(status);
+  if (shouldAttachEmbeddingPullProgress(status)) {
+    clearInitPolling();
+    initPollTimer = setTimeout(() => void pollEmbeddingPullProgress(), 3000);
+  } else {
+    clearInitPolling();
+  }
+}
+
 // Boot-time re-attach: when the popup opens while a run is already live, the
 // uninitialized branch would otherwise paint the idle panel and never poll
-// (the run started elsewhere, so no click/SSE kicked the poll here). Fetch once
-// and, ONLY if a run is in flight, take over with the progress view + poll.
-// The idle path is left untouched (renderInitProgress would clobber it). This
-// mirrors the setup wizard's boot guard and the desktop hydrate re-attach.
+// (the run started elsewhere, so no click/SSE kicked the poll here). The same
+// applies to a packaged desktop's background bge-m3 pull: it is live work,
+// but it has no guided-init run id or SSE event of its own.
 async function maybeAttachRunningInitProgress() {
   let status;
   try {
@@ -1741,6 +1777,12 @@ async function maybeAttachRunningInitProgress() {
     return false;
   }
   if (!shouldAttachRunningInitProgress(status)) {
+    if (shouldAttachEmbeddingPullProgress(status)) {
+      renderEmbeddingPullStatus(status);
+      clearInitPolling();
+      initPollTimer = setTimeout(() => void pollEmbeddingPullProgress(), 1200);
+      return true;
+    }
     return false;
   }
   renderInitProgress(status);
@@ -1802,6 +1844,15 @@ async function handleStartInitClick() {
   if (status.running) {
     renderInitProgress(status);
     _startInitProgressPoll();
+    return;
+  }
+
+  // A background bge-m3 pull is not a guided-init run. Keep the CTA idle and
+  // attach the checklist poll instead of treating the pull as a failed init.
+  if (shouldAttachEmbeddingPullProgress(status)) {
+    renderEmbeddingPullStatus(status);
+    clearInitPolling();
+    initPollTimer = setTimeout(() => void pollEmbeddingPullProgress(), 1200);
     return;
   }
 
@@ -2209,6 +2260,11 @@ function connectRuntimeStream() {
         setHint("后端配置已热重载，正在刷新数据…", "success");
         scheduleRecommendationsRefresh();
       }
+      if (event.type === "config_reload_failed") {
+        const message = String(event.message || "后台应用配置失败，已恢复上一次生效配置。");
+        setHint(message, "error");
+        showToast(message, "error");
+      }
       if (
         event.type === "backend_update_available" ||
         event.type === "backend_update_failed" ||
@@ -2335,6 +2391,7 @@ function connectRuntimeStream() {
           "success",
         );
         scheduleRecommendationsRefresh({ delayMs: 0 });
+        scheduleDialogueConfirmationRefresh();
       }
     },
     onDisconnect() {
@@ -3185,8 +3242,8 @@ function buildMessageCard(probe) {
     item.append(createChatThinkingPlaceholder("阿B 正在思考这个方向"));
   } else if (probe.chat_reply) {
     const reply = document.createElement("div");
-    reply.className = "message-chat-reply";
-    reply.textContent = probe.chat_reply;
+    reply.className = "message-chat-reply chat-markdown";
+    reply.innerHTML = renderMarkdown(probe.chat_reply);
     item.append(reply);
   }
 
@@ -3349,8 +3406,8 @@ function buildDelightCard(delight) {
     item.append(createChatThinkingPlaceholder("阿B 正在品你这句话"));
   } else if (delight.chat_reply) {
     const reply = document.createElement("div");
-    reply.className = "message-chat-reply";
-    reply.textContent = delight.chat_reply;
+    reply.className = "message-chat-reply chat-markdown";
+    reply.innerHTML = renderMarkdown(delight.chat_reply);
     item.append(reply);
   }
 
@@ -3473,9 +3530,10 @@ function expandDelightChat(itemEl, delight) {
       const showReply = (nextTurn) => {
         thinking.remove();
         const replyEl = document.createElement("div");
-        replyEl.className = "message-chat-reply";
-        replyEl.textContent =
-          nextTurn.reply || "\u6536\u5230\u4E86\uFF0C\u6211\u4F1A\u7EE7\u7EED\u89C2\u5BDF\u3002";
+        replyEl.className = "message-chat-reply chat-markdown";
+        replyEl.innerHTML = renderMarkdown(
+          nextTurn.reply || "\u6536\u5230\u4E86\uFF0C\u6211\u4F1A\u7EE7\u7EED\u89C2\u5BDF\u3002",
+        );
         itemEl.append(replyEl);
         applyTurnToMessage(nextTurn);
         applyTurnToDelight(nextTurn);
@@ -3637,9 +3695,10 @@ async function sendInlineChat(itemEl, domain, input, sendBtn, type = "interest.p
       thinking.remove();
       chatArea.remove();
       const replyEl = document.createElement("div");
-      replyEl.className = "message-chat-reply";
-      replyEl.textContent =
-        nextTurn.reply || "\u6536\u5230\u4E86\uFF0C\u6211\u4F1A\u7ED3\u5408\u8FD9\u4E2A\u65B9\u5411\u7EE7\u7EED\u89C2\u5BDF\u3002";
+      replyEl.className = "message-chat-reply chat-markdown";
+      replyEl.innerHTML = renderMarkdown(
+        nextTurn.reply || "\u6536\u5230\u4E86\uFF0C\u6211\u4F1A\u7ED3\u5408\u8FD9\u4E2A\u65B9\u5411\u7EE7\u7EED\u89C2\u5BDF\u3002",
+      );
       itemEl.append(replyEl);
       applyTurnToMessage(nextTurn);
       setTimeout(() => {
@@ -5064,9 +5123,10 @@ function appendChatMessage(role, content, { turnId = "", part = "" } = {}) {
   label.className = "chat-role";
   label.textContent = role;
 
-  const text = document.createElement("p");
-  text.className = "chat-content";
-  text.textContent = content;
+  const text = document.createElement(role === "助手" ? "div" : "p");
+  text.className = `chat-content${role === "助手" ? " chat-markdown" : ""}`;
+  if (role === "助手") text.innerHTML = renderMarkdown(content);
+  else text.textContent = content;
 
   item.append(label, text);
   elements.chatMessages.append(item);
@@ -5093,7 +5153,7 @@ function appendChatThinkingPlaceholder(turnId = "") {
   label.className = "chat-role";
   label.textContent = "助手";
 
-  const text = document.createElement("p");
+  const text = document.createElement("div");
   text.className = "chat-content chat-thinking-content";
   text.innerHTML =
     '<span class="chat-thinking-label">正在想</span>' +
@@ -5119,7 +5179,8 @@ function replaceChatThinkingPlaceholder(placeholder, content) {
   const text = placeholder.querySelector(".chat-content");
   if (text instanceof HTMLElement) {
     text.classList.remove("chat-thinking-content");
-    text.textContent = content;
+    text.classList.add("chat-markdown");
+    text.innerHTML = renderMarkdown(content);
   }
   scrollChatMessagesToBottom();
 }
@@ -5366,7 +5427,7 @@ async function hydrateChatHistory() {
       dialogueTurnsById.clear();
       for (const turn of nextTurns) {
         renderChatTurn(turn);
-        if (turn.scope === "chat" && turn.status === "pending") {
+        if (isDialogueReplyTurn(turn) && (turn.status === "pending" || turn.status === "processing")) {
           pollChatTurnUntilSettled(turn.turn_id, {
             onUpdate: renderChatTurn,
             onDone: refreshAfterChatTurn,
@@ -5734,8 +5795,8 @@ function renderDelightSlot() {
           aiBubble.className = "delight-turn-bubble is-assistant is-error";
           aiBubble.textContent = t.error || "这句还没发出去，稍后再试。";
         } else {
-          aiBubble.className = "delight-turn-bubble is-assistant";
-          aiBubble.textContent = t.reply || "";
+          aiBubble.className = "delight-turn-bubble is-assistant chat-markdown";
+          aiBubble.innerHTML = renderMarkdown(t.reply || "");
         }
         bubbleArea.append(aiBubble);
       }
@@ -5743,8 +5804,8 @@ function renderDelightSlot() {
     } else if (delight.chat_reply) {
       // Fallback: show single chat_reply for backward compat
       const reply = document.createElement("p");
-      reply.className = "delight-banner-chat-reply";
-      reply.textContent = delight.chat_reply;
+      reply.className = "delight-banner-chat-reply chat-markdown";
+      reply.innerHTML = renderMarkdown(delight.chat_reply);
       body.append(reply);
     }
 
@@ -8822,10 +8883,10 @@ function bindSettings() {
         // write identical values for an untouched form.
         xiaohongshu: {
           enabled: checked("cfgXhsEnabled"),
-          daily_search_budget: getInt("cfgXhsDailySearchBudget", 0),
+          daily_search_budget: getInt("cfgXhsDailySearchBudget", 20),
           daily_creator_budget: getInt("cfgXhsDailyCreatorBudget", 0),
-          task_interval_seconds: getInt("cfgXhsTaskInterval", 300),
-          min_interval_minutes: getInt("cfgXhsMinInterval", 3),
+          task_interval_seconds: getInt("cfgXhsTaskInterval", 1200),
+          min_interval_minutes: getInt("cfgXhsMinInterval", 20),
         },
         douyin: {
           enabled: checked("cfgDouyinEnabled"),
@@ -9559,7 +9620,10 @@ function bindSettings() {
         } else {
           clearSettingsDirty();
         }
-        const tone = result.restart_required ? "warning" : result.reloaded ? "success" : "warning";
+        const queued = result.apply_state === "queued";
+        const tone = result.restart_required || queued
+          ? "warning"
+          : result.reloaded ? "success" : "warning";
         showToast(result.message || "配置已保存。", tone);
       } catch (err) {
         if (err?.name === "AbortError") {

@@ -294,12 +294,14 @@
           <div class="lane-title">输入来源</div>
           <div class="lane-body">
             <article class="card blue">
-              <h3>XHS / 抖音 / YouTube bootstrap_profile</h3>
-              <p>插件回传账号信号后转成统一 event，再在初始化完成后推入 <code>ProfileUpdatePipeline</code>。</p>
+              <h3>五源扩展账号 bootstrap</h3>
+              <p>初始化或扩展在线周期回拉复用既有任务；五源全局串行，回传先经 staged durable ingress 和原子有界 seen-key，再由画像 owner 消费。</p>
               <ul>
                 <li>XHS: saved / liked / history</li>
                 <li>Douyin: post / collect / like / follow</li>
                 <li>YouTube: history / subscriptions / likes</li>
+                <li>Zhihu: history / collection / activity</li>
+                <li>Reddit: saved / upvoted / subscribed</li>
               </ul>
             </article>
             <article class="card blue">

@@ -69,6 +69,7 @@ const {
   normalizeContextPreview,
   readContextSelection,
   replyQuoteMarkup,
+  renderMarkdown,
   renderPendingListMarkup,
   renderTurnMarkup,
   selectDialogueTurns,
@@ -86,6 +87,7 @@ const CHAT_HISTORY_REFRESH_INTERVAL_MS = 2500;
 let historyRefreshTimer = null;
 let historyRefreshInFlight = false;
 let lastHistorySignature = null;
+let pendingConfirmationRefreshTimer = null;
 let dialogueStatus = { message: "", tone: "info" };
 let retainedDraft = "";
 let dialogueContextSelection = readContextSelection(
@@ -546,14 +548,20 @@ function updateDialogueTurn(turn) {
   render();
 }
 
-async function refreshPendingConfirmations({ renderNow = true } = {}) {
+export async function refreshPendingConfirmations({ renderNow = true } = {}) {
+  if (!state.online) {
+    if (state.pendingConfirmationCount !== 0) patchState({ pendingConfirmationCount: 0 });
+    return;
+  }
   try {
     const payload = await fetchPendingConfirmations({ session: "popup" });
+    const count = Math.max(0, Number(payload?.count) || 0);
     pendingConfirmations = {
       ...pendingConfirmations,
-      count: Math.max(0, Number(payload?.count) || 0),
+      count,
       items: Array.isArray(payload?.items) ? payload.items : [],
     };
+    if (state.pendingConfirmationCount !== count) patchState({ pendingConfirmationCount: count });
     if (renderNow) render();
   } catch {
     // Preserve the last successful list while the backend reconnects.
@@ -915,6 +923,9 @@ async function loadHistory() {
         pendingConfirmations = { ...pendingConfirmations, ...nextPending };
         changed = true;
       }
+      if (state.pendingConfirmationCount !== nextPending.count) {
+        patchState({ pendingConfirmationCount: nextPending.count });
+      }
     }
     const contextBefore = dialogueContextSelection?.reply_to_turn_id || "";
     await validateDialogueContext({ announce: true });
@@ -1017,6 +1028,13 @@ export function updateBadge() {
 }
 
 export function onStreamEvent(payload) {
+  if (pendingConfirmationRefreshTimer !== null) {
+    window.clearTimeout(pendingConfirmationRefreshTimer);
+  }
+  pendingConfirmationRefreshTimer = window.setTimeout(() => {
+    pendingConfirmationRefreshTimer = null;
+    void refreshPendingConfirmations();
+  }, 300);
   const type = payload?.type || payload?.event;
   if (type === "interest.probe" || type === "avoidance.probe") {
     const item = payload.data || payload;
@@ -1137,8 +1155,8 @@ function expandInlineChatOnCard(card, { scope, subjectId, subjectTitle, placehol
         input.remove();
         sendBtn.remove();
         const replyEl = document.createElement("div");
-        replyEl.className = "inline-chat-reply";
-        replyEl.textContent = t.reply || t.response || "收到了，我会结合这个方向继续观察。";
+        replyEl.className = "inline-chat-reply chat-markdown";
+        replyEl.innerHTML = renderMarkdown(t.reply || t.response || "收到了，我会结合这个方向继续观察。");
         chatArea.appendChild(replyEl);
         setTimeout(() => {
           const domain = subjectId;

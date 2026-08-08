@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from openbiliclaw.memory.manager import MemoryManager
 from openbiliclaw.sources.dy_tasks import DyTaskQueue
+from openbiliclaw.sources.reddit_tasks import RedditTaskQueue
 from openbiliclaw.sources.task_result_protocol import staged_terminal_status
 from openbiliclaw.sources.xhs_tasks import XhsTaskQueue
 from openbiliclaw.sources.yt_tasks import YtTaskQueue
@@ -92,6 +93,26 @@ SOURCE_CASES: tuple[dict[str, Any], ...] = (
         },
         "state_key": "zhihu_seen_item_keys",
         "bootstrap_key": "zhihu_read_history:answer:source-protocol-zhihu",
+    },
+    {
+        "source": "reddit",
+        "table": "reddit_tasks",
+        "queue": RedditTaskQueue,
+        "task_type": "bootstrap_events",
+        "task_payload": {
+            "scopes": ["reddit_saved", "reddit_upvoted", "reddit_subscribed"],
+            "incremental": True,
+        },
+        "field": "items",
+        "item": {
+            "scope": "reddit_saved",
+            "content_type": "post",
+            "title": "ORIGINAL reddit",
+            "url": "https://www.reddit.com/r/LocalLLaMA/comments/source-protocol-reddit/original/",
+            "id": "source-protocol-reddit",
+        },
+        "state_key": "reddit_seen_item_keys",
+        "bootstrap_key": "t3_source-protocol-reddit",
     },
 )
 
@@ -250,31 +271,37 @@ def test_retry_repairs_crash_after_canonical_stage_before_event_ingress(
     assert len(memory.query_events(limit=20)) == 1
 
 
-def test_retry_repairs_crash_after_ingress_before_strict_seen_key_save(
+@pytest.mark.parametrize(
+    "case", (SOURCE_CASES[0], SOURCE_CASES[-1]), ids=lambda case: str(case["source"])
+)
+def test_retry_repairs_crash_after_ingress_before_strict_seen_key_update(
     durable_source_app: tuple[TestClient, Database, MemoryManager],
     monkeypatch: pytest.MonkeyPatch,
+    case: dict[str, Any],
 ) -> None:
     client, database, memory = durable_source_app
-    case = SOURCE_CASES[0]
     queue, task_id = _enqueue(database, case)
-    real_save = memory.save_source_bootstrap_state
+    real_update = memory.update_source_bootstrap_state
     attempts = 0
 
-    def fail_once(state: dict[str, object]) -> None:
+    def fail_once(
+        mutator: Callable[[dict[str, object]], dict[str, object] | None],
+    ) -> dict[str, object]:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise RuntimeError("seen-key save failed")
-        real_save(state)
+            raise RuntimeError("seen-key atomic update failed")
+        return real_update(mutator)
 
-    monkeypatch.setattr(memory, "save_source_bootstrap_state", fail_once)
-    endpoint = "/api/sources/xhs/task-result"
+    monkeypatch.setattr(memory, "update_source_bootstrap_state", fail_once)
+    endpoint = f"/api/sources/{case['source']}/task-result"
     _claim(client, case, task_id)
 
     first = client.post(endpoint, json=_callback(case, task_id))
     assert first.status_code == 500
     assert len(memory.query_events(limit=20)) == 1
     assert memory.load_source_bootstrap_state()[case["state_key"]] == []
+
     staged = queue.get(task_id)
     assert staged is not None and staged["status"] not in {"completed", "failed"}
 
@@ -286,31 +313,35 @@ def test_retry_repairs_crash_after_ingress_before_strict_seen_key_save(
     assert memory.load_source_bootstrap_state()[case["state_key"]] == [case["bootstrap_key"]]
 
 
+@pytest.mark.parametrize(
+    "case", (SOURCE_CASES[0], SOURCE_CASES[-1]), ids=lambda case: str(case["source"])
+)
 def test_retry_repairs_crash_after_seen_key_before_terminal_flip(
     durable_source_app: tuple[TestClient, Database, MemoryManager],
     monkeypatch: pytest.MonkeyPatch,
+    case: dict[str, Any],
 ) -> None:
     client, database, memory = durable_source_app
-    case = SOURCE_CASES[0]
     queue, task_id = _enqueue(database, case)
-    original_complete: Callable[..., bool] = XhsTaskQueue.complete_staged_result
+    queue_type = case["queue"]
+    original_complete: Callable[..., bool] = queue_type.complete_staged_result
     attempts = 0
 
-    def fail_once(self: XhsTaskQueue, current_task_id: str) -> bool:
+    def fail_once(self: Any, current_task_id: str) -> bool:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise RuntimeError("crash before terminal flip")
         return original_complete(self, current_task_id)
 
-    monkeypatch.setattr(XhsTaskQueue, "complete_staged_result", fail_once)
-    endpoint = "/api/sources/xhs/task-result"
+    monkeypatch.setattr(queue_type, "complete_staged_result", fail_once)
+    endpoint = f"/api/sources/{case['source']}/task-result"
     _claim(client, case, task_id)
 
     first = client.post(endpoint, json=_callback(case, task_id))
     assert first.status_code == 500
     assert len(memory.query_events(limit=20)) == 1
-    assert memory.load_source_bootstrap_state()[case["state_key"]] == [case["bootstrap_key"]]
+
     staged = queue.get(task_id)
     assert staged is not None and staged["status"] not in {"completed", "failed"}
 
@@ -319,6 +350,90 @@ def test_retry_repairs_crash_after_seen_key_before_terminal_flip(
     assert repaired.status_code == 200
     assert queue.get(task_id)["status"] == "completed"
     assert len(memory.query_events(limit=20)) == 1
+
+
+@pytest.mark.parametrize("flag", ("profile_update", "incremental"))
+def test_reddit_bootstrap_filters_old_rows_and_repeat_cycle_adds_no_events(
+    durable_source_app: tuple[TestClient, Database, MemoryManager],
+    flag: str,
+) -> None:
+    client, database, memory = durable_source_app
+    case = dict(SOURCE_CASES[-1], task_payload={flag: True})
+    old_item = dict(case["item"], id="old-reddit", title="OLD reddit")
+    new_item = dict(case["item"], id="new-reddit", title="NEW reddit")
+    state = memory.load_source_bootstrap_state()
+    state[case["state_key"]] = ["t3_old-reddit"]
+    memory.save_source_bootstrap_state(state)
+
+    queue, first_task_id = _enqueue(database, case)
+    endpoint = "/api/sources/reddit/task-result"
+    _claim(client, case, first_task_id)
+    first = client.post(
+        endpoint,
+        json={
+            "task_id": first_task_id,
+            "status": "ok",
+            "items": [old_item, new_item],
+        },
+    )
+
+    assert first.status_code == 200, first.text
+    assert queue.get(first_task_id)["status"] == "completed"
+    events = memory.query_events(limit=20)
+    assert len(events) == 1
+    assert events[0]["title"] == "NEW reddit"
+    metadata = json.loads(str(events[0]["metadata"]))
+    assert metadata["profile_update_owner"] == "generic"
+    assert memory.load_source_bootstrap_state()[case["state_key"]] == [
+        "t3_old-reddit",
+        "t3_new-reddit",
+    ]
+
+    queue, repeat_task_id = _enqueue(database, case)
+    _claim(client, case, repeat_task_id)
+    repeated = client.post(
+        endpoint,
+        json={
+            "task_id": repeat_task_id,
+            "status": "ok",
+            "items": [old_item, new_item],
+        },
+    )
+
+    assert repeated.status_code == 200, repeated.text
+    assert queue.get(repeat_task_id)["status"] == "completed"
+    assert len(memory.query_events(limit=20)) == 1
+    assert memory.load_source_bootstrap_state()[case["state_key"]] == [
+        "t3_old-reddit",
+        "t3_new-reddit",
+    ]
+
+
+def test_reddit_seen_checkpoint_preserves_canonical_result_order(
+    durable_source_app: tuple[TestClient, Database, MemoryManager],
+) -> None:
+    client, database, memory = durable_source_app
+    case = SOURCE_CASES[-1]
+    first_item = dict(case["item"], id="z-first", title="FIRST reddit")
+    second_item = dict(case["item"], id="a-second", title="SECOND reddit")
+    queue, task_id = _enqueue(database, case)
+    _claim(client, case, task_id)
+
+    response = client.post(
+        "/api/sources/reddit/task-result",
+        json={
+            "task_id": task_id,
+            "status": "ok",
+            "items": [first_item, second_item],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert queue.get(task_id)["status"] == "completed"
+    assert memory.load_source_bootstrap_state()[case["state_key"]] == [
+        "t3_z-first",
+        "t3_a-second",
+    ]
 
 
 def test_xhs_source_event_identity_ignores_rotating_url_and_title(

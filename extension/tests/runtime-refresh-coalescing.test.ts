@@ -55,24 +55,29 @@ test("runtime stream refresh handlers coalesce expensive frontend reloads", () =
     /if \(event\.type === "activity\.added"\) void loadActivityPage\(\{ reset: true \}\);/,
   );
 
-  // refresh.pool_updated / recommendation.reshuffled are pool-status signals,
-  // not list-replacement signals: hydrating on them would wipe locally appended
-  // ("加载更多") cards. config_reloaded is the broad-reload path; init terminal
-  // events go through refreshInitStatus so completion hydrates once after the
-  // authoritative init status flips. Mirrors the popup + mobile recommend guards below.
-  // v0.3.156+: the trigger is a guarded block (hydration is skipped while the
-  // user is editing #settingsForm so the rehydrate can't stomp unsaved input),
-  // so match the block form rather than the old single-line call.
+  // 库存与推荐重排事件只更新状态，不能整表覆盖用户已加载的卡片。
+  // 配置终态统一通过安全调度入口再水合，并在执行前后都保护未保存草稿。
   const desktopHydrationTrigger =
     desktopJs.match(
-      /if \(\[[^\]]*\]\.includes\(event\.type\)\) \{[\s\S]*?scheduleBackendHydration\(\);[\s\S]*?\n      \}/,
+      /function scheduleSettingsHydrationIfSafe\(\) \{[\s\S]*?scheduleBackendHydration\(\);[\s\S]*?\n    \}/,
     )?.[0] ?? "";
-  assert.match(desktopHydrationTrigger, /settingsForm/, "hydration should skip while editing settings");
-  assert.notEqual(desktopHydrationTrigger, "", "desktop should still hydrate on broad-reload events");
+  assert.match(desktopHydrationTrigger, /settingsDirtyFields/, "存在草稿时必须跳过再水合");
+  assert.match(desktopHydrationTrigger, /settingsFormHasActiveEditor/, "编辑配置时必须跳过再水合");
+  assert.notEqual(desktopHydrationTrigger, "", "配置终态仍需触发安全再水合");
   assert.doesNotMatch(desktopHydrationTrigger, /refresh\.pool_updated/);
   assert.doesNotMatch(desktopHydrationTrigger, /recommendation\.reshuffled/);
-  assert.match(desktopHydrationTrigger, /config_reloaded/);
-  assert.doesNotMatch(desktopHydrationTrigger, /init_completed/);
+  assert.match(desktopJs, /if \(reachedTerminal\) \{/);
+  assert.match(
+    desktopJs,
+    /settingsSavePhase === "failed" && settingsDirtyFields\.size > 0/,
+    "失败终态保留新草稿时必须走 canonical 快照刷新",
+  );
+  assert.match(desktopJs, /void refreshConfigSnapshotOnly\(\);/);
+  assert.match(
+    desktopJs,
+    /scheduleSettingsHydrationIfSafe\(\);/,
+    "没有新草稿时配置终态必须安全再水合",
+  );
   const desktopInitTrigger =
     desktopJs.match(/if \(\["init_progress", "init_failed", "init_completed"\]\.includes\(event\.type\)\) \{[\s\S]*?\n      \}/)?.[0] ?? "";
   assert.notEqual(desktopInitTrigger, "", "desktop should route init events through init status refresh");

@@ -26,3 +26,12 @@ TypeScript entry points and copies the shared browser UI module from
 
 The submission workflow packages this source directly from the same Git commit, builds
 `dist-firefox`, synchronizes `docs/privacy.md`, and invokes `web-ext sign --channel=listed`.
+
+## Privacy-relevant build note
+
+`extension/src/main/xhs-token-sniffer.ts` is bundled as a document-start MAIN-world script for
+Xiaohongshu pages. It observes the page's own fetch/XHR responses without changing requests.
+For the exact web search-notes endpoint it forwards only a bounded, normalized set of public
+card fields and existing per-note access tokens to the same-tab isolated task executor; it never
+forwards raw responses or cookie values. The resulting task payload is sent only to the
+user-configured OpenBiliClaw backend. See `docs/privacy.md` for the complete disclosure.

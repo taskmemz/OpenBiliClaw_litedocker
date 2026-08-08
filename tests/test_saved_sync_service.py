@@ -1280,7 +1280,11 @@ async def test_detached_timeout_restarts_heartbeat_after_later_failure(
     release.set()
     for _ in range(100):
         persisted = service.get_sync_task(task.task_id)
-        if persisted.items and persisted.items[0].status == "synced":
+        if (
+            persisted.items
+            and persisted.items[0].status == "synced"
+            and not service._detached_attempts
+        ):
             break
         await asyncio.sleep(0.01)
     assert persisted.items[0].status == "synced"

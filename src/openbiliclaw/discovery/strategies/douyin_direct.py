@@ -16,7 +16,7 @@ from openbiliclaw.discovery.engine import (
     discovery_raw_candidate_mode_enabled,
     trim_candidates_for_llm,
 )
-from openbiliclaw.discovery.strategies._utils import build_profile_summary
+from openbiliclaw.discovery.strategies._utils import build_query_generation_profile_summary
 from openbiliclaw.llm.json_utils import parse_llm_json_tolerant
 from openbiliclaw.llm.task_options import without_core_memory_kwargs
 from openbiliclaw.sources.douyin_direct import normalize_aweme_item
@@ -68,10 +68,11 @@ _DOUYIN_KEYWORDS_SYSTEM_PROMPT = """\
 
 
 def _build_douyin_keyword_user_prompt(profile: SoulProfile, count: int) -> str:
-    # Same canonical structured profile every other discovery prompt sees
-    # (B站 / YouTube / X / 小红书 query-gen, all-platform evaluation) — no
-    # divergent representation. Deterministic dump keeps the cache prefix stable.
-    summary = build_profile_summary(profile)
+    # Query-trimmed profile: the same MMR-reduced taste shape the main
+    # search/explore/keyword_planner paths use for query generation. Stable
+    # taste, not high-churn full-profile state; deterministic (no embedding
+    # lookup passed) so the cache prefix stays byte-stable.
+    summary = build_query_generation_profile_summary(profile)
     return (
         "<profile_summary>\n"
         + json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True)

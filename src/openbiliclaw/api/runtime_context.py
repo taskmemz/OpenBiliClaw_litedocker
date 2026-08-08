@@ -723,6 +723,7 @@ class RuntimeContext:
         from openbiliclaw.recommendation.engine import RecommendationEngine
         from openbiliclaw.runtime.account_sync import AccountSyncService
         from openbiliclaw.runtime.refresh import ContinuousRefreshController
+        from openbiliclaw.runtime.source_incremental_sync import SourceIncrementalSync
         from openbiliclaw.runtime.updater import AutoUpdateService
         from openbiliclaw.saved_sync.adapters.bilibili import BilibiliNativeSaveAdapter
         from openbiliclaw.saved_sync.adapters.extension import (
@@ -811,6 +812,9 @@ class RuntimeContext:
             memory=self.memory_manager,
             usage_recorder=new_usage_recorder,
             satisfaction_filter_enabled=satisfaction_filter_enabled,
+            preference_prompt_view=str(getattr(soul_cfg, "preference_prompt_view", "legacy")),
+            awareness_prompt_view=str(getattr(soul_cfg, "awareness_prompt_view", "compact-v1")),
+            insight_prompt_view=str(getattr(soul_cfg, "insight_prompt_view", "legacy")),
             posture_gate_mode=str(getattr(soul_cfg, "posture_gate_mode", "shadow")),
             posture_gate_force_enforce=bool(getattr(soul_cfg, "posture_gate_force_enforce", False)),
             module_overrides=new_module_overrides,
@@ -893,6 +897,14 @@ class RuntimeContext:
             info = state.get("xhs_self_info")
             return info if isinstance(info, dict) else None
 
+        configured_copy_target = max(
+            0,
+            int(getattr(new_config.scheduler, "copy_ready_target_count", 0) or 0),
+        )
+        effective_copy_target = min(
+            configured_copy_target,
+            max(0, int(getattr(new_config.scheduler, "pool_target_count", 0) or 0)),
+        )
         new_recommendation_engine = RecommendationEngine(
             llm=new_llm_service,
             database=self.database,
@@ -900,6 +912,7 @@ class RuntimeContext:
             embedding_service=new_embedding_service,
             task_registry=self.task_registry,
             xhs_self_info_provider=_xhs_self_info_provider,
+            copy_ready_target_count=effective_copy_target,
             visual_profile_enabled=bool(
                 getattr(getattr(new_config, "discovery", None), "visual_profile_enabled", False)
             ),
@@ -961,6 +974,7 @@ class RuntimeContext:
             multimodal_image_timeout_seconds=(
                 int(getattr(discovery_cfg, "multimodal_image_timeout_seconds", 6))
             ),
+            eval_prefilter_mode=str(getattr(discovery_cfg, "eval_prefilter_mode", "shadow")),
         )
         search_strategy = SearchStrategy(
             llm_service=new_llm_service,
@@ -1062,8 +1076,10 @@ class RuntimeContext:
             discovery_engine=new_discovery_engine,
             pool_target_count=new_config.scheduler.pool_target_count,
             admission_min_score=admission_min_score,
-            min_eval_batch_size=8,
-            max_eval_wait_seconds=120,
+            min_eval_batch_size=int(getattr(new_config.scheduler, "eval_min_batch_size", 15)),
+            max_eval_wait_seconds=float(
+                getattr(new_config.scheduler, "eval_max_wait_seconds", 90.0)
+            ),
             candidate_fetch_oversample=4,
             xhs_self_nickname_provider=lambda: str(
                 (_xhs_self_info_provider() or {}).get("nickname", "") or ""
@@ -1122,8 +1138,8 @@ class RuntimeContext:
                 soul_engine=new_soul_engine,
                 llm_service=new_llm_service,
                 enabled=xhs_enabled,
-                daily_budget=int(getattr(xhs_cfg, "daily_search_budget", 0)),
-                min_interval_minutes=int(getattr(xhs_cfg, "min_interval_minutes", 3)),
+                daily_budget=int(getattr(xhs_cfg, "daily_search_budget", 20)),
+                min_interval_minutes=int(getattr(xhs_cfg, "min_interval_minutes", 20)),
                 keyword_fetch=new_keyword_fetch,
             )
             from openbiliclaw.runtime.douyin_producer import build_douyin_discovery_producer
@@ -1252,6 +1268,33 @@ class RuntimeContext:
             inspiration_provider=inspiration_provider,
         )
 
+        async def _kick_source_incremental(source: str) -> None:
+            publish = getattr(self.event_hub, "publish", None)
+            if callable(publish):
+                await publish({"type": f"{source}_task_available"})
+
+        source_configs = getattr(new_config, "sources", None)
+
+        def _source_enabled(name: str) -> bool:
+            return bool(getattr(getattr(source_configs, name, None), "enabled", False))
+
+        new_source_incremental_sync = SourceIncrementalSync(
+            database=self.database,
+            memory_manager=self.memory_manager,
+            presence=self.presence,
+            source_enabled={
+                "xhs": _source_enabled("xiaohongshu"),
+                "dy": _source_enabled("douyin"),
+                "yt": _source_enabled("youtube"),
+                "zhihu": _source_enabled("zhihu"),
+                "reddit": _source_enabled("reddit"),
+            },
+            scheduler_config=new_config.scheduler,
+            profile_ready=lambda: bool(new_soul_engine.is_profile_ready()),
+            init_active=lambda: bool(self.init_coordinator.init_active()),
+            kick=_kick_source_incremental,
+        )
+
         new_runtime_controller = ContinuousRefreshController(
             memory_manager=self.memory_manager,
             database=self.database,
@@ -1261,6 +1304,7 @@ class RuntimeContext:
             discovery_candidate_pipeline=new_candidate_pipeline,
             keyword_planner=new_keyword_planner,
             keyword_fetch=new_keyword_fetch,
+            source_incremental_sync=new_source_incremental_sync,
             pool_target_count=new_config.scheduler.pool_target_count,
             pool_source_shares=_pool_source_shares_from_config(new_config),
             signal_event_threshold=int(getattr(new_config.scheduler, "signal_event_threshold", 6)),
@@ -1318,8 +1362,7 @@ class RuntimeContext:
             )
 
         async def _request_candidate_supply(reason: str) -> dict[str, object]:
-            await new_runtime_controller.request_replenishment(reason=reason)
-            return await new_runtime_controller.refresh_if_needed()
+            return await new_runtime_controller.supply_candidates_once(reason=reason)
 
         async def _precompute_committed_candidates() -> None:
             expression_coordinator.notify("candidate_commit")
@@ -1340,7 +1383,7 @@ class RuntimeContext:
             return int(completed)
 
         expression_coordinator = ExpressionCopyCoordinator(
-            pending_count_provider=lambda: int(_candidate_eval_snapshot().admitted_pending_copy),
+            pending_count_provider=new_recommendation_engine.count_pending_expression_copy_demand,
             drain_callback=_drain_expression_copy,
             safety_wake_seconds=float(
                 getattr(new_config.scheduler, "refresh_check_interval_seconds", 60)
@@ -1591,6 +1634,10 @@ class RuntimeContext:
         # Start new tasks from the freshly-built components.
         # v0.3.63+: route through ``self.task_registry.track`` so the
         # next hot-reload's ``cancel_all`` cleanly stops them too.
+        # ``False`` is also the setup/guided-init lane fence: starting the
+        # controller here would start every discovery loop, not only the
+        # extension-account scheduler. The normal post-init restart owns the
+        # one replacement controller and its independent source loop.
         if run_post_reload_llm_work:
             run_forever = getattr(self.runtime_controller, "run_forever", None)
             if "refresh_task" not in stuck_tasks:

@@ -135,7 +135,8 @@ def test_get_legacy_config_projects_masked_instances_without_rewriting(
         json={"llm": _native_payload_from_get(llm)},
     )
 
-    assert migrated.status_code == 200
+    assert migrated.status_code == 202
+    assert migrated.json()["apply_state"] == "queued"
     assert load_config(path).llm.instance_routing is True
     assert llm_migration_backup_path(path).read_bytes() == before
 
@@ -156,7 +157,8 @@ def test_put_native_instances_replaces_deleted_entries_and_preserves_masked_secr
 
     response = client.put("/api/config", json={"llm": payload})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
+    assert response.json()["apply_state"] == "queued"
     stored = load_config(path)
     assert list(stored.llm.instances) == ["gateway-a"]
     assert stored.llm.instances["gateway-a"].api_key == "secret-a"
@@ -208,7 +210,8 @@ def test_legacy_extension_update_targets_first_matching_instance_without_collaps
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
+    assert response.json()["apply_state"] == "queued"
     stored = load_config(path)
     assert stored.llm.default_chain == ["gateway-a", "gateway-b"]
     assert stored.llm.instances["gateway-a"].model == "updated-primary"

@@ -32,7 +32,7 @@ from openbiliclaw.discovery.engine import (
     discovery_raw_candidate_mode_enabled,
     trim_candidates_for_llm,
 )
-from openbiliclaw.discovery.strategies._utils import build_profile_summary
+from openbiliclaw.discovery.strategies._utils import build_query_generation_profile_summary
 from openbiliclaw.llm.task_options import without_core_memory_kwargs
 from openbiliclaw.youtube.client import YtScraperClient, normalize_yt_video
 
@@ -152,7 +152,7 @@ class YoutubeSearchStrategy(DiscoveryStrategy):
         return deduped
 
     async def _generate_queries(self, profile: SoulProfile) -> list[str]:
-        profile_summary = build_profile_summary(profile)
+        profile_summary = build_query_generation_profile_summary(profile)
         user_input = json.dumps(
             {"profile": profile_summary, "max_queries": self.queries_per_run},
             ensure_ascii=False,

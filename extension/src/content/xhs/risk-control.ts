@@ -16,6 +16,29 @@ export interface XhsRiskControlDetection {
   reason: XhsRiskControlReason;
 }
 
+const LOGIN_REQUIRED_PATTERN = /登录后查看搜索结果|登录即可查看\s*(?:Ta 的)?笔记/i;
+const LOGIN_REQUIRED_CONTROL_SELECTOR = [
+  "[role='dialog']",
+  "[role='dialog'] input[type='tel']",
+  ".login-container",
+  ".login-container input[type='tel']",
+  ".login-modal",
+  ".login-modal input[type='tel']",
+  ".side-bar .side-bar-component.login-btn button.login-btn",
+].join(", ");
+const DIRECT_LOGIN_REQUIRED_CONTROL_SELECTOR = [
+  "[role='dialog'] input[type='tel']",
+  ".login-container input[type='tel']",
+  ".login-modal input[type='tel']",
+  ".side-bar .side-bar-component.login-btn button.login-btn",
+].join(", ");
+
+/** Detect the stable login-gate copy without returning any surrounding text. */
+export function classifyXhsLoginRequiredText(value: unknown): boolean {
+  const text = normalizeRiskText(value);
+  return text ? LOGIN_REQUIRED_PATTERN.test(text) : false;
+}
+
 const STRONG_FREQUENCY_PATTERNS = [
   /请(?:勿|不要)频繁(?:操作|访问|请求)/i,
   /(?:操作|请求|访问)(?:过于|太)?频繁/i,
@@ -89,6 +112,21 @@ function isEffectivelyVisible(element: HTMLElement, root: Document): boolean {
   }
   const rect = element.getBoundingClientRect();
   return rect.width > 0 && rect.height > 0;
+}
+
+/** Detect the visible XHS login gate that can coexist with a stale web_session cookie. */
+export function detectXhsTaskLoginRequired(root: Document): boolean {
+  const overlays = root.querySelectorAll<HTMLElement>(LOGIN_REQUIRED_CONTROL_SELECTOR);
+  for (let index = 0; index < overlays.length; index += 1) {
+    const overlay = overlays[index];
+    if (!overlay || !isEffectivelyVisible(overlay, root)) continue;
+    // Current XHS logged-out pages expose either the phone field inside the
+    // login modal or one exact sidebar login control. Both are stronger than
+    // a stale web_session cookie and avoid inspecting unrelated page text.
+    if (overlay.matches(DIRECT_LOGIN_REQUIRED_CONTROL_SELECTOR)) return true;
+    if (classifyXhsLoginRequiredText(overlay.innerText ?? overlay.textContent)) return true;
+  }
+  return false;
 }
 
 /**

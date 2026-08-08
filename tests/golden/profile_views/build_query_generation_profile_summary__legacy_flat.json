@@ -1,0 +1,277 @@
+{
+  "cognitive_style": [
+    "结构化",
+    "证据优先"
+  ],
+  "core_traits": [
+    "理性",
+    "好奇",
+    "克制"
+  ],
+  "current_phase": "整理信息源",
+  "deep_needs": [
+    "确定性",
+    "掌控感"
+  ],
+  "disliked_topics": [
+    "不喜欢-0",
+    "不喜欢-1",
+    "不喜欢-2",
+    "不喜欢-3",
+    "不喜欢-4",
+    "不喜欢-5",
+    "不喜欢-6",
+    "不喜欢-7",
+    "不喜欢-8",
+    "不喜欢-9",
+    "不喜欢-10",
+    "不喜欢-11"
+  ],
+  "exploration_openness": 0.55,
+  "interest_domains": [
+    {
+      "domain": "类别-0",
+      "specifics": [
+        "标签-0",
+        "标签-6",
+        "标签-12",
+        "标签-18",
+        "标签-24"
+      ],
+      "weight": 1.0
+    },
+    {
+      "domain": "类别-1",
+      "specifics": [
+        "标签-1",
+        "标签-7",
+        "标签-13",
+        "标签-19",
+        "标签-25"
+      ],
+      "weight": 0.98
+    },
+    {
+      "domain": "类别-2",
+      "specifics": [
+        "标签-2",
+        "标签-8",
+        "标签-14",
+        "标签-20",
+        "标签-26"
+      ],
+      "weight": 0.96
+    },
+    {
+      "domain": "类别-3",
+      "specifics": [
+        "标签-3",
+        "标签-9",
+        "标签-15",
+        "标签-21",
+        "标签-27"
+      ],
+      "weight": 0.94
+    },
+    {
+      "domain": "类别-4",
+      "specifics": [
+        "标签-4",
+        "标签-10",
+        "标签-16",
+        "标签-22",
+        "标签-28"
+      ],
+      "weight": 0.92
+    },
+    {
+      "domain": "类别-5",
+      "specifics": [
+        "标签-5",
+        "标签-11",
+        "标签-17",
+        "标签-23",
+        "标签-29"
+      ],
+      "weight": 0.9
+    }
+  ],
+  "interests": [
+    {
+      "category": "类别-0",
+      "name": "标签-0",
+      "weight": 1.0
+    },
+    {
+      "category": "类别-1",
+      "name": "标签-1",
+      "weight": 0.98
+    },
+    {
+      "category": "类别-2",
+      "name": "标签-2",
+      "weight": 0.96
+    },
+    {
+      "category": "类别-3",
+      "name": "标签-3",
+      "weight": 0.94
+    },
+    {
+      "category": "类别-4",
+      "name": "标签-4",
+      "weight": 0.92
+    },
+    {
+      "category": "类别-5",
+      "name": "标签-5",
+      "weight": 0.9
+    },
+    {
+      "category": "类别-0",
+      "name": "标签-6",
+      "weight": 0.88
+    },
+    {
+      "category": "类别-1",
+      "name": "标签-7",
+      "weight": 0.86
+    },
+    {
+      "category": "类别-2",
+      "name": "标签-8",
+      "weight": 0.84
+    },
+    {
+      "category": "类别-3",
+      "name": "标签-9",
+      "weight": 0.82
+    },
+    {
+      "category": "类别-4",
+      "name": "标签-10",
+      "weight": 0.8
+    },
+    {
+      "category": "类别-5",
+      "name": "标签-11",
+      "weight": 0.78
+    },
+    {
+      "category": "类别-0",
+      "name": "标签-12",
+      "weight": 0.76
+    },
+    {
+      "category": "类别-1",
+      "name": "标签-13",
+      "weight": 0.74
+    },
+    {
+      "category": "类别-2",
+      "name": "标签-14",
+      "weight": 0.72
+    },
+    {
+      "category": "类别-3",
+      "name": "标签-15",
+      "weight": 0.7
+    },
+    {
+      "category": "类别-4",
+      "name": "标签-16",
+      "weight": 0.68
+    },
+    {
+      "category": "类别-5",
+      "name": "标签-17",
+      "weight": 0.66
+    },
+    {
+      "category": "类别-0",
+      "name": "标签-18",
+      "weight": 0.64
+    },
+    {
+      "category": "类别-1",
+      "name": "标签-19",
+      "weight": 0.62
+    },
+    {
+      "category": "类别-2",
+      "name": "标签-20",
+      "weight": 0.6
+    },
+    {
+      "category": "类别-3",
+      "name": "标签-21",
+      "weight": 0.58
+    },
+    {
+      "category": "类别-4",
+      "name": "标签-22",
+      "weight": 0.56
+    },
+    {
+      "category": "类别-5",
+      "name": "标签-23",
+      "weight": 0.54
+    },
+    {
+      "category": "类别-0",
+      "name": "标签-24",
+      "weight": 0.52
+    },
+    {
+      "category": "类别-1",
+      "name": "标签-25",
+      "weight": 0.5
+    },
+    {
+      "category": "类别-2",
+      "name": "标签-26",
+      "weight": 0.48
+    },
+    {
+      "category": "类别-3",
+      "name": "标签-27",
+      "weight": 0.46
+    },
+    {
+      "category": "类别-4",
+      "name": "标签-28",
+      "weight": 0.44
+    },
+    {
+      "category": "类别-5",
+      "name": "标签-29",
+      "weight": 0.42
+    }
+  ],
+  "life_stage": "工作稳定期",
+  "mbti": {
+    "confidence": 0.6,
+    "dimensions": {
+      "EI": {
+        "pole": "I",
+        "strength": 0.7
+      }
+    },
+    "type": "INTP"
+  },
+  "motivational_drivers": [
+    "理解底层",
+    "降噪"
+  ],
+  "style": {
+    "depth_preference": 0.6,
+    "humor_preference": 0.5,
+    "preferred_duration": "medium",
+    "preferred_pace": "moderate",
+    "quality_sensitivity": 0.6
+  },
+  "values": [
+    "真实",
+    "自主"
+  ]
+}

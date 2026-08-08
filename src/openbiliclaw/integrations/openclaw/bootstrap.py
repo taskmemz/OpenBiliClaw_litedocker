@@ -134,6 +134,9 @@ def build_openclaw_adapter_services() -> OpenClawAdapterServices:
         satisfaction_filter_enabled=bool(
             getattr(preference_cfg, "satisfaction_filter_enabled", True)
         ),
+        preference_prompt_view=str(getattr(soul_cfg, "preference_prompt_view", "legacy")),
+        awareness_prompt_view=str(getattr(soul_cfg, "awareness_prompt_view", "compact-v1")),
+        insight_prompt_view=str(getattr(soul_cfg, "insight_prompt_view", "legacy")),
         posture_gate_mode=str(getattr(soul_cfg, "posture_gate_mode", "shadow")),
         posture_gate_force_enforce=bool(getattr(soul_cfg, "posture_gate_force_enforce", False)),
         module_overrides=module_overrides,
@@ -205,11 +208,20 @@ def build_openclaw_adapter_services() -> OpenClawAdapterServices:
     )
 
     curator = PoolCurator(database)
+    configured_copy_target = max(
+        0,
+        int(getattr(config.scheduler, "copy_ready_target_count", 0) or 0),
+    )
+    effective_copy_target = min(
+        configured_copy_target,
+        max(0, int(getattr(config.scheduler, "pool_target_count", 0) or 0)),
+    )
     recommendation_engine = RecommendationEngine(
         llm=llm_service,
         database=database,
         curator=curator,
         embedding_service=embedding_service,
+        copy_ready_target_count=effective_copy_target,
         visual_profile_enabled=config.discovery.visual_profile_enabled,
         keyframe_enabled=config.discovery.keyframe_enabled,
         keyframe_max_frames=config.discovery.keyframe_max_frames,
@@ -227,12 +239,14 @@ def build_openclaw_adapter_services() -> OpenClawAdapterServices:
         llm_evaluation_concurrency=background_llm_concurrency(llm_concurrency),
         search_budget_total=30,
     )
+    discovery_cfg = getattr(config, "discovery", None)
 
     discovery_engine = ContentDiscoveryEngine(
         llm_service=llm_service,
         database=database,
         embedding_service=embedding_service,
         concurrency=concurrency,
+        eval_prefilter_mode=str(getattr(discovery_cfg, "eval_prefilter_mode", "shadow")),
     )
     search_strategy = SearchStrategy(
         llm_service=llm_service,

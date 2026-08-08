@@ -52,8 +52,8 @@
    - 消息历史
    - 文本输入 & 发送
    - AI 思考中状态
-   - 与插件、桌面 Web 共享 `session=popup&scope=chat` 的主聊天历史；聊天页可见且在线时约每 2.5 秒检查一次新 turn，历史未变化不重绘，用户阅读旧消息时保留滚动位置
-   - 与插件共享 `session=popup` 的 durable 对话历史；普通文字写入 `scope=chat`，历史读取不限定 scope，同时展示 `hypothesis` 觉察卡与 `confusion` 澄清问题
+   - 与插件、桌面 Web 共享 `session=popup` 的主聊天历史；普通文字写入 `scope=chat`，消息里的兴趣 / 避雷「多聊聊」分别写入 `scope=probe` / `scope=avoidance_probe`，三类文字轮次在主对话中按时间顺序对齐；聊天页可见且在线时约每 2.5 秒检查一次新 turn，历史未变化不重绘，用户阅读旧消息时保留滚动位置
+   - 与插件共享 `session=popup` 的 durable 对话历史；历史读取不限定 scope，同时展示 `hypothesis` 觉察卡、`confusion` 澄清问题和 probe 聊天轮次；惊喜推荐 `delight` 仍保留在推荐卡自己的内聊历史中
    - 确认卡 / 疑惑作为一等 durable turn 留在历史中；「聊聊」只提交 `reply_to_turn_id`，从只读 context preview 构建 context bar/reply quote，服务端失败时保留目标与草稿，不根据 current anchor 猜测关系
    - 「待聊确认」列表、主动打开、假设卡「准 / 不准 / 聊聊 / 稍后」四动作与按需结算轮询；纯数字、UUID、BVID、事件前缀或裸哈希等 opaque evidence 不展示
    - 待聊列表、消息历史与 composer 各自使用有界布局；后台刷新保留读者位置、已展开依据、输入草稿与焦点
@@ -197,7 +197,7 @@ Delight UI 投影矩阵：
 - MBTI 会保留后端 `confidence` 显示为“可信度”；内容口味将 `long/slow` 等 raw 枚举映射为“长视频 / 慢节奏”等中文标签；使用场景会显示 `session_type` 为“模式”。
 - 认知更新卡片会保留后端 `context_line` 与 `source_label`，即使前端已做过一次 normalize 后再次渲染，也不回退成泛化上下文。
 - 对话 turn 兼容 `response` 和后端当前返回的 `reply` 字段，统一映射成聊天气泡使用的 `response`。
-- 移动端主对话与插件读取同一 `session=popup`，不在历史 GET 上限定 `scope=chat`，否则会把同一 durable 流里的 `hypothesis/confusion` 卡片隐藏；普通用户消息仍写入 `scope=chat`。contextual delight/probe 聊天通过 `scope=delight/probe` 标识主题上下文。惊喜推荐内联聊天也复用 `session=popup&scope=delight`，按 `subject_id=bvid` hydrate 每条候选自己的 `turns` 历史，pending turn 通过 `/api/chat/turns/{turn_id}` 轮询恢复。
+- 移动端主对话与插件读取同一 `session=popup`，不在历史 GET 上限定 `scope`；共享 renderer 展示 `chat/hypothesis/confusion/probe/avoidance_probe`，因此消息里的探针聊天不会因关闭消息 overlay 而消失。普通用户消息仍写入 `scope=chat`，contextual probe 通过 `scope=probe/avoidance_probe` 标识主题上下文；惊喜推荐 `delight` 仍按 `subject_id=bvid` hydrate 在每条候选自己的内聊历史中，pending turn 通过 `/api/chat/turns/{turn_id}` 轮询恢复。
 - 封面图会在渲染前归一化：B 站 `http` / protocol-relative 地址升级为 HTTPS，推荐、惊喜推荐和消息封面统一走本地 `/api/image-proxy`，加载失败时保留固定比例 fallback。推荐列表当前批次默认预热 12 张封面，前 12 张使用 eager 加载，追加批次会先等待封面预热/解码或短超时再插入卡片；封面 frame 使用粉蓝渐变骨架占位，真实图片 decode 完成后淡入，减少高速滑动过程中的白屏。
 
 ### 静态资源

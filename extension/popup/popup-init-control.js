@@ -610,6 +610,18 @@ export function shouldAttachRunningInitProgress(status) {
   return Boolean(status && status.running);
 }
 
+// A packaged desktop can pull bge-m3 before the user has started guided init.
+// Keep that separate from the stage-progress view: the init panel is still
+// idle, but its embedding checklist owns the live download bar.
+export function shouldAttachEmbeddingPullProgress(status) {
+  return Boolean(
+    status &&
+      !status.running &&
+      !status.initialized &&
+      embeddingPullProgressView(status.prerequisites).active,
+  );
+}
+
 // Map an error thrown by startInit() (requestJson attaches .status/.details)
 // onto human text. 409 carries a machine reason in details.error.
 export function describeInitStartError(error) {

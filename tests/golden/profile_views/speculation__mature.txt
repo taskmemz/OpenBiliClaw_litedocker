@@ -1,0 +1,66 @@
+## 核心特质
+trait-0, trait-1, trait-2, trait-3, trait-4, trait-5, trait-6, trait-7, trait-8, trait-9, trait-10, trait-11, trait-12, trait-13, trait-14, trait-15, trait-16, trait-17, trait-18, trait-19, trait-20, trait-21, trait-22, trait-23, trait-24, trait-25, trait-26, trait-27, trait-28, trait-29, trait-30, trait-31, trait-32, trait-33, trait-34, trait-35, trait-36, trait-37, trait-38, trait-39
+
+## MBTI
+INTJ (置信度: 82%)
+
+## 价值观
+value-0, value-1, value-2, value-3, value-4, value-5, value-6, value-7, value-8, value-9, value-10, value-11, value-12, value-13, value-14, value-15, value-16, value-17, value-18, value-19, value-20, value-21, value-22, value-23, value-24, value-25, value-26, value-27, value-28, value-29, value-30, value-31, value-32, value-33, value-34, value-35, value-36, value-37, value-38, value-39
+
+## 内在驱动力
+driver-0, driver-1, driver-2, driver-3, driver-4, driver-5, driver-6, driver-7, driver-8, driver-9, driver-10, driver-11, driver-12, driver-13, driver-14, driver-15, driver-16, driver-17, driver-18, driver-19, driver-20, driver-21, driver-22, driver-23, driver-24, driver-25, driver-26, driver-27, driver-28, driver-29, driver-30, driver-31, driver-32, driver-33, driver-34, driver-35, driver-36, driver-37, driver-38, driver-39
+
+## 当前阶段
+重新整理信息源
+
+## 深层需求
+need-0, need-1, need-2, need-3, need-4, need-5, need-6, need-7, need-8, need-9, need-10, need-11, need-12, need-13, need-14, need-15, need-16, need-17, need-18, need-19, need-20, need-21, need-22, need-23, need-24, need-25, need-26, need-27, need-28, need-29, need-30, need-31, need-32, need-33, need-34, need-35, need-36, need-37, need-38, need-39
+
+## 兴趣
+- 领域-0 (细分-0-0, 细分-0-1, 细分-0-2)
+- 领域-1 (细分-1-0, 细分-1-1, 细分-1-2)
+- 领域-2 (细分-2-0, 细分-2-1, 细分-2-2)
+- 领域-3 (细分-3-0, 细分-3-1, 细分-3-2)
+- 领域-4 (细分-4-0, 细分-4-1, 细分-4-2)
+
+## 不喜欢
+厌恶-0, 厌恶-1, 厌恶-2, 厌恶-3, 厌恶-4
+
+## 来源分布
+bilibili 60% · youtube 30% · xhs 10%
+
+## 猜测兴趣（待验证）
+- 猜测领域-0（因为行为信号-0）
+- 猜测领域-1（因为行为信号-1）
+- 猜测领域-2（因为行为信号-2）
+- 猜测领域-3（因为行为信号-3）
+- 猜测领域-4（因为行为信号-4）
+
+## 当前洞察
+- 假设-0 推理推理推理推理推理 (置信度: 60%)
+- 假设-1 推理推理推理推理推理 (置信度: 61%)
+- 假设-2 推理推理推理推理推理 (置信度: 62%)
+- 假设-3 推理推理推理推理推理 (置信度: 63%)
+- 假设-4 推理推理推理推理推理 (置信度: 64%)
+- 假设-5 推理推理推理推理推理 (置信度: 65%)
+- 假设-6 推理推理推理推理推理 (置信度: 66%)
+- 假设-7 推理推理推理推理推理 (置信度: 67%)
+- 假设-8 推理推理推理推理推理 (置信度: 68%)
+- 假设-9 推理推理推理推理推理 (置信度: 69%)
+- 假设-10 推理推理推理推理推理 (置信度: 70%)
+- 假设-11 推理推理推理推理推理 (置信度: 71%)
+- 假设-12 推理推理推理推理推理 (置信度: 72%)
+- 假设-13 推理推理推理推理推理 (置信度: 73%)
+- 假设-14 推理推理推理推理推理 (置信度: 74%)
+- 假设-15 推理推理推理推理推理 (置信度: 75%)
+- 假设-16 推理推理推理推理推理 (置信度: 76%)
+- 假设-17 推理推理推理推理推理 (置信度: 77%)
+- 假设-18 推理推理推理推理推理 (置信度: 78%)
+- 假设-19 推理推理推理推理推理 (置信度: 79%)
+
+## 近期观察
+- [2026-06-16] 观察-15 细节细节细节细节细节
+- [2026-06-17] 观察-16 细节细节细节细节细节
+- [2026-06-18] 观察-17 细节细节细节细节细节
+- [2026-06-19] 观察-18 细节细节细节细节细节
+- [2026-06-20] 观察-19 细节细节细节细节细节

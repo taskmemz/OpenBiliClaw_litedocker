@@ -56,6 +56,7 @@ from .dialogue_learn_queue import (
     DialogueJobResult,
     DialogueSettlementQueue,
 )
+from .event_prompt_views import normalize_cognition_input_view
 from .identity import build_hash8_map
 from .insight_analyzer import InsightAnalyzer
 from .ledger import ProfileLedger
@@ -317,6 +318,9 @@ class SoulEngine:
         cognition_cycle_interval_seconds: int | None = None,
         usage_recorder: Any | None = None,
         satisfaction_filter_enabled: bool = True,
+        preference_prompt_view: str = "legacy",
+        awareness_prompt_view: str = "compact-v1",
+        insight_prompt_view: str = "legacy",
         module_overrides: Mapping[str, ModuleOverride] | None = None,
         llm_concurrency: int = 4,
         llm_concurrency_gate: Any | None = None,
@@ -347,6 +351,9 @@ class SoulEngine:
         self._llm = llm
         self._memory = memory
         self._satisfaction_filter_enabled = satisfaction_filter_enabled
+        self._preference_prompt_view = normalize_cognition_input_view(preference_prompt_view)
+        self._awareness_prompt_view = normalize_cognition_input_view(awareness_prompt_view)
+        self._insight_prompt_view = normalize_cognition_input_view(insight_prompt_view)
         self._feedback_batch_threshold = max(1, feedback_batch_threshold)
         # Unified interest line kill switch (spec 2026-07-27). False (Wave A
         # default) keeps feedback on the legacy batch only — turning both on
@@ -385,13 +392,21 @@ class SoulEngine:
             concurrency=llm_concurrency,
             concurrency_gate=llm_concurrency_gate,
         )
-        self._awareness_analyzer = AwarenessAnalyzer(self._llm_service)
+        self._awareness_analyzer = AwarenessAnalyzer(
+            self._llm_service,
+            plain_prompt_view="legacy",
+            confusions_prompt_view=self._awareness_prompt_view,
+        )
         self._dialogue_insight_analyzer = DialogueInsightAnalyzer(self._llm_service)
-        self._insight_analyzer = InsightAnalyzer(self._llm_service)
+        self._insight_analyzer = InsightAnalyzer(
+            self._llm_service,
+            cognition_prompt_view=self._insight_prompt_view,
+        )
         self._preference_analyzer = PreferenceAnalyzer(
             self._llm_service,
             satisfaction_filter_enabled=satisfaction_filter_enabled,
             embedding_service=embedding_service,
+            cognition_prompt_view=self._preference_prompt_view,
         )
         self._profile_builder = ProfileBuilder(self._llm_service)
         data_dir = getattr(memory, "_data_dir", None)
@@ -799,6 +814,23 @@ class SoulEngine:
             raise SoulProfileNotInitializedError("Soul profile has not been initialized yet.")
         profile = OnionProfile.from_dict(soul_data)
         profile = apply_overrides(profile, self._memory.load_profile_overrides())
+        # Flat preference writeback can land before the asynchronous profile
+        # rebuild. Expose the authoritative dislike snapshot immediately so
+        # serve-time and recommendation-output filters cannot observe a stale
+        # profile in that window.
+        effective_dislikes = self.get_effective_disliked_topics()
+        existing_dislikes = {
+            str(domain.domain).strip().casefold() for domain in profile.interest.dislikes
+        }
+        if effective_dislikes:
+            from openbiliclaw.soul.profile import InterestDomain
+
+            for topic in effective_dislikes:
+                text = str(topic).strip()
+                key = text.casefold()
+                if text and key not in existing_dislikes:
+                    profile.interest.dislikes.append(InterestDomain(domain=text, weight=0.9))
+                    existing_dislikes.add(key)
         # Attach active speculations so downstream consumers (Discovery) can use them
         active_specs = self._speculator.get_active_speculations()
         if active_specs:

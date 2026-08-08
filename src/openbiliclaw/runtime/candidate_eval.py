@@ -49,11 +49,27 @@ def effective_candidate_eval_workers(configured: int, llm_concurrency: int) -> i
 
 
 def _supply_result_is_productive(result: Any) -> bool:
-    """Treat only recognized mapping results without refresh output as unproductive."""
+    """Return whether a supply request made concrete replenishment progress.
+
+    New runtime callbacks report an explicit productivity flag or count.  The
+    legacy ``refreshed`` fallback remains for third-party/one-shot callbacks,
+    but an explicit zero must win over ``refreshed=True``: merely executing a
+    discovery strategy does not mean it inserted a new raw candidate.
+    """
 
     if not isinstance(result, Mapping):
         return True
     try:
+        if "supply_productive" in result:
+            return bool(result.get("supply_productive"))
+        for key in ("supply_progress_count", "supply_inserted_count"):
+            if key in result:
+                return int(result.get(key, 0) or 0) > 0
+
+        progress_keys = ("inserted", "enqueued", "cached", "discovered")
+        present_progress = [key for key in progress_keys if key in result]
+        if present_progress:
+            return any(int(result.get(key, 0) or 0) > 0 for key in present_progress)
         return bool(result.get("refreshed"))
     except Exception:
         logger.debug(
@@ -136,7 +152,8 @@ class CandidateEvalCoordinator:
         self.last_wake_reason = str(reason)
         self._supply_cooldown_until = 0.0
         resume_notification = self._resume_notification(reason)
-        if resume_notification:
+        supply_progress_notification = str(reason).strip().lower().startswith("candidate_enqueued:")
+        if resume_notification or supply_progress_notification:
             self._reset_supply_backoff()
         if self._paused and resume_notification:
             self._paused = False
@@ -182,7 +199,7 @@ class CandidateEvalCoordinator:
                 if self._projected_inventory(snapshot) >= snapshot.target:
                     self.state = "idle"
                 else:
-                    self._fill_open_slots()
+                    coalescing_wait = self._fill_open_slots()
                     snapshot = self._snapshot()
                     if not self._workers and snapshot.pending_eval <= 0:
                         supply_cooldown_remaining = self._supply_cooldown_until - now
@@ -196,6 +213,12 @@ class CandidateEvalCoordinator:
                         self.state = "waiting_supply" if self._supply_task else "idle"
                     elif self._workers:
                         self.state = "running"
+                    elif coalescing_wait is not None and coalescing_wait > 0:
+                        self.state = "coalescing"
+                        await self._wait_for_activity(
+                            min(self.safety_wake_seconds, coalescing_wait)
+                        )
+                        continue
 
                 await self._wait_for_activity(self.safety_wake_seconds)
         finally:
@@ -247,19 +270,27 @@ class CandidateEvalCoordinator:
             admitted_pending_copy=int(value.get("admitted_pending_copy", 0)),
         )
 
-    def _fill_open_slots(self) -> None:
+    def _fill_open_slots(self) -> float | None:
         while not self._stopping and len(self._workers) < self.worker_count:
             snapshot = self._snapshot()
             if self._projected_inventory(snapshot) >= snapshot.target or snapshot.pending_eval <= 0:
-                return
-            claim = self.pipeline.claim_batch(limit=self.batch_size)
+                return None
+            claim_ready = getattr(self.pipeline, "claim_ready_batch", None)
+            if callable(claim_ready):
+                claim = claim_ready(limit=self.batch_size)
+            else:
+                claim = self.pipeline.claim_batch(limit=self.batch_size)
             if claim is None:
-                return
+                ready_in = getattr(self.pipeline, "eval_ready_in_seconds", None)
+                if callable(ready_in):
+                    return max(0.0, float(ready_in(limit=self.batch_size)))
+                return None
             task = asyncio.create_task(
                 self._evaluate_worker(claim),
                 name=f"candidate_eval:{claim.token[:8]}",
             )
             self._workers[task] = claim
+        return None
 
     async def _evaluate_worker(self, claim: Any) -> Any:
         profile = self.profile_provider()

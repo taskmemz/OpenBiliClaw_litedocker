@@ -136,6 +136,18 @@ Agent：那我理解了。这是一个很有意思的特质——你可能也会
 
 **目标**：像一个熟悉多个内容社区的专业编辑一样，通过多种方式主动发现好内容。
 
+#### 2.2.1 不喜欢的即时推荐边界
+
+普通 dislike 的语义是“不再推荐这张卡 / 已确认主题”，不是“禁止搜索这个词”。单卡反馈提交后同步把
+recommendation 标为 processed 并失效推荐快照；主题 dislike 一旦写入 flat preference，
+`SoulEngine.get_effective_disliked_topics()` 就把 flat preference、Soul 与用户 overrides 合成当前权威快照，
+`get_profile()` 在完整 Soul 重建前也会带上它。
+
+推荐历史缓存把该快照 digest 纳入命中条件；推荐首屏、换一批、追加、OpenClaw fallback 与主动通知在最终输出
+边界再次按最新快照过滤。结构化 topic 精确命中始终排除；自然语言子串若误杀整个多卡窗口，只恢复没有精确
+topic 命中的条目，单条 push 不恢复。异步 embedding + LLM 清池继续减少无效库存，但不再承担展示正确性。
+Discovery 可以继续宽搜，普通 dislike 不撤销关键词或来源任务。
+
 #### 发现策略
 
 | 策略 | 说明 |
@@ -154,8 +166,9 @@ Agent：那我理解了。这是一个很有意思的特质——你可能也会
 > 评估的核心依据是**用户的 Soul（灵魂画像）和深层兴趣**，而非通用指标。
 
 - **核心评估**：这个内容是否匹配这个用户的深层兴趣和当前状态？
+- **时效性基准**：来源 `published_at` 与本轮精确 UTC `evaluated_at` 一起进入单条、批量及推荐池补分类 prompt；模型比较两者判断热点 / 时事 / 版本更新是否仍新鲜，不根据自身知识截止日期猜当前时间。发布时间缺失或无效时保持中性；评分缓存绑定发布时间摘要与独立评估小时桶。
 - **可选辅助指标**：播放量/点赞/弹幕质量等——由用户画像决定是否参考（有些用户在意质量指标，有些人不在意）
-- **统一待评估池与准入**：API daemon 的不同来源 raw candidates 进入 `discovery_candidates` 后，由唯一 `CandidateEvalCoordinator` tokenized claim；默认 3 个 30 条 LLM worker 并行，任一完成即补位，SQLite 完成提交与 admission 串行。pipeline 单次 enqueue callback 立即唤醒这个 owner，refresh / managed producer 不再同步 drain。串行 lane 先持久化全部 token-owned 评分，再按 `target - available - admitted_pending_copy` admission；超过 headroom 的达标结果保留为 `evaluated`。OpenClaw direct one-shot 不启动 daemon owner，`recommend(refresh_if_needed=True)` 的首轮 source supply / inline claim 固定 ≤4（fetch oversample=1、min eval batch=4、inline evaluator=1），随后请求再补下一批，并在每次 durable admission 后同步 drain ≤4 条 expression copy、`max_extra_requests=0`；首 batch 的有效 subset 立即可 serve，未完成行保持 durable pending 由下一请求续补，既不遗留 notify-only coordinator，也不遗留 provider copy task。调度 projected 固定为 `available + admitted_pending_copy + evaluated_pending_admission`，普通 `pending_eval/evaluating` 不计入；60 秒只作 API coordinator 的安全 backstop。来源只影响取数方式、配额和 prompt 上下文；平台节流、raw ceiling 与准入阈值不变。
+- **统一待评估池与准入**：API daemon 的不同来源 raw candidates 进入 `discovery_candidates` 后，由唯一 `CandidateEvalCoordinator` tokenized claim；默认 3 个 30 条 LLM worker 并行，任一完成即补位，SQLite 完成提交与 admission 串行。pipeline 单次 enqueue callback 立即唤醒这个 owner，refresh / managed producer 不再同步 drain。raw 清空且 projected 仍低于目标时，coordinator 调用 quota-aware supply wave，即时 tick 所有欠份额 producer 并执行 B 站 refresh；同平台周期 / 即时 tick 由 per-source lock 去重。补池生产性以真实 `inserted/enqueued` 为准，全部 duplicate 即使跑过策略也进入 30/60/120/300/600 秒退避，真实入队立即清零。串行 lane 先持久化全部 token-owned 评分，再按 `target - available - admitted_pending_copy` admission；超过 headroom 的达标结果保留为 `evaluated`。评估输入包含正文 / 标签 / 互动指标；`[discovery].eval_prefilter_mode` 默认 shadow 只记录 embedding would-filter，enforce 才会让明显低相似且非 explore 的候选本地低分缓存并跳过 LLM；多模态评估开启且模型支持图像时会复用运行时图片缓存。OpenClaw direct one-shot 不启动 daemon owner，`recommend(refresh_if_needed=True)` 的首轮 source supply / inline claim 固定 ≤4，并在 durable admission 后同步 drain ≤4 条 expression copy。调度 projected 固定为 `available + admitted_pending_copy + evaluated_pending_admission`，普通 raw 不计入；来源只影响取数方式、配额和 prompt 上下文，平台节流、raw ceiling 与准入阈值不变。
 
 ---
 
@@ -231,9 +244,13 @@ config recovery control plane (normal or degraded; business APIs stay gated)
                 ├─ draft → /api/config/probe-service → temporary registry → total gate
                 └─ draft → /api/config/discover-models → exact instance GET /models
                           → editable model list + local effort advisory (no config write)
-XHS/DY/YT/Zhihu task final: canonical staged result → durable event receipt → verified seen-key → terminal flip
-                          stale lease reclaim replays first write; staged row rejects late mutation
-                          Reddit task-result is not migrated by this protocol change
+config save control plane: persist first → HTTP 202 queued/apply_revision → latest-wins queue → runtime receipt/status
+XHS hidden search tab → MAIN search-response normalizer → isolated replay/DOM fallback → task final
+XHS/DY/YT/Zhihu/Reddit task final: canonical staged result (XHS bootstrap payload caps enforced) → durable event receipt
+                                 → atomic bounded seen-key → terminal flip
+                                 stale lease reclaim replays first write; staged row rejects late mutation
+extension-online periodic re-pull: presence + profile/init/config gates → persisted round-robin
+                                 → one active bootstrap across five task tables → EventHub → extension
 
 cover images: proxy foreground ─┐
               refresh prefetch ─┴→ app-stable coordinator(total 4 / bg 3, fg priority)
@@ -321,6 +338,7 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │ bili/xhs/dy/yt/zhihu/reddit 任务调度 + 源开关/比例配置（后台 tab / 初始化导入 / 配比建议）│ │
 │  │ XHS 自动任务：source/scheduler 领取门 → SQLite 节流/风控冷却 → 关闭/限流时不再开任务 tab │ │
+│  │ XHS search：inactive tab → MAIN 搜索响应归一化 → isolated replay / DOM 兜底          │ │
 │  └──────────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │ runtime-stream 20s idle 心跳 + B站/抖音/X Cookie 请求与扩展回传│   │
@@ -368,7 +386,7 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  │ 推荐点击：content_id/url/source_platform -> source-aware click signal │ │
 │  └──────────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │ durable chat：session=popup -> 插件/移动/桌面；可见时同步历史 │   │
+│  │ durable chat：session=popup -> 插件/移动/桌面；主历史含 probe 聊天 │   │
 │  └──────────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │ 推荐/探针反馈：即时 UI -> 10s 可撤销 -> event commit/HTTP 200 -> 5s owner │ │
@@ -399,6 +417,7 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │     PoolCurator + 双轴 fatigue + per-group 窗口 + 新兴趣放大保护 │ │
 │  │     request_replenishment + 定时/手动补货 + B/XHS/DY/YT/X/Zhihu/Reddit/Bangumi=5/1/1/1/1/1/1/1 │ │
+│  │     raw断供 → 欠份额 producer 即时并行唤醒 → 真实新增计数 / 无产出阶梯退避 │ │
 │  │ API CandidateEvalCoordinator: durable projected -> 3×30 workers -> serial headroom admit │ │
 │  │ OpenClaw refresh: first source/eval <=4 -> copy <=4/no split retry -> canonical subset; both hosts recover first │ │
 │  │ delight: copy/topic ready + seen_items guard -> score/snapshot -> UI × writes seen ledger │ │
@@ -426,6 +445,8 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  │     Pool readiness: servable/raw/pending 统一库存口径       │   │
 │  │     Atomic maintenance: canonical protected -> topic/source/raw -> invariant/rollback │ │
 │  │     Source bootstrap seen-key guard -> Memory/Profile      │   │
+│  │     Extension-online re-pull -> five bootstrap tables (global serial) -> installed extension │ │
+│  │       -> staged durable ingress -> atomic seen keys (5000/source) -> terminal │ │
 │  │     Profile overrides overlay: 用户编辑 -> profile_overrides.json │ │
 │  │       -> get_profile()/sync_profile_files 读时叠加（抗画像重建）│ │
 │  └──────────────────────────────────────────────────────┘   │
@@ -501,7 +522,10 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  可选视觉 / 弹幕预热：质心、关键帧、完整 document embedding；endpoint provenance + stable slot retry │
 │  Desktop bundle: official Ollama.app runtime (ollama + runner dylibs/assets) │
 │  LLMService caller bucket → inherit global chain / custom chain │
+│  cognition named views → task gate: awareness_confusions compact; others legacy │
+│    └→ token diet: preference packing + weighted recent/judged/relevant/important insight≤40 → full merge │
 │  discovery evaluator: text + metrics + optional compressed cover image input │
+│    └→ embedding prefilter shadow → privacy-safe decision → raw score/admission join → read-only gate │
 │  OpenAI auth_mode: api_key / experimental Codex CLI OAuth      │
 │  结构化 JSON helper: wrapper / fenced / JSONL / schema echo / MiMo 容错 │
 ├──────────────────────────────────────────────────────────────┤
@@ -513,6 +537,9 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  └───────────┘ └─────────────┘ └────────────┘ └─────────┘  │
 │  SQLite: events(inferred_satisfaction) / seen_items(views+saves+snapshot)   │
 │          discovery_candidates                                      │
+│          evaluator_prefilter_shadow_audit (30d / 20k bounded, no raw content) │
+│          discovery_keywords → 24h safe cross-digest pending reconcile (0=hard expiry) │
+│          admitted pending copy → bounded copy-ready watermark → serve/refill │
 │          discovery_keywords(+cohort gate) / discovery_inspiration_*│
 │          content_cache(item_key: nonblank partial unique + legacy blank repair)              │
 │          recommendations(item_key) / chat_turns / card_settlements / avoidance_state          │

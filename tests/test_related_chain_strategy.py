@@ -51,9 +51,18 @@ class FakeLLMService:
                 batch_data = _json.loads(
                     user_input.split("<content_batch>")[1].split("</content_batch>")[0]
                 )
-                batch_size = len(batch_data) if isinstance(batch_data, list) else 1
+                batch_items = (
+                    batch_data
+                    if isinstance(batch_data, list)
+                    else batch_data.get("items", [])
+                    if isinstance(batch_data, dict)
+                    else []
+                )
+                batch_size = len(batch_items)
+                local_ids = isinstance(batch_data, dict)
             except Exception:
                 batch_size = 1
+                local_ids = False
 
             items: list[object] = []
             for _ in range(batch_size):
@@ -64,6 +73,8 @@ class FakeLLMService:
                 try:
                     parsed = _json.loads(raw)
                     if isinstance(parsed, dict) and "score" in parsed:
+                        if local_ids:
+                            parsed["id"] = str(len(items))
                         items.append(parsed)
                     else:
                         self.contents.insert(0, raw)  # put back non-score response

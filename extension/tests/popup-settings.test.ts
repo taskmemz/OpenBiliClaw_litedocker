@@ -47,6 +47,7 @@ test("settings page exposes advanced config fields from backend schema", () => {
     "cfgXhsDailySearchBudget",
     "cfgXhsDailyCreatorBudget",
     "cfgXhsTaskInterval",
+    "cfgXhsMinInterval",
     "cfgDouyinEnabled",
     "cfgDouyinCookie",
     "cfgDouyinCookieEnv",
@@ -179,6 +180,15 @@ test("settings source tab separates every platform into its own block", () => {
   assert.match(popupJs, /xhsEnabled\.checked = cfg\.sources\?\.xiaohongshu\?\.enabled === true/);
   assert.match(popupJs, /bilibili:\s*\{\s*enabled: checked\("cfgBilibiliEnabled", true\)/);
   assert.match(popupJs, /xiaohongshu:\s*\{\s*enabled: checked\("cfgXhsEnabled"\)/);
+  assert.match(
+    popupJs,
+    /daily_search_budget: getInt\("cfgXhsDailySearchBudget", 20\)/,
+  );
+  assert.match(popupJs, /task_interval_seconds: getInt\("cfgXhsTaskInterval", 1200\)/);
+  assert.match(popupJs, /min_interval_minutes: getInt\("cfgXhsMinInterval", 20\)/);
+  assert.match(sourcesPanel, /id="cfgXhsDailySearchBudget"[^>]*placeholder="默认 20"/);
+  assert.match(sourcesPanel, /id="cfgXhsTaskInterval"[^>]*placeholder="1200"/);
+  assert.match(sourcesPanel, /id="cfgXhsMinInterval"[^>]*placeholder="20"/);
 });
 
 test("settings logging tab edits a single full log path", () => {
@@ -871,6 +881,17 @@ test("settings save renders timeout warning before structured or generic errors"
   assert.match(saveBlock, /finally[\s\S]*renderSettingsDirty/);
 });
 
+test("settings save understands queued config apply and background failure events", () => {
+  const popupJs = readFileSync(resolve("popup", "popup.js"), "utf8");
+  const saveBlock =
+    popupJs.match(/saveBtn\.addEventListener\("click"[\s\S]*?\n  \}\);/)?.[0] ?? "";
+
+  assert.match(saveBlock, /result\.apply_state === "queued"/);
+  assert.match(saveBlock, /queued[\s\S]*"warning"/);
+  assert.match(popupJs, /event\.type === "config_reload_failed"/);
+  assert.match(popupJs, /后台应用配置失败，已恢复上一次生效配置/);
+});
+
 test("settings page wires offline cache and degraded-mode banners", () => {
   const popupHtml = readFileSync(resolve("popup", "popup.html"), "utf8");
   const popupJs = readFileSync(resolve("popup", "popup.js"), "utf8");
@@ -899,6 +920,8 @@ test("settings page shows the budget-semantics hint for every per-source budget 
     "预算 = 每日任务次数上限，不是开关；填 1 表示每天只允许 1 次。0 或留空 = 不限。";
   const redditNote =
     "预算 = 每日任务次数上限，不是开关；填 1 表示每天只允许 1 次。0 或留空 = 不限（Reddit 各分支默认 300）。";
+  const xhsNote =
+    "预算 = 每日任务次数上限；搜索默认每天 20 次，显式填 0 = 不限；创作者预算 0 或留空 = 不限。";
 
   // Every source card that has a daily budget input must carry a note.
   const budgetCards = ["xiaohongshu", "douyin", "youtube", "twitter", "zhihu", "reddit"];
@@ -917,9 +940,10 @@ test("settings page shows the budget-semantics hint for every per-source budget 
 
   // Reddit keeps its 300-default clarification.
   assert.ok(popupHtml.includes(redditNote), "reddit note should mention the 300 default");
-  // The other five use the base wording.
+  // XHS has a conservative search default while the other four use base wording.
+  assert.ok(popupHtml.includes(xhsNote), "xhs note should mention the 20/day default");
   const baseCount = popupHtml.split(baseNote).length - 1;
-  assert.ok(baseCount >= 5, `expected >=5 base budget notes, got ${baseCount}`);
+  assert.ok(baseCount >= 4, `expected >=4 base budget notes, got ${baseCount}`);
 });
 
 test("settings page wires the keyword generation mode selector (matches desktop web)", () => {

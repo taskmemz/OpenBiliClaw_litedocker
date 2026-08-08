@@ -154,21 +154,30 @@ multimodal_enabled = false
 
 [llm.routes.soul]
 # Soul profile generation / incremental updates (init, role/values/core delta)
+# Keep this bucket on the quality model; it owns durable preference and sentiment judgment.
 inherit = true
 chain = []
 
 [llm.routes.discovery]
 # Content discovery (search query generation, domain exploration)
+# Covers caller families: discovery.search/explore/trending/related/keyword/x/douyin,
+# runtime.bilibili_extension_search, yt_search, sources.xhs.
 inherit = true
 chain = []
+# Example custom chain: ["deepseek-fast"]
 
 [llm.routes.recommendation]
 # Recommendation expression generation
+# Covers caller families: recommendation.* except recommendation.evaluate_batch.
 inherit = true
 chain = []
 
 [llm.routes.evaluation]
 # Content relevance evaluation (LLM-as-judge for discovered content)
+# Covers caller families: recommendation.evaluate_batch, discovery.evaluate*, discovery.eval*, eval*.
+# Validate a downgrade with:
+# scripts/run_profile_diet_ab.py --arm-b model=<instance-id> --sample 100 \
+#   --repeats 3 --output data/eval/model-route.json
 inherit = true
 chain = []
 
@@ -237,15 +246,14 @@ min_interval_minutes = 3                 # producer 两次入队之间的最小�
 # pool_source_shares 中的 xiaohongshu 配额会被丢弃（不会让池子卡在低于目标）。
 # 默认 false；init 交互式提示选 Yes、--yes-xhs 或插件设置页打开后才会写回 true。
 enabled = false
-# 每天后端允许入队的 Soul 驱动搜索任务数上限；0 表示不设每日上限，
-# 仅受平台缺口、每轮 discovery_limit 与任务节流控制。
-daily_search_budget = 0
+# 每天后端允许入队的 Soul 驱动搜索任务数上限；默认 20，0 表示不设每日上限。
+daily_search_budget = 20
 # 每天订阅创作者抓取任务上限；0 表示不设每日上限。
 daily_creator_budget = 0
-# 后端允许扩展领取两次搜索/创作者任务之间的最小间隔（秒）；
-# 状态持久化，重启扩展或同时使用多个浏览器配置也不会绕过
-task_interval_seconds = 300
-min_interval_minutes = 3                 # producer 两次入队之间的最小间隔
+# 后端允许扩展领取两次搜索/创作者任务的目标间隔（秒）；实际按 ±25% 抖动，
+# 下一次领取时间持久化，重启扩展或同时使用多个浏览器配置也不会绕过。
+task_interval_seconds = 1200
+min_interval_minutes = 20                # producer 两次入队之间的最小间隔
 
 # ── 抖音（Douyin）direct-cookie discovery 专用配置 ──
 # 初始化画像仍走浏览器扩展；这里仅控制可选的后台内容发现。
@@ -367,10 +375,28 @@ discovery_cron = "0 */8 * * *"
 # Keep at least this many fresh candidates ready in the discovery pool
 # Allowed range: 1..600; each single refresh will backfill at most 60
 pool_target_count = 300
+# Number of candidates kept immediately serveable with validated recommendation
+# copy. 0 restores legacy behaviour and drains copy for the entire candidate pool.
+# Runtime clamps this high watermark to pool_target_count.
+copy_ready_target_count = 90
 # Low-frequency account sync interval for history / favorites / following
 account_sync_interval_hours = 6
+# Extension-online periodic account bootstrap refresh. This only runs while
+# the OpenBiliClaw browser extension runtime-stream is connected; it does not
+# perform browser-free/private-account synchronization. 0 disables all five
+# sources. Allowed values: integer 0..168 hours.
+source_incremental_hours = 24
+# Per-source overrides: omit (or set through the API to null) to inherit the
+# global interval; 0 disables only that source. Allowed values: 0..168.
+# xhs_incremental_hours = 12
+# douyin_incremental_hours = 24
+# youtube_incremental_hours = 24
+# zhihu_incremental_hours = 24
+# reddit_incremental_hours = 24
 # --- Runtime refresh tuning ---
 refresh_check_interval_seconds = 60      # Main loop poll interval; values <15 fallback
+# eval_min_batch_size = 15               # Coalesce trickle candidates into fuller eval batches; 1..90
+# eval_max_wait_seconds = 90.0           # A lone candidate waits at most this many seconds; 0..600
 signal_event_threshold = 6               # New behavior events before search+related refresh
 trending_refresh_minutes = 3               # Minimum interval for trending strategy
 explore_refresh_minutes = 3               # Minimum interval for explore strategy
@@ -457,7 +483,11 @@ claim_lease_minutes = 10
 planner_poll_seconds = 120
 # 兜底失效（小时）：即便画像 digest 未变，pending 关键词超过这个时长也会过期。
 plan_ttl_hours = 12
-# 统一推荐池入池最低分。来源/插件 observed 标签不能绕过该门槛。
+# 画像 digest 变化后，近期且未命中当前避雷主题的普通 pending 关键词可继续复用。
+# 合法范围 0-168 小时；设为 0 可恢复旧版“digest 一变立即过期”的行为。
+keyword_digest_grace_hours = 24
+# 统一推荐池入池最低分，合法范围 [0.5, 1]；低于 0.5 会回退 0.6。
+# 来源/插件 observed 标签不能绕过该门槛。
 admission_min_score = 0.6
 # query inspiration 脑暴默认开启，与旧 merged keyword planner 并行组成“混合”模式；
 # planner 会通过本机 mcporter 调用搜索 provider 链获取预览，再由
@@ -484,6 +514,10 @@ inspiration_breadth = "high"
 # raw 候选在途。运行时会为聊天等交互保留一个全局 LLM 槽位，因此有效并发为
 # min(本值, max(1, llm.concurrency - 1))。
 candidate_eval_concurrency = 3
+# 评估前 embedding 预过滤：off = 不计算；shadow = 只记录 would-filter；
+# enforce = 低相似候选不进 LLM。默认 shadow；先 grep prefilter-shadow，
+# 确认 would-be-filtered 且 LLM 分数 >= admission_min_score 的候选约为 0 后再切 enforce。
+eval_prefilter_mode = "shadow"
 # 可选封面图评估。默认关闭；开启后 discovery evaluator 会在模型支持图像输入时
 # 把已压缩的候选封面一并送入评估器，模型不支持时自动退回纯文本评估。
 multimodal_evaluation_enabled = false
@@ -561,6 +595,15 @@ aggregate_budget_mb = 500
 unmanaged_truncate_mb = 200
 # logs/ 目录里超过这个天数的 *unmanaged* 文件,启动时直接删除。设 0 关闭。
 unmanaged_max_age_days = 30
+
+[soul]
+# Provider-agnostic prompt projections roll out independently per task.
+# 2026-08-06 SenseTime replay passed only the awareness-with-confusions caller;
+# plain soul.awareness, Preference, and Insight remain on the byte-compatible
+# rollback path pending their own task-scoped quality gates.
+preference_prompt_view = "legacy"
+awareness_prompt_view = "compact-v1"
+insight_prompt_view = "legacy"
 
 [soul.preference]
 # v0.3.x event-satisfaction signal.

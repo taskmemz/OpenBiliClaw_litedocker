@@ -425,50 +425,62 @@ def materialize_platform_keywords(
             reverse=True,
         )
 
-    for interest_key, target in target_lookup.items():
-        target_platforms = [_normalize_platform(platform) for platform in target.platforms]
-        min_axes = max(0, int(target.min_axes))
-        for platform in target_platforms:
-            if not platform:
+    # Allocate breadth before depth. The previous interest-major loop filled
+    # ``min_axes`` for the first interests before visiting later ones, so a
+    # four-keyword cap with four selected interests materialized only the first
+    # two (two axes each). Round-robin by coverage depth gives every selected
+    # interest one chance before any interest receives a second axis.
+    slots = [
+        (interest_key, platform, target)
+        for interest_key, target in target_lookup.items()
+        for platform in (_normalize_platform(raw) for raw in target.platforms)
+        if platform
+    ]
+    max_slot_depth = max(
+        (max(1, int(target.min_axes)) for _interest, _platform, target in slots),
+        default=0,
+    )
+    for desired_depth in range(1, max_slot_depth + 1):
+        for interest_key, platform, target in slots:
+            if platform_counts[platform] >= platform_cap:
                 continue
-            while platform_counts[platform] < platform_cap:
-                slot_axes = slot_coverage[(interest_key, platform)]
-                slot_candidates = [
-                    item
-                    for item in candidates_by_slot.get((interest_key, platform), [])
-                    if (item.platform, _normalize_match_text(item.keyword)) not in selected_keys
-                ]
-                chosen = _choose_materialize_candidate(
-                    slot_candidates,
-                    slot_axes,
-                    min_axes=min_axes,
+            slot_axes = slot_coverage[(interest_key, platform)]
+            if len(slot_axes) >= desired_depth:
+                continue
+            slot_candidates = [
+                item
+                for item in candidates_by_slot.get((interest_key, platform), [])
+                if (item.platform, _normalize_match_text(item.keyword)) not in selected_keys
+            ]
+            chosen = _choose_materialize_candidate(
+                slot_candidates,
+                slot_axes,
+                min_axes=desired_depth,
+            )
+            if chosen is None:
+                chosen = _deterministic_fill_candidate(
+                    interest_key=interest_key,
+                    platform=platform,
+                    allocation=target,
+                    axis_lookup=axis_lookup,
+                    coverage_axes=slot_axes,
+                    selected_keys=selected_keys,
+                    max_keyword_chars=char_cap,
+                    rejects=rejects,
+                    shortfalls=_telemetry_list(telemetry, "coverage_shortfall"),
                 )
                 if chosen is None:
-                    chosen = _deterministic_fill_candidate(
-                        interest_key=interest_key,
-                        platform=platform,
-                        allocation=target,
-                        axis_lookup=axis_lookup,
-                        coverage_axes=slot_axes,
-                        selected_keys=selected_keys,
-                        max_keyword_chars=char_cap,
-                        rejects=rejects,
-                        shortfalls=_telemetry_list(telemetry, "coverage_shortfall"),
-                    )
-                    if chosen is None:
-                        break
-                    deterministic_fill_count += 1
-                    scores.append(chosen.score)
-                _append_materialize_selection(
-                    chosen,
-                    selected=selected,
-                    selected_keys=selected_keys,
-                    platform_counts=platform_counts,
-                    coverage=coverage,
-                    slot_coverage=slot_coverage,
-                )
-                if len(slot_axes) >= min_axes:
-                    break
+                    continue
+                deterministic_fill_count += 1
+                scores.append(chosen.score)
+            _append_materialize_selection(
+                chosen,
+                selected=selected,
+                selected_keys=selected_keys,
+                platform_counts=platform_counts,
+                coverage=coverage,
+                slot_coverage=slot_coverage,
+            )
 
     _record_materialize_shortfalls(
         target_lookup,

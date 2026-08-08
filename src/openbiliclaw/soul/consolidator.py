@@ -3,7 +3,7 @@
 Interest tags and disliked topics accumulate wording variants forever:
 the merge path only collapses exact ``(name, category)`` matches, and
 weight decay never removes a variant that keeps getting reinforced. On
-real profiles this leaves the weight-sorted top-64 (the slice that
+real profiles this leaves the weight-sorted top-48 (the slice that
 actually reaches LLM prompts) half-occupied by duplicates of the same
 concept, crowding genuinely distinct interests out of the boundary.
 
@@ -12,8 +12,10 @@ The consolidator runs a staged, mostly-free pipeline:
 1. **Rule layer** — identical names within the same category merge in
    code (no LLM); identical names across categories are forced to LLM
    judgement as homonym-safety clusters.
-2. **Clustering** — embedding cosine similarity (or substring fallback)
-   groups suspect duplicates. Only multi-member clusters proceed.
+2. **Clustering** — a high-recall similarity graph (embedding plus lexical
+   overlap, or lexical-only fallback) groups suspect duplicates by connected
+   component. This preserves bridge matches that seed-first greedy grouping
+   used to lose. Only multi-member clusters proceed.
 3. **No-merge memory** — pairs an earlier run already judged "distinct"
    are not re-asked; a cluster with no unjudged pair is skipped, so
    steady-state runs make zero LLM calls.
@@ -35,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +48,7 @@ from openbiliclaw.llm.json_utils import (
     parse_llm_json_tolerant,
 )
 from openbiliclaw.llm.prompts import build_profile_consolidation_prompt
+from openbiliclaw.llm.task_options import without_core_memory_kwargs
 from openbiliclaw.soul.ledger import ProfileLedger
 
 if TYPE_CHECKING:
@@ -59,16 +63,26 @@ logger = logging.getLogger(__name__)
 # _DISLIKED_TOPICS_STORE_CAP). Real profiles accumulate 1000+ interest
 # tags; a narrow boundary (128 until v0.3.121) left most wording
 # variants untouched, so duplicate weight stayed split across variants
-# and never re-entered the truncated top-64. 512 covers the whole
+# and never re-entered the truncated top-48. 512 covers the whole
 # meaningful store; only the deep <0.5-weight tail is left to decay.
 _LIKES_BOUNDARY = 512
-_SIMILARITY_THRESHOLD = 0.85
-_OVER_TARGET_SIMILARITY_FLOOR = 0.75
-_OVER_TARGET_SIMILARITY_MAX_DROP = 0.10
+# Likes are only *candidate-recalled* at this threshold; the LLM still makes
+# the final merge/keep decision. A higher 0.85 cut missed many real secondary
+# duplicates on bge-m3 (e.g. 社会时事/时事新闻 around 0.81), so likes use a
+# recall-oriented boundary while dislikes retain the stricter old boundary.
+_SIMILARITY_THRESHOLD = 0.80
+_DISLIKE_SIMILARITY_THRESHOLD = 0.85
+_SAME_CATEGORY_SIMILARITY_MARGIN = 0.04
+_OVER_TARGET_SIMILARITY_FLOOR = 0.72
+_OVER_TARGET_SIMILARITY_MAX_DROP = 0.08
 _DEFAULT_MIN_INTERVAL_SECONDS = 12 * 3600
 _STATE_FILENAME = "consolidation_state.json"
 _RUNS_DIRNAME = "consolidation_runs"
 _CHANGELOG_FILENAME = "soul_changelog.md"
+# Bump when candidate recall or merge semantics change. Old keep decisions
+# were made under the stricter "true synonym only" policy and must not pin
+# redundant same-intent likes forever after this policy changes.
+_CONSOLIDATION_POLICY_VERSION = 2
 # Known-distinct pair memory is capped so the state file stays bounded
 # even after months of 12h runs. Sized for the 512-likes boundary: a
 # wide first pass can judge hundreds of clusters in one run.
@@ -143,6 +157,8 @@ class ConsolidationReport:
     throttled: bool = False
     skipped_clean: bool = False
     dry_run: bool = False
+    applied: bool = False
+    write_conflict: bool = False
     run_id: str = ""
     rule_merges: list[str] = field(default_factory=list)
     clusters_sent: int = 0
@@ -159,6 +175,7 @@ class ConsolidationReport:
     archived_interests: list[str] = field(default_factory=list)
     protected_interests: list[str] = field(default_factory=list)
     inventory_reason: str = ""
+    retry_pending: bool = False
     errors: list[str] = field(default_factory=list)
 
 
@@ -168,6 +185,7 @@ class _Cluster:
     scope: str  # "likes" | "dislikes"
     members: list[str]
     member_categories: list[str] | None = None
+    known_distinct_pairs: list[list[str]] = field(default_factory=list)
 
     @property
     def member_keys(self) -> list[str]:
@@ -184,6 +202,25 @@ def _pair_key(a: str, b: str) -> str:
     return "||".join(sorted((a, b)))
 
 
+def _preference_revision(data: dict[str, Any]) -> str:
+    """Hash every preference field that consolidation may overwrite."""
+    import hashlib
+
+    payload = {
+        "interests": data.get("interests", []),
+        "archived_interests": data.get("archived_interests", []),
+        "disliked_topics": data.get("disliked_topics", []),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _batch_count(item_count: int, batch_size: int) -> int:
     if item_count <= 0 or batch_size <= 0:
         return 0
@@ -193,14 +230,16 @@ def _batch_count(item_count: int, batch_size: int) -> int:
 def _log_run_summary(report: ConsolidationReport, *, changed: bool) -> None:
     logger.info(
         "profile consolidation run completed: "
-        "run_id=%s dry_run=%s clusters=%d llm_batches=%d changed=%s "
+        "run_id=%s dry_run=%s clusters=%d llm_batches=%d changed=%s applied=%s conflict=%s "
         "merges=%d rule_merges=%d rejected=%d archived=%d "
-        "likes=%d->%d dislikes=%d->%d errors=%d",
+        "likes=%d->%d dislikes=%d->%d retry_pending=%s errors=%d",
         report.run_id,
         report.dry_run,
         report.clusters_sent,
         report.llm_batches,
         changed,
+        report.applied,
+        report.write_conflict,
         len(report.merges),
         len(report.rule_merges),
         len(report.rejected_clusters),
@@ -209,6 +248,7 @@ def _log_run_summary(report: ConsolidationReport, *, changed: bool) -> None:
         report.likes_after,
         report.dislikes_before,
         report.dislikes_after,
+        report.retry_pending,
         len(report.errors),
     )
 
@@ -241,6 +281,64 @@ def _interest_member_key(item: dict[str, Any]) -> str:
 
 def _normalize_name(name: str) -> str:
     return re.sub(r"\s+", "", str(name or "")).lower()
+
+
+def _lexical_form(name: str) -> str:
+    """Normalize a label for conservative character-overlap recall."""
+    return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", str(name or "").lower())
+
+
+def _longest_common_substring_length(a: str, b: str) -> int:
+    if not a or not b:
+        return 0
+    previous = [0] * (len(b) + 1)
+    best = 0
+    for char_a in a:
+        current = [0] * (len(b) + 1)
+        for index, char_b in enumerate(b, start=1):
+            if char_a == char_b:
+                current[index] = previous[index - 1] + 1
+                best = max(best, current[index])
+        previous = current
+    return best
+
+
+def _lexically_related(a: str, b: str) -> bool:
+    """High-recall lexical gate for like labels; the LLM remains final judge."""
+    left = _lexical_form(a)
+    right = _lexical_form(b)
+    if not left or not right or left == right:
+        return left == right and bool(left)
+    shorter = min(len(left), len(right))
+    if shorter < 2:
+        return False
+    left_numbers = re.findall(r"\d+", left)
+    right_numbers = re.findall(r"\d+", right)
+    if left_numbers and right_numbers and left_numbers != right_numbers:
+        return False
+    # Version/model suffixes are often the *meaningful* distinction (GPT-4 vs
+    # GPT-5), and test/eval fixtures also use A/B or numeric suffixes. Do not
+    # let a long shared prefix collapse those enumerated labels into one giant
+    # connected component; embeddings can still recall them when appropriate.
+    if len(left) == len(right):
+        differing = [(x, y) for x, y in zip(left, right, strict=True) if x != y]
+        if differing and all(
+            x.isascii() and x.isalnum() and y.isascii() and y.isalnum() for x, y in differing
+        ):
+            return False
+    left_suffix = re.fullmatch(r"(.+?)([a-z0-9]+)", left)
+    right_suffix = re.fullmatch(r"(.+?)([a-z0-9]+)", right)
+    if (
+        left_suffix is not None
+        and right_suffix is not None
+        and left_suffix.group(1) == right_suffix.group(1)
+        and left_suffix.group(2) != right_suffix.group(2)
+    ):
+        return False
+    if left in right or right in left:
+        return True
+    overlap = _longest_common_substring_length(left, right)
+    return overlap >= 2 and overlap / shorter >= 0.5
 
 
 def _as_str_list(value: object) -> list[str]:
@@ -316,6 +414,7 @@ class ProfileConsolidator:
         if (
             digest
             and digest == state.get("last_input_digest")
+            and state.get("policy_version") == _CONSOLIDATION_POLICY_VERSION
             and not self._is_like_inventory_over_target()
         ):
             state["last_run_at"] = current.isoformat()
@@ -336,19 +435,21 @@ class ProfileConsolidator:
         )
 
         preference_layer = self._memory.get_layer("preference")
+        preference_data = preference_layer.data
+        source_revision = _preference_revision(preference_data)
         interests_raw = [
             dict(item)
-            for item in preference_layer.data.get("interests", [])
+            for item in preference_data.get("interests", [])
             if isinstance(item, dict) and str(item.get("name", "")).strip()
         ]
         dislikes_raw = [
             str(item).strip()
-            for item in preference_layer.data.get("disliked_topics", [])
+            for item in preference_data.get("disliked_topics", [])
             if str(item).strip()
         ]
         archived_raw = [
             dict(item)
-            for item in preference_layer.data.get("archived_interests", [])
+            for item in preference_data.get("archived_interests", [])
             if isinstance(item, dict) and str(item.get("name", "")).strip()
         ]
         report.likes_before = len(interests_raw)
@@ -359,6 +460,12 @@ class ProfileConsolidator:
             "archived_interests": [dict(item) for item in archived_raw],
             "disliked_topics": list(dislikes_raw),
         }
+        # ``populate_from_flat_preference`` is intentionally lossy: it rebuilds
+        # the interest tree from the flat store and can change domain ordering,
+        # metadata and weights that pre-date this consolidation pass. Keep the
+        # exact raw Soul layer so revert is a true restore rather than another
+        # derived rebuild.
+        soul_before = deepcopy(dict(self._memory.get_layer("soul").data))
 
         # ── Topic lifecycle scan (Phase 4): decay/archive/trial graduation +
         # subdivision shadow proposals. Folds into the same 12h cadence. ────
@@ -381,7 +488,13 @@ class ProfileConsolidator:
 
         # ── Stage 1: clustering ────────────────────────────────────────────
         state = self._load_state()
-        no_merge: set[str] = set(str(p) for p in state.get("no_merge_pairs", []))
+        policy_is_current = state.get("policy_version") == _CONSOLIDATION_POLICY_VERSION
+        protected_no_merge = self._protected_no_merge_pairs(state)
+        no_merge: set[str] = (
+            set(str(p) for p in state.get("no_merge_pairs", [])) | protected_no_merge
+            if policy_is_current
+            else set(protected_no_merge)
+        )
         forced_clusters = [
             _Cluster(
                 cluster_id=f"H{idx + 1}",
@@ -391,12 +504,32 @@ class ProfileConsolidator:
             )
             for idx, group in enumerate(homonym_groups)
         ]
+        for cluster in forced_clusters:
+            cluster.known_distinct_pairs = self._known_distinct_pairs(cluster, no_merge)
+        homonym_names = {
+            _normalize_name(str(group[0].get("name", ""))) for group in homonym_groups if group
+        }
+        ordinary_like_names = [
+            name for name in like_slice_names if _normalize_name(name) not in homonym_names
+        ]
+        like_category_by_name = {
+            str(item.get("name", "")): str(item.get("category", ""))
+            for item in ranked[:likes_boundary]
+            if _normalize_name(str(item.get("name", ""))) not in homonym_names
+        }
         like_clusters = await self._cluster(
-            like_slice_names,
+            ordinary_like_names,
             scope="likes",
             similarity_threshold=like_similarity_threshold,
+            category_by_name=like_category_by_name,
+            no_merge=no_merge,
         )
-        dislike_clusters = await self._cluster(dislikes_raw, scope="dislikes")
+        dislike_clusters = await self._cluster(
+            dislikes_raw,
+            scope="dislikes",
+            similarity_threshold=_DISLIKE_SIMILARITY_THRESHOLD,
+            no_merge=no_merge,
+        )
         clusters = [
             cluster
             for cluster in (*forced_clusters, *like_clusters, *dislike_clusters)
@@ -430,6 +563,7 @@ class ProfileConsolidator:
                 )
         elif clusters:
             report.errors.append("llm: service unavailable")
+        report.retry_pending = bool(clusters) and len(judged_clusters) < len(clusters)
 
         # ── Stage 3: apply ─────────────────────────────────────────────────
         rename_map: dict[str, str] = {}
@@ -472,6 +606,35 @@ class ProfileConsolidator:
             _log_run_summary(report, changed=changed)
             return report
 
+        # Embedding + LLM judgement can take tens of seconds. Preference
+        # analysis may legitimately publish new evidence in that window; never
+        # overwrite it with a consolidation result computed from the old
+        # snapshot. A due tick will retry immediately because no state digest
+        # or timestamp is advanced on this optimistic-write conflict.
+        latest_preference_data = preference_layer.data
+        if _preference_revision(latest_preference_data) != source_revision:
+            report.applied = False
+            report.write_conflict = True
+            report.retry_pending = True
+            report.errors.append(
+                "profile changed during consolidation; apply skipped and will retry"
+            )
+            report.rule_merges.clear()
+            report.merges.clear()
+            report.rejected_clusters.clear()
+            report.archived_interests.clear()
+            report.inventory_reason = ""
+            current_interests = latest_preference_data.get("interests", [])
+            current_dislikes = latest_preference_data.get("disliked_topics", [])
+            report.likes_before = report.likes_after = len(
+                [item for item in current_interests if isinstance(item, dict)]
+            )
+            report.dislikes_before = report.dislikes_after = len(
+                [item for item in current_dislikes if str(item).strip()]
+            )
+            _log_run_summary(report, changed=False)
+            return report
+
         if changed:
             # Ledger write point D5 #6: 12h profile consolidation (compress /
             # archive). ``revert`` records a separate compensating row below.
@@ -488,16 +651,19 @@ class ProfileConsolidator:
                 )
                 or ["consolidation"],
             ) as _entry:
-                preference_layer.data["interests"] = interests
-                preference_layer.data["archived_interests"] = archived_raw
-                preference_layer.data["disliked_topics"] = dislikes_raw
+                latest_preference_data["interests"] = interests
+                latest_preference_data["archived_interests"] = archived_raw
+                latest_preference_data["disliked_topics"] = dislikes_raw
                 preference_layer.save()
                 _entry.after = {
                     "likes_after": report.likes_after,
                     "dislikes_after": report.dislikes_after,
                 }
-            self._rebuild_profile_tree(preference_layer.data)
             overrides_before = self._remap_overrides(rename_map)
+            # Sync the rebuilt tree only after override labels follow the
+            # canonical rename map, otherwise soul_profile.{json,md} is
+            # rendered against stale overrides until some later profile write.
+            self._rebuild_profile_tree(preference_layer.data)
             keyword_label_rows = self._preview_keyword_interest_label_migration(
                 keyword_interest_rename_map
             )
@@ -507,10 +673,12 @@ class ProfileConsolidator:
                 before_snapshot,
                 rename_map,
                 overrides_before,
+                soul_before=soul_before,
                 keyword_interest_rename_map=keyword_interest_rename_map,
                 keyword_interest_label_rows=keyword_label_rows,
             )
             self._append_changelog(report, current)
+            report.applied = True
 
         # Record judged-distinct pairs so future runs skip them, and
         # advance run bookkeeping even on no-op runs.
@@ -526,9 +694,19 @@ class ProfileConsolidator:
             for i, a in enumerate(survivors):
                 for b in survivors[i + 1 :]:
                     no_merge.add(_pair_key(a, b))
-        state["no_merge_pairs"] = sorted(no_merge)[:_NO_MERGE_PAIRS_CAP]
+        ordered_protected = sorted(protected_no_merge)
+        remaining_no_merge = sorted(no_merge - protected_no_merge)
+        state["protected_no_merge_pairs"] = ordered_protected[:_NO_MERGE_PAIRS_CAP]
+        state["no_merge_pairs"] = [*ordered_protected, *remaining_no_merge][:_NO_MERGE_PAIRS_CAP]
+        state["policy_version"] = _CONSOLIDATION_POLICY_VERSION
         state["last_run_at"] = current.isoformat()
-        state["last_input_digest"] = self._input_digest()
+        if report.retry_pending:
+            # Do not call an unresolved input "clean". The next due tick must
+            # retry even when the profile itself has not changed (e.g. a
+            # temporary provider cooldown or malformed partial response).
+            state.pop("last_input_digest", None)
+        else:
+            state["last_input_digest"] = self._input_digest()
         if changed:
             state["last_applied_run_id"] = report.run_id
         self._save_state(state)
@@ -720,6 +898,8 @@ class ProfileConsolidator:
         *,
         scope: str,
         similarity_threshold: float | None = None,
+        category_by_name: dict[str, str] | None = None,
+        no_merge: set[str] | None = None,
     ) -> list[_Cluster]:
         unique_names = list(dict.fromkeys(name for name in names if name))
         if len(unique_names) < 2:
@@ -729,7 +909,61 @@ class ProfileConsolidator:
             self._similarity_threshold if similarity_threshold is None else similarity_threshold
         )
 
-        groups: list[list[str]] = []
+        known_distinct = no_merge or set()
+        parent = {name: name for name in unique_names}
+
+        def find(name: str) -> str:
+            root = name
+            while parent[root] != root:
+                root = parent[root]
+            while parent[name] != name:
+                next_name = parent[name]
+                parent[name] = root
+                name = next_name
+            return root
+
+        def union(first: str, second: str) -> None:
+            first_root = find(first)
+            second_root = find(second)
+            if first_root != second_root:
+                parent[second_root] = first_root
+
+        def pair_is_known_distinct(first: str, second: str) -> bool:
+            return _pair_key(first, second) in known_distinct
+
+        # Likes get a lexical recall path even when embedding is available.
+        # This catches obvious wording families whose vector score is model-
+        # sensitive (生活日常/生活记录, 社会时事/时事新闻). Dislikes keep the
+        # older, stricter containment-only fallback because false broadening
+        # there can suppress valid recommendations.
+        for index, name in enumerate(unique_names):
+            for other in unique_names[index + 1 :]:
+                if pair_is_known_distinct(name, other):
+                    continue
+                left = _normalize_name(name)
+                right = _normalize_name(other)
+                if scope == "likes":
+                    same_category = False
+                    if category_by_name is not None:
+                        category = category_by_name.get(name, "")
+                        same_category = bool(
+                            category and category == category_by_name.get(other, "")
+                        )
+                    # A shared two-character suffix across unrelated categories
+                    # (游戏资讯/科技资讯) is not enough evidence and can bridge
+                    # otherwise separate components. Cross-category lexical
+                    # recall therefore requires containment; same-category
+                    # secondary interests retain the broader overlap gate.
+                    lexical_match = (
+                        _lexically_related(name, other)
+                        if category_by_name is None or same_category
+                        else bool(left and right and (left in right or right in left))
+                    )
+                else:
+                    lexical_match = bool(left and right and (left in right or right in left))
+                if lexical_match:
+                    union(name, other)
+
         if self._embedding_service is not None:
             vectors: dict[str, list[float]] = {}
             for name in unique_names:
@@ -740,42 +974,47 @@ class ProfileConsolidator:
                 if vec:
                     vectors[name] = vec
             embeddable = [n for n in unique_names if n in vectors]
-            assigned: set[str] = set()
             for i, name in enumerate(embeddable):
-                if name in assigned:
-                    continue
-                group = [name]
-                assigned.add(name)
                 for other in embeddable[i + 1 :]:
-                    if other in assigned:
+                    if pair_is_known_distinct(name, other):
                         continue
-                    if _cosine(vectors[name], vectors[other]) >= threshold:
-                        group.append(other)
-                        assigned.add(other)
-                if len(group) >= 2:
-                    groups.append(group)
-        else:
-            # Fallback without embeddings: substring containment grouping.
-            assigned = set()
-            for i, name in enumerate(unique_names):
-                if name in assigned:
-                    continue
-                norm = _normalize_name(name)
-                group = [name]
-                for other in unique_names[i + 1 :]:
-                    if other in assigned:
-                        continue
-                    other_norm = _normalize_name(other)
-                    if norm and other_norm and (norm in other_norm or other_norm in norm):
-                        group.append(other)
-                        assigned.add(other)
-                if len(group) >= 2:
-                    assigned.add(name)
-                    groups.append(group)
+                    pair_threshold = threshold
+                    if scope == "likes" and category_by_name is not None:
+                        category = category_by_name.get(name, "")
+                        if category and category == category_by_name.get(other, ""):
+                            pair_threshold = max(
+                                _OVER_TARGET_SIMILARITY_FLOOR,
+                                threshold - _SAME_CATEGORY_SIMILARITY_MARGIN,
+                            )
+                    if _cosine(vectors[name], vectors[other]) >= pair_threshold:
+                        union(name, other)
+
+        grouped: dict[str, list[str]] = {}
+        for name in unique_names:
+            grouped.setdefault(find(name), []).append(name)
+        groups = [group for group in grouped.values() if len(group) >= 2]
 
         return [
-            _Cluster(cluster_id=f"{prefix}{idx + 1}", scope=scope, members=group)
+            _Cluster(
+                cluster_id=f"{prefix}{idx + 1}",
+                scope=scope,
+                members=group,
+                known_distinct_pairs=self._known_distinct_pairs_for_keys(group, known_distinct),
+            )
             for idx, group in enumerate(groups)
+        ]
+
+    @staticmethod
+    def _known_distinct_pairs(cluster: _Cluster, no_merge: set[str]) -> list[list[str]]:
+        return ProfileConsolidator._known_distinct_pairs_for_keys(cluster.member_keys, no_merge)
+
+    @staticmethod
+    def _known_distinct_pairs_for_keys(keys: list[str], no_merge: set[str]) -> list[list[str]]:
+        return [
+            [first, second]
+            for index, first in enumerate(keys)
+            for second in keys[index + 1 :]
+            if _pair_key(first, second) in no_merge
         ]
 
     @staticmethod
@@ -847,6 +1086,7 @@ class ProfileConsolidator:
         likes_payload: list[dict[str, object]] = [
             {
                 "cluster_id": c.cluster_id,
+                "known_distinct_pairs": c.known_distinct_pairs,
                 "members": [
                     {
                         "name": name,
@@ -875,7 +1115,11 @@ class ProfileConsolidator:
             if c.scope == "likes"
         ]
         dislikes_payload: list[dict[str, object]] = [
-            {"cluster_id": c.cluster_id, "members": list(c.members)}
+            {
+                "cluster_id": c.cluster_id,
+                "known_distinct_pairs": c.known_distinct_pairs,
+                "members": list(c.members),
+            }
             for c in clusters
             if c.scope == "dislikes"
         ]
@@ -883,12 +1127,17 @@ class ProfileConsolidator:
             likes_clusters=likes_payload,
             dislikes_clusters=dislikes_payload,
         )
+        # Cluster merge/keep decisions are judged purely from the interest-label
+        # payload in the user prompt (see ``build_profile_consolidation_prompt``);
+        # the user's portrait/core memory is irrelevant to whether two labels denote
+        # the same interest. Opt out of the default core-memory injection.
         response = await self._llm_service.complete_structured_task(
             system_instruction=messages[0]["content"],
             user_input=messages[1]["content"],
             temperature=0.2,
             max_tokens=DEFAULT_STRUCTURED_MAX_TOKENS,
             caller="soul.consolidation",
+            **without_core_memory_kwargs(self._llm_service.complete_structured_task),
         )
         parsed = parse_llm_json_tolerant(response.content)
         if not isinstance(parsed, dict):
@@ -924,6 +1173,9 @@ class ProfileConsolidator:
             for idx, name in enumerate(cluster.members)
         ]
         record_keys = {record["key"] for record in records}
+        known_distinct_keys = {
+            _pair_key(pair[0], pair[1]) for pair in cluster.known_distinct_pairs if len(pair) == 2
+        }
         covered: list[str] = []
 
         def consume(ref: object) -> tuple[str, str] | None:
@@ -969,6 +1221,10 @@ class ProfileConsolidator:
                     covered.append(key)
                 if len(members) < 2:
                     return "merge with fewer than 2 members"
+                for index, first in enumerate(member_keys):
+                    for second in member_keys[index + 1 :]:
+                        if _pair_key(first, second) in known_distinct_keys:
+                            return f"merge violates known-distinct pair: {first!r}, {second!r}"
                 canonical = str(op.get("canonical", "")).strip()
                 problem = self._validate_canonical(canonical, members, scope=cluster.scope)
                 if problem:
@@ -1240,8 +1496,6 @@ class ProfileConsolidator:
             preference_layer.data["disliked_topics"] = _as_str_list(before.get("disliked_topics"))
             preference_layer.save()
             _entry.after = {"interests": len(preference_layer.data.get("interests", []))}
-        self._rebuild_profile_tree(preference_layer.data)
-
         overrides_before = record.get("overrides_before")
         if isinstance(overrides_before, dict):
             saver = getattr(self._memory, "save_profile_overrides", None)
@@ -1252,21 +1506,43 @@ class ProfileConsolidator:
                     saver(ProfileOverrides.from_dict(overrides_before))
                 except Exception:
                     logger.exception("Failed to restore profile overrides for %s", run_id)
+
+        # New run records retain the exact raw Soul layer. Legacy records fall
+        # back to rebuilding from preference, preserving backwards-compatible
+        # revert support without pretending that old snapshots were lossless.
+        if not self._restore_soul_snapshot(record.get("soul_before")):
+            self._rebuild_profile_tree(preference_layer.data)
         self._restore_keyword_interest_label_rows(record.get("keyword_interest_label_rows"))
 
         # Pin the rolled-back merges as known-distinct so the next run
         # doesn't redo them.
         state = self._load_state()
-        no_merge = set(str(p) for p in state.get("no_merge_pairs", []))
+        protected_no_merge = self._protected_no_merge_pairs(state)
+        no_merge = (
+            set(str(p) for p in state.get("no_merge_pairs", [])) | protected_no_merge
+            if state.get("policy_version") == _CONSOLIDATION_POLICY_VERSION
+            else set(protected_no_merge)
+        )
         for merge in record.get("merges", []):
             if not isinstance(merge, dict):
                 continue
-            names = [*_as_str_list(merge.get("members")), str(merge.get("canonical", ""))]
+            raw_members = merge.get("members", [])
+            member_refs = raw_members if isinstance(raw_members, list) else []
+            names = [
+                *(_member_ref_key(member) for member in member_refs),
+                str(merge.get("canonical", "")),
+            ]
             names = [n for n in dict.fromkeys(names) if n]
             for i, a in enumerate(names):
                 for b in names[i + 1 :]:
-                    no_merge.add(_pair_key(a, b))
-        state["no_merge_pairs"] = sorted(no_merge)[:_NO_MERGE_PAIRS_CAP]
+                    pair = _pair_key(a, b)
+                    no_merge.add(pair)
+                    protected_no_merge.add(pair)
+        ordered_protected = sorted(protected_no_merge)
+        remaining_no_merge = sorted(no_merge - protected_no_merge)
+        state["protected_no_merge_pairs"] = ordered_protected[:_NO_MERGE_PAIRS_CAP]
+        state["no_merge_pairs"] = [*ordered_protected, *remaining_no_merge][:_NO_MERGE_PAIRS_CAP]
+        state["policy_version"] = _CONSOLIDATION_POLICY_VERSION
         state["last_input_digest"] = ""
         self._save_state(state)
 
@@ -1277,10 +1553,72 @@ class ProfileConsolidator:
             logger.debug("Failed to append revert changelog", exc_info=True)
         return True
 
+    def _restore_soul_snapshot(self, snapshot: object) -> bool:
+        """Restore an exact Soul layer snapshot and refresh effective mirrors."""
+        if not isinstance(snapshot, dict):
+            return False
+        try:
+            soul_layer = self._memory.get_layer("soul")
+            soul_layer.data.clear()
+            soul_layer.data.update(deepcopy(snapshot))
+            soul_layer.save()
+        except Exception:
+            logger.exception("Failed to restore Soul snapshot after consolidation revert")
+            return False
+
+        # Mirror refresh is best-effort and must not turn a successful raw
+        # restore into the lossy legacy fallback. Overrides have already been
+        # restored above, so the rendered files represent the same effective
+        # profile as before the consolidation run.
+        sync = getattr(self._memory, "sync_profile_files", None)
+        if snapshot and callable(sync):
+            try:
+                sync(deepcopy(snapshot))
+            except Exception:
+                logger.exception("Failed to refresh Soul mirrors after consolidation revert")
+        return True
+
     # -- Persistence -------------------------------------------------------------------
 
     def _state_path(self) -> Path | None:
         return self._data_dir / _STATE_FILENAME if self._data_dir else None
+
+    def _protected_no_merge_pairs(self, state: dict[str, Any]) -> set[str]:
+        """Return user-reverted pairs, reconstructing pre-v2 state when needed."""
+        if "protected_no_merge_pairs" in state:
+            return {str(pair) for pair in state.get("protected_no_merge_pairs", [])}
+        if self._data_dir is None:
+            return set()
+
+        # Policy v1 stored LLM keeps and explicit user reverts in one list.
+        # Recover the latter from the append-only audit + run snapshots before
+        # invalidating old judge decisions, so a policy upgrade never undoes a
+        # user's explicit rollback.
+        changelog_path = self._data_dir / _CHANGELOG_FILENAME
+        try:
+            changelog = changelog_path.read_text(encoding="utf-8")
+        except OSError:
+            return set()
+        run_ids = set(re.findall(r"^## 画像整理回滚 (\d{8}-\d{6})", changelog, re.MULTILINE))
+        protected: set[str] = set()
+        for run_id in run_ids:
+            record_path = self._data_dir / _RUNS_DIRNAME / f"{run_id}.json"
+            try:
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            merges = record.get("merges", []) if isinstance(record, dict) else []
+            for merge in merges:
+                if not isinstance(merge, dict):
+                    continue
+                raw_members = merge.get("members", [])
+                member_refs = raw_members if isinstance(raw_members, list) else []
+                keys = [_member_ref_key(member) for member in member_refs]
+                keys = [key for key in dict.fromkeys(keys) if key]
+                for index, first in enumerate(keys):
+                    for second in keys[index + 1 :]:
+                        protected.add(_pair_key(first, second))
+        return protected
 
     def _load_state(self) -> dict[str, Any]:
         path = self._state_path()
@@ -1330,6 +1668,7 @@ class ProfileConsolidator:
         rename_map: dict[str, str],
         overrides_before: dict[str, object] | None = None,
         *,
+        soul_before: dict[str, object] | None = None,
         keyword_interest_rename_map: dict[str, str] | None = None,
         keyword_interest_label_rows: list[dict[str, object]] | None = None,
     ) -> None:
@@ -1342,6 +1681,7 @@ class ProfileConsolidator:
                 "run_id": report.run_id,
                 "kind": "consolidation",
                 "before": before_snapshot,
+                "soul_before": soul_before,
                 "like_similarity_threshold": report.like_similarity_threshold,
                 "rule_merges": report.rule_merges,
                 "merges": report.merges,

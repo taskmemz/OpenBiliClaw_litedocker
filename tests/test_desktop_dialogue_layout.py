@@ -43,6 +43,21 @@ def test_desktop_dialogue_composer_has_an_accessible_name() -> None:
     assert 'id="chatInput" aria-label="和阿B聊聊你的口味"' in html
 
 
+def test_desktop_pending_chat_turn_keeps_a_visible_accessible_thinking_state() -> None:
+    js = APP_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert "function desktopTurnIsWaitingForReply(turn)" in js
+    assert 'status === "pending" || status === "processing"' in js
+    assert "desktopChatThinkingMarkup()" in js
+    assert "阿B 正在思考，等待模型回复…" in js
+    assert 'role="status"' in js
+    assert 'aria-live="polite"' in js
+    assert 'aria-busy="true"' in js
+    assert ".chat-page .chat-bubble.chat-thinking" in css
+    assert "@keyframes dialogue-thinking-dot" in css
+
+
 def test_desktop_dialogue_first_open_scrolls_restored_history_to_latest() -> None:
     source = APP_JS.read_text(encoding="utf-8")
     start = source.index("    function openChatPage()")

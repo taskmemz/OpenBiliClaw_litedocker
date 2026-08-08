@@ -41,7 +41,7 @@ def test_config_api_exposes_and_updates_saved_sync(
         json={"saved_sync": {"auto_sync_enabled": True}},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert client.get("/api/config").json()["saved_sync"] == {"auto_sync_enabled": True}
     assert load_config(tmp_path / "config.toml").saved_sync.auto_sync_enabled is True
 
@@ -112,7 +112,7 @@ def test_config_api_allows_omitted_saved_sync(
 
     response = client.put("/api/config", json={"language": "en"})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert response.json()["config"]["saved_sync"] == {"auto_sync_enabled": False}
     loaded = load_config(tmp_path / "config.toml")
     assert loaded.language == "en"

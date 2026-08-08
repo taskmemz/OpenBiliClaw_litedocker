@@ -259,6 +259,12 @@ test("detectXiaohongshuPageType classifies common xhs pages", () => {
     "search",
   );
   assert.equal(
+    detectXiaohongshuPageType(
+      "https://www.xiaohongshu.com/search_result/69dea966000000001a0280ad",
+    ),
+    "note",
+  );
+  assert.equal(
     detectXiaohongshuPageType("https://www.xiaohongshu.com/user/profile/abc123"),
     "user",
   );

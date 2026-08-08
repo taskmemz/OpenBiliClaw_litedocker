@@ -36,15 +36,17 @@ _SYSTEM_PROMPT = """你是小红书内容策略师。给你一个用户的兴趣
 
 
 def _build_user_prompt(profile: SoulProfile | OnionProfile, count: int) -> str:
-    # Same canonical structured profile every other discovery prompt sees
-    # (B站 / YouTube / X query-gen, all-platform evaluation) — no divergent
-    # representation. Lazy import keeps sources/ off discovery/ at module load.
-    # Deterministic dump keeps the prompt-cache prefix stable.
-    from openbiliclaw.discovery.strategies._utils import build_profile_summary
+    # Query-trimmed profile: the same MMR-reduced taste shape the main
+    # search/explore/keyword_planner paths use for query generation. Lazy import
+    # keeps sources/ off discovery/ at module load. Deterministic (no embedding
+    # lookup passed) so the prompt-cache prefix stays byte-stable.
+    from openbiliclaw.discovery.strategies._utils import (
+        build_query_generation_profile_summary,
+    )
 
-    # build_profile_summary is annotated for SoulProfile but supports OnionProfile
-    # too (back-compat properties); the producer hands us either.
-    summary = build_profile_summary(cast("SoulProfile", profile))
+    # The helper is annotated for SoulProfile but supports OnionProfile too
+    # (back-compat properties); the producer hands us either.
+    summary = build_query_generation_profile_summary(cast("SoulProfile", profile))
     return (
         "<profile_summary>\n"
         + json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True)

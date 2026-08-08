@@ -281,6 +281,7 @@ def test_put_config_preserves_reddit_extension_backend(
         json={"sources": {"reddit": {"enabled": True, "backend": "extension"}}},
     )
 
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["apply_state"] == "queued"
     assert cfg.sources.reddit.backend == "extension"
     assert resp.json()["config"]["sources"]["reddit"]["backend"] == "extension"

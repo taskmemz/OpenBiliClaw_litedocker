@@ -48,6 +48,7 @@ class _ControlledRegistry:
         self.peak_expression = 0
         self.expression_batch_sizes: list[int] = []
         self.evaluation_batch_sizes: list[int] = []
+        self.evaluation_call_count = 0
         self.expression_barrier_expected = 0
         self.expression_barrier_ready = asyncio.Event()
         self.expression_barrier_release = asyncio.Event()
@@ -86,17 +87,18 @@ class _ControlledRegistry:
                     for row in rows
                 ]
             else:
-                ids = list(dict.fromkeys(re.findall(r'"(?:content_id|bvid)"\s*:\s*"([^"]+)"', raw)))
-                self.evaluation_batch_sizes.append(len(ids))
+                rows = _tagged_json(raw, "content_batch")
+                self.evaluation_batch_sizes.append(len(rows))
+                self.evaluation_call_count += 1
                 payload = [
                     {
-                        "content_id": content_id,
+                        "id": str(row["id"]),
                         "score": 0.9,
                         "reason": "relevant",
-                        "topic_group": f"technology-{content_id}",
+                        "topic_group": (f"technology-{self.evaluation_call_count}-{row['id']}"),
                         "style_key": "deep_dive",
                     }
-                    for content_id in ids
+                    for row in rows
                 ]
             return LLMResponse(content=json.dumps(payload), provider="controlled", model="test")
         finally:
@@ -115,6 +117,9 @@ def _tagged_json(raw: str, tag: str) -> list[dict[str, Any]]:
     match = re.search(rf"<{tag}>\s*(.*?)\s*</{tag}>", raw, re.S)
     assert match is not None
     value = json.loads(match.group(1))
+    if isinstance(value, dict):
+        value = value.get("items", [])
+    assert isinstance(value, list)
     return [dict(item) for item in value if isinstance(item, dict)]
 
 

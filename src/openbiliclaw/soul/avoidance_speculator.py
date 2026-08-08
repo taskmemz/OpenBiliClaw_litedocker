@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 from openbiliclaw.llm.json_utils import DEFAULT_STRUCTURED_MAX_TOKENS, parse_llm_json_tolerant
 from openbiliclaw.llm.task_options import without_core_memory_kwargs
+from openbiliclaw.soul import profile_views
 from openbiliclaw.soul.speculator import (
     PROBE_DEFER_DAYS,
     PROBE_MAX_DEFERS,
@@ -1268,9 +1269,14 @@ class AvoidanceSpeculator:
         if slots <= 0:
             return state
 
+        # ``profile`` is annotated ``OnionProfile`` but the getattr guard is kept
+        # as belt-and-suspenders for callers that hand in a bare dict/other shape
+        # (then the prompt just carries no profile block). The object path now
+        # routes through the shared ``profile_views.speculation`` view so the
+        # portrait-excluded serializer lives in exactly one place (Task 7).
         to_context = getattr(profile, "to_llm_context", None)
-        profile_summary: dict[str, object] = (
-            to_context(include_portrait=False) if callable(to_context) else {}
+        profile_summary: str | dict[str, object] = (
+            profile_views.speculation(profile) if callable(to_context) else {}
         )
 
         interest = getattr(profile, "interest", None)

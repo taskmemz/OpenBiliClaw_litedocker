@@ -80,6 +80,13 @@ class GuidedInitStub:
         self.config_puts: list[dict[str, Any]] = []
         self.config_put_status = 200
         self.config_put_response: dict[str, Any] = {"ok": True, "config": {}}
+        self.config_apply_status_response: dict[str, Any] = {
+            "state": "idle",
+            "requested_revision": 0,
+            "applied_revision": 0,
+            "message": "",
+            "error": "",
+        }
         self.current_status = _status()
         self.post_init_error: tuple[int, dict[str, Any]] | None = None
         self.fail_next_status = False
@@ -304,6 +311,8 @@ def guided_init_server() -> tuple[str, GuidedInitStub]:
                         }
                     },
                 )
+            if path == "/api/config/apply-status":
+                return _json_response(self, state.config_apply_status_response)
             if path == "/api/ping":
                 return _json_response(self, state.ping_response)
             if path == "/api/init-status":
@@ -630,6 +639,47 @@ def test_setup_wizard_e2e_save_llm_does_not_start_guided_init(
     assert stub.init_posts == []
     assert len(stub.config_puts) == 1
     assert stub.config_puts[0]["suppress_background_llm_work"] is True
+
+
+def test_setup_wizard_waits_for_queued_config_apply_before_next_step(
+    guided_init_server: tuple[str, GuidedInitStub],
+    chromium_page: Any,
+) -> None:
+    base_url, stub = guided_init_server
+    stub.config_put_status = 202
+    stub.config_put_response = {
+        "ok": True,
+        "config": {},
+        "apply_state": "queued",
+        "apply_revision": 7,
+    }
+    stub.config_apply_status_response = {
+        "state": "applying",
+        "requested_revision": 7,
+        "applied_revision": 0,
+        "message": "正在后台应用配置",
+        "error": "",
+    }
+
+    chromium_page.goto(f"{base_url}/setup/")
+    chromium_page.locator("#provider").select_option("deepseek")
+    chromium_page.locator("#apiKey").fill("sk-e2e-test")
+    chromium_page.locator("#saveLlm").click()
+
+    chromium_page.wait_for_function(
+        "() => document.querySelector('#doneLlm')?.innerText.includes('正在应用')"
+    )
+    assert chromium_page.locator('[data-panel="0"].active').count() == 1
+    assert chromium_page.locator('[data-panel="1"].active').count() == 0
+
+    stub.config_apply_status_response = {
+        "state": "applied",
+        "requested_revision": 7,
+        "applied_revision": 7,
+        "message": "配置已应用",
+        "error": "",
+    }
+    chromium_page.wait_for_selector('[data-panel="1"].active', timeout=3000)
 
 
 def test_setup_wizard_e2e_replaces_invalid_first_run_placeholder(

@@ -27,6 +27,7 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 _BILLING_BACKOFF_STATUS_CODES = {402}
+_NON_RETRYABLE_REQUEST_STATUS_CODES = {400, 403, 404, 405, 422}
 _BILLING_BACKOFF_MARKERS = (
     "insufficient balance",
     "payment required",
@@ -40,6 +41,10 @@ _BILLING_BACKOFF_MARKERS = (
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
+
+
+class _NonRetryableRequestError(LLMProviderError):
+    """A request/configuration failure that cannot heal through immediate retry."""
 
 
 def _generic_json_schema_response_format() -> dict[str, Any]:
@@ -506,7 +511,12 @@ class OpenAIProvider(LLMProvider):
                 status_code,
                 body_excerpt,
             )
-            return LLMProviderError(
+            error_type = (
+                _NonRetryableRequestError
+                if status_code_int in _NON_RETRYABLE_REQUEST_STATUS_CODES
+                else LLMProviderError
+            )
+            return error_type(
                 f"{self._provider_name} request failed: HTTP {status_code}: {body_excerpt}"
             )
 
@@ -557,7 +567,7 @@ class OpenAIProvider(LLMProvider):
         # A 401 stays a 401 until the user edits config. Retrying only
         # multiplies rejected requests in the provider console and drags out
         # the wait before the actionable error reaches the user.
-        if isinstance(exc, (LLMRateLimitError, LLMAuthError)):
+        if isinstance(exc, (LLMRateLimitError, LLMAuthError, _NonRetryableRequestError)):
             return False
         return isinstance(exc, (LLMProviderError, LLMTimeoutError))
 

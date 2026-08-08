@@ -201,10 +201,143 @@ def _parse_cookie_header(cookie: str) -> dict[str, str]:
 def reddit_item_key(item: dict[str, Any]) -> str:
     """Return the stable identity key for one Reddit item."""
 
+    bootstrap_key = reddit_bootstrap_item_key(item)
+    if bootstrap_key:
+        return bootstrap_key
     content_id = _content_id(item)
     url = _content_url(item)
     title = _text(item, "title", "body", "selftext", "text")
     return content_id or url or title
+
+
+def reddit_bootstrap_item_key(item: dict[str, Any]) -> str:
+    """Return the cross-task identity for one Reddit bootstrap row.
+
+    Reddit bootstrap batches can contain posts, comments, subscribed
+    subreddits, and an optional account row.  Their stable identities use the
+    same fullname-like prefixes as Reddit itself, while community and account
+    rows use normalized names.  A valid Reddit URL is only a last-resort
+    identity; mutable titles and arbitrary nested values are never keys.
+    """
+    if not isinstance(item, dict):
+        return ""
+
+    content_type = _identity_text(item, "content_type", "item_type", "type").lower()
+    kind = _identity_text(item, "kind").lower()
+    scope = _identity_text(item, "scope").lower()
+    is_subreddit = (
+        content_type in {"subreddit", "community"}
+        or kind in {"subreddit", "community", "sr", "t5"}
+        or (scope == "reddit_subscribed" and content_type in {"", "community"})
+    )
+    if is_subreddit:
+        name = _identity_text(
+            item,
+            "subreddit",
+            "subreddit_name_prefixed",
+            "display_name",
+            "display_name_prefixed",
+            "name",
+            "id",
+        )
+        normalized = _normalize_reddit_named_identity(name, prefixes=("sr_", "r/", "t5_"))
+        if normalized:
+            return f"sr_{normalized.lower()}"
+        url_match = re.search(
+            r"/(?:r|subreddit)/([^/?#]+)", _identity_text(item, "url", "permalink", "link"), re.I
+        )
+        if url_match:
+            normalized = _normalize_reddit_named_identity(
+                url_match.group(1), prefixes=("sr_", "r/", "t5_")
+            )
+            if normalized:
+                return f"sr_{normalized.lower()}"
+        return ""
+
+    is_user = content_type in {"user", "account", "profile", "creator"} or kind in {
+        "t2",
+        "user",
+        "account",
+    }
+    if is_user:
+        name = _identity_text(item, "username", "user_name", "author", "user", "name", "id")
+        normalized = _normalize_reddit_named_identity(name, prefixes=("usr_", "u/", "t2_"))
+        if normalized and normalized.lower() not in {"deleted", "[deleted]"}:
+            return f"usr_{normalized.lower()}"
+        url_match = re.search(
+            r"/(?:u|user)/([^/?#]+)", _identity_text(item, "url", "permalink", "link"), re.I
+        )
+        if url_match:
+            normalized = _normalize_reddit_named_identity(
+                url_match.group(1), prefixes=("usr_", "u/", "t2_")
+            )
+            if normalized and normalized.lower() not in {"deleted", "[deleted]"}:
+                return f"usr_{normalized.lower()}"
+        return ""
+
+    prefixed_identity = _identity_text(item, "fullname", "name", "content_id", "id")
+    is_comment = (
+        content_type in {"comment", "reply"}
+        or kind == "t1"
+        or prefixed_identity.lower().startswith("t1_")
+    )
+    prefix = "t1_" if is_comment else "t3_"
+    identity_fields = (
+        ("comment_id", "fullname", "name", "id", "content_id")
+        if is_comment
+        else ("post_id", "fullname", "name", "id", "content_id")
+    )
+    for field_name in identity_fields:
+        raw_identity = _identity_text(item, field_name)
+        if not raw_identity:
+            continue
+        lowered = raw_identity.lower()
+        if lowered.startswith(("t1_", "t3_")):
+            if lowered.startswith(prefix):
+                return raw_identity
+            # Do not reinterpret a lower-priority bare id after an upstream
+            # fullname has already identified the opposite Reddit thing type.
+            return ""
+        return f"{prefix}{raw_identity}"
+
+    url = _identity_text(item, "url", "permalink", "link")
+    if is_comment:
+        # A comment permalink has post id + title slug + comment id. A shorter
+        # post URL cannot identify a comment and must not be mislabeled with
+        # the post id (or with the mutable title segment).
+        match = re.search(r"/comments/[^/?#]+/[^/?#]+/([^/?#]+)", url, re.I)
+    else:
+        match = re.search(r"(?:/comments/|redd\.it/)([^/?#]+)", url, re.I)
+    if match:
+        value = match.group(1)
+        value = re.sub(r"^t[13]_", "", value, flags=re.I)
+        if value:
+            return f"{prefix}{value}"
+    return ""
+
+
+def _identity_text(item: dict[str, Any], *keys: str) -> str:
+    """Read only scalar identity fields from an upstream Reddit row."""
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, str):
+            text = value.strip()
+        elif isinstance(value, int | float) and not isinstance(value, bool):
+            text = str(value).strip()
+        else:
+            continue
+        if text:
+            return text
+    return ""
+
+
+def _normalize_reddit_named_identity(value: str, *, prefixes: tuple[str, ...]) -> str:
+    normalized = value.strip()
+    for prefix in prefixes:
+        if normalized.lower().startswith(prefix.lower()):
+            normalized = normalized[len(prefix) :].strip()
+            break
+    return normalized.strip().strip("/")
 
 
 def parse_reddit_command_output(output: str) -> list[dict[str, Any]]:
@@ -233,11 +366,11 @@ def reddit_items_to_contents(
         url = _content_url(item)
         title = _text(item, "title", "name")
         body_text = _text(item, "selftext", "body", "text", "content")
-        if not content_id and not url:
+        if not content_id:
             continue
         if not title and not body_text and not url:
             continue
-        key = content_id or url
+        key = content_id
         if key in seen:
             continue
         seen.add(key)
@@ -258,13 +391,13 @@ def reddit_items_to_contents(
 
         contents.append(
             DiscoveredContent(
-                bvid=content_id or url,
+                bvid=content_id,
                 title=title or body_text[:80] or url,
                 up_name=author,
                 author_name=author,
                 description=body_text,
                 body_text=body_text,
-                content_id=content_id or url,
+                content_id=content_id,
                 content_url=url,
                 content_type=_content_type(content_id, item),
                 source_platform=SOURCE_REDDIT,
@@ -299,6 +432,8 @@ def reddit_items_to_events(
     events: list[dict[str, Any]] = []
     for item in items:
         content_id = _content_id(item)
+        if not content_id:
+            continue
         url = _content_url(item)
         title = _text(item, "title", "name") or _text(item, "selftext", "body", "text")[:80]
         if not title and not url:
@@ -497,6 +632,8 @@ class RedditTaskQueue:
         *,
         daily_budget: int = 100,
     ) -> str | None:
+        conn = self._db.conn
+        participating_in_transaction = bool(conn.in_transaction)
         count_today = self._budgeted_count_today(task_type) if daily_budget > 0 else 0
         if daily_budget > 0 and count_today >= daily_budget:
             logger.info(
@@ -509,11 +646,12 @@ class RedditTaskQueue:
             )
             return None
         task_id = str(uuid.uuid4())
-        self._db.conn.execute(
+        conn.execute(
             "INSERT INTO reddit_tasks (id, type, payload_json) VALUES (?, ?, ?)",
             (task_id, task_type, json.dumps(payload, ensure_ascii=False)),
         )
-        self._db.conn.commit()
+        if not participating_in_transaction:
+            conn.commit()
         return task_id
 
     def _budgeted_count_today(self, task_type: str) -> int:
@@ -537,6 +675,8 @@ class RedditTaskQueue:
 
     def next_pending(self, only_ids: set[str] | None = None) -> dict[str, Any] | None:
         stale_before = (datetime.now(UTC) - timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
+        # Staged results are logically terminal, but remain reclaimable until
+        # durable event/state projections and the final status flip succeed.
         where = "(status = 'pending' OR (status = 'in_progress' AND claimed_at <= ?))"
         params: list[Any] = [stale_before]
         if only_ids is not None:
@@ -628,6 +768,8 @@ class RedditTaskQueue:
             WHERE status = 'pending'
               AND type IN ({placeholders})
               AND created_at < ?
+              AND COALESCE(result_json, '') NOT LIKE
+                  '%"_openbiliclaw_terminal_status"%'
             """,
             (result_payload, *normalized_types, cutoff_text),
         )
@@ -650,36 +792,63 @@ class RedditTaskQueue:
         debug: dict[str, Any] | None = None,
         complete: bool = False,
     ) -> list[dict[str, Any]]:
-        row = self.get(task_id)
-        current: dict[str, Any] = {}
-        if row and row.get("result_json"):
-            try:
-                parsed = json.loads(str(row["result_json"]))
-                if isinstance(parsed, dict):
-                    current = parsed
-            except json.JSONDecodeError:
-                current = {}
+        from openbiliclaw.sources.task_result_protocol import mutate_unstaged_result
 
-        merged, added = _merge_reddit_result_payload(
-            current,
-            items=items,
-            scope_counts=scope_counts,
-            debug=debug,
+        added: list[dict[str, Any]] = []
+
+        def mutate(current: dict[str, Any]) -> dict[str, Any]:
+            nonlocal added
+            merged, added = _merge_reddit_result_payload(
+                current,
+                items=items,
+                scope_counts=scope_counts,
+                debug=debug,
+            )
+            return merged
+
+        mutated, _canonical = mutate_unstaged_result(
+            self._db,
+            table="reddit_tasks",
+            task_id=task_id,
+            mutate=mutate,
+            terminal_status="completed" if complete else None,
         )
-        result = json.dumps(merged, ensure_ascii=False)
-        if complete:
-            self._db.conn.execute(
-                "UPDATE reddit_tasks SET status = 'completed', result_json = ?, "
-                "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (result, task_id),
+        return added if mutated else []
+
+    def stage_final_result(
+        self,
+        task_id: str,
+        *,
+        terminal_status: str,
+        items: list[dict[str, Any]] | None = None,
+        scope_counts: dict[str, Any] | None = None,
+        debug: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Stage the immutable canonical result before downstream projection."""
+        from openbiliclaw.sources.task_result_protocol import stage_terminal_result
+
+        def merge(current: dict[str, Any]) -> dict[str, Any]:
+            merged, _added = _merge_reddit_result_payload(
+                current,
+                items=items,
+                scope_counts=scope_counts,
+                debug=debug,
             )
-        else:
-            self._db.conn.execute(
-                "UPDATE reddit_tasks SET result_json = ? WHERE id = ?",
-                (result, task_id),
-            )
-        self._db.conn.commit()
-        return added
+            return merged
+
+        return stage_terminal_result(
+            self._db,
+            table="reddit_tasks",
+            task_id=task_id,
+            terminal_status=terminal_status,
+            merge=merge,
+        )
+
+    def complete_staged_result(self, task_id: str) -> bool:
+        """Mark a staged canonical result complete without replacing it."""
+        from openbiliclaw.sources.task_result_protocol import complete_staged_result
+
+        return complete_staged_result(self._db, table="reddit_tasks", task_id=task_id)
 
     def fail(
         self,
@@ -687,17 +856,20 @@ class RedditTaskQueue:
         *,
         error: str = "",
         debug: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         result_payload: dict[str, Any] = {"error": error}
         if debug is not None:
             result_payload["debug"] = debug
-        result = json.dumps(result_payload, ensure_ascii=False)
-        self._db.conn.execute(
-            "UPDATE reddit_tasks SET status = 'failed', result_json = ?, "
-            "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (result, task_id),
+        from openbiliclaw.sources.task_result_protocol import mutate_unstaged_result
+
+        mutated, _canonical = mutate_unstaged_result(
+            self._db,
+            table="reddit_tasks",
+            task_id=task_id,
+            mutate=lambda _current: result_payload,
+            terminal_status="failed",
         )
-        self._db.conn.commit()
+        return mutated
 
 
 def _is_stale_pending_result(result_json: Any) -> bool:
@@ -1109,14 +1281,7 @@ def _reddit_read_post_id(value: str) -> str:
 
 
 def _content_id(item: dict[str, Any]) -> str:
-    raw = _text(item, "content_id", "name", "fullname", "id", "post_id")
-    if not raw:
-        return ""
-    if raw.startswith(("t1_", "t3_")):
-        return raw
-    kind = str(item.get("kind") or item.get("type") or "").strip().lower()
-    prefix = "t1_" if kind in {"comment", "t1"} else "t3_"
-    return f"{prefix}{raw}"
+    return reddit_bootstrap_item_key(item)
 
 
 def _content_url(item: dict[str, Any]) -> str:
@@ -1143,8 +1308,12 @@ def _author(item: dict[str, Any]) -> str:
 
 def _content_type(content_id: str, item: dict[str, Any]) -> str:
     explicit = str(item.get("content_type") or item.get("type") or "").strip().lower()
-    if explicit in {"comment", "post"}:
+    if explicit in {"comment", "post", "subreddit", "user"}:
         return explicit
+    if content_id.startswith("sr_"):
+        return "subreddit"
+    if content_id.startswith("usr_"):
+        return "user"
     return "comment" if content_id.startswith("t1_") else "post"
 
 

@@ -119,3 +119,18 @@ class TestLLMExtractor:
         assert len(service.calls) == 1
         user_input = service.calls[0]["user_input"]
         assert len(user_input) < 10000
+
+    def test_extraction_opts_out_of_core_memory_injection(self) -> None:
+        # Page extraction never reads the profile; it must not carry the
+        # core-memory block (portrait included) into its prompt, which would
+        # both waste tokens and churn the caller's cache prefix.
+        service = FakeLLMService("[]")
+        asyncio.run(
+            extract_content_from_page(
+                "a" * 100,
+                source_platform="web",
+                llm_service=service,
+            )
+        )
+        assert len(service.calls) == 1
+        assert service.calls[0].get("inject_core_memory") is False

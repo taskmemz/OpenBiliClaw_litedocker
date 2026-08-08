@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from openbiliclaw.storage.database import Database
@@ -36,6 +37,15 @@ class RecordingMemoryManager:
 
     def save_source_bootstrap_state(self, state: dict[str, object]) -> None:
         self._source_bootstrap_state = dict(state)
+
+    def update_source_bootstrap_state(
+        self,
+        mutator: Callable[[dict[str, object]], dict[str, object] | None],
+    ) -> dict[str, object]:
+        state = dict(self._source_bootstrap_state)
+        result = mutator(state)
+        self._source_bootstrap_state = state if result is None else result
+        return dict(self._source_bootstrap_state)
 
 
 class RecordingProfilePipeline:

@@ -208,6 +208,7 @@ body.chat-view-active .back-to-top {
 
 /* ── Tab Bar ──────────────────────────────────────────────── */
 .tab-item {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -227,6 +228,27 @@ body.chat-view-active .back-to-top {
   font-size: 20px;
   line-height: 1;
 }
+
+.tab-count-badge {
+  position: absolute;
+  top: 4px;
+  left: calc(50% + 7px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border: 2px solid var(--bg-base);
+  border-radius: 999px;
+  background: var(--brand);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.tab-count-badge[hidden] { display: none; }
 
 .tab-label {
   font-size: 10px;
@@ -1696,6 +1718,31 @@ body.chat-view-active .back-to-top {
   color: var(--text-muted);
   font-style: italic;
 }
+
+/* AI dialogue is rendered from a deliberately small, HTML-escaped Markdown
+   subset. Keep block spacing compact so formatted replies still read like
+   chat bubbles rather than full articles. */
+.chat-markdown {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.chat-markdown > :first-child { margin-top: 0; }
+.chat-markdown > :last-child { margin-bottom: 0; }
+.chat-markdown p { margin: 0 0 0.65em; }
+.chat-markdown h1,
+.chat-markdown h2,
+.chat-markdown h3,
+.chat-markdown h4,
+.chat-markdown h5,
+.chat-markdown h6 { margin: 0 0 0.5em; font-size: 1em; line-height: 1.35; }
+.chat-markdown ul,
+.chat-markdown ol { margin: 0 0 0.65em; padding-left: 1.35em; }
+.chat-markdown li + li { margin-top: 0.25em; }
+.chat-markdown blockquote { margin: 0 0 0.65em; padding-left: 0.8em; border-left: 3px solid var(--line); color: var(--text-secondary); }
+.chat-markdown pre { margin: 0 0 0.65em; padding: 8px 10px; overflow-x: auto; border-radius: 8px; background: var(--surface-soft); font-size: 0.9em; }
+.chat-markdown code { padding: 0.08em 0.28em; border-radius: 4px; background: var(--surface-soft); font-size: 0.92em; }
+.chat-markdown pre code { padding: 0; background: transparent; }
+.chat-markdown a { color: var(--brand-strong); text-decoration: underline; text-underline-offset: 2px; }
 
 .chat-input-row {
   position: sticky;

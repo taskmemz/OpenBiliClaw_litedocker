@@ -82,8 +82,24 @@ _LLM_PROVIDER_DISPLAY_NAMES = {
 }
 _MIN_POOL_TARGET_COUNT = 1
 _MAX_POOL_TARGET_COUNT = 600
+# Copy-ready inventory is deliberately shallower than the 300-row candidate
+# pool: three complete 30-item expression batches keep several UI/CLI serves
+# warm while avoiding copy for rows that expire unseen. Recalibrate after a
+# provider/model swap or a material serve-size change (CLAUDE.md pitfall #3).
+_DEFAULT_COPY_READY_TARGET_COUNT = 90
+_MIN_COPY_READY_TARGET_COUNT = 0  # 0 restores legacy drain-the-whole-backlog mode.
+_MAX_COPY_READY_TARGET_COUNT = _MAX_POOL_TARGET_COUNT
+_DEFAULT_EVAL_MIN_BATCH_SIZE = 15
+_MIN_EVAL_MIN_BATCH_SIZE = 1
+_MAX_EVAL_MIN_BATCH_SIZE = 90
+_DEFAULT_EVAL_MAX_WAIT_SECONDS = 90.0
+_MIN_EVAL_MAX_WAIT_SECONDS = 0.0
+_MAX_EVAL_MAX_WAIT_SECONDS = 600.0
 _DEFAULT_EXTENSION_DISCONNECT_GRACE_SECONDS = 90
 _DEFAULT_EXTENSION_TOKEN_TTL_HOURS = 24
+_DEFAULT_SOURCE_INCREMENTAL_HOURS = 24
+_MIN_SOURCE_INCREMENTAL_HOURS = 0
+_MAX_SOURCE_INCREMENTAL_HOURS = 168
 _DEFAULT_REFRESH_CHECK_INTERVAL_SECONDS = 60
 _DEFAULT_SIGNAL_EVENT_THRESHOLD = 6
 _DEFAULT_TRENDING_REFRESH_MINUTES = 3
@@ -109,6 +125,7 @@ _DEFAULT_HISTORY_WINDOW_HOURS = 48
 _DEFAULT_CLAIM_LEASE_MINUTES = 10
 _DEFAULT_PLANNER_POLL_SECONDS = 120
 _DEFAULT_PLAN_TTL_HOURS = 12
+_DEFAULT_KEYWORD_DIGEST_GRACE_HOURS = 24
 # Phase-2 config collapse: these constants are the ``medium`` breadth tier
 # (the pre-collapse per-knob defaults, item-identical — a table-driven test
 # guards the equality so upgrading is zero behavior drift).
@@ -130,6 +147,9 @@ _DEFAULT_INSPIRATION_SEARCH_BACKENDS: tuple[str, ...] = (
 )
 _DEFAULT_ADMISSION_MIN_SCORE = 0.60
 _DEFAULT_CANDIDATE_EVAL_CONCURRENCY = 3
+_MIN_ADMISSION_MIN_SCORE = 0.50
+_DEFAULT_EVAL_PREFILTER_MODE = "shadow"
+_SUPPORTED_EVAL_PREFILTER_MODES = {"off", "shadow", "enforce"}
 _DEFAULT_MULTIMODAL_BATCH_SIZE = 8
 _DEFAULT_MULTIMODAL_IMAGE_MAX_PX = 384
 _DEFAULT_MULTIMODAL_IMAGE_QUALITY = 72
@@ -155,6 +175,15 @@ _DEFAULT_POOL_SOURCE_SHARES = {
     "zhihu": 1,
     "reddit": 1,
     "bangumi": 1,
+}
+
+_SOURCE_INCREMENTAL_ENV_FIELDS = {
+    "OPENBILICLAW_SCHEDULER_SOURCE_INCREMENTAL_HOURS": "source_incremental_hours",
+    "OPENBILICLAW_SCHEDULER_XHS_INCREMENTAL_HOURS": "xhs_incremental_hours",
+    "OPENBILICLAW_SCHEDULER_DOUYIN_INCREMENTAL_HOURS": "douyin_incremental_hours",
+    "OPENBILICLAW_SCHEDULER_YOUTUBE_INCREMENTAL_HOURS": "youtube_incremental_hours",
+    "OPENBILICLAW_SCHEDULER_ZHIHU_INCREMENTAL_HOURS": "zhihu_incremental_hours",
+    "OPENBILICLAW_SCHEDULER_REDDIT_INCREMENTAL_HOURS": "reddit_incremental_hours",
 }
 _DEFAULT_AUTO_UPDATE_ALLOWED_REMOTES = [
     "https://github.com/whiteguo233/OpenBiliClaw.git",
@@ -900,11 +929,22 @@ class SchedulerConfig:
     extension_disconnect_grace_seconds: int = _DEFAULT_EXTENSION_DISCONNECT_GRACE_SECONDS
     discovery_cron: str = "0 */8 * * *"
     pool_target_count: int = 300
+    copy_ready_target_count: int = _DEFAULT_COPY_READY_TARGET_COUNT
     pool_source_shares: dict[str, int] = field(
         default_factory=lambda: dict(_DEFAULT_POOL_SOURCE_SHARES)
     )
     account_sync_interval_hours: int = 6
+    # Extension-online periodic account bootstrap refresh.  Zero disables the
+    # global schedule; a source override of ``None`` inherits the global value.
+    source_incremental_hours: int = _DEFAULT_SOURCE_INCREMENTAL_HOURS
+    xhs_incremental_hours: int | None = None
+    douyin_incremental_hours: int | None = None
+    youtube_incremental_hours: int | None = None
+    zhihu_incremental_hours: int | None = None
+    reddit_incremental_hours: int | None = None
     refresh_check_interval_seconds: int = _DEFAULT_REFRESH_CHECK_INTERVAL_SECONDS
+    eval_min_batch_size: int = _DEFAULT_EVAL_MIN_BATCH_SIZE
+    eval_max_wait_seconds: float = _DEFAULT_EVAL_MAX_WAIT_SECONDS
     signal_event_threshold: int = _DEFAULT_SIGNAL_EVENT_THRESHOLD
     # 2026-07-26: unit changed hours → minutes and both aligned to 3, so the
     # Bilibili main-discovery cadence matches every source producer's
@@ -996,6 +1036,9 @@ class DiscoveryConfig:
     # Plan staleness backstop: pending keywords older than this expire even if
     # the profile digest hasn't changed.
     plan_ttl_hours: int = _DEFAULT_PLAN_TTL_HOURS
+    # Recent safe regular keywords may survive profile-digest churn without
+    # losing their original generation provenance. 0 restores hard expiry.
+    keyword_digest_grace_hours: int = _DEFAULT_KEYWORD_DIGEST_GRACE_HOURS
     # Search-inspired query brainstorming stage. Default on in hybrid mode:
     # the merged keyword planner keeps running while the inspiration flow adds
     # grounded adjacent concepts and metadata-bearing keywords.
@@ -1015,6 +1058,9 @@ class DiscoveryConfig:
     # 3×30 design caps this at three (90 raw candidates in flight); runtime
     # also reserves one global LLM slot, so the effective count may be lower.
     candidate_eval_concurrency: int = _DEFAULT_CANDIDATE_EVAL_CONCURRENCY
+    # Embedding pre-filter rollout for discovery evaluation. ``shadow`` logs
+    # would-be filtered candidates without suppressing LLM evaluation.
+    eval_prefilter_mode: str = _DEFAULT_EVAL_PREFILTER_MODE
     # Optional cover-image evaluation. Kept off by default because it changes
     # LLM cost/latency and requires a vision-capable evaluation model.
     multimodal_evaluation_enabled: bool = False
@@ -1064,18 +1110,17 @@ class XiaohongshuSourceConfig:
     # browser session. Init --yes-xhs or the settings page can enable it later.
     enabled: bool = False
     # Max Soul-driven search tasks the backend may enqueue per day.
-    daily_search_budget: int = 0
+    daily_search_budget: int = 20
     # Max creator-subscription fetch tasks per day.
     daily_creator_budget: int = 0
     # Minimum seconds the backend permits between extension-dispatched
-    # search/creator task claims. Persisted centrally so MV3/browser restarts
-    # and multiple extension profiles cannot bypass the pacing floor.
-    task_interval_seconds: int = 300
-    # Minimum gap between two producer runs for this source. Aligned to 3
-    # minutes across every source (2026-07-26) so pool replenishment has one
-    # cadence instead of eight; the per-run size is still bounded by
-    # ``[scheduler].discovery_limit`` and each branch's daily budget.
-    min_interval_minutes: int = 3
+    # search/creator task claims. This is a target: each claim applies stable
+    # ±25% jitter and persists the resulting next-claim time centrally.
+    task_interval_seconds: int = 1200
+    # Minimum gap between two producer runs for this source. Keep production
+    # aligned with the 20-minute claim target; queue backlog is separately
+    # bounded before the producer claims or generates more keywords.
+    min_interval_minutes: int = 20
 
 
 @dataclass
@@ -1322,6 +1367,7 @@ POSTURE_GATE_ENFORCE_RECENT_WINDOW_DAYS = 7
 POSTURE_GATE_ENFORCE_MIN_RECENT_COUNT = 1
 _POSTURE_GATE_MODES = frozenset({"shadow", "enforce", "off"})
 _TOPIC_LIFECYCLE_SERIALIZATION_MODES = frozenset({"off", "on"})
+_COGNITION_PROMPT_VIEW_MODES = frozenset({"legacy", "compact-v1"})
 
 
 @dataclass
@@ -1337,6 +1383,13 @@ class SoulConfig:
     """
 
     preference: SoulPreferenceConfig = field(default_factory=SoulPreferenceConfig)
+    # Provider-agnostic LLM input projections are rolled out independently per
+    # cognition task. ``legacy`` is the byte-for-byte rollback path;
+    # ``compact-v1`` removes internal event fields and duplicate profile
+    # subtrees while preserving the model-visible evidence contract.
+    preference_prompt_view: str = "legacy"
+    awareness_prompt_view: str = "compact-v1"
+    insight_prompt_view: str = "legacy"
     posture_gate_mode: str = "shadow"
     posture_gate_force_enforce: bool = False
     # Topic-lifecycle serialization (spec §Phase 4). ``off`` (default) keeps the
@@ -1519,6 +1572,12 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
         # `_build_api_auth` reads every API_AUTH_ENV_VARS var explicitly, so skip
         # them here entirely (review r7#1).
         if env_key in API_AUTH_ENV_VARS or env_key in TLS_PROXY_ENV_VARS:
+            continue
+        incremental_field = _SOURCE_INCREMENTAL_ENV_FIELDS.get(env_key)
+        if incremental_field is not None:
+            scheduler = raw.setdefault("scheduler", {})
+            if isinstance(scheduler, dict):
+                scheduler[incremental_field] = env_value
             continue
         parts = env_key[len(prefix) :].lower().split("_")
         current = raw
@@ -1925,10 +1984,10 @@ def _build_config(raw: dict[str, Any]) -> Config:
         ),
         xiaohongshu=XiaohongshuSourceConfig(
             enabled=bool(xhs_raw.get("enabled", False)),
-            daily_search_budget=int(xhs_raw.get("daily_search_budget", 0)),
+            daily_search_budget=int(xhs_raw.get("daily_search_budget", 20)),
             daily_creator_budget=int(xhs_raw.get("daily_creator_budget", 0)),
-            task_interval_seconds=int(xhs_raw.get("task_interval_seconds", 300)),
-            min_interval_minutes=max(0, int(xhs_raw.get("min_interval_minutes", 3))),
+            task_interval_seconds=int(xhs_raw.get("task_interval_seconds", 1200)),
+            min_interval_minutes=max(0, int(xhs_raw.get("min_interval_minutes", 20))),
         ),
         douyin=DouyinSourceConfig(
             enabled=bool(douyin_raw.get("enabled", False)),
@@ -2029,6 +2088,15 @@ def _build_config(raw: dict[str, Any]) -> Config:
         soul_raw.get("preference", {}) if isinstance(soul_raw.get("preference"), dict) else {}
     )
     raw_gate_mode = str(soul_raw.get("posture_gate_mode", "shadow") or "shadow").strip().lower()
+    raw_preference_prompt_view = (
+        str(soul_raw.get("preference_prompt_view", "legacy") or "legacy").strip().lower()
+    )
+    raw_awareness_prompt_view = (
+        str(soul_raw.get("awareness_prompt_view", "compact-v1") or "compact-v1").strip().lower()
+    )
+    raw_insight_prompt_view = (
+        str(soul_raw.get("insight_prompt_view", "legacy") or "legacy").strip().lower()
+    )
     raw_lifecycle = (
         str(soul_raw.get("topic_lifecycle_serialization", "off") or "off").strip().lower()
     )
@@ -2038,6 +2106,9 @@ def _build_config(raw: dict[str, Any]) -> Config:
                 soul_preference_raw.get("satisfaction_filter_enabled", True)
             ),
         ),
+        preference_prompt_view=raw_preference_prompt_view,
+        awareness_prompt_view=raw_awareness_prompt_view,
+        insight_prompt_view=raw_insight_prompt_view,
         posture_gate_mode=raw_gate_mode if raw_gate_mode in _POSTURE_GATE_MODES else "shadow",
         posture_gate_force_enforce=bool(soul_raw.get("posture_gate_force_enforce", False)),
         topic_lifecycle_serialization=(
@@ -2084,10 +2155,58 @@ def _build_config(raw: dict[str, Any]) -> Config:
                     "pool_source_shares": _normalize_pool_source_shares(
                         sched_raw.get("pool_source_shares")
                     ),
+                    "source_incremental_hours": _normalize_source_incremental_hours(
+                        sched_raw.get("source_incremental_hours"),
+                        default=_DEFAULT_SOURCE_INCREMENTAL_HOURS,
+                        allow_none=False,
+                    ),
+                    "xhs_incremental_hours": _normalize_source_incremental_hours(
+                        sched_raw.get("xhs_incremental_hours"),
+                        default=None,
+                        allow_none=True,
+                    ),
+                    "douyin_incremental_hours": _normalize_source_incremental_hours(
+                        sched_raw.get("douyin_incremental_hours"),
+                        default=None,
+                        allow_none=True,
+                    ),
+                    "youtube_incremental_hours": _normalize_source_incremental_hours(
+                        sched_raw.get("youtube_incremental_hours"),
+                        default=None,
+                        allow_none=True,
+                    ),
+                    "zhihu_incremental_hours": _normalize_source_incremental_hours(
+                        sched_raw.get("zhihu_incremental_hours"),
+                        default=None,
+                        allow_none=True,
+                    ),
+                    "reddit_incremental_hours": _normalize_source_incremental_hours(
+                        sched_raw.get("reddit_incremental_hours"),
+                        default=None,
+                        allow_none=True,
+                    ),
+                    "copy_ready_target_count": _normalize_scheduler_int(
+                        sched_raw.get("copy_ready_target_count"),
+                        default=_DEFAULT_COPY_READY_TARGET_COUNT,
+                        min_value=_MIN_COPY_READY_TARGET_COUNT,
+                        max_value=_MAX_COPY_READY_TARGET_COUNT,
+                    ),
                     "refresh_check_interval_seconds": _normalize_scheduler_int(
                         sched_raw.get("refresh_check_interval_seconds"),
                         default=_DEFAULT_REFRESH_CHECK_INTERVAL_SECONDS,
                         min_value=15,
+                    ),
+                    "eval_min_batch_size": _normalize_scheduler_int(
+                        sched_raw.get("eval_min_batch_size"),
+                        default=_DEFAULT_EVAL_MIN_BATCH_SIZE,
+                        min_value=_MIN_EVAL_MIN_BATCH_SIZE,
+                        max_value=_MAX_EVAL_MIN_BATCH_SIZE,
+                    ),
+                    "eval_max_wait_seconds": _normalize_scheduler_float(
+                        sched_raw.get("eval_max_wait_seconds"),
+                        default=_DEFAULT_EVAL_MAX_WAIT_SECONDS,
+                        min_value=_MIN_EVAL_MAX_WAIT_SECONDS,
+                        max_value=_MAX_EVAL_MAX_WAIT_SECONDS,
                     ),
                     "signal_event_threshold": _normalize_scheduler_int(
                         sched_raw.get("signal_event_threshold"),
@@ -2285,6 +2404,12 @@ def _build_discovery(discovery_raw: dict[str, Any]) -> DiscoveryConfig:
             default=_DEFAULT_PLAN_TTL_HOURS,
             min_value=1,
         ),
+        keyword_digest_grace_hours=_normalize_scheduler_int(
+            discovery_raw.get("keyword_digest_grace_hours"),
+            default=_DEFAULT_KEYWORD_DIGEST_GRACE_HOURS,
+            min_value=0,
+            max_value=168,
+        ),
         inspiration_search_enabled=_coerce_bool(
             discovery_raw.get("inspiration_search_enabled"),
             default=True,
@@ -2308,6 +2433,9 @@ def _build_discovery(discovery_raw: dict[str, Any]) -> DiscoveryConfig:
             default=_DEFAULT_CANDIDATE_EVAL_CONCURRENCY,
             min_value=1,
             max_value=3,
+        ),
+        eval_prefilter_mode=_normalize_eval_prefilter_mode(
+            discovery_raw.get("eval_prefilter_mode")
         ),
         multimodal_evaluation_enabled=_coerce_bool(
             discovery_raw.get("multimodal_evaluation_enabled"),
@@ -2377,7 +2505,7 @@ def _build_discovery(discovery_raw: dict[str, Any]) -> DiscoveryConfig:
 
 
 def _normalize_probability(value: object, *, default: float) -> float:
-    """Normalize a TOML probability in the open interval ``(0, 1]``."""
+    """Normalize the admission floor in the supported interval ``[0.5, 1]``."""
     if isinstance(value, bool):
         return default
     if not isinstance(value, (int, float, str)):
@@ -2386,9 +2514,16 @@ def _normalize_probability(value: object, *, default: float) -> float:
         score = float(value)
     except (TypeError, ValueError):
         return default
-    if score <= 0.0 or score > 1.0:
+    if score < _MIN_ADMISSION_MIN_SCORE or score > 1.0:
         return default
     return score
+
+
+def _normalize_eval_prefilter_mode(value: object) -> str:
+    if not isinstance(value, str):
+        return _DEFAULT_EVAL_PREFILTER_MODE
+    mode = value.strip().lower()
+    return mode or _DEFAULT_EVAL_PREFILTER_MODE
 
 
 def _coerce_bool(value: object, *, default: bool = False) -> bool:
@@ -2949,6 +3084,51 @@ def _normalize_scheduler_int(
     return normalized
 
 
+def _normalize_source_incremental_hours(
+    value: object,
+    *,
+    default: int | None,
+    allow_none: bool,
+    strict: bool = False,
+) -> int | None:
+    """Normalize an extension-bootstrap interval using one shared contract.
+
+    ``None`` is meaningful only for per-source overrides and means "inherit
+    the global interval".  Every concrete value is an integer in ``0..168``;
+    zero is the explicit disable value.  Config loading falls back to the
+    supplied default for malformed values, while save/API validation can ask
+    for the same function to raise instead.
+    """
+
+    if value is None:
+        if allow_none:
+            return None
+        if strict:
+            raise ValueError("source_incremental_hours 必须是 0..168 的整数")
+        return default
+
+    parsed: int | None = None
+    if isinstance(value, bool):
+        parsed = None
+    elif isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if text:
+            try:
+                parsed = int(text)
+            except ValueError:
+                parsed = None
+
+    if parsed is None or not (
+        _MIN_SOURCE_INCREMENTAL_HOURS <= parsed <= _MAX_SOURCE_INCREMENTAL_HOURS
+    ):
+        if strict:
+            raise ValueError("source incremental interval must be an integer in 0..168")
+        return default
+    return parsed
+
+
 def _normalize_inspiration_breadth(value: object) -> str:
     """Validate the breadth tier; unset → default, invalid → ConfigError."""
     if value is None:
@@ -2956,6 +3136,31 @@ def _normalize_inspiration_breadth(value: object) -> str:
     tier = str(value).strip().lower()
     derive_inspiration_breadth_params(tier)  # raises ConfigError when invalid
     return tier
+
+
+def _normalize_scheduler_float(
+    value: object,
+    *,
+    default: float,
+    min_value: float,
+    max_value: float | None = None,
+) -> float:
+    """Normalize scheduler tuning values into bounded floats."""
+    if isinstance(value, int | float):
+        normalized = float(value)
+    elif isinstance(value, str):
+        try:
+            normalized = float(value.strip())
+        except ValueError:
+            return default
+    else:
+        return default
+
+    if normalized < min_value:
+        return default
+    if max_value is not None and normalized > max_value:
+        return default
+    return normalized
 
 
 def _normalize_auto_update_allowed_remotes(value: object) -> list[str]:
@@ -3172,6 +3377,31 @@ def _collect_config_issues(config: Config) -> list[ConfigIssue]:
     """Collect non-fatal config issues to display as guidance."""
     issues: list[ConfigIssue] = []
 
+    incremental_intervals = (
+        ("source_incremental_hours", config.scheduler.source_incremental_hours, False),
+        ("xhs_incremental_hours", config.scheduler.xhs_incremental_hours, True),
+        ("douyin_incremental_hours", config.scheduler.douyin_incremental_hours, True),
+        ("youtube_incremental_hours", config.scheduler.youtube_incremental_hours, True),
+        ("zhihu_incremental_hours", config.scheduler.zhihu_incremental_hours, True),
+        ("reddit_incremental_hours", config.scheduler.reddit_incremental_hours, True),
+    )
+    for field_name, value, allow_none in incremental_intervals:
+        try:
+            _normalize_source_incremental_hours(
+                value,
+                default=None if allow_none else _DEFAULT_SOURCE_INCREMENTAL_HOURS,
+                allow_none=allow_none,
+                strict=True,
+            )
+        except ValueError as exc:
+            issues.append(
+                ConfigIssue(
+                    field=f"scheduler.{field_name}",
+                    message=str(exc),
+                    severity="blocking",
+                )
+            )
+
     try:
         from openbiliclaw.sources.bangumi_client import validate_bangumi_username
 
@@ -3231,6 +3461,23 @@ def _collect_config_issues(config: Config) -> list[ConfigIssue]:
             )
         )
 
+    for field_name in (
+        "preference_prompt_view",
+        "awareness_prompt_view",
+        "insight_prompt_view",
+    ):
+        raw_prompt_view = getattr(config.soul, field_name)
+        if str(raw_prompt_view or "").strip().lower() not in _COGNITION_PROMPT_VIEW_MODES:
+            issues.append(
+                ConfigIssue(
+                    field=f"soul.{field_name}",
+                    message=(
+                        f"不支持的 {field_name}: `{raw_prompt_view}`。仅支持: legacy, compact-v1。"
+                    ),
+                    severity="blocking",
+                )
+            )
+
     if (
         str(config.soul.topic_lifecycle_serialization or "").strip().lower()
         not in _TOPIC_LIFECYCLE_SERIALIZATION_MODES
@@ -3266,6 +3513,21 @@ def _collect_config_issues(config: Config) -> list[ConfigIssue]:
                     severity="blocking",
                 )
             )
+
+    if not (
+        _MIN_COPY_READY_TARGET_COUNT
+        <= config.scheduler.copy_ready_target_count
+        <= _MAX_COPY_READY_TARGET_COUNT
+    ):
+        issues.append(
+            ConfigIssue(
+                field="scheduler.copy_ready_target_count",
+                message=(
+                    "`scheduler.copy_ready_target_count` 必须在 "
+                    f"{_MIN_COPY_READY_TARGET_COUNT}..{_MAX_COPY_READY_TARGET_COUNT} 之间。"
+                ),
+            )
+        )
 
     if config.llm.instance_routing:
         issues.extend(_collect_llm_instance_routing_issues(config.llm))
@@ -3509,6 +3771,44 @@ def _collect_config_issues(config: Config) -> list[ConfigIssue]:
                     "`scheduler.pool_target_count` 必须在 "
                     f"{_MIN_POOL_TARGET_COUNT}..{_MAX_POOL_TARGET_COUNT} 之间。"
                 ),
+            )
+        )
+
+    if not (
+        _MIN_EVAL_MIN_BATCH_SIZE <= config.scheduler.eval_min_batch_size <= _MAX_EVAL_MIN_BATCH_SIZE
+    ):
+        issues.append(
+            ConfigIssue(
+                field="scheduler.eval_min_batch_size",
+                message=(
+                    "`scheduler.eval_min_batch_size` 必须在 "
+                    f"{_MIN_EVAL_MIN_BATCH_SIZE}..{_MAX_EVAL_MIN_BATCH_SIZE} 之间。"
+                ),
+            )
+        )
+
+    if not (
+        _MIN_EVAL_MAX_WAIT_SECONDS
+        <= config.scheduler.eval_max_wait_seconds
+        <= _MAX_EVAL_MAX_WAIT_SECONDS
+    ):
+        issues.append(
+            ConfigIssue(
+                field="scheduler.eval_max_wait_seconds",
+                message=(
+                    "`scheduler.eval_max_wait_seconds` 必须在 "
+                    f"{_MIN_EVAL_MAX_WAIT_SECONDS:g}..{_MAX_EVAL_MAX_WAIT_SECONDS:g} 之间。"
+                ),
+            )
+        )
+
+    eval_prefilter_mode = str(config.discovery.eval_prefilter_mode or "").strip().lower()
+    if eval_prefilter_mode not in _SUPPORTED_EVAL_PREFILTER_MODES:
+        issues.append(
+            ConfigIssue(
+                field="discovery.eval_prefilter_mode",
+                message='`discovery.eval_prefilter_mode` 仅支持: "off", "shadow", "enforce"。',
+                severity="blocking",
             )
         )
 
@@ -4034,6 +4334,20 @@ def save_config(
     )
 
     _validate_auto_update_check_interval(config.scheduler.auto_update_check_interval_hours)
+    for field_name, allow_none in (
+        ("source_incremental_hours", False),
+        ("xhs_incremental_hours", True),
+        ("douyin_incremental_hours", True),
+        ("youtube_incremental_hours", True),
+        ("zhihu_incremental_hours", True),
+        ("reddit_incremental_hours", True),
+    ):
+        _normalize_source_incremental_hours(
+            getattr(config.scheduler, field_name),
+            default=None if allow_none else _DEFAULT_SOURCE_INCREMENTAL_HOURS,
+            allow_none=allow_none,
+            strict=True,
+        )
     config.sources.bangumi.username = validate_bangumi_username(config.sources.bangumi.username)
     config.sources.bangumi.access_token = validate_bangumi_access_token(
         config.sources.bangumi.access_token
@@ -4285,8 +4599,37 @@ def _render_config_toml(
             f"{config.scheduler.extension_disconnect_grace_seconds}",
             f"discovery_cron = {_toml_string(config.scheduler.discovery_cron)}",
             f"pool_target_count = {config.scheduler.pool_target_count}",
+            f"copy_ready_target_count = {config.scheduler.copy_ready_target_count}",
             f"account_sync_interval_hours = {config.scheduler.account_sync_interval_hours}",
+            f"source_incremental_hours = {config.scheduler.source_incremental_hours}",
+            *(
+                [f"xhs_incremental_hours = {config.scheduler.xhs_incremental_hours}"]
+                if config.scheduler.xhs_incremental_hours is not None
+                else []
+            ),
+            *(
+                [f"douyin_incremental_hours = {config.scheduler.douyin_incremental_hours}"]
+                if config.scheduler.douyin_incremental_hours is not None
+                else []
+            ),
+            *(
+                [f"youtube_incremental_hours = {config.scheduler.youtube_incremental_hours}"]
+                if config.scheduler.youtube_incremental_hours is not None
+                else []
+            ),
+            *(
+                [f"zhihu_incremental_hours = {config.scheduler.zhihu_incremental_hours}"]
+                if config.scheduler.zhihu_incremental_hours is not None
+                else []
+            ),
+            *(
+                [f"reddit_incremental_hours = {config.scheduler.reddit_incremental_hours}"]
+                if config.scheduler.reddit_incremental_hours is not None
+                else []
+            ),
             f"refresh_check_interval_seconds = {config.scheduler.refresh_check_interval_seconds}",
+            f"eval_min_batch_size = {config.scheduler.eval_min_batch_size}",
+            f"eval_max_wait_seconds = {config.scheduler.eval_max_wait_seconds:g}",
             f"signal_event_threshold = {config.scheduler.signal_event_threshold}",
             f"trending_refresh_minutes = {config.scheduler.trending_refresh_minutes}",
             f"explore_refresh_minutes = {config.scheduler.explore_refresh_minutes}",
@@ -4360,6 +4703,7 @@ def _render_config_toml(
             f"claim_lease_minutes = {config.discovery.claim_lease_minutes}",
             f"planner_poll_seconds = {config.discovery.planner_poll_seconds}",
             f"plan_ttl_hours = {config.discovery.plan_ttl_hours}",
+            f"keyword_digest_grace_hours = {config.discovery.keyword_digest_grace_hours}",
             f"admission_min_score = {config.discovery.admission_min_score:g}",
             f"candidate_eval_concurrency = {config.discovery.candidate_eval_concurrency}",
             "inspiration_search_enabled = "
@@ -4369,6 +4713,7 @@ def _render_config_toml(
             "inspiration_replace_merged_keywords = "
             f"{_toml_bool(config.discovery.inspiration_replace_merged_keywords)}",
             f"inspiration_breadth = {_toml_string(config.discovery.inspiration_breadth)}",
+            f"eval_prefilter_mode = {_toml_string(config.discovery.eval_prefilter_mode)}",
             "multimodal_evaluation_enabled = "
             f"{_toml_bool(config.discovery.multimodal_evaluation_enabled)}",
             f"visual_profile_enabled = {_toml_bool(config.discovery.visual_profile_enabled)}",
@@ -4408,6 +4753,11 @@ def _render_config_toml(
             f"unmanaged_max_age_days = {config.logging.unmanaged_max_age_days}",
             "",
             "[soul]",
+            "# Provider-agnostic cognition prompt views. Each task rolls out",
+            "# independently; legacy is the byte-compatible rollback path.",
+            f"preference_prompt_view = {_toml_string(config.soul.preference_prompt_view)}",
+            f"awareness_prompt_view = {_toml_string(config.soul.awareness_prompt_view)}",
+            f"insight_prompt_view = {_toml_string(config.soul.insight_prompt_view)}",
             "# Deep-write consistency gate (spec Phase 3). shadow = async",
             "# side-channel judging without blocking writes (default);",
             "# enforce = synchronous gate (savable only after >=14 days of",

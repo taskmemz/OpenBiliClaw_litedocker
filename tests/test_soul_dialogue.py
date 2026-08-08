@@ -386,6 +386,42 @@ def test_dialogue_clear_history_resets_turns() -> None:
     assert dialogue.history == []
 
 
+@pytest.mark.asyncio
+async def test_respond_with_tools_never_consults_phantom_core_memory_block() -> None:
+    """The tool path must not probe for ``_build_core_memory_block``.
+
+    That method exists on no real service; core-memory injection happens inside
+    ``complete_with_tools`` / ``complete_with_core_memory``. A service that *does*
+    expose the attribute must never see it called — under the old getattr probe
+    it would be, which is exactly the dead plumbing removed in Task 3.
+    """
+    consulted = False
+
+    class ProbeTrackingToolService:
+        def _build_core_memory_block(self) -> str:
+            nonlocal consulted
+            consulted = True
+            return "PHANTOM_CORE_MEMORY"
+
+        async def complete_with_tools(self, **kwargs: object) -> LLMResponse:
+            return LLMResponse(content="工具路径直接回复")
+
+    dialogue = SocraticDialogue(
+        llm=None,
+        soul_engine=SimpleNamespace(learn_from_dialogue=AsyncMock()),
+        llm_service=ProbeTrackingToolService(),
+        tools=[{"name": "noop"}],
+        tool_dispatcher=object(),
+        learning_mode=DialogueLearningMode.LEGACY_DIRECT,
+    )
+
+    reply = await dialogue.respond("你好")
+    await asyncio.sleep(0)
+
+    assert reply == "工具路径直接回复"
+    assert consulted is False
+
+
 def test_dialogue_reuses_soul_engine_service_identity() -> None:
     shared_service = FakeService(response="共享")
     soul_engine = FakeSoulEngine()

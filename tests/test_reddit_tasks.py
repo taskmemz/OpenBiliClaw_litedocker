@@ -13,10 +13,136 @@ from openbiliclaw.sources.reddit_tasks import (
     probe_reddit_command_backend,
     recent_reddit_related_urls,
     recent_reddit_subreddits,
+    reddit_bootstrap_item_key,
     reddit_items_to_contents,
     reddit_items_to_events,
     sync_rdt_credential_from_cookie_header,
 )
+
+
+def test_reddit_bootstrap_item_key_covers_all_account_scopes() -> None:
+    assert reddit_bootstrap_item_key({"content_type": "post", "id": "post-1"}) == "t3_post-1"
+    assert reddit_bootstrap_item_key({"kind": "t1", "id": "comment-1"}) == "t1_comment-1"
+    assert (
+        reddit_bootstrap_item_key(
+            {
+                "scope": "reddit_subscribed",
+                "content_type": "subreddit",
+                "subreddit": "r/LocalLLaMA",
+            }
+        )
+        == "sr_localllama"
+    )
+    assert (
+        reddit_bootstrap_item_key({"content_type": "user", "username": "u/Agent_Builder"})
+        == "usr_agent_builder"
+    )
+
+
+def test_reddit_bootstrap_item_key_uses_stable_identity_before_url_fallback() -> None:
+    original = {
+        "content_type": "post",
+        "id": "stable-post",
+        "title": "Original title",
+        "url": "https://www.reddit.com/r/test/comments/stable-post/old-title/?t=old",
+    }
+    changed = {
+        **original,
+        "title": "Updated title",
+        "url": "https://www.reddit.com/r/test/comments/stable-post/new-title/?t=new",
+    }
+
+    assert reddit_bootstrap_item_key(original) == "t3_stable-post"
+    assert reddit_bootstrap_item_key(changed) == "t3_stable-post"
+    assert (
+        reddit_bootstrap_item_key(
+            {
+                "content_type": "comment",
+                "url": "https://www.reddit.com/r/test/comments/post-1/comment-1/",
+            }
+        )
+        == ""
+    )
+    assert (
+        reddit_bootstrap_item_key(
+            {
+                "content_type": "comment",
+                "url": "https://www.reddit.com/r/test/comments/post-1/title/comment-1/",
+            }
+        )
+        == "t1_comment-1"
+    )
+    assert (
+        reddit_bootstrap_item_key(
+            {
+                "content_type": "comment",
+                "post_id": "post-1",
+                "comment_id": "comment-1",
+            }
+        )
+        == "t1_comment-1"
+    )
+
+
+def test_reddit_bootstrap_item_key_rejects_unidentifiable_rows_and_deduplicates_batch() -> None:
+    assert reddit_bootstrap_item_key({}) == ""
+    assert reddit_bootstrap_item_key({"title": "not an identity"}) == ""
+    assert (
+        reddit_bootstrap_item_key(
+            {
+                "scope": "reddit_subscribed",
+                "content_type": "subreddit",
+                "title": "mutable community title",
+            }
+        )
+        == ""
+    )
+    assert reddit_bootstrap_item_key({"id": {"nested": "no"}}) == ""
+    assert (
+        reddit_bootstrap_item_key(
+            {
+                "content_type": "comment",
+                "name": "t3_parent-post",
+                "id": "parent-post",
+                "body": "opposite fullname must not fall through to a bare id",
+            }
+        )
+        == ""
+    )
+
+    rows = [
+        {"content_type": "post", "id": "same"},
+        {"content_type": "post", "id": "same", "title": "rerendered"},
+        {"content_type": "comment", "id": "same"},
+        {"content_type": "subreddit", "subreddit": "Example"},
+        {"content_type": "user", "username": "Example"},
+    ]
+    assert (
+        len({reddit_bootstrap_item_key(row) for row in rows if reddit_bootstrap_item_key(row)}) == 4
+    )
+
+
+def test_reddit_staged_result_is_not_expired_as_stale_pending(tmp_path) -> None:
+    from openbiliclaw.storage.database import Database
+
+    database = Database(tmp_path / "reddit-staged.db")
+    database.initialize()
+    queue = RedditTaskQueue(database)
+    task_id = queue.enqueue_with_id("bootstrap_events", {}, daily_budget=0)
+    assert task_id is not None
+    queue.stage_final_result(
+        task_id,
+        terminal_status="ok",
+        items=[{"scope": "reddit_saved", "content_type": "post", "id": "staged"}],
+    )
+    database.conn.execute(
+        "UPDATE reddit_tasks SET created_at = '2000-01-01 00:00:00' WHERE id = ?",
+        (task_id,),
+    )
+    database.conn.commit()
+
+    assert queue.expire_stale_pending(("bootstrap_events",), older_than_seconds=0) == 0
+    assert queue.get(task_id)["status"] == "pending"
 
 
 def test_parse_reddit_command_output_accepts_json_wrappers() -> None:
@@ -223,6 +349,49 @@ def test_reddit_items_to_events_maps_bootstrap_scopes_to_profile_signals() -> No
     assert events[2]["metadata"]["signal_strength"] == 0.65
     assert events[2]["metadata"]["source_platform"] == "reddit"
     assert events[2]["context"].startswith("在Reddit关注了")
+
+
+def test_reddit_event_conversion_requires_and_preserves_type_specific_identity() -> None:
+    events = reddit_items_to_events(
+        [
+            {
+                "scope": "reddit_upvoted",
+                "content_type": "comment",
+                "post_id": "parent-post",
+                "comment_id": "comment-a",
+                "body": "first comment",
+                "url": "https://www.reddit.com/r/test/comments/parent/title/comment-a/",
+            },
+            {
+                "scope": "reddit_upvoted",
+                "content_type": "comment",
+                "post_id": "parent-post",
+                "comment_id": "comment-b",
+                "body": "second comment",
+                "url": "https://www.reddit.com/r/test/comments/parent/title/comment-b/",
+            },
+            {
+                "scope": "reddit_upvoted",
+                "content_type": "comment",
+                "post_id": "parent-post",
+                "body": "no stable comment identity",
+                "url": "https://www.reddit.com/r/test/comments/parent/title/",
+            },
+            {
+                "scope": "reddit_upvoted",
+                "content_type": "comment",
+                "name": "t3_parent-post",
+                "id": "parent-post",
+                "body": "opposite fullname must not fall through to a bare id",
+            },
+        ],
+        import_source="reddit_bootstrap_events",
+    )
+
+    assert [event["metadata"]["content_id"] for event in events] == [
+        "t1_comment-a",
+        "t1_comment-b",
+    ]
 
 
 def test_probe_reddit_command_backend_reports_missing_without_side_effects() -> None:

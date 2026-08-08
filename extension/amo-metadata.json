@@ -31,8 +31,8 @@
     "approval_notes": "OpenBiliClaw is local-first and requires a user-run backend. It does not load remote code or send telemetry to servers operated by the project. The optional all-sites host permission is requested only when a user explicitly configures a non-local backend; public hosts require HTTPS and device authentication. The declared data categories cover supported-site browsing/activity signals, user-triggered search and source tasks, locally stored authentication status, and comments/chat/danmaku text only after the user successfully submits it. Data is sent to the backend endpoint configured by the user. A reproducible source archive is attached; from its root run `cd extension`, `npm ci`, then `npm run build:firefox` using Node.js 22. The output submitted for review is `extension/dist-firefox`. See docs/firefox-amo-source-build.md and docs/privacy.md for the complete build and data-flow explanation.",
     "license": "MIT",
     "release_notes": {
-      "en-US": "Initial public AMO submission. Adds the reviewed Firefox distribution channel for OpenBiliClaw's local-first sidebar, cross-platform discovery, private profile, and recommendation feedback flows.",
-      "zh-CN": "首次提交 Firefox AMO 公开版本，为 OpenBiliClaw 本地优先侧边栏、跨平台发现、私有画像与推荐反馈链路增加经审核的自动更新渠道。"
+      "en-US": "Fixes pending-chat badges not refreshing promptly after the local backend comes back online, the runtime stream reconnects, or the Firefox sidebar becomes visible again. This maintenance release keeps the listed Firefox channel aligned with OpenBiliClaw 0.3.196.",
+      "zh-CN": "修复本地后端恢复在线、实时连接重连或 Firefox 侧边栏重新可见后，待聊确认数字角标未及时刷新的问题。本维护版本让 Firefox 公开渠道与 OpenBiliClaw 0.3.196 保持同步。"
     }
   }
 }

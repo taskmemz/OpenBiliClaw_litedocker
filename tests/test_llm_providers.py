@@ -432,6 +432,43 @@ async def test_openai_provider_does_not_retry_unauthorized(
 
 
 @pytest.mark.asyncio
+async def test_openai_provider_does_not_retry_missing_model_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAIProvider(
+        api_key="test-key",
+        base_url="https://api.sensenova.cn/compatible-mode/v1",
+        provider_name="openai_compatible",
+    )
+    calls = {"count": 0}
+
+    class NotFoundError(Exception):
+        status_code = 404
+        body = {
+            "error": {
+                "message": "model route not found",
+                "type": "not_found_error",
+                "code": "5",
+            }
+        }
+
+    async def fake_sleep(_: float) -> None:
+        pytest.fail("a missing model route should fail fast until config changes")
+
+    async def fake_create(**_: object) -> SimpleNamespace:
+        calls["count"] += 1
+        raise NotFoundError("Error code: 404")
+
+    monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+    monkeypatch.setattr("openbiliclaw.llm.openai_provider.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(LLMProviderError, match="model route not found"):
+        await provider.complete([{"role": "user", "content": "hi"}])
+
+    assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_openai_provider_treats_insufficient_balance_as_provider_backoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

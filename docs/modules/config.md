@@ -575,7 +575,7 @@ daemon，保留当前 v2 文件和自动备份，再由操作者显式把导出�
 >
 > `127.0.0.1` 与 `localhost` 并非总是等价：macOS 上 Chrome 常只绑定 IPv6 `::1:9222`，而 Python urllib 默认走 IPv4。用 `localhost` 最稳妥（`getaddrinfo` 会同时尝试两边）。
 
-> **关于 `daily_*_budget`：** 这些字段是**每 UTC 日、按任务类型的入队次数上限**，不是启用 / 关闭该来源的开关（来源开关是各段的 `enabled`）。`0`（或留空）表示不设每日上限，补池只受平台缺口 / `discovery_limit` / producer 节流控制。填 `1` 只会把该任务类型限制到每天 1 次——配置加载时对落在 1–4 的可疑值会打印一次 WARN 提示。
+> **关于 `daily_*_budget`：** 这些字段是**每 UTC 日、按任务类型的入队次数上限**，不是启用 / 关闭该来源的开关（来源开关是各段的 `enabled`）。显式填 `0` 表示不设每日上限，补池只受平台缺口 / `discovery_limit` / producer 节流控制；字段缺省时使用各来源表格所列默认值，其中小红书搜索为 `20`。填 `1` 只会把该任务类型限制到每天 1 次——配置加载时对落在 1–4 的可疑值会打印一次 WARN 提示。
 
 ### `[sources.bilibili]`
 
@@ -610,17 +610,19 @@ Bilibili discovery 的平台级开关。B 站账号登录 / Cookie 获取仍由 
 
 ### `[sources.xiaohongshu]`
 
-小红书专用配置。内容发现和元数据提取都由浏览器扩展在真实登录态下完成：被动收集、后台标签页搜索和创作者订阅都会通过扩展任务桥回写后端。主后端不主动爬取小红书，也不再依赖 `sidecar_url`。
+小红书专用配置。内容发现和元数据提取都由浏览器扩展在真实登录态下完成：被动收集、短暂前台渲染的搜索任务和创作者订阅都会通过扩展任务桥回写后端。主后端不主动爬取小红书，也不再依赖 `sidecar_url`。
 
 | 键 | 类型 | 默认值 | 说明 |
 |----|------|--------|------|
 | `enabled` | bool | `false` | 是否启用小红书 discovery 和 init bootstrap；默认关闭，`init` 选 Yes、`--yes-xhs` 或插件设置页打开后才会写回 `true`。关闭后 producer 停止产词，`/api/sources/xhs/next-task` 也不会领取此前已排队的自动 search / creator / bootstrap 任务，因此扩展不会继续打开自动发现页面；任务保留为 pending，重新开启后恢复 |
-| `daily_search_budget` | int | `0` | 每天后端允许入队的 Soul 驱动搜索任务数上限；`0` 表示不设每日上限，持续补池只受平台缺口、单轮 `discovery_limit` 和 producer 节流控制 |
+| `daily_search_budget` | int | `20` | 每天后端允许入队的 Soul 驱动搜索任务数上限；`0` 表示不设每日上限。默认 20 是保守工程起点，不代表小红书官方阈值 |
 | `daily_creator_budget` | int | `0` | 每天订阅创作者抓取任务上限；`0` 表示不设每日上限 |
-| `task_interval_seconds` | int | `300` | 后端领取连续 search / creator 任务的最小间隔（秒，默认 5 分钟）；下一次可领取时间持久化在 SQLite，后端重启、MV3 service worker 重启或多个浏览器 profile 都不能绕过。bootstrap 不受普通间隔限制，但仍受来源开关和平台风控冷却约束 |
-| `min_interval_minutes` | int | `3` | `XhsTaskProducer` 两次入队之间的最小间隔；`0` 表示每个 refresh tick 都允许检查执行。v0.3.186 前该项名为 `min_interval_hours`（默认 `1`）且不可配置，单位改为分钟以与其余来源对齐 |
+| `task_interval_seconds` | int | `1200` | 后端领取连续 search / creator 任务的**目标间隔**（默认 20 分钟）；每个任务按稳定的 ±25% 抖动得到实际 15–25 分钟窗口，下一次可领取时间持久化在 SQLite，后端重启、MV3 service worker 重启或多个浏览器 profile 都不能绕过。bootstrap 不受普通间隔限制，但仍受来源开关和平台风控冷却约束 |
+| `min_interval_minutes` | int | `20` | `XhsTaskProducer` 两次入队之间的最小间隔；producer 还会在 pending + in-progress 搜索任务达到 5 条时停止 claim / 生成关键词，只补到 5 条，不让积压继续增长。`0` 只关闭 producer 时间闸，不关闭这道积压门 |
 
-> **安全设计要点：** 后端从不直接调用小红书搜索 / Feed API。所有"主动发现"（关键词搜索、创作者主页浏览）都在用户自己的浏览器中以后台标签页形式执行，由扩展代理完成。被动发现则利用用户正常浏览时已经加载的卡片 URL，零额外请求。扩展识别到可见的安全验证、操作频繁或 HTTP 429 后会返回结构化 `rate_limited`；后端固定进入 1 小时持久化平台冷却，期间停止任务领取和关键词生产。该安全窗口当前故意不提供可调短配置，避免用户误把风控保护降到不安全值。
+> **默认值升级边界：** 上述 `20 / 1200 / 20` 只用于新配置或缺少对应键的配置。已有 `config.toml` 中显式写入的值（包括 `0 / 300 / 3`）继续原样读取，不做静默迁移或强制覆盖。
+>
+> **安全设计要点：** 后端从不直接调用小红书搜索 / Feed API。所有“主动发现”（关键词搜索、创作者主页浏览）都在用户自己的浏览器中由扩展代理完成；搜索页因隐藏标签不渲染笔记虚拟列表，会短暂切到前台，任务结束后自动关闭并恢复原标签。被动发现则利用用户正常浏览时已经加载的卡片 URL，零额外请求。扩展识别到可见的安全验证、操作频繁或 HTTP 429 后会返回结构化 `rate_limited`；后端按连续风控轮次使用 `1h → 2h → 4h → 8h → 16h → 24h` 持久化冷却（24 小时封顶），同一活动冷却内的重复报告不增加轮次，冷却后完成一条正常 search / creator 任务才重置。冷却期间停止全部任务领取和关键词生产；安全窗口不提供可调短配置。
 
 ### `[sources.douyin]`
 
@@ -746,13 +748,21 @@ TOML 与显式环境变量覆盖在构造 `SchedulerConfig` 前统一归一为�
 
 | 键 | 类型 | 默认值 | 说明 |
 |----|------|--------|------|
-| `enabled` | bool | `true` | 后台 LLM / embedding 工作总开关；插件设置页显示为「停止后台 LLM 请求」。关闭后 runtime 的刷新、补池预计算、账户同步、猜测兴趣和主动推送等 daemon-owned 后台任务都会跳过；手动 CLI / API 请求仍按显式操作执行。若候选池为空，推荐页可能暂时没有内容 |
+| `enabled` | bool | `true` | daemon 后台调度总开关；插件设置页显示为「停止后台 LLM 请求」。关闭后 runtime 的刷新、补池预计算、账户同步、猜测兴趣、主动推送和五源扩展账号周期回拉都会跳过；手动 CLI / API 请求仍按显式操作执行。若候选池为空，推荐页可能暂时没有内容 |
 | `pause_on_extension_disconnect` | bool | `false` | 开启后，daemon-owned 后台 LLM / embedding 工作只在浏览器插件有 `/api/runtime-stream` 连接、或刚断开仍处于宽限窗口内时运行；离线期间不会自动补新内容 |
 | `extension_disconnect_grace_seconds` | int | `90` | 插件最后一个 `runtime-stream` 连接断开后的宽限秒数；小于等于 0 或无法解析时回退到 `90` |
 | `discovery_cron` | string | `"0 */8 * * *"` | 兼容旧配置的保留字段；当前 runtime 不消费这个 cron，发现补池由轮询、候选池缺口、行为阈值和下方策略间隔驱动。插件与桌面 Web 设置页均不再暴露该字段，只能通过手改 `config.toml` 保留 |
 | `pool_target_count` | int | `300` | 前端真实可换候选目标；允许范围 `1..600`。`count_pool_candidates()`（含预生成 / 分类 / 可打开 / 最近看过过滤 / topic window）达到目标时 refresh（含 `force_refresh`）返回 `pool_at_cap` 不再 discover；后台定时 refresh 采用约 90% 的低水位，略低于目标时不立即跑 discovery，等库存真正低于水位再补货。raw 素材库存由独立 raw ceiling `max(pool_target_count * 2, pool_target_count + 120)` 控制，不再被压成与可换目标相同 |
 | `account_sync_interval_hours` | int | `6` | 账户侧长期信号同步间隔；运行时会低频拉取 history / favorites / following |
+| `source_incremental_hours` | int | `24` | 已安装扩展在线时，XHS / 抖音 / YouTube / 知乎 / Reddit 账号 bootstrap 信号的全局周期（小时），范围 `0..168`；`0` 关闭五源周期回拉。它复用浏览器登录态，不是无浏览器后台同步 |
+| `xhs_incremental_hours` | int 或 null | `null` | 小红书周期覆盖；缺省 / `null` 继承全局，`0` 只关闭小红书，范围 `0..168` |
+| `douyin_incremental_hours` | int 或 null | `null` | 抖音周期覆盖；缺省 / `null` 继承全局，`0` 只关闭抖音，范围 `0..168` |
+| `youtube_incremental_hours` | int 或 null | `null` | YouTube 周期覆盖；缺省 / `null` 继承全局，`0` 只关闭 YouTube，范围 `0..168` |
+| `zhihu_incremental_hours` | int 或 null | `null` | 知乎周期覆盖；缺省 / `null` 继承全局，`0` 只关闭知乎，范围 `0..168` |
+| `reddit_incremental_hours` | int 或 null | `null` | Reddit 周期覆盖；缺省 / `null` 继承全局，`0` 只关闭 Reddit，范围 `0..168` |
 | `refresh_check_interval_seconds` | int | `60` | `ContinuousRefreshController` 主循环轮询间隔；小于 `15` 或无法解析时回退默认值 |
+| `eval_min_batch_size` | int | `15` | API daemon raw candidate 评估 drain 的最小聚合批量；允许范围 `1..90`，小流量候选会等待凑批以减少 LLM trickle 调用。手动 CLI 是一次性进程，固定立即 drain，不读取该等待策略 |
+| `eval_max_wait_seconds` | float | `90.0` | API daemon raw candidate 评估 drain 的最长等待秒数；允许范围 `0..600`，单个候选最多等待该时长后会小批量送评。协调器按剩余等待时间唤醒 |
 | `signal_event_threshold` | int | `6` | 累计多少条新行为事件后触发 `search + related_chain` 补池；小于 `1` 时回退默认值 |
 | `trending_refresh_minutes` | int | `3` | `trending` 策略的最小刷新间隔（分钟）；小于 `1` 时回退默认值。**v0.3.186 起单位由小时改为分钟**并与各来源 producer 的 `min_interval_minutes` 对齐；旧配置里的 `trending_refresh_hours` 仍会被读取并按 ×60 换算（`3` 小时 → `180` 分钟），保存后写回新键 |
 | `explore_refresh_minutes` | int | `3` | `explore` 策略的最小刷新间隔（分钟）；小于 `1` 时回退默认值。**v0.3.186 起单位由小时改为分钟**，旧键 `explore_refresh_hours` 同样按 ×60 换算（`12` 小时 → `720` 分钟）。**它是纯下游消费闸，不驱动关键词生产**：`KeywordPlanner._explore_domains_request()` 只在「一次常规 merged 关键词调用已经在构建中」且 B 站有真实缺口时，才把 `<explore_domains>` 块搭上去，从不为 explore 单独发起 LLM 调用；LLM 调用频率完全由 planner 自己的背压决定（`_due_platforms()` 要求 `keyword_kind="regular"` 的缓存低于 `kw_cache_low` **且**该平台有真实缺口，外加 B 站的 catalyst——池子低于目标或信号事件超阈值，均与 explore 无关）。explore 词以 `keyword_kind="explore"` 独立入库，**不计入**触发生产的那条水位。因此缩短本间隔只会让 `ExploreStrategy` 更频繁地从 explore 缓存 claim 并请求 B 站，不会增加 LLM 调用次数；缓存抽干后该策略自然停摆，由背压模型兜住。统一关键词 planner 复用同一时钟：当该间隔已到或距到期不足一个 `refresh_check_interval_seconds`，且 B 站仍有补货空间时，会把探索 query 生成合并进当轮关键词调用 |
@@ -788,6 +798,8 @@ TOML 与显式环境变量覆盖在构造 `SchedulerConfig` 前统一归一为�
 > 即使 `pool_target_count` 设得较高，单次 refresh 里的 discover wave 也由 `discovery_limit` 控制（默认 `30`，最大 `60`），避免一次性把全部缺口都打满。
 > 后台 refresh 还会使用约 90% 的可换池低水位；池子只是轻微低于 `pool_target_count` 时不跑 discovery。B 站完整四策略补货在小缺口阶段优先只给 `search + related_chain` 预算，`trending/explore` 延后到更深缺口。
 > `pause_on_extension_disconnect` 只约束后端 daemon 自己发起的后台 LLM / embedding 工作；用户手动点击刷新、CLI 显式命令、配置保存和普通读取接口不因为插件离线而被拦截。`runtime-stream` 连接断开由后端 receive-side detector 记录，浏览器 idle disconnect 后不会让 presence 状态卡住。
+>
+> 五源账号周期回拉始终直接检查扩展 presence，不受 `pause_on_extension_disconnect` 的默认值影响。逐源字段在 TOML 中应省略以继承；`config.example.toml` 只把它们作为注释示例。`PUT /api/config` 可用 JSON `null` 恢复继承；设置页热重载后新 scheduler 立即采用新周期，但不会越过已有五源 active task。
 
 ### `[scheduler.pool_source_shares]`
 
@@ -813,6 +825,12 @@ TOML 与显式环境变量覆盖在构造 `SchedulerConfig` 前统一归一为�
 **统一关键词规划器 / Discover 背压 / 评估输入**（`DiscoveryConfig`）。把"每平台各自定时调 LLM 生成搜索词"换成**缺口拉动的双缓冲背压模型**：一个关键词存储（cache + 历史 + 产出）夹在「生成」与「抓取」之间，生成只在缓存见底且池子有真实缺口时触发（一次合并 LLM 调用覆盖所有缺货平台，带历史去重 + 池子分布避让）。B 站 explore 方向也复用这条关键词存储：到达 `[scheduler].explore_refresh_minutes` 的 refresh plan 窗口且 B 站有补货空间时，planner 会把 `explore_domains` 合并进同一次关键词生成，而不是新增配置项或单独 caller。同一段也承载 discovery evaluator 的可选封面图输入开关。本段**与 `[llm.routes.discovery]` 是两个独立的表**——后者选择 discovery 模块使用的 Provider 实例链，本段是规划器 / 背压 / 评估输入调参。完整设计见 [`docs/plans/2026-06-14-discover-backpressure-refactor-design.md`](../plans/2026-06-14-discover-backpressure-refactor-design.md) §6 参数表。
 
 > ✅ `unified_keyword_planner_enabled` **v0.3.124 起默认 `true`**：搜索词走统一规划器 + 关键词存储，本段其余字段随之生效。设为 `false` 可逐字回退到旧的逐平台搜索词生成路径（旧路径保留、回退无副作用）。
+
+#### 保存与运行时应用状态
+
+`PUT /api/config` 的持久化阶段继续执行候选配置校验、`config.toml.bak` 快照、完整写盘和凭据 patch 语义；只有这些步骤成功才会返回 2xx。受保护的 dialogue execution、dialogue settlement、event owner 或另一轮 runtime rebuild 正忙时，后端不再让 HTTP 请求同步等待最长 25 分钟，而是返回 HTTP 202：`apply_state="queued"`、单调递增的 `apply_revision`、`reloaded=false`。插件与桌面 Web 应把它显示为“已保存、等待后台应用”，不能当作保存失败。
+
+后台队列只合并尚未开始的修订并保留最新值；正在应用的修订完成后会立即追上最新 pending。`GET /api/config/apply-status` 返回 `requested_revision / applied_revision / state / message / error / updated_at`，其中不含配置或秘密。最终成功广播 `config_reloaded`；最新修订失败会恢复最后一次已生效配置并广播 `config_reload_failed`。初始化与配置应用互斥：应用中的 `POST /api/init` 返回 `409 config_applying`，运行中的 init 继续让配置保存返回 `409 init_running`。
 
 #### Web 与插件设置页的「高级功能」
 
@@ -840,12 +858,15 @@ TOML 与显式环境变量覆盖在构造 `SchedulerConfig` 前统一归一为�
 | `claim_lease_minutes` | int | `10` | 领取租约（分钟）：`claimed`/`executing` 超过这个时长未变会被回收成 `pending`，防 loop / 任务崩溃泄漏在途行。小于 `1` 时回退默认值 |
 | `planner_poll_seconds` | int | `120` | 关键词规划器轮询间隔（秒）；空闲轮询近似零成本。小于 `1` 时回退默认值 |
 | `plan_ttl_hours` | int | `12` | 兜底失效（小时）：即便画像 `profile_kw_digest` 未变，`pending` 关键词超过这个时长也会过期；同画像、同平台需求块、同池子避让提示的 merged keyword 生成结果也按这个 TTL 在进程内复用。小于 `1` 时回退默认值 |
-| `admission_min_score` | float | `0.60` | 普通推荐池统一入池最低分。候选行 / raw payload 显式 `score_threshold` 可作为策略阈值覆盖；来源标签如 `admission_policy="observed"` 不能绕过该分数门。探索类策略可略低于该值，但平台 / 插件来源不能获得特权。必须在 `(0, 1]` 内，非法值回退默认值 |
+| `keyword_digest_grace_hours` | int | `24` | 画像 digest 变化后，最近且安全的旧 `regular/pending` 关键词可继续领取的宽限时长，合法范围 `0..168`。整理时当前 digest 优先；旧词命中显式 dislike / 平台 avoid、过龄、重复或超过动态高水位都会过期，原 digest 与生成溯源不会改写。`0` 恢复旧版“digest 一变即硬过期”，也是独立回滚开关。GET/PUT 配置 API、热重载、CLI/OpenClaw 构造与 TOML round-trip 均透传该值 |
+| `admission_min_score` | float | `0.60` | 普通推荐池统一入池最低分。候选行 / raw payload 显式 `score_threshold` 只能抬高门槛；来源标签如 `admission_policy="observed"` 不能绕过该分数门。探索类策略固定使用 `0.58`，平台 / 插件来源不能获得特权。支持范围为 `[0.5, 1]`，非法值回退默认值；下界与 evaluator 的 reason 省略契约绑定，禁止低于 0.5 的无 reason 候选入池 |
+| `eval_prefilter_mode` | string | `"shadow"` | discovery evaluator 的 embedding 预过滤模式：`"off"` 不计算相似度；`"shadow"` 只记录 `prefilter-shadow` would-filter 日志但仍送 LLM；`"enforce"` 对 top-256 recall-visible 兴趣与 compact 兴趣域均低相似的非 explore 候选缓存低分并跳过 LLM。余弦值先夹到 `0..1`，单批过滤超过 50% 时 fail-open。非法值会被运行时配置校验拦截；OpenClaw、GET/PUT 配置接口与 daemon 热重载均透传该字段。上线时先用 shadow 观察 would-filter 中是否仍有高于 `admission_min_score` 的候选，再切 enforce |
 | `candidate_eval_concurrency` | int | `3` | 候选 LLM 评估的期望 worker 数，合法范围 `1..3`；每个 worker 最多 30 条，因此总 raw 在途上限为 90。超出范围的手工 TOML / API 值按本段既有整型规则回退默认 `3`。有效值为 `min(本值, max(1, llm.concurrency-1))`，为聊天等交互保留一个全局 LLM 槽位；插件与桌面 Web 设置页可修改，CLI `config-show` 自动显示。移动 Web 没有配置面板，不适用。 |
 | `inspiration_search_enabled` | bool | `true` | 是否启用 query inspiration 脑暴阶段。默认与 merged keyword planner 并行组成“混合”模式；`KeywordPlanner` 会通过本机 mcporter 搜索 provider 链获取搜索预览，再让 `discovery.keyword_inspiration` LLM caller 做 Profile Curator / Detail Expander，最终把带 `aspect_id/inspiration_id/expansion_id` 元数据的关键词写入 `discovery_keywords` |
 | `inspiration_search_backends` | list[str] | `["local_cache", "platform_sources", "exa", "you"]` | query inspiration 搜索后端顺序。`local_cache` 会先从本地 `content_cache` 抽取相关标题 / URL / 摘要作为 evidence，本地命中不消耗外部 grounding 预算；证据不足时才 fallback。`platform_sources` 会从用户已启用且当前可同步/可注入 bridge 的平台源里抽样做 inspiration-only grounding（B站 / YouTube / X / Reddit；抖音 direct client；小红书 / 知乎 bridge 可用时），只把标题 / URL / 摘要作为灵感证据，不写候选池；`exa` 调用 `mcporter call exa.web_search_exa`；`you` 调用 `mcporter call you.you-search`（You.com Free MCP profile）。某个后端报错 / 限流 / 返回空结果时会继续尝试后面的后端。远端 MCP server 需要先写入本机 `config/mcporter.json` |
 | `inspiration_replace_merged_keywords` | bool | `false` | 实验性替换模式。仅在 `inspiration_search_enabled=true` 且 inspiration provider 可用时生效：due 平台跳过旧 `discovery.keyword_planner` merged call，只通过 search-backed inspiration flow 产词；当 B 站 explore 到期且有补货空间时，也会用同一轮共享 brainstorm / grounding stage 写入 `keyword_kind="explore"` 的探索词池。开 replace 前应先用 `keyword-inspiration-report` 跑 cohort 门禁，避免无质量数据直接替换 |
 | `inspiration_breadth` | str | `"high"` | 探索广度档位（Phase 2 config 收敛，13→4）：`low` / `medium` / `high`。旧的 10 个 `inspiration_*` 细粒度旋钮已删除，其派生成内部常量的有效值由本档位决定（见下表）。**默认 `high`（更宽的素材/轴/关键词产量）**；`medium` 逐项等于旧的 `_DEFAULT_INSPIRATION_*` 默认值，需与收敛前行为逐项对齐时显式设 `medium`。注意 `high` 会把每轮真实 probe 搜索与 LLM 用量放大（daemon 常驻），成本敏感可设 `medium`/`low`。非法档位（非 `low`/`medium`/`high`）→ 配置错误（`ConfigError`），未设置回退 `high` |
+| `eval_prefilter_mode` | string | `"shadow"` | discovery evaluator 的 embedding 预过滤模式：`"off"` 不计算相似度；`"shadow"` 只记录 `prefilter-shadow` would-filter 日志但仍送 LLM；`"enforce"` 将低于相似度阈值的非 explore 候选以低分缓存并跳过 LLM。非法值会被运行时配置校验拦截。上线时先用 shadow 观察 would-filter 中是否仍有高于 `admission_min_score` 的候选，再切 enforce |
 | `multimodal_evaluation_enabled` | bool | `false` | 是否在 discovery batch evaluator 中加入候选封面图。默认关闭；开启后仅当当前 evaluation 路由支持图像输入且候选有 `cover_url` 时使用，否则自动退回纯文本评估 |
 | `danmaku_enabled` | bool | `false` | 是否启用**弹幕文本**加成（P2）：B 站候选喂给推荐的语义只有 `title` + `description`，而 description 常是"求三连"之类的无信息文本、`body_text` 在 B 站路径恒为空；弹幕是 B 站独有信号，反映观众实际在讨论什么。抓取走 `comment.bilibili.com/{cid}.xml`（**无需鉴权**，`cid` 直接从已有的 `/x/web-interface/view` 响应读，零额外请求），清洗后嵌入为独立排序信号。**纯文本信号，无需多模态嵌入模型**（与 P1/P3 不同）；仅对 B 站视频有效。默认关闭时加成恒 0，排序逐字节一致 |
 | `danmaku_fetch_limit` | int | `50` | 每轮预热处理的视频数上限。合法范围 `1..200` |
@@ -931,13 +952,22 @@ TOML 与显式环境变量覆盖在构造 `SchedulerConfig` 前统一归一为�
 |----|------|--------|------|
 | `db_path` | string | `"data/openbiliclaw.db"` | SQLite 数据库路径 |
 
-### `[soul]` (v0.3.176+，态势门控)
+### `[soul]`（态势门控与 task-scoped cognition rollout）
 
 | 键 | 类型 | 默认值 | 说明 |
 |----|------|--------|------|
+| `preference_prompt_view` | string | `"legacy"` | Preference prompt 的独立输入视图，只允许 `legacy` / `compact-v1`。2026-08-06 SenseTime task gate 未放行 Preference compact，因此默认保留逐字节回滚路径 |
+| `awareness_prompt_view` | string | `"compact-v1"` | 仅控制 `AwarenessAnalyzer.analyze_with_confusions()` / `soul.awareness_confusions` 的输入视图，只允许 `legacy` / `compact-v1`。2026-08-06 SenseTime token + quality gate 只放行了该 caller，因此默认启用；普通 `analyze()` / `soul.awareness` 固定为 `legacy`，不继承这个值 |
+| `insight_prompt_view` | string | `"legacy"` | Insight prompt 的独立输入视图，只允许 `legacy` / `compact-v1`。Insight 尚无预声明 token 阈值且本轮未获放行，默认保留 `legacy` |
 | `posture_gate_mode` | string | `"shadow"` | 深层写入一致性门控（认知画像流水线 Phase 3）。`shadow`=判定异步旁路、**零延迟不阻塞原写入**，判定只落台账（`shadow_accept`/`shadow_downgrade`/`shadow_reject`，LLM 异常记 `shadow_error`）；`enforce`=写入前同步判定，reject/downgrade 拦截深层写入（downgrade 转为待验证假设），异常/解析失败保守 downgrade；`off`=完全旁路、与未接门控前逐字节一致。门控作用面仅三处：对话 goal/value/state 深层候选、管线 VALUES/CORE 层、soul 整份重建（interest 快线与 ROLE 层永不过门控） |
 | `posture_gate_force_enforce` | bool | `false` | 逃生门。切到 `enforce` 需满足 save-time 三条件（最早有效 shadow 判定距今 ≥14 天 **且** 近 14 天有效判定 ≥10 条 **且** 近 7 天 ≥1 条），否则保存被 blocking 拒绝。置 `true` 无条件放行——**有风险**：门控尚未校准即启用可能误拦或误放深层写入 |
-| `topic_lifecycle_serialization` | string | `"off"` | topic 状态机的 archived 序列化排除开关（认知画像流水线 Phase 4，本版**唯一最小消费**）。`off`（默认）时 `build_profile_summary` 与未接状态机前**逐字节一致**（回放门）；`on` 时把 `archived` 状态的 topic 排出 LLM 可见画像（domain/tag 两级）。进程启动时由 `create_app` / CLI 读入并设 `discovery.strategies._utils.set_topic_lifecycle_serialization`。仅 `off`/`on` 两值，其余落默认 `off` |
+| `topic_lifecycle_serialization` | string | `"off"` | topic 状态机的 archived 序列化排除开关（认知画像流水线 Phase 4，本版**唯一最小消费**）。`off`（默认）时 `build_profile_summary` 与未接状态机前**逐字节一致**（回放门）；`on` 时把 `archived` 状态的 topic 排出 LLM 可见画像（domain/tag 两级）。规范 owner 是 `soul.profile_views.set_topic_lifecycle_serialization`；进程启动时由 `create_app` / CLI 设置，旧 `discovery.strategies._utils` 路径仅保留兼容 re-export。仅 `off`/`on` 两值，其余落默认 `off` |
+
+三个 prompt view 从 TOML、`GET/PUT /api/config`、CLI runtime、API 热重载与 OpenClaw
+bootstrap 一路独立透传到 `SoulEngine`；其中 Awareness 值只进入 with-confusions seam，普通
+Awareness seam 固定为 `legacy`。未发布的聚合字段
+`soul.cognition_prompt_view` 已删除且不作为兼容别名读取，避免一次配置误把三个任务全部
+切到 compact；replay 仍显式渲染 A/B 双臂，不读取这些生产默认值。
 
 ### `[soul.preference]`
 
@@ -972,7 +1002,7 @@ TOML 与显式环境变量覆盖在构造 `SchedulerConfig` 前统一归一为�
 - 基础：`language`、`data_dir`、`storage.db_path`
 - LLM：展示实例、全局调用链与四个模块链摘要，允许调整全局并发 / 超时、测试默认链，并跳转桌面 Web 完整编辑；插件保存其他字段时不会回写或压扁实例路由
 - B 站与多源：`bilibili.browser.*`、`sources.bilibili.enabled`、`sources.browser.*`、`sources.xiaohongshu.*`、`sources.douyin.*`、`sources.youtube.*`、`sources.twitter.*`、`sources.zhihu.*`、`sources.reddit.*`
-- 调度：`scheduler.enabled`、`pause_on_extension_disconnect`、`extension_disconnect_grace_seconds`、`pool_target_count`、`account_sync_interval_hours`、refresh / signal / trending / explore / discovery limit / proactive push / speculator idle 等 runtime 频率参数、八个平台 `pool_source_shares`、猜测兴趣参数、不喜欢领域探针参数、自动更新参数；设置页可调用 `/api/config/source-share-suggestion` 按已有事件和当前表单开关填入建议比例
+- 调度：`scheduler.enabled`、`pause_on_extension_disconnect`、`extension_disconnect_grace_seconds`、`pool_target_count`、`account_sync_interval_hours`、eval drain 凑批参数、refresh / signal / trending / explore / discovery limit / proactive push / speculator idle 等 runtime 频率参数、八个平台 `pool_source_shares`、猜测兴趣参数、不喜欢领域探针参数、自动更新参数；设置页可调用 `/api/config/source-share-suggestion` 按已有事件和当前表单开关填入建议比例
 - 日志：控制台 / 文件级别、完整日志路径（保存时拆回 `directory` / `filename`）、轮转与非托管日志清理参数
 
 `[saved_sync].auto_sync_enabled` 已在桌面 / 移动 Web 和插件设置控件中暴露，也可通过 `config.toml` 或严格校验的 `/api/config` 管理。保留但不单独暴露的字段还包括目前只有一个有效值的内部兼容项，例如 `[sources.douyin].mode = "direct"`；保存时插件会继续按当前支持值写回，不会删除其他高级字段。
@@ -990,7 +1020,7 @@ TOML 与显式环境变量覆盖在构造 `SchedulerConfig` 前统一归一为�
 - 安装包 `/setup/` 第一页保存 LLM 配置时会传请求级字段 `suppress_background_llm_work=true`。该字段不写入 `config.toml`，只表示本次保存后热重载组件但暂停 refresh / account-sync 等 LLM 后台循环与 post-reload 探针 / 预热；用户在第二页点击「开始初始化」后，guided init 先严格生成完整画像和首轮可用推荐，init 终态后恢复后台循环并调度兴趣 / 避雷探针。普通设置页保存不传该字段，仍保持原有热重载和后台续跑行为。
 - 首次启动的模板包含一个等待填写 Key 的 DeepSeek 占位实例；若用户在 `/setup/` 改选其他 Provider，向导会读取 `GET /api/config.issues`，只把其中明确指向 `llm.instances.<id>.*` 的 blocking 旧实例设为 `enabled=false` 并从全局链移除。被显式自定义模块链引用的实例不会被自动改写，正常或仅 warning 的既有实例也会保留；完整多实例整理仍由桌面/插件设置页负责。校验 400 会按 `ConfigUpdateResponse.config.issues` 展示具体原因，不再把响应 JSON 截成一段不可读文本。
 - 写盘前会先用新配置构建 LLM registry；blocking issue 会返回 400 且不写入 `config.toml`。
-- 写盘前会生成 `config.toml.bak`。正常模式下热重载失败会尝试恢复备份，并在响应里设置 `rollback_applied=true`；如果备份恢复也失败，接口返回 500 和人工恢复提示。
+- 写盘前会生成 `config.toml.bak`。持久化成功后接口统一返回 `202 apply_state="queued"` 和单调 `apply_revision`；后台热重载失败会恢复最后一次已生效的磁盘与内存 runtime 配置，并广播 `config_reload_failed`。如果恢复本身失败，状态接口保留人工恢复提示。
 - 热重载与唯一 `DialogueSettlementQueue` 交接时保持 admission 开放，直到旧 worker 的 active job 与 backlog 真正排空，再在无 `await` 临界段原子暂停、撤销旧 permit 并注册新 worker；因此保存配置期间的聊天/待聊请求不再被直接丢弃。对话 LLM 单请求上限为 20 分钟，安全 drain 窗口相应为 25 分钟；桌面/插件自己的 60 秒请求预算到期只表示后端仍在等待安全切换，不会取消后端保存。超过 25 分钟才回滚，空字符串 `TimeoutError` 会转换为可读诊断。
 
 ## 模型列表发现（不写配置）
@@ -1007,6 +1037,8 @@ OpenAI-compatible 协议没有列举 reasoning effort 能力的标准接口；�
 | `reloaded` | 是否已热重载运行时组件。 |
 | `rollback_applied` | 热重载失败后是否已从 `config.toml.bak` 回滚。 |
 | `restart_required` | 新配置是否已写入但无法原地激活、需要重启 daemon 的异常兜底。正常保存和成功的降级恢复都返回 `false`。 |
+| `apply_state` | 后台应用阶段：持久化成功的响应为 `queued`；状态接口还会返回 `applying`、`applied` 或 `failed`。 |
+| `apply_revision` | 单调递增的后台应用修订号；与 `GET /api/config/apply-status` 的 `requested_revision` / `applied_revision` 对应。 |
 | `config` | 保存后或回滚后的配置快照，API Key 仍默认 masked。 |
 | `message` | 给 UI 展示的人类可读状态。 |
 
@@ -1023,6 +1055,12 @@ OpenAI-compatible 协议没有列举 reasoning effort 能力的标准接口；�
 | `OPENBILICLAW_PROXY_PORT` | Docker 运行时可选宿主机代理端口，默认 `7897` |
 | `OPENBILICLAW_PROXY_TIMEOUT` | Docker 运行时代理探测超时（秒），默认 `1.0` |
 | `OPENBILICLAW_DOUYIN_COOKIE` | 抖音 direct-cookie discovery 的显式 Cookie 覆盖；未设置时读取扩展同步的 `data/douyin_cookie.json` |
+| `OPENBILICLAW_SCHEDULER_SOURCE_INCREMENTAL_HOURS` | 覆盖五源扩展在线周期回拉的全局小时数（`0..168`） |
+| `OPENBILICLAW_SCHEDULER_XHS_INCREMENTAL_HOURS` | 覆盖小红书周期；空值按未覆盖处理，`0` 只关闭该源 |
+| `OPENBILICLAW_SCHEDULER_DOUYIN_INCREMENTAL_HOURS` | 覆盖抖音周期；空值按未覆盖处理，`0` 只关闭该源 |
+| `OPENBILICLAW_SCHEDULER_YOUTUBE_INCREMENTAL_HOURS` | 覆盖 YouTube 周期；空值按未覆盖处理，`0` 只关闭该源 |
+| `OPENBILICLAW_SCHEDULER_ZHIHU_INCREMENTAL_HOURS` | 覆盖知乎周期；空值按未覆盖处理，`0` 只关闭该源 |
+| `OPENBILICLAW_SCHEDULER_REDDIT_INCREMENTAL_HOURS` | 覆盖 Reddit 周期；空值按未覆盖处理，`0` 只关闭该源 |
 | `OPENBILICLAW_API_AUTH_ENABLED` | 覆盖 `[api.auth].enabled`（局域网密码门禁总开关） |
 | `OPENBILICLAW_API_AUTH_PASSWORD` | 明文访问密码；启动时即 scrypt hash，优先于 `_PASSWORD_HASH`（适合 Docker / 多 worker 注入同一密码） |
 | `OPENBILICLAW_API_AUTH_PASSWORD_HASH` | 预生成的 scrypt 密码哈希；覆盖 `[api.auth].password_hash` |

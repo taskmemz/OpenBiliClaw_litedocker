@@ -54,6 +54,12 @@ import {
 import { openContentUrl } from "../app-launch.js";
 import { createSavedMutationRegistry } from "../saved-sync-runtime.js";
 
+const dialogueConfirmation = globalThis.OpenBiliClawDialogueConfirmation;
+if (!dialogueConfirmation) {
+  throw new Error("dialogue-confirmation shared helper did not load");
+}
+const { renderMarkdown } = dialogueConfirmation;
+
 let $root = null;
 let loaded = false;
 let loading = false;
@@ -619,7 +625,8 @@ function renderDelightTray() {
         aiBubble.textContent = t.error || "这句还没发出去，稍后再试。";
       } else {
         aiBubble.className = "delight-chat-bubble assistant";
-        aiBubble.textContent = t.reply || "";
+        aiBubble.classList.add("chat-markdown");
+        aiBubble.innerHTML = renderMarkdown(t.reply || "");
       }
       bubbleArea.appendChild(aiBubble);
     }

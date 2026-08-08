@@ -473,50 +473,66 @@ def _ensure_embedding_model_async() -> None:
     bundle). No-op when embedding isn't Ollama or the model is already present.
     """
 
-    def _worker() -> None:
-        try:
-            from openbiliclaw.config import load_config
+    try:
+        from openbiliclaw.config import load_config
 
-            cfg = load_config()
-            emb = cfg.llm.embedding
-            if str(emb.provider).strip().lower() != "ollama":
-                return
-            model = str(emb.model).strip() or "bge-m3"
-            base_url = (
-                str(emb.base_url).strip()
-                or str(cfg.llm.ollama.base_url).strip()
-                or "http://localhost:11434/v1"
-            )
-            from openbiliclaw.cli import _ollama_has_model
-            from openbiliclaw.llm.ollama_diagnostics import native_root, pull_ollama_model
-            from openbiliclaw.runtime import embedding_progress
+        cfg = load_config()
+        emb = cfg.llm.embedding
+        if str(emb.provider).strip().lower() != "ollama":
+            return
+        model = str(emb.model).strip() or "bge-m3"
+        base_url = (
+            str(emb.base_url).strip()
+            or str(cfg.llm.ollama.base_url).strip()
+            or "http://localhost:11434/v1"
+        )
+        from openbiliclaw.runtime import embedding_progress
 
-            if _ollama_has_model(model, native_root(base_url)):
-                return
-            print(f"[OpenBiliClaw] 后台拉取本地 embedding 模型 {model}(约 1.1GB,仅首次)…")
-            embedding_progress.mark_pull_running(model)
-            ok = False
-            error = ""
+        # Publish the in-flight state before starting the worker. The API can
+        # bind and serve its first /api/init-status request before a newly
+        # created thread gets scheduled; without this early mark the GUI sees
+        # one idle snapshot and stops polling, so the user must click the init
+        # CTA to discover the download.
+        embedding_progress.mark_pull_running(model)
+
+        def _worker() -> None:
             try:
-                ok, error = asyncio.run(
-                    pull_ollama_model(
-                        base_url,
-                        model,
-                        on_progress=embedding_progress.report_pull,
-                    )
+                from openbiliclaw.cli import _ollama_has_model
+                from openbiliclaw.llm.ollama_diagnostics import (
+                    native_root,
+                    pull_ollama_model,
                 )
+
+                if _ollama_has_model(model, native_root(base_url)):
+                    embedding_progress.mark_pull_done(True, "")
+                    return
+                print(f"[OpenBiliClaw] 后台拉取本地 embedding 模型 {model}(约 1.1GB,仅首次)…")
+                ok = False
+                error = ""
+                try:
+                    ok, error = asyncio.run(
+                        pull_ollama_model(
+                            base_url,
+                            model,
+                            on_progress=embedding_progress.report_pull,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 — background best-effort only
+                    error = f"{type(exc).__name__}: {exc}"
+                finally:
+                    embedding_progress.mark_pull_done(ok, error)
+                if ok:
+                    print(f"[OpenBiliClaw] 本地 embedding 模型 {model} 就绪")
+                elif error:
+                    print(f"[OpenBiliClaw] 本地 embedding 模型 {model} 拉取失败: {error}")
             except Exception as exc:  # noqa: BLE001 — background best-effort only
                 error = f"{type(exc).__name__}: {exc}"
-            finally:
-                embedding_progress.mark_pull_done(ok, error)
-            if ok:
-                print(f"[OpenBiliClaw] 本地 embedding 模型 {model} 就绪")
-            elif error:
-                print(f"[OpenBiliClaw] 本地 embedding 模型 {model} 拉取失败: {error}")
-        except Exception as exc:  # noqa: BLE001 — background best-effort only
-            print(f"[OpenBiliClaw] 模型自动拉取跳过: {exc}")
+                embedding_progress.mark_pull_done(False, error)
+                print(f"[OpenBiliClaw] 模型自动拉取跳过: {exc}")
 
-    threading.Thread(target=_worker, name="obc-embed-pull", daemon=True).start()
+        threading.Thread(target=_worker, name="obc-embed-pull", daemon=True).start()
+    except Exception as exc:  # noqa: BLE001 — startup must remain best-effort
+        print(f"[OpenBiliClaw] 模型自动拉取跳过: {exc}")
 
 
 # Dedicated port for the ``with-embedding`` variant's PRIVATE Ollama daemon, so

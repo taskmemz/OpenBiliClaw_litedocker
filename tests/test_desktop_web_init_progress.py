@@ -187,9 +187,19 @@ def test_desktop_reattaches_init_poll_when_a_run_is_live_at_load() -> None:
     # The init-status resource owner must attach the poll for every live state.
     assert "state.initStatus = snapshot;" in apply_snapshot
     assert "snapshot.running" in apply_snapshot
-    assert "embeddingPullProgressView(snapshot).active" in apply_snapshot
+    assert "embeddingPullNeedsPolling(snapshot)" in apply_snapshot
     assert "initWaitingForFirstPool" not in apply_snapshot
     assert "scheduleInitStatusRefresh(INIT_STATUS_POLL_MS)" in apply_snapshot
+
+
+def test_desktop_keeps_watching_a_startup_embedding_pull_before_init() -> None:
+    """A slow first-run bge-m3 pull is live work even when init is still idle."""
+    app_js = _app_js()
+    assert "function embeddingPullNeedsPolling(status)" in app_js
+    assert "embeddingPullNeedsPolling(status)" in app_js
+    apply_snapshot = app_js.split("function applyInitStatusSnapshot(snapshot)", 1)[1]
+    apply_snapshot = apply_snapshot.split("\n      }", 1)[0]
+    assert "embeddingPullNeedsPolling(snapshot)" in apply_snapshot
 
 
 def test_desktop_terminal_init_status_wins_over_stale_runtime_snapshot() -> None:

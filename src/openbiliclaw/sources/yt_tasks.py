@@ -218,6 +218,8 @@ class YtTaskQueue:
         *,
         daily_budget: int = 100,
     ) -> str | None:
+        conn = self._db.conn
+        participating_in_transaction = bool(conn.in_transaction)
         count_today = self._budgeted_count_today(task_type) if daily_budget > 0 else 0
         if daily_budget > 0 and count_today >= daily_budget:
             logger.info(
@@ -230,11 +232,12 @@ class YtTaskQueue:
             )
             return None
         task_id = str(uuid.uuid4())
-        self._db.conn.execute(
+        conn.execute(
             "INSERT INTO yt_tasks (id, type, payload_json) VALUES (?, ?, ?)",
             (task_id, task_type, json.dumps(payload, ensure_ascii=False)),
         )
-        self._db.conn.commit()
+        if not participating_in_transaction:
+            conn.commit()
         return task_id
 
     def _budgeted_count_today(self, task_type: str) -> int:

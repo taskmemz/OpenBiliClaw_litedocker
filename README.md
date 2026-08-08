@@ -221,12 +221,10 @@
 
 ## 最近更新
 
-📌 最新版本：**v0.3.192（2026-08-03）**
+📌 最新版本：**v0.3.201（2026-08-08）**
 
-- **多模态推荐增强可独立控制** —— 视觉画像、弹幕语义与关键帧加权可以分别开关，视觉相关能力默认关闭。
-- **反馈与对话提交更可靠** —— 点赞、点踩、聊天和待聊结算改为持久异步处理，慢模型或重启不再让已提交操作丢失。
-- **高级配置更顺手** —— 插件保存栏固定在底部，搜索词生成默认混合模式，多模态与搜索配置集中到高级功能页。
-- **连接与远程部署更稳** —— X 登录态会在运行时重连后立即同步，并新增 Caddy HTTPS Compose 部署入口。
+- **「多聊聊」对话不丢失** —— 从消息里的探针卡发起的聊天会同步出现在插件、桌面 Web 和移动 Web 的主对话中。
+- **不感兴趣反馈即时生效** —— 推荐展示会立即遵守最新 dislike，同时保留精确主题的避雷保护，不误伤宽泛探索。
 
 完整变更详见 [docs/changelog.md](docs/changelog.md)。
 
@@ -585,7 +583,7 @@ OpenClaw 收到 `interest.probe` 事件（或主动拉取 `next-probe`），发�
 - ⚡ **「换一批」瞬间响应且默认去重** — reshuffle ~0.6s；当前卡、推荐历史和持久化已看账本三层排除，连续刷不卡顿也不靠“忽略当前”开关
 - 💬 **有温度的推荐理由** — 像朋友一样解释为什么你会喜欢，而不是「因为你看过类似视频」
 - 🔄 **持续学习** — 苏格拉底式对话 + 行为分析 + 反馈即时生效，越用越懂你
-- ⭐ **本地优先收藏 / 稍后看** — 推荐卡先写本地 SQLite，自动同步默认关闭；B站和六个扩展平台均支持收藏与原生稍后看/收藏回退，2026-07-14 七平台两类动作真实账号回归均为 `synced/already_synced`
+- ⭐ **本地优先收藏 / 稍后看** — 推荐卡先写本地 SQLite，自动同步默认关闭；桌面 Web 刷新后首屏就显示保存数量徽标；B站和六个扩展平台均支持收藏与原生稍后看/收藏回退，2026-07-14 七平台两类动作真实账号回归均为 `synced/already_synced`
 - 🧩 **浏览器插件** — Chrome / Edge / Brave / Arc / Firefox，侧边栏推荐 + 跨站行为采集，装上就能用
 - 🚀 **图形化引导初始化** — 安装包 `/setup/`、桌面 Web 和插件都能点一下完成初始化，不碰命令行
 - 🔬 **自动化评测优化** — 5 个模块各带 LLM-as-judge 自优化循环，prompt 质量随轮次自动提升
@@ -624,6 +622,7 @@ background ─ background admission (default 3) ──────┘
                        ├→ one context digest → prompt/history/event/learn/settlement provenance
                        ├→ action 本地≤1s：完成 200 / 阻塞 202 → popup/移动/桌面 1/2/5s 轮询≤30s
                        └→ 疑惑 FIFO≤5 / 队头 fencing / 12h 补扫
+配置保存：事务落盘后统一 HTTP 202 queued/apply_revision → latest-wins 后台应用队列 → apply-status / 成功失败回执
 配置热重载：保持接单并排空旧 worker → 原子暂停/revoke → 新 worker；安全窗25分钟
 实时连接：runtime-stream 20s idle 心跳 → 短暂 close 显示重连中并自动续连
 封面：proxy 前台 + refresh 预取 → app-stable lane（总4/后台3、前台优先）
@@ -649,6 +648,8 @@ background ─ background admission (default 3) ──────┘
 ├─────────┴──────────┴───────────┴───────────────┤
 │ 普通事件/推荐点击 → generic durable cursor ─┐    │
 │ 内容反馈 → content_feedback durable cursor ─┴→ buffer+cursor 同一原子 checkpoint │
+│ dislike：单卡同步隐藏；主题写入后 effective snapshot → 推荐历史/换批/通知最终复核 │
+│ discovery 可继续宽搜；异步语义清池只优化库存，不作为展示正确性边界 │
 │ 首启 fence+task admission → listener；后台 owner recovery → tick_if_buffered │
 │ 热重载 pause/drain/recover 后 rebind；周期画像维护才调用 tick │
 │ 对话 → typed settlement worker → learning          │
@@ -664,7 +665,14 @@ background ─ background admission (default 3) ──────┘
 │  来源族注册表：alias · strategy · URL host             │
 │             → pool 统计 · seen_items 持久化已看账本     │
 │ Bangumi 官方匿名 API → search/ranked/latest producer → shared eval │
+│ 候选评估时钟：published_at + 精确 UTC evaluated_at → 小时桶缓存失效 │
+│ evaluator prefilter 默认 shadow → 隐私安全决策/原始分数 join → 只读质量 gate（不自动 enforce）│
+│ cognition named views → task-scoped gate：仅 awareness_confusions compact；其余 legacy │
+│ token diet：偏好逐段真实装箱；洞察 近期/裁决保底 + 相关/重要/多样性加权≤40 → 完整历史 merge │
+│ keyword planner → 24h 安全跨 digest pending 整理 → 缺口/生成/领取（0=硬过期）│
+│ admitted backlog → copy-ready 高水位缺口补文案 → serve 后异步回水（0=legacy drain-all）│
 │ API projected 库存 → 3×30 worker → 串行入池；OpenClaw 首批≤4 → copy≤4/不拆分重试 → 四端 │
+│ API raw 断供 → 欠份额来源即时并行补给 → 真实新增清退避 / 重复空转阶梯退避 │
 │ 惊喜就绪门：正式推荐词/主题就绪 + seen_items 硬过滤 → 打分并原子快照 → 四端 × 写回已看账本 │
 │ 库存 API/OpenClaw 启动钩子 → 历史恢复/原子维护 → 再暴露 LLM │
 │ 换屏快路：当前卡硬排除 → PoolServeSnapshot/seen_items → recommendation+shown 短事务 → 单条 reshuffle 事件 │
@@ -674,7 +682,10 @@ background ─ background admission (default 3) ──────┘
 │ /api/saved/* · 保存 Router · B 站原生保存 Adapter      │
 │ 六平台 Adapter → ExtensionNativeSaveBroker → extension_native_save_jobs │
 │ 六平台 source task multiplex：xhs / dy / yt / x / zhihu / reddit       │
+│ 扩展在线周期回拉：Runtime → 五源 bootstrap task（全局串行）→ installed extension │
+│ task-result → staged durable ingress → 原子有界 seen keys（每源5000）→ terminal │
 │ XHS 自动任务：来源/调度领取门 → SQLite 节流/风控冷却 → 关闭或限流时不开新 tab │
+│ XHS 搜索：inactive tab → MAIN 搜索响应归一化 → isolated replay / DOM 兜底   │
 │ extension_native_save_jobs -> /api/sources/<slug>/next-task -> installed extension │
 │ exact OpenBiliClaw / YouTube Watch Later 目标 → 安全 task-result          │
 │ trusted-local E2E 精确授权 → 单 item saved sync → 六字段安全 callback      │
@@ -740,8 +751,8 @@ durable turn → 固定时间/payload → 确认入口（待聊列表/卡片） 
 
 发现之后的统一流程：
 
-- **安全取数** — 后端不代登录、不爬你看不到的内容；所有平台复用你浏览器里已有的登录会话，首轮画像信号只在你点「开始初始化」后按所选来源拉取。
-- **连续统一评估** — 各来源原始候选进入同一待评估池，默认 3×30 worker 任一完成即补位；调度只计可用、待文案与已评估 durable 库存，串行 admission 按实时 headroom 封顶，raw 不会虚增库存。
+- **安全取数** — 后端不代登录、不爬你看不到的内容；所有平台复用你浏览器里已有的登录会话，首轮画像信号只在你点「开始初始化」后按所选来源拉取。画像完成后，已启用的小红书、抖音、YouTube、知乎和 Reddit 也只在扩展在线时按配置周期回拉。
+- **连续统一评估** — 各来源原始候选进入同一待评估池，由共享 evaluator 结合灵魂画像、正文和近期负反馈批量打分；默认 3×30 worker 任一完成即补位，调度只计 durable 库存，串行 admission 按实时 headroom 封顶。可选 embedding 预过滤默认先 shadow 观测，确认无误后才 enforce 跳过明显低相似候选。
 - **多样性选择** — 平台配额 → 主题去重 → 风格均衡 → 跨平台混排 → 数量封顶；开箱只启用 B 站，其余平台在设置里显式打开。
 
 > 各平台任务链路、候选池计数、fallback 策略等完整机制见 [内容发现引擎文档](docs/modules/discovery.md)。
@@ -797,7 +808,7 @@ OpenBiliClaw/
 | 浏览器插件 | TypeScript + Chrome Extension (Manifest V3) |
 | LLM | 同一 Provider 类型可建多个独立 Base URL / token / model 实例，并配置全局及模块有序降级链；首次迁移自动保留旧配置备份，`config-export-legacy` 可生成旧版副本；内置 Gemini / DeepSeek / OpenAI / Claude / OpenRouter / Ollama，兼容任意 OpenAI 协议服务；OpenAI 可实验性复用 Codex CLI OAuth |
 | B 站交互 | 自研 API 客户端 (WBI 签名 · v_voucher 自动恢复 · 速率控制) |
-| 小红书交互 | 扩展 DOM/state 元数据提取 + 插件任务调度；滚动型初始化会前台打开 `/explore` 并点击页面 profile 入口（零后端爬取） |
+| 小红书交互 | 扩展 DOM/state 元数据提取 + 插件任务调度；search / creator 在后台标签执行，search 用 MAIN-world 页面响应桥避开隐藏页虚拟 DOM 限制；仅滚动型初始化会前台打开 `/explore` 并点击页面 profile 入口（零后端爬取） |
 | 抖音交互 | 扩展 DOM + MAIN-world 被动 fetch tap + 插件任务调度；初始化导入发布 / 收藏 / 点赞 / 关注信号，search / hot / feed discovery 从抖音首页模拟 DOM 操作触发加载，search/feed 被动收集页面响应 / 渲染结果，hot 可用热榜 `group_id` seed 走已登录页面 related fallback（零后端代登录） |
 | YouTube 交互 | 扩展 DOM 任务调度读取观看历史 / 订阅 / 点赞；Google Takeout 可离线导入旧数据 |
 | X 交互 | 服务端 cookie 重放（默认安装内置 `twitter-cli`，只读且 lazy import）；扩展捕获你在 x.com 的互动并同步 cookie；推文为纯文本卡片 |

@@ -17,6 +17,7 @@ from openbiliclaw.llm.json_utils import (
 from openbiliclaw.llm.prompts import build_insight_prompt
 from openbiliclaw.llm.service import LLMServiceError
 from openbiliclaw.llm.task_options import without_core_memory_kwargs
+from openbiliclaw.soul.event_prompt_views import normalize_cognition_input_view
 
 from .profile import AwarenessNote, InsightHypothesis
 
@@ -46,10 +47,12 @@ class InsightAnalyzer:
     """Generate and merge structured insight hypotheses."""
 
     registry: SupportsCoreMemoryTask
+    cognition_prompt_view: str = "legacy"
 
     def __post_init__(self) -> None:
         if not hasattr(self.registry, "complete_structured_task"):
             raise TypeError("InsightAnalyzer requires a service with complete_structured_task().")
+        self.cognition_prompt_view = normalize_cognition_input_view(self.cognition_prompt_view)
 
     async def analyze(
         self,
@@ -67,6 +70,7 @@ class InsightAnalyzer:
             existing_hypotheses=[
                 self._hypothesis_to_context_dict(item) for item in (existing_insights or [])
             ],
+            input_view=self.cognition_prompt_view,
         )
         try:
             complete_structured = self.registry.complete_structured_task

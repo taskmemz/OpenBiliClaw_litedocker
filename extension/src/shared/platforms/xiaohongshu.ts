@@ -22,6 +22,7 @@ const SEARCH_INPUT_SELECTOR =
   'input[placeholder*="搜索"], input[type="search"], .search-input input';
 
 export function detectXiaohongshuPageType(url: string): PageType {
+  if (/\/search_result\/[0-9a-f]{24}(?:[/?#]|$)/i.test(url)) return "note";
   if (url.includes("/search_result")) return "search";
   if (url.includes("/explore/") || url.includes("/discovery/item/")) return "note";
   if (url.includes("/user/profile/")) return "user";

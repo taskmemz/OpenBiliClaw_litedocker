@@ -13,6 +13,30 @@
 `danmaku_max_chars (100..2000)` 做范围校验，保存后由 RuntimeContext 透传到推荐引擎；配置文件
 与 API round-trip 保持这些数值。配置字段仍默认关闭视觉 / 弹幕功能，不会改变默认排序。
 
+Discovery 配置响应与更新白名单同时公开 `keyword_digest_grace_hours`，默认 `24`、合法范围
+`0..168`。`PUT /api/config` 拒绝布尔值、非整数和越界值；合法值进入同一次 TOML 持久化与
+runtime apply。`0` 是只关闭跨 digest 关键词复用的回滚值，不会关闭统一 planner 或删除历史行。
+
+## 配置保存与后台应用
+
+`PUT /api/config` 把“持久化成功”和“运行时已经切换”分成两个明确阶段。请求仍在 `_CONFIG_SAVE_LOCK` 内完成校验、`config.toml.bak` 快照、`config.toml` 写入和凭据存储，然后统一立即返回 `202 apply_state="queued"`、`apply_revision` 与已脱敏配置快照；运行时 lane 由 app-owned latest-wins 队列在后台安全应用，前端通过 `GET /api/config/apply-status` 或 runtime event 观察终态，不把 202 当作失败。
+
+Phase 2 cognition rollout 在配置 API 中也是 task-scoped：`soul` GET/PUT 模型公开
+`preference_prompt_view`、`awareness_prompt_view`、`insight_prompt_view` 三个
+`legacy|compact-v1` 字段，默认分别为 `legacy / compact-v1 / legacy`。旧的聚合
+`cognition_prompt_view` 不在响应模型或更新白名单中。热重载后 Awareness 字段只影响
+`soul.awareness_confusions`；普通 `soul.awareness` 固定使用 `legacy`，其余两个值各自只影响
+对应 analyzer。
+
+后台配置应用队列为 app-owned、latest-wins：正在应用的修订不会被取消，尚未开始的多个修订会合并为最新一份；因为每次 PATCH 都基于最新已落盘配置构建，合并不会丢掉前一轮已保存字段。成功广播 `config_reloaded`；失败且没有更新修订等待时恢复最后一次已生效配置并广播 `config_reload_failed`，若已有更新修订则不回滚覆盖它，直接继续应用最新值。进程在排队期间退出也不会丢配置，下一次启动直接从已落盘 `config.toml` 构建运行时。
+
+| 方法与路径 | 状态 | 契约 |
+|---|---|---|
+| `PUT /api/config` | ✅ | 持久化成功后统一返回 `202 queued`；响应新增 `apply_state`、`apply_revision`，原有 `reloaded` / `rollback_applied` / `restart_required` 保持兼容。 |
+| `GET /api/config/apply-status` | ✅ | 返回 `state`、最新请求修订、最后已应用修订、消息、非敏感错误分类和更新时间；不包含配置内容或凭据。 |
+
+guided init 不与待应用配置并行：队列为 `queued/applying` 时 `POST /api/init` 返回 `409 config_applying`；init 已开始时 `PUT /api/config` 仍返回既有 `409 init_running`。
+
 ## 公开项目统计
 
 | 方法与路径 | 状态 | 契约 |
@@ -27,6 +51,17 @@
 | `POST /api/delight/sent` | ✅ | 仅确认主动通知已送达并维护推送冷却，不代表用户已看，不写 `seen_items`；UI 叉号不得把它作为消费路径。 |
 
 ## 推荐反馈端点
+
+### 推荐输出与 dislike 的即时一致性
+
+| 方法与路径 | 状态 | 契约 |
+|---|---|---|
+| `GET /api/recommendations` | ✅ | 只读未处理历史；1 秒 snapshot 只有在 TTL 与 effective dislike digest 都未变化时复用。加载期间 dislike 变化会按新快照重读，再在 franchise cap 前过滤。 |
+| `POST /api/recommendations/reshuffle` / `append` | ✅ | serve 使用带 flat-preference overlay 的画像，完成后在 HTTP 序列化前再读一次最新 effective dislikes，关闭请求进行中的偏好竞态。 |
+| `GET /api/notifications/pending` | ✅ | 单条候选在返回前按最新 dislike 复核；模糊命中时不使用多卡窗口的“全灭恢复”保护。 |
+| profile edit / `POST /api/feedback` | ✅ | durable edit 或单卡反馈 projection 完成后立即失效 recommendation snapshot；单卡反馈仍由 `exclude_processed` 同步隐藏。 |
+
+这些边界不阻止 discovery 搜索，也不等待异步语义清池或完整 Soul rebuild。
 
 ### 公开事件写入口的幂等 ID
 
@@ -50,7 +85,9 @@ ID 字段是严格 JSON string，不接受数字、布尔或其它类型的自�
 
 ## 来源任务结果的两阶段完成
 
-`POST /api/sources/{xhs,dy,yt,zhihu}/task-result` 的最终回调不再先把任务写成 `completed`。后端先在 `BEGIN IMMEDIATE` 中合并并冻结第一份 canonical result（含 XHS `self_info` 私有快照），任务仍保持非终态；随后只从这份持久结果重放来源事件、seen-key 和来源专属投影，全部成功后才执行不替换 `result_json` 的 terminal flip。若进程分别退出在 canonical merge→event ingress、event ingress→seen-key 或 seen-key→terminal 三个窗口，后续 callback 会忽略变化后的 body，用第一份结果补齐缺口。队列把 staged marker 视为业务 mutation 的逻辑终态：并发/迟到的 partial、final、fail、rate-limit 都不能改写它；但它继续遵守普通 claim lease，丢失非 2xx 响应后会在 15 分钟 lease 过期时由 dispatcher 重新领取，从而自动触发修复。seen-key 保存使用严格写后读验证，失败会阻止 terminal flip；事件稳定键不含 task ID，因此 ingress 已提交但 marker 未写时的重放只返回 duplicate receipt。
+`POST /api/sources/{xhs,dy,yt,zhihu,reddit}/task-result` 的最终回调不再先把任务写成 `completed`。后端先在 `BEGIN IMMEDIATE` 中合并并冻结第一份 canonical result（含 XHS `self_info` 私有快照），任务仍保持非终态；随后只从这份持久结果重放来源事件、seen-key 和来源专属投影，全部成功后才执行不替换 `result_json` 的 terminal flip。若进程分别退出在 canonical merge→event ingress、event ingress→seen-key 或 seen-key→terminal 三个窗口，后续 callback 会忽略变化后的 body，用第一份结果补齐缺口。队列把 staged marker 视为业务 mutation 的逻辑终态：并发/迟到的 partial、final、fail、rate-limit 都不能改写它；但它继续遵守普通 claim lease，丢失非 2xx 响应后会在 15 分钟 lease 过期时由 dispatcher 重新领取，从而自动触发修复。seen-key 通过 `update_source_bootstrap_state()` 原子、严格落盘并按源保留最新 5,000 个身份键，失败会阻止 terminal flip；事件稳定键不含 task ID，因此 ingress 已提交但 marker 未写时的重放只返回 duplicate receipt。Reddit post/comment/subreddit/user 使用各自稳定身份，comment URL fallback 只接受含 comment id 的完整 permalink，不能把 post id 或标题误作 comment key。
+
+周期任务 payload 带 `incremental=true`；五源 handler 在 guided init 外给 durable event 标记 `profile_update_owner="generic"`，在 init-owned 回调中只落事实、由阶段 2/3 统一建模。事件 ingress 成功或 duplicate receipt 后才按响应顺序 checkpoint seen key，再翻 terminal；没有 handler 直接调用画像 pipeline。扩展离线时 runtime 不创建任务，也不推进调度时间。
 
 ## 封面代理与抓取状态
 
@@ -60,7 +97,7 @@ ID 字段是严格 JSON string，不接受数字、布尔或其它类型的自�
 
 ## 降级配置恢复
 
-`PUT /api/config` 在 `llm_registry_unavailable` 降级态下不再只写盘并要求重启。服务端会复用当前进程已经初始化的数据库、MemoryManager、事件总线、任务注册表和 LLM total gate，通过正常热重载路径原子构造完整的 LLM Registry、Soul、Discovery、Recommendation、来源客户端与 runtime controller。构造全部成功后才同步解除业务 API 的 503 guard，并返回 `reloaded=true`、`restart_required=false`；`/setup/` 和插件设置页可以在同一进程里立即继续。
+`PUT /api/config` 在 `llm_registry_unavailable` 降级态下不再只写盘并要求重启。服务端会复用当前进程已经初始化的数据库、MemoryManager、事件总线、任务注册表和 LLM total gate，通过正常热重载路径原子构造完整的 LLM Registry、Soul、Discovery、Recommendation、来源客户端与 runtime controller。构造全部成功后才解除业务 API 的 503 guard，并在后台应用状态进入 `applied` 后广播 `config_reloaded`；`/setup/` 会等待该终态，插件与桌面设置页也会观察同一状态后继续。
 
 如果核心运行时构造失败，已有 `config.toml` 会从事务备份恢复，响应为 HTTP 503、`ok=false`、`rollback_applied=true`，降级 guard 保持不变。若核心已经成功发布、只是附属后台循环重启失败，则保留已生效的新配置与健康运行时，返回 `ok=true`、`reloaded=true` 并携带 warning，避免把磁盘配置回滚成与内存运行时不一致的旧版本。只有没有可回滚旧文件且进程内激活失败的异常 bootstrap 路径，才保留 `restart_required=true` 兼容兜底。
 
@@ -68,9 +105,10 @@ ID 字段是严格 JSON string，不接受数字、布尔或其它类型的自�
 
 | 方法与路径 | 状态 | 契约 |
 |---|---|---|
-| `GET /api/sources/xhs/next-task` | ✅ | native-save job 仍是用户显式动作；自动 discovery 的 search / creator / bootstrap 则在每次 claim 前动态检查 `sources.xiaohongshu.enabled` 与 `scheduler.enabled`。任一关闭时返回 bodyless 204，既有任务保持 pending，不会再驱动扩展打开页面。search / creator 的 `task_interval_seconds` 由后端持久化执行；处于节流或平台冷却时返回 204，存在明确等待时间时附 `Retry-After`。 |
-| `POST /api/sources/xhs/task-result` | ✅ | 除 `ok / partial / empty / error` 外接受 `status="rate_limited"`。legacy task 命中后终结该任务、持久化 1 小时平台冷却，并将关联 `source_keyword_id` 从 executing 无损退回 pending；native-save 结果命中同样打开平台级冷却。debug 只接受扩展给出的结构化风险原因，不要求或存储验证页全文。 |
-| `GET /api/sources/status` | ✅ | 来源仍开启且冷却生效时，将小红书 legacy 状态投影为 `state="rate_limited"`、`feed_paused=true` 并显示剩余分钟；来源已关闭时不让冷却覆盖 `enabled=false` 的正交配置事实。该端点只读本地状态，不访问小红书。 |
+| `GET /api/sources/xhs/next-task` | ✅ | native-save job 仍是用户显式动作；自动 discovery 的 search / creator / bootstrap 则在每次 claim 前动态检查 `sources.xiaohongshu.enabled` 与 `scheduler.enabled`。任一关闭时返回 bodyless 204，既有任务保持 pending，不会再驱动扩展打开页面。search / creator 的 `task_interval_seconds` 是目标值，后端按任务 ID 施加 ±25% 稳定抖动并持久化实际下一次时间；处于节流或平台冷却时返回 204，存在明确等待时间时附 `Retry-After`。 |
+| `POST /api/sources/xhs/task-result` | ✅ | 除 `ok / partial / empty / error` 外接受 `status="rate_limited"`。legacy task 命中后终结该任务、按连续轮次持久化 `1h → 2h → 4h … → 24h` 平台冷却，并将关联 `source_keyword_id` 从 executing 无损退回 pending；同一活动冷却内的重复报告不增加轮次，native-save 结果命中同样打开平台级冷却。冷却后的正常 search / creator 完成会重置轮次，活动冷却中的晚到成功不会提前解封。search / creator 的 `empty` 仍作为可重试失败，但缺失 error 的旧插件 payload 会归一为 `xhs_empty_result`；扩展结构化 debug 只允许 pathname、页面生命周期和 route anchor 计数，不要求或存储搜索词、验证页全文或页面 state。 |
+| `POST /api/sources/xhs/observed-urls` | ✅ | URL-only 与带 note metadata 两条分支都接受 `/explore/{id}`、旧 `/discovery/item/{id}` 和 `/search_result/{id}` 三种笔记路由；`/search_result?keyword=...` 搜索列表页本身不计入 accepted。metadata 继续进入 `discovery_candidates`，URL-only 继续写 observed ledger 并参与 token 回填。 |
+| `GET /api/sources/status` | ✅ | 来源仍开启且冷却生效时，将小红书 legacy 状态投影为 `state="rate_limited"`、`feed_paused=true` 并显示连续触发轮次和剩余分钟；来源已关闭时不让冷却覆盖 `enabled=false` 的正交配置事实。该端点只读本地状态，不访问小红书。 |
 
 ## 对话确认端点
 

@@ -46,10 +46,12 @@ class _StubLLM:
         self.payload = payload or {}
         self.calls = 0
         self.last_user_input = ""
+        self.call_kwargs: list[dict[str, Any]] = []
 
     async def complete_structured_task(self, **kwargs: Any) -> Any:
         self.calls += 1
         self.last_user_input = str(kwargs.get("user_input", ""))
+        self.call_kwargs.append(dict(kwargs))
         return SimpleNamespace(content=json.dumps(self.payload, ensure_ascii=False))
 
 
@@ -255,3 +257,19 @@ async def test_apply_rebuilds_onion_tree_first_level_within_vocab(tmp_path: Path
     assert {item["domain"] for item in likes} <= set(CATEGORY_VOCAB)
     assert memory.get_layer("soul").save_count == 1
     assert memory.synced_profiles
+
+
+async def test_category_mapping_opts_out_of_core_memory_injection(tmp_path: Path) -> None:
+    """Task 8 audit: taxonomy canonicalization needs no profile/core memory."""
+    from openbiliclaw.soul.category_migration import CategoryMigrator
+
+    memory = _memory(tmp_path, soul={"personality_portrait": "PORTRAIT_SENTINEL_XYZ"})
+    llm = _StubLLM({"mapping": {"泛娱乐": "娱乐", "宠物": "萌宠", "科技": "科技"}})
+    migrator = CategoryMigrator(memory=memory, llm_service=llm, data_dir=tmp_path)
+
+    await migrator.run(dry_run=True)
+
+    assert llm.calls >= 1
+    for call in llm.call_kwargs:
+        assert call.get("inject_core_memory") is False
+    assert "PORTRAIT_SENTINEL_XYZ" not in llm.last_user_input

@@ -1996,8 +1996,8 @@ def test_config_route_keeps_masked_echo_and_blank_field_semantics(contract_env: 
         masked = client.put("/api/config", json={"bilibili": {"cookie": "SESS****2345"}})
         blank = client.put("/api/config", json={"bilibili": {"cookie": ""}})
 
-    assert masked.status_code == 200, masked.text
-    assert blank.status_code == 200, blank.text
+    assert masked.status_code == 202, masked.text
+    assert blank.status_code == 202, blank.text
     assert contract_env.cfg.bilibili.cookie == _FULL_BILI_COOKIE
     assert probes == [], "a field that was not edited must not be probed"
 
@@ -2735,7 +2735,8 @@ def test_a_valid_config_save_still_writes_external_credentials(
     with _write_client(contract_env) as client:
         response = client.put("/api/config", json=_config_patch_for(slug, new))
 
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
+    assert response.json()["apply_state"] == "queued"
     assert _stored_credential(contract_env, slug) == new
 
 
@@ -2797,7 +2798,8 @@ def test_both_write_paths_record_the_verdict_they_paid_for(
             response = client.post(f"/api/sources/{slug}/credential", json={"value": cookie})
         else:
             response = client.put("/api/config", json=_config_patch_for(slug, cookie))
-        assert response.status_code == 200, response.text
+        expected_status = 202 if surface == "config-put" else 200
+        assert response.status_code == expected_status, response.text
 
     contract = SourceAuthContract.model_validate(_status_payload(contract_env)[slug]["auth"])
     assert contract.verification == "verified", f"{surface} discarded the probe verdict it paid for"

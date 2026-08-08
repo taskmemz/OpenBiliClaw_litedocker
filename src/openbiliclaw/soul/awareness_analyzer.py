@@ -20,6 +20,7 @@ from openbiliclaw.llm.prompts import (
 )
 from openbiliclaw.llm.service import LLMServiceError
 from openbiliclaw.llm.task_options import without_core_memory_kwargs
+from openbiliclaw.soul.event_prompt_views import normalize_cognition_input_view
 
 from .profile import AwarenessNote
 
@@ -72,10 +73,14 @@ class AwarenessAnalyzer:
     """Generate structured recent-awareness notes from events."""
 
     registry: SupportsCoreMemoryTask
+    plain_prompt_view: str = "legacy"
+    confusions_prompt_view: str = "legacy"
 
     def __post_init__(self) -> None:
         if not hasattr(self.registry, "complete_structured_task"):
             raise TypeError("AwarenessAnalyzer requires a service with complete_structured_task().")
+        self.plain_prompt_view = normalize_cognition_input_view(self.plain_prompt_view)
+        self.confusions_prompt_view = normalize_cognition_input_view(self.confusions_prompt_view)
 
     async def analyze(
         self,
@@ -100,6 +105,7 @@ class AwarenessAnalyzer:
             events=events,
             preference_summary=preference,
             soul_profile=soul_profile,
+            input_view=self.plain_prompt_view,
         )
         try:
             complete_structured = self.registry.complete_structured_task
@@ -152,6 +158,7 @@ class AwarenessAnalyzer:
             events=events,
             preference_summary=preference,
             soul_profile=soul_profile,
+            input_view=self.confusions_prompt_view,
         )
         try:
             complete_structured = self.registry.complete_structured_task

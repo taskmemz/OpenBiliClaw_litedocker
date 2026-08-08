@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -138,6 +138,29 @@ class OpenClawAdapter:
         """Generate recommendations for OpenClaw consumption."""
         try:
             profile = await self.services.soul_engine.get_profile()
+            fallback_dislikes = [
+                str(item).strip()
+                for item in getattr(profile.preferences, "disliked_topics", [])
+                if str(item).strip()
+            ]
+
+            def latest_dislikes() -> list[str]:
+                getter = getattr(
+                    self.services.soul_engine,
+                    "get_effective_disliked_topics",
+                    None,
+                )
+                if not callable(getter):
+                    return fallback_dislikes
+                try:
+                    return [str(item).strip() for item in getter() if str(item).strip()]
+                except Exception:
+                    logger.warning(
+                        "OpenClaw effective dislike read failed; using profile snapshot",
+                        exc_info=True,
+                    )
+                    return fallback_dislikes
+
             rows: list[dict[str, object]] | None = None
             if refresh_if_needed:
                 refresh = getattr(self.services.runtime_controller, "refresh_if_needed", None)
@@ -160,9 +183,26 @@ class OpenClawAdapter:
                         )
                 get_recommendations = getattr(self.services.database, "get_recommendations", None)
                 if callable(get_recommendations):
+                    history_limit = limit
+                    try:
+                        stored_rows = get_recommendations(
+                            limit=history_limit,
+                            exclude_processed=True,
+                        )
+                    except TypeError:
+                        stored_rows = get_recommendations(limit=history_limit)
                     rows = [
-                        row for row in get_recommendations(limit=limit) if isinstance(row, dict)
+                        row
+                        for row in stored_rows
+                        if isinstance(row, dict)
+                        and not str(row.get("feedback_type", "") or "").strip()
                     ]
+                    if rows:
+                        from openbiliclaw.recommendation.exclusion import (
+                            filter_recommendation_rows,
+                        )
+
+                        rows = filter_recommendation_rows(rows, latest_dislikes())[:limit]
             # A fresh one-shot runtime has canonical pool rows but no
             # recommendation-history rows yet.  Only return the history fast
             # path when it actually has entries; otherwise serve the newly
@@ -190,21 +230,28 @@ class OpenClawAdapter:
             )
         except Exception as exc:  # pragma: no cover - defensive adapter boundary
             raise AdapterOperationError("Failed to generate recommendations.") from exc
-        return RecommendationResponse(
-            items=[
-                RecommendationItem(
-                    recommendation_id=int(getattr(item, "recommendation_id", 0) or 0),
-                    bvid=str(getattr(getattr(item, "content", None), "bvid", "")),
-                    title=str(getattr(getattr(item, "content", None), "title", "")),
-                    up_name=str(getattr(getattr(item, "content", None), "up_name", "")),
-                    cover_url=str(getattr(getattr(item, "content", None), "cover_url", "")),
-                    reason=str(getattr(item, "expression", "")),
-                    topic_label=str(getattr(item, "topic_label", "")),
-                    confidence=float(getattr(item, "confidence", 0.0) or 0.0),
-                )
-                for item in items
-            ]
-        )
+        response_items = [
+            RecommendationItem(
+                recommendation_id=int(getattr(item, "recommendation_id", 0) or 0),
+                bvid=str(getattr(getattr(item, "content", None), "bvid", "")),
+                title=str(getattr(getattr(item, "content", None), "title", "")),
+                up_name=str(getattr(getattr(item, "content", None), "up_name", "")),
+                cover_url=str(getattr(getattr(item, "content", None), "cover_url", "")),
+                reason=str(getattr(item, "expression", "")),
+                topic_label=str(getattr(item, "topic_label", "")),
+                confidence=float(getattr(item, "confidence", 0.0) or 0.0),
+            )
+            for item in items
+        ]
+        if response_items:
+            from openbiliclaw.recommendation.exclusion import filter_recommendation_rows
+
+            filtered_rows = filter_recommendation_rows(
+                [asdict(item) for item in response_items],
+                latest_dislikes(),
+            )
+            response_items = [RecommendationItem(**row) for row in filtered_rows]
+        return RecommendationResponse(items=response_items[:limit])
 
     async def submit_feedback(self, request: FeedbackRequest) -> FeedbackResponse:
         """Persist recommendation feedback and trigger downstream learning hooks."""

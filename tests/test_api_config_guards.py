@@ -69,7 +69,7 @@ def test_put_config_ignores_masked_chat_provider_api_key(monkeypatch, tmp_path) 
 
     response = client.put("/api/config", json={"llm": {"openai": {"api_key": "sk-d****cdef"}}})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).llm.openai.api_key == "sk-real-key-1234567890abcdef"
 
 
@@ -78,7 +78,7 @@ def test_put_config_ignores_empty_chat_provider_api_key(monkeypatch, tmp_path) -
 
     response = client.put("/api/config", json={"llm": {"openai": {"api_key": ""}}})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).llm.openai.api_key == "sk-real-key-1234567890abcdef"
 
 
@@ -90,7 +90,7 @@ def test_put_config_writes_real_new_chat_provider_api_key(monkeypatch, tmp_path)
         json={"llm": {"openai": {"api_key": "sk-new-real-key-fedcba0987654321"}}},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).llm.openai.api_key == (
         "sk-new-real-key-fedcba0987654321"
     )
@@ -101,7 +101,7 @@ def test_put_config_ignores_empty_chat_provider_model(monkeypatch, tmp_path) -> 
 
     response = client.put("/api/config", json={"llm": {"openai": {"model": ""}}})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).llm.openai.model == "gpt-4o-mini"
 
 
@@ -110,7 +110,7 @@ def test_put_config_writes_real_new_chat_provider_model(monkeypatch, tmp_path) -
 
     response = client.put("/api/config", json={"llm": {"openai": {"model": "gpt-4.1-mini"}}})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).llm.openai.model == "gpt-4.1-mini"
 
 
@@ -128,7 +128,7 @@ def test_put_config_round_trips_openai_auth_mode(monkeypatch, tmp_path) -> None:
         json={"llm": {"openai": {"auth_mode": "codex_oauth"}}},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).llm.openai.auth_mode == "codex_oauth"
     get_response = client.get("/api/config")
     assert get_response.status_code == 200
@@ -152,7 +152,7 @@ def test_put_config_round_trips_explicit_fallback_providers(monkeypatch, tmp_pat
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     loaded = load_config_from_path(config_path)
     assert loaded.llm.fallback_provider == "claude"
     assert loaded.llm.embedding.fallback_provider == "ollama"
@@ -174,7 +174,7 @@ def test_put_config_round_trips_embedding_multimodal_enabled(monkeypatch, tmp_pa
         "/api/config",
         json={"llm": {"embedding": {"multimodal_enabled": True}}},
     )
-    assert response.status_code == 200
+    assert response.status_code == 202
 
     loaded = load_config_from_path(config_path)
     assert loaded.llm.embedding.multimodal_enabled is True
@@ -201,7 +201,7 @@ def test_put_config_accepts_dashscope_embedding_provider(monkeypatch, tmp_path) 
             }
         },
     )
-    assert response.status_code == 200, response.json()
+    assert response.status_code == 202, response.json()
 
     loaded = load_config_from_path(config_path)
     assert loaded.llm.embedding.provider == "dashscope"
@@ -221,7 +221,7 @@ def test_put_config_round_trips_embedding_output_dimensionality(monkeypatch, tmp
         json={"llm": {"embedding": {"output_dimensionality": 768}}},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).llm.embedding.output_dimensionality == 768
 
     get_response = client.get("/api/config")
@@ -250,7 +250,7 @@ def test_put_config_ignores_whitespace_only_chat_provider_api_key(monkeypatch, t
 
     response = client.put("/api/config", json={"llm": {"openai": {"api_key": "   "}}})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).llm.openai.api_key == "sk-real-key-1234567890abcdef"
 
 
@@ -264,14 +264,14 @@ def test_put_config_uses_same_guard_for_other_chat_providers(monkeypatch, tmp_pa
             "/api/config",
             json={"llm": {provider_name: {"api_key": masked}}},
         )
-        assert response.status_code == 200
+        assert response.status_code == 202
         assert getattr(load_config_from_path(config_path).llm, provider_name).api_key == before
 
         response = client.put(
             "/api/config",
             json={"llm": {provider_name: {"api_key": ""}}},
         )
-        assert response.status_code == 200
+        assert response.status_code == 202
         assert getattr(load_config_from_path(config_path).llm, provider_name).api_key == before
 
 
@@ -280,7 +280,7 @@ def test_put_config_explicit_reset_clears_allowlisted_secret(monkeypatch, tmp_pa
 
     response = client.put("/api/config", json={"reset_fields": ["llm.openai.api_key"]})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert cfg.llm.openai.api_key == ""
     assert load_config_from_path(config_path).llm.openai.api_key == ""
 
@@ -310,7 +310,7 @@ def test_put_config_ignores_empty_embedding_model_and_base_url(monkeypatch, tmp_
         json={"llm": {"embedding": {"model": "", "base_url": ""}}},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     embedding = load_config_from_path(config_path).llm.embedding
     assert embedding.model == "text-embedding-3-small"
     assert embedding.base_url == "https://embed.example.com/v1"
@@ -368,7 +368,7 @@ def test_put_config_ignores_masked_bilibili_cookie_echo(monkeypatch, tmp_path) -
         json={"bilibili": {"cookie": "SESS************ID=42"}},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).bilibili.cookie == (
         "SESSDATA=real-sess; bili_jct=real-csrf; DedeUserID=42"
     )
@@ -379,7 +379,7 @@ def test_put_config_ignores_empty_bilibili_cookie(monkeypatch, tmp_path) -> None
 
     response = client.put("/api/config", json={"bilibili": {"cookie": ""}})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).bilibili.cookie == (
         "SESSDATA=real-sess; bili_jct=real-csrf; DedeUserID=42"
     )
@@ -394,7 +394,7 @@ def test_put_config_writes_real_new_bilibili_cookie(monkeypatch, tmp_path) -> No
         json={"bilibili": {"cookie": "SESSDATA=new-sess; bili_jct=new-csrf; DedeUserID=43"}},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).bilibili.cookie == (
         "SESSDATA=new-sess; bili_jct=new-csrf; DedeUserID=43"
     )
@@ -416,7 +416,7 @@ def test_put_config_routes_douyin_cookie_to_data_file(monkeypatch, tmp_path) -> 
         json={"sources": {"douyin": {"cookie": "sessionid=dy-sess; ttwid=dy-tw"}}},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     # Secret lands in data/douyin_cookie.json, never in config.toml.
     assert DouyinCookieManager(cfg.data_path).load_cookie() == "sessionid=dy-sess; ttwid=dy-tw"
     assert "dy-sess" not in config_path.read_text(encoding="utf-8")
@@ -435,7 +435,7 @@ def test_put_config_routes_x_cookie_to_data_file(monkeypatch, tmp_path) -> None:
         json={"sources": {"twitter": {"cookie": "auth_token=x-at; ct0=x-csrf"}}},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert XCookieManager(cfg.data_path).load_cookie() == "auth_token=x-at; ct0=x-csrf"
     assert "x-at" not in config_path.read_text(encoding="utf-8")
 
@@ -454,7 +454,7 @@ def test_put_config_ignores_masked_douyin_cookie_echo(monkeypatch, tmp_path) -> 
         json={"sources": {"douyin": {"cookie": "sess************real"}}},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert manager.load_cookie() == "sessionid=dy-real"
 
 
@@ -471,7 +471,7 @@ def test_put_config_empty_cookie_env_keeps_existing_name(monkeypatch, tmp_path) 
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     saved = load_config_from_path(config_path)
     assert saved.sources.douyin.cookie_env == "OPENBILICLAW_DOUYIN_COOKIE"
     assert saved.sources.twitter.cookie_env == "OPENBILICLAW_X_COOKIE"
@@ -540,7 +540,7 @@ def test_put_config_writes_valid_network_proxy(monkeypatch, tmp_path) -> None:
 
     response = client.put("/api/config", json={"network": {"proxy": "socks5://127.0.0.1:1080"}})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).network.proxy == "socks5://127.0.0.1:1080"
     # Hot path updated the process-level source of truth.
     assert network.outbound_proxy_mode() == "custom"
@@ -568,7 +568,7 @@ def test_put_config_switches_to_direct_and_ignores_environment_proxy(monkeypatch
 
     response = client.put("/api/config", json={"network": {"mode": "direct"}})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).network.mode == "direct"
     assert network.outbound_httpx_kwargs() == {"trust_env": False}
 
@@ -590,7 +590,7 @@ def test_put_config_proxy_only_payload_clears_to_system_not_direct(monkeypatch, 
 
     response = client.put("/api/config", json={"network": {"proxy": ""}})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     saved = load_config_from_path(config_path)
     assert saved.network.mode == "system"
     assert saved.network.proxy == ""
@@ -616,5 +616,5 @@ def test_put_config_ignores_masked_proxy_echo(monkeypatch, tmp_path) -> None:
 
     response = client.put("/api/config", json={"network": {"proxy": "socks5://***@127.0.0.1:1080"}})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert load_config_from_path(config_path).network.proxy == "socks5://user:secret@127.0.0.1:1080"

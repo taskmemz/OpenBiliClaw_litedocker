@@ -505,17 +505,11 @@ _INIT_BILIBILI_FOLLOW_LIMIT = 100
 # twitter-cli (no extension task). Both are strong explicit-preference signals.
 _INIT_X_LIKES_LIMIT = 200
 _INIT_X_BOOKMARKS_LIMIT = 200
-_INIT_BOOTSTRAP_MAX_ITEMS_PER_SCOPE = 300
 _DEFAULT_XHS_BOOTSTRAP_WAIT_SECONDS = 180.0
 _DEFAULT_DY_BOOTSTRAP_WAIT_SECONDS = 180.0
 _DEFAULT_YT_BOOTSTRAP_WAIT_SECONDS = 240.0
 _DEFAULT_ZHIHU_BOOTSTRAP_WAIT_SECONDS = 180.0
 _DEFAULT_REDDIT_BOOTSTRAP_WAIT_SECONDS = 180.0
-_DEFAULT_XHS_BOOTSTRAP_DEDUPE_HOURS = 6.0
-_DEFAULT_DY_BOOTSTRAP_DEDUPE_HOURS = 6.0
-_DEFAULT_YT_BOOTSTRAP_DEDUPE_HOURS = 6.0
-_DEFAULT_ZHIHU_BOOTSTRAP_DEDUPE_HOURS = 6.0
-_DEFAULT_REDDIT_BOOTSTRAP_DEDUPE_HOURS = 6.0
 _EXTENSION_PRESENCE_REQUIRED_WARNING = (
     "WARN extension presence required; backend will pause background LLM work "
     "after grace period if no extension client connects"
@@ -882,6 +876,9 @@ def _build_soul_engine() -> Any:
         memory=memory,
         usage_recorder=_build_usage_recorder(),
         satisfaction_filter_enabled=cfg.soul.preference.satisfaction_filter_enabled,
+        preference_prompt_view=str(getattr(cfg.soul, "preference_prompt_view", "legacy")),
+        awareness_prompt_view=str(getattr(cfg.soul, "awareness_prompt_view", "compact-v1")),
+        insight_prompt_view=str(getattr(cfg.soul, "insight_prompt_view", "legacy")),
         posture_gate_mode=cfg.soul.posture_gate_mode,
         posture_gate_force_enforce=cfg.soul.posture_gate_force_enforce,
         module_overrides=module_overrides_from_config(cfg),
@@ -934,6 +931,14 @@ def _build_recommendation_engine() -> Any:
     memory = _build_memory_manager()
     database = _get_runtime_database()
     cfg = load_config()
+    configured_copy_target = max(
+        0,
+        int(getattr(cfg.scheduler, "copy_ready_target_count", 0) or 0),
+    )
+    effective_copy_target = min(
+        configured_copy_target,
+        max(0, int(getattr(cfg.scheduler, "pool_target_count", 0) or 0)),
+    )
     registry = _build_registry()
     llm_service = LLMService(
         registry=registry,
@@ -962,6 +967,7 @@ def _build_recommendation_engine() -> Any:
         database=database,
         embedding_service=embedding_service,
         xhs_self_info_provider=_xhs_self_info_provider,
+        copy_ready_target_count=effective_copy_target,
         visual_profile_enabled=bool(
             getattr(getattr(cfg, "discovery", None), "visual_profile_enabled", False)
         ),
@@ -1126,6 +1132,7 @@ def _build_discovery_engine() -> Any:
         multimodal_image_timeout_seconds=int(
             getattr(discovery_cfg, "multimodal_image_timeout_seconds", 6)
         ),
+        eval_prefilter_mode=str(getattr(discovery_cfg, "eval_prefilter_mode", "shadow")),
     )
     search_strategy = SearchStrategy(
         llm_service=llm_service,
@@ -2855,75 +2862,14 @@ async def _run_init_discovery_backfill_async(
     return discovered_count
 
 
-def _xhs_bootstrap_dedupe_hours() -> float:
-    raw = os.environ.get(
-        "OPENBILICLAW_XHS_BOOTSTRAP_DEDUPE_HOURS",
-        str(_DEFAULT_XHS_BOOTSTRAP_DEDUPE_HOURS),
-    )
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return _DEFAULT_XHS_BOOTSTRAP_DEDUPE_HOURS
-
-
-def _dy_bootstrap_dedupe_hours() -> float:
-    raw = os.environ.get(
-        "OPENBILICLAW_DY_BOOTSTRAP_DEDUPE_HOURS",
-        str(_DEFAULT_DY_BOOTSTRAP_DEDUPE_HOURS),
-    )
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return _DEFAULT_DY_BOOTSTRAP_DEDUPE_HOURS
-
-
-def _yt_bootstrap_dedupe_hours() -> float:
-    raw = os.environ.get(
-        "OPENBILICLAW_YT_BOOTSTRAP_DEDUPE_HOURS",
-        str(_DEFAULT_YT_BOOTSTRAP_DEDUPE_HOURS),
-    )
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return _DEFAULT_YT_BOOTSTRAP_DEDUPE_HOURS
-
-
-def _zhihu_bootstrap_dedupe_hours() -> float:
-    raw = os.environ.get(
-        "OPENBILICLAW_ZHIHU_BOOTSTRAP_DEDUPE_HOURS",
-        str(_DEFAULT_ZHIHU_BOOTSTRAP_DEDUPE_HOURS),
-    )
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return _DEFAULT_ZHIHU_BOOTSTRAP_DEDUPE_HOURS
-
-
-def _reddit_bootstrap_dedupe_hours() -> float:
-    raw = os.environ.get(
-        "OPENBILICLAW_REDDIT_BOOTSTRAP_DEDUPE_HOURS",
-        str(_DEFAULT_REDDIT_BOOTSTRAP_DEDUPE_HOURS),
-    )
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return _DEFAULT_REDDIT_BOOTSTRAP_DEDUPE_HOURS
-
-
-def _enqueue_xhs_bootstrap_task(*, force: bool = False, kick: bool = True) -> str | None:
-    """Fire-and-forget enqueue of the bootstrap_profile task.
-
-    Returns the task_id if enqueue succeeded, ``None`` otherwise (DB
-    unavailable, daily budget exhausted, etc.). Doesn't wait — the
-    extension picks the task off the queue and runs it in parallel
-    with the rest of init.
-
-    Defaults: ``max_scroll_rounds=15`` and ``max_items_per_scope=300``.
-    Both can be overridden via env vars
-    ``OPENBILICLAW_XHS_BOOTSTRAP_SCROLL_ROUNDS`` and
-    ``OPENBILICLAW_XHS_BOOTSTRAP_MAX_ITEMS``.
-    """
-    from openbiliclaw.sources.xhs_tasks import XhsTaskQueue
+def _enqueue_xhs_bootstrap_task(
+    *,
+    force: bool = False,
+    kick: bool = True,
+    incremental: bool = False,
+) -> str | None:
+    """Resolve the runtime database and enqueue the XHS bootstrap task."""
+    from openbiliclaw.sources import source_bootstrap
 
     try:
         database = _get_runtime_database()
@@ -2933,59 +2879,15 @@ def _enqueue_xhs_bootstrap_task(*, force: bool = False, kick: bool = True) -> st
     if not hasattr(database, "conn"):
         return None
 
-    scroll_rounds = int(os.environ.get("OPENBILICLAW_XHS_BOOTSTRAP_SCROLL_ROUNDS", "15"))
-    max_items = int(
-        os.environ.get(
-            "OPENBILICLAW_XHS_BOOTSTRAP_MAX_ITEMS",
-            str(_INIT_BOOTSTRAP_MAX_ITEMS_PER_SCOPE),
-        )
+    result = source_bootstrap.enqueue_xhs_bootstrap(
+        database,
+        force=force,
+        incremental=incremental,
+        notify=console.print,
     )
-    task_id: str | None = None
-
-    try:
-        queue = XhsTaskQueue(database)
-        dedupe_hours = _xhs_bootstrap_dedupe_hours()
-        find_recent = getattr(queue, "find_recent_task", None)
-        if not force and dedupe_hours > 0 and callable(find_recent):
-            recent = find_recent(
-                "bootstrap_profile",
-                recent_hours=dedupe_hours,
-                statuses=("pending", "in_progress", "completed", "failed"),
-            )
-            if recent is not None:
-                task_id = str(recent.get("id", "")).strip()
-                if task_id:
-                    status = str(recent.get("status", "unknown"))
-                    console.print(
-                        "  [dim]复用最近的小红书 bootstrap 任务"
-                        f"({status})；需要重新拉取可用 `openbiliclaw fetch-xhs --force`。[/dim]"
-                    )
-                    return task_id
-        task_id = queue.enqueue_with_id(
-            "bootstrap_profile",
-            {
-                "scopes": ["saved", "liked", "xhs_history"],
-                "max_items_per_scope": max(1, max_items),
-                "max_scroll_rounds": max(0, scroll_rounds),
-            },
-            daily_budget=10,
-        )
-    except Exception as exc:
-        console.print(f"  [yellow]小红书初始化信号未导入: {exc}[/yellow]")
-        return None
-    if not task_id:
-        console.print("  [yellow]小红书初始化信号未导入: 今日任务预算已用完。[/yellow]")
-        return None
-    # Wake the extension dispatcher immediately via the runtime-stream
-    # WebSocket instead of waiting up to 60s for the next chrome.alarms
-    # tick. The kick is best-effort — if the daemon's API isn't running
-    # the existing alarm-based poll still picks up the task on next fire.
-    # ``kick=False`` lets the guided-init pipeline register task ownership
-    # with the coordinator *before* waking the extension (avoids a
-    # register-after-kick race where an owned result is treated as foreign).
-    if kick:
+    if result.created and result.task_id and kick:
         _kick_task_dispatcher("xhs")
-    return task_id
+    return result.task_id
 
 
 def _kick_task_dispatcher(source: str) -> None:
@@ -3116,22 +3018,14 @@ def _import_xhs_bootstrap_events() -> tuple[list[dict[str, Any]], dict[str, int]
     return events, counts
 
 
-def _enqueue_dy_bootstrap_task(*, kick: bool = True) -> str | None:
-    """Fire-and-forget enqueue of the Douyin bootstrap_profile task.
-
-    Mirror of ``_enqueue_xhs_bootstrap_task`` for the Douyin pipeline.
-    No code shared between the two — separate ``DyTaskQueue`` table,
-    separate env vars, separate user-visible messages. Soul-engine
-    consumes the resulting events through the unified
-    ``event_format.build_event`` contract, so the cross-source
-    analysis remains uniform downstream.
-
-    Defaults: ``max_scroll_rounds=15`` and ``max_items_per_scope=300``.
-    Both can be overridden via env vars
-    ``OPENBILICLAW_DY_BOOTSTRAP_SCROLL_ROUNDS`` and
-    ``OPENBILICLAW_DY_BOOTSTRAP_MAX_ITEMS``.
-    """
-    from openbiliclaw.sources.dy_tasks import DyTaskQueue
+def _enqueue_dy_bootstrap_task(
+    *,
+    force: bool = False,
+    kick: bool = True,
+    incremental: bool = False,
+) -> str | None:
+    """Resolve the runtime database and enqueue the Douyin bootstrap task."""
+    from openbiliclaw.sources import source_bootstrap
 
     try:
         database = _get_runtime_database()
@@ -3141,72 +3035,15 @@ def _enqueue_dy_bootstrap_task(*, kick: bool = True) -> str | None:
     if not hasattr(database, "conn"):
         return None
 
-    scroll_rounds = int(os.environ.get("OPENBILICLAW_DY_BOOTSTRAP_SCROLL_ROUNDS", "15"))
-    max_items = int(
-        os.environ.get(
-            "OPENBILICLAW_DY_BOOTSTRAP_MAX_ITEMS",
-            str(_INIT_BOOTSTRAP_MAX_ITEMS_PER_SCOPE),
-        )
+    result = source_bootstrap.enqueue_dy_bootstrap(
+        database,
+        force=force,
+        incremental=incremental,
+        notify=console.print,
     )
-    task_id: str | None = None
-
-    try:
-        queue = DyTaskQueue(database)
-        dedupe_hours = _dy_bootstrap_dedupe_hours()
-        find_recent = getattr(queue, "find_recent_task", None)
-        if dedupe_hours > 0 and callable(find_recent):
-            recent = find_recent(
-                "bootstrap_profile",
-                recent_hours=dedupe_hours,
-                statuses=("pending", "in_progress", "completed", "failed"),
-            )
-            if recent is not None:
-                raw_result = recent.get("result_json")
-                if isinstance(raw_result, dict):
-                    parsed_result = raw_result
-                elif isinstance(raw_result, (str, bytes, bytearray)):
-                    try:
-                        parsed_result = json.loads(raw_result)
-                    except (TypeError, ValueError):
-                        parsed_result = None
-                else:
-                    parsed_result = None
-                recent_is_degraded = (
-                    isinstance(parsed_result, dict)
-                    and str(parsed_result.get("status", "")).strip().lower() == "degraded"
-                )
-                if recent_is_degraded:
-                    console.print(
-                        "  [dim]最近的抖音 bootstrap 任务仅部分完成；本次重新入队以补齐分页。[/dim]"
-                    )
-                else:
-                    task_id = str(recent.get("id", "")).strip()
-                    if task_id:
-                        status = str(recent.get("status", "unknown"))
-                        console.print(
-                            "  [dim]复用最近的抖音 bootstrap 任务"
-                            f"({status})；需要重新拉取可设 "
-                            "OPENBILICLAW_DY_BOOTSTRAP_DEDUPE_HOURS=0。[/dim]"
-                        )
-                        return task_id
-        task_id = queue.enqueue_with_id(
-            "bootstrap_profile",
-            {
-                "scopes": ["dy_post", "dy_collect", "dy_like", "dy_follow"],
-                "max_items_per_scope": max(1, max_items),
-                "max_scroll_rounds": max(0, scroll_rounds),
-            },
-            daily_budget=10,
-        )
-    except Exception as exc:
-        console.print(f"  [yellow]抖音初始化信号未导入: {exc}[/yellow]")
-        return None
-    if not task_id:
-        console.print("  [yellow]抖音初始化信号未导入: 今日任务预算已用完。[/yellow]")
-        return None
-    if kick:
+    if result.created and result.task_id and kick:
         _kick_task_dispatcher("dy")
-    return task_id
+    return result.task_id
 
 
 def _collect_dy_bootstrap_events(
@@ -3308,15 +3145,14 @@ def _collect_dy_bootstrap_events(
     return events, scope_counts, status_label
 
 
-def _enqueue_yt_bootstrap_task(*, kick: bool = True) -> str | None:
-    """Enqueue a YouTube bootstrap_profile task for the browser extension.
-
-    Defaults: ``max_scroll_rounds=10`` and ``max_items_per_scope=300``.
-    Both can be overridden via env vars
-    ``OPENBILICLAW_YT_BOOTSTRAP_SCROLL_ROUNDS`` and
-    ``OPENBILICLAW_YT_BOOTSTRAP_MAX_ITEMS``.
-    """
-    from openbiliclaw.sources.yt_tasks import YtTaskQueue
+def _enqueue_yt_bootstrap_task(
+    *,
+    force: bool = False,
+    kick: bool = True,
+    incremental: bool = False,
+) -> str | None:
+    """Resolve the runtime database and enqueue the YouTube bootstrap task."""
+    from openbiliclaw.sources import source_bootstrap
 
     try:
         database = _get_runtime_database()
@@ -3326,53 +3162,15 @@ def _enqueue_yt_bootstrap_task(*, kick: bool = True) -> str | None:
     if not hasattr(database, "conn"):
         return None
 
-    scroll_rounds = int(os.environ.get("OPENBILICLAW_YT_BOOTSTRAP_SCROLL_ROUNDS", "10"))
-    max_items = int(
-        os.environ.get(
-            "OPENBILICLAW_YT_BOOTSTRAP_MAX_ITEMS",
-            str(_INIT_BOOTSTRAP_MAX_ITEMS_PER_SCOPE),
-        )
+    result = source_bootstrap.enqueue_yt_bootstrap(
+        database,
+        force=force,
+        incremental=incremental,
+        notify=console.print,
     )
-    task_id: str | None = None
-
-    try:
-        queue = YtTaskQueue(database)
-        dedupe_hours = _yt_bootstrap_dedupe_hours()
-        find_recent = getattr(queue, "find_recent_task", None)
-        if dedupe_hours > 0 and callable(find_recent):
-            recent = find_recent(
-                "bootstrap_profile",
-                recent_hours=dedupe_hours,
-                statuses=("pending", "in_progress", "completed", "failed"),
-            )
-            if recent is not None:
-                task_id = str(recent.get("id", "")).strip()
-                if task_id:
-                    status = str(recent.get("status", "unknown"))
-                    console.print(
-                        "  [dim]复用最近的 YouTube bootstrap 任务"
-                        f"({status})；需要重新拉取可设 "
-                        "OPENBILICLAW_YT_BOOTSTRAP_DEDUPE_HOURS=0。[/dim]"
-                    )
-                    return task_id
-        task_id = queue.enqueue_with_id(
-            "bootstrap_profile",
-            {
-                "scopes": ["yt_history", "yt_subscriptions", "yt_likes"],
-                "max_items_per_scope": max(1, max_items),
-                "max_scroll_rounds": max(0, scroll_rounds),
-            },
-            daily_budget=10,
-        )
-    except Exception as exc:
-        console.print(f"  [yellow]YouTube 初始化信号未导入: {exc}[/yellow]")
-        return None
-    if not task_id:
-        console.print("  [yellow]YouTube 初始化信号未导入: 今日任务预算已用完。[/yellow]")
-        return None
-    if kick:
+    if result.created and result.task_id and kick:
         _kick_task_dispatcher("yt")
-    return task_id
+    return result.task_id
 
 
 def _collect_yt_bootstrap_events(
@@ -3467,13 +3265,11 @@ def _enqueue_zhihu_bootstrap_task(
     profile_slug: str = "",
     kick: bool = True,
     profile_update: bool = False,
+    force: bool = False,
+    incremental: bool = False,
 ) -> str | None:
-    """Enqueue a Zhihu bootstrap_events task for the browser extension.
-
-    The extension executes same-origin Zhihu session fetches in the logged-in
-    browser. This command is fetch-only; it does not trigger profile generation.
-    """
-    from openbiliclaw.sources.zhihu_tasks import ZhihuTaskQueue
+    """Resolve the runtime database and enqueue the Zhihu bootstrap task."""
+    from openbiliclaw.sources import source_bootstrap
 
     try:
         database = _get_runtime_database()
@@ -3483,62 +3279,17 @@ def _enqueue_zhihu_bootstrap_task(
     if not hasattr(database, "conn"):
         return None
 
-    max_items = int(
-        os.environ.get(
-            "OPENBILICLAW_ZHIHU_BOOTSTRAP_MAX_ITEMS",
-            str(_INIT_BOOTSTRAP_MAX_ITEMS_PER_SCOPE),
-        )
+    result = source_bootstrap.enqueue_zhihu_bootstrap(
+        database,
+        force=force,
+        incremental=incremental,
+        profile_slug=profile_slug,
+        profile_update=profile_update,
+        notify=console.print,
     )
-    max_collections = int(os.environ.get("OPENBILICLAW_ZHIHU_BOOTSTRAP_MAX_COLLECTIONS", "20"))
-    task_id: str | None = None
-
-    try:
-        queue = ZhihuTaskQueue(database)
-        dedupe_hours = _zhihu_bootstrap_dedupe_hours()
-        find_recent = getattr(queue, "find_recent_task", None)
-        if dedupe_hours > 0 and callable(find_recent):
-            recent = find_recent(
-                "bootstrap_events",
-                recent_hours=dedupe_hours,
-                statuses=("pending", "in_progress", "completed", "failed"),
-            )
-            if recent is not None:
-                task_id = str(recent.get("id", "")).strip()
-                if task_id:
-                    status = str(recent.get("status", "unknown"))
-                    console.print(
-                        "  [dim]复用最近的知乎 bootstrap 任务"
-                        f"({status})；需要重新拉取可设 "
-                        "OPENBILICLAW_ZHIHU_BOOTSTRAP_DEDUPE_HOURS=0。[/dim]"
-                    )
-                    return task_id
-
-        scopes = ["zhihu_read_history", "zhihu_collection", "zhihu_activity"]
-        if not profile_slug.strip():
-            console.print(
-                "  [dim]未传 --profile-slug，扩展会尝试从知乎登录态识别当前用户；"
-                "识别失败时只返回浏览记录和收藏夹。[/dim]"
-            )
-        task_id = queue.enqueue_with_id(
-            "bootstrap_events",
-            {
-                "scopes": scopes,
-                "profile_slug": profile_slug.strip(),
-                "max_items_per_scope": max(1, max_items),
-                "max_collections": max(1, max_collections),
-                "profile_update": bool(profile_update),
-            },
-            daily_budget=10,
-        )
-    except Exception as exc:
-        console.print(f"  [yellow]知乎事件未拉取: {exc}[/yellow]")
-        return None
-    if not task_id:
-        console.print("  [yellow]知乎事件未拉取: 今日任务预算已用完。[/yellow]")
-        return None
-    if kick:
+    if result.created and result.task_id and kick:
         _kick_task_dispatcher("zhihu")
-    return task_id
+    return result.task_id
 
 
 def _collect_zhihu_bootstrap_events(
@@ -4002,9 +3753,11 @@ def _enqueue_reddit_bootstrap_task(
     *,
     kick: bool = True,
     profile_update: bool = False,
+    force: bool = False,
+    incremental: bool = False,
 ) -> str | None:
-    """Enqueue a Reddit bootstrap_events task for the browser extension."""
-    from openbiliclaw.sources.reddit_tasks import RedditTaskQueue
+    """Resolve the runtime database and enqueue the Reddit bootstrap task."""
+    from openbiliclaw.sources import source_bootstrap
 
     try:
         database = _get_runtime_database()
@@ -4014,52 +3767,16 @@ def _enqueue_reddit_bootstrap_task(
     if not hasattr(database, "conn"):
         return None
 
-    max_items = int(
-        os.environ.get(
-            "OPENBILICLAW_REDDIT_BOOTSTRAP_MAX_ITEMS",
-            str(_INIT_BOOTSTRAP_MAX_ITEMS_PER_SCOPE),
-        )
+    result = source_bootstrap.enqueue_reddit_bootstrap(
+        database,
+        force=force,
+        incremental=incremental,
+        profile_update=profile_update,
+        notify=console.print,
     )
-    task_id: str | None = None
-    try:
-        queue = RedditTaskQueue(database)
-        dedupe_hours = _reddit_bootstrap_dedupe_hours()
-        find_recent = getattr(queue, "find_recent_task", None)
-        if dedupe_hours > 0 and callable(find_recent):
-            recent = find_recent(
-                "bootstrap_events",
-                recent_hours=dedupe_hours,
-                statuses=("pending", "in_progress", "completed", "failed"),
-            )
-            if recent is not None:
-                task_id = str(recent.get("id", "")).strip()
-                if task_id:
-                    status = str(recent.get("status", "unknown"))
-                    console.print(
-                        "  [dim]复用最近的 Reddit bootstrap 任务"
-                        f"({status})；需要重新拉取可设 "
-                        "OPENBILICLAW_REDDIT_BOOTSTRAP_DEDUPE_HOURS=0。[/dim]"
-                    )
-                    return task_id
-
-        task_id = queue.enqueue_with_id(
-            "bootstrap_events",
-            {
-                "scopes": ["reddit_saved", "reddit_upvoted", "reddit_subscribed"],
-                "max_items_per_scope": max(1, max_items),
-                "profile_update": bool(profile_update),
-            },
-            daily_budget=10,
-        )
-    except Exception as exc:
-        console.print(f"  [yellow]Reddit 初始化事件未拉取: {exc}[/yellow]")
-        return None
-    if not task_id:
-        console.print("  [yellow]Reddit 初始化事件未拉取: 今日任务预算已用完。[/yellow]")
-        return None
-    if kick:
+    if result.created and result.task_id and kick:
         _kick_task_dispatcher("reddit")
-    return task_id
+    return result.task_id
 
 
 def _collect_reddit_bootstrap_events(
@@ -7252,6 +6969,10 @@ async def run_guided_init(
     run lifecycle (mark_running / complete / fail) stays with the caller.
     """
 
+    import logging
+
+    logger = logging.getLogger("openbiliclaw.cli")
+
     async def _stage_started(n: int) -> None:
         if coordinator is not None and run_id is not None:
             await coordinator.stage_started(run_id, n)
@@ -7837,6 +7558,25 @@ async def run_guided_init(
         )
     elif reddit_status == "failed":
         console.print("  [yellow]Reddit 任务失败 —— 检查扩展日志,或重试 init。[/yellow]")
+
+    # Guided-init collection is a real bootstrap attempt even though profile
+    # analysis has not started yet. Seed only evidence-backed terminal states;
+    # this is scheduling state and must not change the event/output payload.
+    try:
+        from openbiliclaw.sources.source_bootstrap import seed_guided_init_attempts
+
+        seed_guided_init_attempts(
+            memory,
+            {
+                "xhs": xhs_status,
+                "dy": dy_status,
+                "yt": yt_status,
+                "zhihu": zhihu_status,
+                "reddit": reddit_status,
+            },
+        )
+    except Exception:
+        logger.warning("guided init source incremental state seed failed", exc_info=True)
 
     # Build events from all data sources via the unified event_format
     # builder so B站 / 小红书 / future-source events share one shape.
@@ -9374,7 +9114,7 @@ def profile_consolidate(
         console.print(f"  [yellow]库存说明:[/yellow] {report.inventory_reason}")
     if not apply and (report.merges or report.rule_merges):
         console.print("\n  [dim]满意的话用 --apply 真正写入。[/dim]")
-    if apply and (report.merges or report.rule_merges or report.archived_interests):
+    if apply and report.applied:
         console.print(f"\n  [dim]已备份，run_id={report.run_id}[/dim]")
 
 
@@ -11447,8 +11187,8 @@ def _run_xhs_discovery(*, force: bool) -> None:
         soul_engine=soul_engine,
         llm_service=llm_service,
         enabled=True,
-        daily_budget=int(getattr(xhs_cfg, "daily_search_budget", 0)),
-        min_interval_minutes=0 if force else int(getattr(xhs_cfg, "min_interval_minutes", 3)),
+        daily_budget=int(getattr(xhs_cfg, "daily_search_budget", 20)),
+        min_interval_minutes=0 if force else int(getattr(xhs_cfg, "min_interval_minutes", 20)),
     )
     result = asyncio.run(producer.produce_if_due())
 
@@ -11463,12 +11203,12 @@ def _run_xhs_discovery(*, force: bool) -> None:
             [
                 ("入队关键词数", str(enqueued)),
                 ("尝试关键词数", str(attempted)),
-                ("今日预算", str(int(getattr(xhs_cfg, "daily_search_budget", 0)))),
+                ("今日预算", str(int(getattr(xhs_cfg, "daily_search_budget", 20)))),
                 (
                     "节流开关",
                     "已跳过（--force）"
                     if force
-                    else f"{int(getattr(xhs_cfg, 'min_interval_minutes', 3))} 分钟节流",
+                    else f"{int(getattr(xhs_cfg, 'min_interval_minutes', 20))} 分钟节流",
                 ),
             ],
         )
@@ -11482,8 +11222,18 @@ def _run_xhs_discovery(*, force: bool) -> None:
         ),
         "throttled": (
             "info",
-            f"距离上次关键词生产不足 {int(getattr(xhs_cfg, 'min_interval_minutes', 3))} 分钟",
+            f"距离上次关键词生产不足 {int(getattr(xhs_cfg, 'min_interval_minutes', 20))} 分钟",
             "可使用 `--force` 忽略节流重新触发。",
+        ),
+        "backlog": (
+            "info",
+            "小红书搜索任务队列已满",
+            "已有 5 条待执行或执行中的搜索任务；扩展消费后会自动继续补充。",
+        ),
+        "rate_limited": (
+            "warning",
+            "小红书后台任务正在风控冷却",
+            "请等待状态页显示的冷却时间结束；`--force` 不会绕过该安全窗口。",
         ),
         "no_profile": (
             "warning",
@@ -11731,6 +11481,11 @@ def _build_discovery_candidate_pipeline(
         discovery_engine=discovery_engine,
         pool_target_count=int(getattr(config.scheduler, "pool_target_count", 300)),
         admission_min_score=admission_min_score,
+        # Manual producer commands are one-shot processes. An in-memory wait
+        # window cannot survive process exit, so they must drain immediately;
+        # daemon coalescing is owned by CandidateEvalCoordinator.
+        min_eval_batch_size=1,
+        max_eval_wait_seconds=0.0,
     )
 
 

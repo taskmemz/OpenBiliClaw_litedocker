@@ -80,6 +80,7 @@ test("XHS native save accepts only canonical correlated note/video identities", 
   for (const candidate of [
     task,
     { ...task, content_type: "video", content_url: `https://www.xiaohongshu.com/discovery/item/${CONTENT_ID}` },
+    { ...task, content_url: `https://www.xiaohongshu.com/search_result/${CONTENT_ID}` },
   ]) {
     const env = fixture({ currentUrl: candidate.content_url });
     assert.deepEqual(await saveXiaohongshu(candidate, env), { status: "synced" });

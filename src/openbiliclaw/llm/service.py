@@ -222,9 +222,14 @@ class LLMService:
         ("discovery.explore", "discovery"),
         ("discovery.trending", "discovery"),
         ("discovery.related", "discovery"),
+        ("discovery.x", "discovery"),
+        ("discovery.douyin", "discovery"),
+        ("runtime.bilibili_extension_search", "discovery"),
         ("yt_search", "discovery"),
         ("sources.xhs", "discovery"),
         ("recommendation", "recommendation"),
+        ("pool_purge", "soul"),
+        ("api.sentiment", "soul"),
         ("soul", "soul"),
     )
     # Channel-facing work is dominated by bounded JSON extraction, scoring,
@@ -406,6 +411,46 @@ class LLMService:
             return normalized
         return f"{normalized}\n\njson" if normalized else "json"
 
+    def _core_memory_blocks(self, inject_core_memory: bool) -> tuple[str, str]:
+        """Return ``(stable_block, volatile_block)`` for core-memory injection.
+
+        The stable block (portrait / identity / preference) goes into the system
+        prefix so provider prompt caching keeps firing; the volatile block
+        (recent awareness / active insights) goes into the user message so
+        awareness churn no longer invalidates the cached prefix.
+
+        Prefers the manager's split API (``render_core_memory_blocks``). The
+        ``getattr`` guard falls back to the legacy single-block
+        ``render_core_memory_prompt`` (whole block treated as stable) purely for
+        lightweight memory doubles in tests that predate the split — the real
+        ``MemoryManager`` always exposes the split API. This is deliberately not
+        a probe for a nonexistent method (cf. the removed ``_build_core_memory_block``
+        getattr): both fallback targets are real, public rendering methods.
+        """
+        if not inject_core_memory or self.memory is None:
+            return "", ""
+        blocks_fn = getattr(self.memory, "render_core_memory_blocks", None)
+        if callable(blocks_fn):
+            with suppress(Exception):
+                stable, volatile = blocks_fn()
+                return str(stable), str(volatile)
+            return "", ""
+        with suppress(Exception):
+            return str(self.memory.render_core_memory_prompt()), ""
+        return "", ""
+
+    @staticmethod
+    def _prepend_volatile_core_memory(user_input: str, volatile_block: str) -> str:
+        """Prepend the volatile core-memory block ahead of the turn content.
+
+        Most-stable-first ordering: the volatile profile context (still more
+        stable than this turn's user input) leads, then the actual request. No
+        empty paragraph is added when there is no volatile block.
+        """
+        if not volatile_block:
+            return user_input
+        return f"以下是该用户的近期动态（观察 / 洞察，供参考）：\n{volatile_block}\n\n{user_input}"
+
     async def complete_with_core_memory(
         self,
         *,
@@ -440,23 +485,21 @@ class LLMService:
         ``user_input``. This keeps provider-side prompt-cache prefixes
         stable without changing the information available to the task.
         """
-        core_memory_block = ""
-        if inject_core_memory and self.memory is not None:
-            with suppress(Exception):
-                core_memory_block = self.memory.render_core_memory_prompt()
+        stable_block, volatile_block = self._core_memory_blocks(inject_core_memory)
         parts = [system_instruction.strip()]
-        if core_memory_block:
+        if stable_block:
             parts.append("以下是当前用户的 core memory，请作为理解背景：")
-            parts.append(core_memory_block)
+            parts.append(stable_block)
         system_content = "\n\n".join(parts)
         effective_reasoning_effort = self._reasoning_effort_for_call(
             caller,
             reasoning_effort,
         )
+        user_content = self._prepend_volatile_core_memory(user_input, volatile_block)
         messages: list[dict[str, str]] = [{"role": "system", "content": system_content}]
         if history:
             messages.extend(history)
-        messages.append({"role": "user", "content": user_input})
+        messages.append({"role": "user", "content": user_content})
 
         async def _do_llm_call() -> LLMResponse:
             routed_chain = self._resolve_module_chain(caller)
@@ -610,21 +653,19 @@ class LLMService:
         inject_core_memory: bool = True,
     ) -> LLMResponse:
         """Execute a JSON-mode task with user text plus image inputs."""
-        core_memory_block = ""
-        if inject_core_memory and self.memory is not None:
-            with suppress(Exception):
-                core_memory_block = self.memory.render_core_memory_prompt()
+        stable_block, volatile_block = self._core_memory_blocks(inject_core_memory)
         parts = [self._structured_json_contract(system_instruction)]
-        if core_memory_block:
+        if stable_block:
             parts.append("以下是当前用户的 core memory，请作为理解背景：")
-            parts.append(core_memory_block)
+            parts.append(stable_block)
         system_content = "\n\n".join(parts)
         effective_reasoning_effort = self._reasoning_effort_for_call(
             caller,
             reasoning_effort,
         )
 
-        user_parts: list[dict[str, Any]] = [{"type": "text", "text": user_input}]
+        user_text = self._prepend_volatile_core_memory(user_input, volatile_block)
+        user_parts: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
         for image in image_inputs:
             content_id = str(image.get("content_id") or "").strip()
             data_url = str(image.get("data_url") or "").strip()

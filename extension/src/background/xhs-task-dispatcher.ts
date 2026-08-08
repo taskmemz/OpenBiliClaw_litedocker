@@ -3,7 +3,9 @@
  *
  * Polls ``GET /api/sources/xhs/next-task`` at intervals. When the backend
  * hands out a task, the dispatcher:
- *   1. Opens a background tab at the appropriate xhs URL.
+ *   1. Opens discovery URLs in a hidden tab. Search results come from the
+ *      page's own API-response bridge when XHS skips hidden-tab DOM rendering.
+ *      Profile bootstrap remains foreground because it intentionally scrolls.
  *   2. Listens for ``XHS_TASK_RESULT`` from the content script.
  *   3. POSTs the result back to ``/api/sources/xhs/task-result``.
  *   4. Closes the tab.
@@ -184,6 +186,10 @@ function shouldActivateBeforeExecute(task: XhsLegacyTask): boolean {
   return bootstrapNavigationCount > 0;
 }
 
+function shouldOpenTaskForeground(task: XhsLegacyTask): boolean {
+  return task.type === "bootstrap_profile";
+}
+
 function buildExecuteMessageData(task: XhsLegacyTask): Record<string, unknown> {
   const data: Record<string, unknown> = { task_id: task.id, type: task.type };
   if (task.scopes !== undefined) data.scopes = task.scopes;
@@ -354,9 +360,7 @@ function cleanupTask(): void {
     clearTimeout(taskNavigationFallbackId);
     taskNavigationFallbackId = null;
   }
-  if (taskTabId !== null && ownsTaskTab) {
-    void chrome.tabs.remove(taskTabId).catch(() => {});
-  }
+  const tabToClose = taskTabId !== null && ownsTaskTab ? taskTabId : null;
   taskTabId = null;
   ownsTaskTab = false;
   currentTaskId = null;
@@ -366,6 +370,11 @@ function cleanupTask(): void {
   dispatcherDebugEvents = [];
   taskInFlight = false;
   releaseDispatcherMutex("xhs");
+  if (tabToClose !== null) {
+    void (async () => {
+      await chrome.tabs.remove(tabToClose).catch(() => {});
+    })();
+  }
 }
 
 function armTaskTimeout(task: XhsLegacyTask): void {
@@ -492,21 +501,17 @@ export async function executeTask(
   }
 
   try {
-    // Foreground for init-time bootstrap (user is running ``openbiliclaw
-    // init`` and expects to see XHS profile pull happen — also XHS's
-    // virtualised lists only paginate properly in an active tab).
-    // Background for discovery (search / creator) so ongoing scraping
-    // doesn't interrupt active browsing.
+    const foreground = shouldOpenTaskForeground(task);
     const tab = await chrome.tabs.create({
       url,
-      active: task.type === "bootstrap_profile",
+      active: foreground,
     });
     taskTabId = tab.id ?? null;
     ownsTaskTab = taskTabId !== null;
     recordDispatcherDebug("task_tab_created", {
       tab_id: taskTabId ?? "",
       url,
-      active: task.type === "bootstrap_profile",
+      active: foreground,
     });
   } catch {
     await reportTaskResult({ task_id: task.id, urls: [], status: "error", error: "tab_create_failed" });

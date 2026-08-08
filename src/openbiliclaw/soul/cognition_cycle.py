@@ -22,7 +22,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
+import re
+import unicodedata
+from collections import Counter
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -82,6 +86,75 @@ _AWARENESS_CONTEXT_LOOKBACK = 10
 # but still large enough that real runs (a handful of new notes) are one call.
 _INSIGHT_NOTE_BACKLOG_CAP = 450
 _INSIGHT_NOTE_BATCH_SIZE = 150
+
+# Model-visible existing-hypothesis context is intentionally smaller than the
+# durable insight ledger. Production measurement on 2026-08-06 found 441
+# persisted hypotheses (79,558 rendered characters) while the latest twenty
+# required only 3,724 characters. Twenty recent items preserve roughly ten
+# days at the observed 1-4 new hypotheses/day cadence. A separate judged tail
+# keeps older user-confirmed/rejected facts visible without letting prompt size
+# grow forever. Re-open both caps if the hypothesis lifecycle or provider/model
+# changes; storage and merge always retain the complete history.
+_INSIGHT_CONTEXT_RECENT_CAP = 20
+_INSIGHT_CONTEXT_JUDGED_CAP = 20
+
+# Weighted prompt-view policy (2026-08-06 calibration). The total cap stays at
+# the already-shipped Phase 3 worst case, but the membership is no longer a
+# fixed recent/judged union. Eight recent + eight judged anchors are hard
+# reserves; relevance and importance lanes use the remaining budget before a
+# weighted/diverse fill. Re-open these constants if the hypothesis schema or
+# observed generation cadence changes. None affects the durable ledger.
+_INSIGHT_CONTEXT_TOTAL_CAP = 40
+_INSIGHT_CONTEXT_RECENT_RESERVE = 8
+_INSIGHT_CONTEXT_JUDGED_RESERVE = 8
+_INSIGHT_CONTEXT_RELEVANCE_QUOTA = 16
+_INSIGHT_CONTEXT_IMPORTANCE_QUOTA = 8
+
+# General ranking weights. Relevance deliberately leads because the selector
+# exists to recover older hypotheses that can explain *this* awareness batch;
+# recency still has a 40-row half-life and a separate hard reserve.
+_INSIGHT_RELEVANCE_WEIGHT = 0.35
+_INSIGHT_RECENCY_WEIGHT = 0.25
+_INSIGHT_VERDICT_WEIGHT = 0.20
+_INSIGHT_QUALITY_WEIGHT = 0.15
+_INSIGHT_RECURRENCE_WEIGHT = 0.05
+_INSIGHT_RECENCY_HALF_LIFE = 40.0
+_INSIGHT_AWARENESS_RELEVANCE_SHARE = 0.80
+_INSIGHT_PROFILE_RELEVANCE_SHARE = 0.20
+_INSIGHT_NEAR_DUPLICATE_THRESHOLD = 0.82
+_INSIGHT_DIVERSITY_PENALTY = 0.18
+
+_INSIGHT_WORD_RE = re.compile(r"[a-z0-9][a-z0-9_+.-]*|[\u3400-\u9fff]+")
+_INSIGHT_GENERIC_FEATURES = frozenset(
+    {
+        "用户",
+        "可能",
+        "最近",
+        "内容",
+        "喜欢",
+        "关注",
+        "观看",
+        "倾向",
+        "表现",
+        "通过",
+        "说明",
+        "偏好",
+        "视频",
+        "假设",
+        "洞察",
+        "这个",
+        "一种",
+        "the",
+        "and",
+        "that",
+        "this",
+        "user",
+        "content",
+        "recent",
+        "likely",
+        "may",
+    }
+)
 
 # Output-token budget for the batched cognition LLM calls. Larger than the
 # generic 16k default so a dense batch of events/notes can emit a full notes /
@@ -469,11 +542,26 @@ class CognitionCycle:
         processed = cursor
         for batch in _chunk(new_notes, _INSIGHT_NOTE_BATCH_SIZE):
             existing = self._load_insights()
+            try:
+                prompt_context = _select_insight_prompt_context(
+                    existing,
+                    awareness_notes=batch,
+                    preference=preference,
+                    soul_profile=soul_profile_data,
+                )
+            except Exception:
+                # Prompt selection is an optimization, never the owner of the
+                # durable cognition cycle. Preserve the previously shipped
+                # bounded view if malformed legacy text surprises the scorer.
+                logger.exception(
+                    "Weighted insight context selection failed; using fixed bounded fallback"
+                )
+                prompt_context = _select_fixed_insight_prompt_context(existing)
             new_insights = await self._insight_analyzer.analyze(
                 awareness_notes=batch,
                 preference=preference,
                 soul_profile=soul_profile_data,
-                existing_insights=existing,
+                existing_insights=prompt_context,
                 max_tokens=_COGNITION_MAX_TOKENS,
             )
             if new_insights:
@@ -622,6 +710,307 @@ class CognitionCycle:
             with suppress(OSError):
                 if tmp_path.exists():
                     tmp_path.unlink()
+
+
+def _select_fixed_insight_prompt_context(
+    insights: list[InsightHypothesis],
+) -> list[InsightHypothesis]:
+    """Return the shipped Phase 3 fixed recent/judged view (fallback/control)."""
+    if not insights:
+        return []
+    recent_start = max(0, len(insights) - _INSIGHT_CONTEXT_RECENT_CAP)
+    selected_indices = set(range(recent_start, len(insights)))
+    judged_indices = [
+        index
+        for index, item in enumerate(insights)
+        if bool(item.validated) or bool(str(item.user_verdict or "").strip())
+    ]
+    selected_indices.update(judged_indices[-_INSIGHT_CONTEXT_JUDGED_CAP:])
+    return [item for index, item in enumerate(insights) if index in selected_indices]
+
+
+def _insight_text_features(value: object) -> frozenset[str]:
+    """Return deterministic tokenizer/provider-independent lexical features."""
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    features: set[str] = set()
+    for match in _INSIGHT_WORD_RE.finditer(normalized):
+        token = match.group(0).strip("._+-")
+        if not token:
+            continue
+        if any("\u3400" <= char <= "\u9fff" for char in token):
+            chars = [char for char in token if "\u3400" <= char <= "\u9fff"]
+            if len(chars) == 1:
+                features.add(chars[0])
+            else:
+                features.update(
+                    "".join(chars[index : index + 2]) for index in range(len(chars) - 1)
+                )
+        elif len(token) >= 2 or token.isdigit():
+            features.add(token)
+    return frozenset(feature for feature in features if feature not in _INSIGHT_GENERIC_FEATURES)
+
+
+def _insight_context_strings(value: object) -> list[str]:
+    """Flatten text values only; mapping keys are schema, not user context."""
+    strings: list[str] = []
+
+    def _visit(item: object) -> None:
+        if isinstance(item, str):
+            if item.strip():
+                strings.append(item)
+            return
+        if isinstance(item, dict):
+            for key in sorted(item, key=str):
+                _visit(item[key])
+            return
+        if isinstance(item, list | tuple):
+            for child in item:
+                _visit(child)
+
+    _visit(value)
+    return strings
+
+
+def _insight_overlap(
+    candidate: frozenset[str],
+    context: frozenset[str],
+) -> float:
+    if not candidate or not context:
+        return 0.0
+    return len(candidate & context) / min(len(candidate), len(context))
+
+
+def _insight_similarity(
+    left: frozenset[str],
+    right: frozenset[str],
+) -> float:
+    if not left or not right:
+        return 0.0
+    intersection = len(left & right)
+    union = len(left | right)
+    jaccard = intersection / union if union else 0.0
+    containment = intersection / min(len(left), len(right))
+    return max(jaccard, containment * 0.9)
+
+
+def _insight_semantic_state(item: InsightHypothesis) -> str:
+    verdict = str(item.user_verdict or "").strip().lower()
+    if verdict == "rejected":
+        return "rejected"
+    if item.validated or verdict == "confirmed":
+        return "confirmed"
+    return "unjudged"
+
+
+def _select_insight_prompt_context(
+    insights: list[InsightHypothesis],
+    *,
+    awareness_notes: list[AwarenessNote] | None = None,
+    preference: dict[str, object] | None = None,
+    soul_profile: dict[str, object] | None = None,
+) -> list[InsightHypothesis]:
+    """Select a bounded importance/relevance/diversity prompt view.
+
+    Membership is ranked, but returned rows are the original objects in source
+    order. The caller still merges against ``insights`` in full; this function
+    never rewrites or summarizes durable hypotheses.
+    """
+    if not insights:
+        return []
+
+    count = len(insights)
+    eligible_indices = [
+        index for index, item in enumerate(insights) if str(item.hypothesis or "").strip()
+    ]
+    if not eligible_indices:
+        return []
+    hypothesis_features = [_insight_text_features(item.hypothesis) for item in insights]
+    candidate_features = []
+    for item in insights:
+        evidence = item.evidence if isinstance(item.evidence, list) else []
+        candidate_features.append(
+            _insight_text_features(
+                " ".join(
+                    [
+                        str(item.hypothesis or ""),
+                        *(str(value) for value in evidence if str(value).strip()),
+                    ]
+                )
+            )
+        )
+    states = [_insight_semantic_state(item) for item in insights]
+
+    awareness_text = " ".join(
+        text
+        for note in awareness_notes or []
+        for text in (note.observation, note.trend, note.emotion_guess)
+        if str(text or "").strip()
+    )
+    profile_text = " ".join(
+        [
+            *_insight_context_strings(preference or {}),
+            *_insight_context_strings(soul_profile or {}),
+        ]
+    )
+    awareness_features = _insight_text_features(awareness_text)
+    profile_features = _insight_text_features(profile_text)
+
+    relevance: list[float] = []
+    recency: list[float] = []
+    verdict_scores: list[float] = []
+    quality: list[float] = []
+    recurrence: list[float] = []
+    for index, item in enumerate(insights):
+        awareness_match = _insight_overlap(candidate_features[index], awareness_features)
+        profile_match = _insight_overlap(candidate_features[index], profile_features)
+        if awareness_features:
+            relevance.append(
+                _INSIGHT_AWARENESS_RELEVANCE_SHARE * awareness_match
+                + _INSIGHT_PROFILE_RELEVANCE_SHARE * profile_match
+            )
+        else:
+            relevance.append(profile_match)
+        age = count - 1 - index
+        recency.append(math.pow(0.5, age / _INSIGHT_RECENCY_HALF_LIFE))
+        verdict_scores.append(1.0 if states[index] != "unjudged" else 0.0)
+        try:
+            raw_confidence = float(item.confidence)
+        except (TypeError, ValueError):
+            raw_confidence = 0.0
+        confidence = max(0.0, min(1.0, raw_confidence)) if math.isfinite(raw_confidence) else 0.0
+        evidence_score = (
+            min(len(item.evidence), 3) / 3.0 if isinstance(item.evidence, list) else 0.0
+        )
+        quality.append(0.6 * confidence + 0.4 * evidence_score)
+
+    # Recurrence is a small support signal, so an exact normalized-feature
+    # signature is sufficient and keeps selection linear before the bounded
+    # diversity pass. Near-duplicate prompt competition below still uses the
+    # richer similarity metric; durable-ledger growth must not create O(n^2)
+    # work every cognition cycle.
+    signature_counts = Counter(
+        (states[index], hypothesis_features[index])
+        for index in eligible_indices
+        if hypothesis_features[index]
+    )
+    for index in range(count):
+        related = (
+            signature_counts[(states[index], hypothesis_features[index])] - 1
+            if hypothesis_features[index]
+            else 0
+        )
+        recurrence.append(min(max(related, 0), 4) / 4.0)
+
+    general_scores = [
+        _INSIGHT_RELEVANCE_WEIGHT * relevance[index]
+        + _INSIGHT_RECENCY_WEIGHT * recency[index]
+        + _INSIGHT_VERDICT_WEIGHT * verdict_scores[index]
+        + _INSIGHT_QUALITY_WEIGHT * quality[index]
+        + _INSIGHT_RECURRENCE_WEIGHT * recurrence[index]
+        for index in range(count)
+    ]
+
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    similarity_cache: dict[tuple[int, int], float] = {}
+
+    def _pair_similarity(left: int, right: int) -> float:
+        key = (left, right) if left < right else (right, left)
+        cached = similarity_cache.get(key)
+        if cached is not None:
+            return cached
+        similarity = _insight_similarity(
+            hypothesis_features[left],
+            hypothesis_features[right],
+        )
+        similarity_cache[key] = similarity
+        return similarity
+
+    def _max_selected_similarity(index: int) -> float:
+        return max(
+            (
+                _pair_similarity(index, other)
+                for other in selected
+                if states[other] == states[index]
+            ),
+            default=0.0,
+        )
+
+    def _same_state_duplicate(index: int) -> bool:
+        return any(
+            states[other] == states[index]
+            and _pair_similarity(index, other) >= _INSIGHT_NEAR_DUPLICATE_THRESHOLD
+            for other in selected
+        )
+
+    def _add(index: int) -> bool:
+        if (
+            index in selected_set
+            or len(selected) >= _INSIGHT_CONTEXT_TOTAL_CAP
+            or _same_state_duplicate(index)
+        ):
+            return False
+        selected.append(index)
+        selected_set.add(index)
+        return True
+
+    def _take_ordered(indices: list[int], quota: int) -> None:
+        added = 0
+        for index in indices:
+            if _add(index):
+                added += 1
+                if added >= quota:
+                    break
+
+    def _take_ranked(indices: list[int], quota: int, lane_scores: list[float]) -> None:
+        candidates = {index for index in indices if index not in selected_set}
+        added = 0
+        while candidates and added < quota and len(selected) < _INSIGHT_CONTEXT_TOTAL_CAP:
+            best = max(
+                candidates,
+                key=lambda index: (
+                    lane_scores[index]
+                    - _INSIGHT_DIVERSITY_PENALTY * _max_selected_similarity(index),
+                    general_scores[index],
+                    index,
+                ),
+            )
+            candidates.remove(best)
+            if _add(best):
+                added += 1
+
+    judged_newest = [index for index in reversed(eligible_indices) if states[index] != "unjudged"]
+    _take_ordered(judged_newest, _INSIGHT_CONTEXT_JUDGED_RESERVE)
+    _take_ordered(
+        list(reversed(eligible_indices)),
+        _INSIGHT_CONTEXT_RECENT_RESERVE,
+    )
+
+    relevance_lane = [
+        0.75 * relevance[index] + 0.25 * general_scores[index] for index in range(count)
+    ]
+    _take_ranked(
+        [index for index in eligible_indices if relevance[index] > 0.0],
+        _INSIGHT_CONTEXT_RELEVANCE_QUOTA,
+        relevance_lane,
+    )
+
+    importance_lane = [
+        0.50 * quality[index] + 0.30 * verdict_scores[index] + 0.20 * recurrence[index]
+        for index in range(count)
+    ]
+    _take_ranked(
+        eligible_indices,
+        _INSIGHT_CONTEXT_IMPORTANCE_QUOTA,
+        importance_lane,
+    )
+    _take_ranked(
+        eligible_indices,
+        _INSIGHT_CONTEXT_TOTAL_CAP - len(selected),
+        general_scores,
+    )
+
+    return [insights[index] for index in sorted(selected)]
 
 
 def _parse_iso(value: Any) -> datetime | None:

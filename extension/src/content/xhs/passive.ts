@@ -20,7 +20,11 @@ import {
 
 /** Note detail URL variants xhs exposes. We accept any non-empty segment
  *  after the prefix; backend validation can tighten the id shape. */
-const NOTE_PATH_PATTERNS = [/^\/explore\/[^/?#]+/i, /^\/discovery\/item\/[^/?#]+/i];
+const NOTE_PATH_PATTERNS = [
+  /^\/explore\/[^/?#]+/i,
+  /^\/discovery\/item\/[^/?#]+/i,
+  /^\/search_result\/[^/?#]+/i,
+];
 
 /** Query params we preserve. xsec_token is required by xhs detail APIs. */
 const PRESERVED_QUERY_PARAMS = new Set(["xsec_token"]);
@@ -96,6 +100,7 @@ export interface XhsUrlObservation {
 }
 
 export function classifyXhsPageType(url: string): XhsPageType {
+  if (/\/search_result\/[^/?#]+/i.test(url)) return "note";
   if (url.includes("/search_result")) return "search";
   if (url.includes("/user/profile/")) return "profile";
   if (url.includes("/explore/") || url.includes("/discovery/item/")) return "note";

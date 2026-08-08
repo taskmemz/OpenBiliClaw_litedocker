@@ -15,6 +15,7 @@ YouTube 模块负责把用户在 YouTube 上的长期兴趣信号接入 OpenBili
 |------|------|------|
 | YouTube bootstrap 队列 | ✅ | `YtTaskQueue` 管理 `yt_tasks` 表，支持 pending / in_progress / completed / failed 状态、每日预算、过期 pending 清理和近期任务复用 |
 | 扩展任务回写 | ✅ | 后端 `/api/sources/yt/task-result` 接收 `partial` / `ok` / `empty` / `failed`，单任务内合并去重，并通过 `source_bootstrap_state.json` 跳过跨任务旧条目 |
+| 扩展在线周期回拉 | ✅ | 完整画像存在、初始化空闲且扩展 runtime-stream 在线时，runtime 按 `[scheduler]` 全局/YouTube 间隔把同一 `bootstrap_profile` 任务纳入五来源全局串行 round-robin；离线不入队，也不新增扩展 scope |
 | init 集成 | ✅ | `init --yes-youtube` 在抖音 collect 完成后才入队，避免多个前台 tab 任务争抢焦点 |
 | 单源 smoke | ✅ | `fetch-youtube` 独立验证扩展、登录态和后端任务桥，不隐式重建画像 |
 | Takeout 导入 | ✅ | `import-youtube` 支持 Google Takeout `.zip` 或目录，JSON / HTML watch history、subscriptions CSV、liked videos CSV |

@@ -14,6 +14,7 @@ from openbiliclaw.llm.json_utils import (
 )
 from openbiliclaw.llm.prompts import build_dialogue_insight_prompt
 from openbiliclaw.llm.service import LLMServiceError
+from openbiliclaw.llm.task_options import without_core_memory_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +82,17 @@ class DialogueInsightAnalyzer:
             anchor=anchor,
         )
         try:
+            # ``build_dialogue_insight_prompt`` already serializes the full
+            # ``core_memory`` dict (soul + preference + awareness + insights) into
+            # the user prompt, so the default core-memory *injection* would be an
+            # exact duplicate. Opt out: the model still sees the curated core memory
+            # via the explicit param, we just drop the redundant second copy.
             response = await self.registry.complete_structured_task(
                 system_instruction=messages[0]["content"],
                 user_input=messages[1]["content"],
                 max_tokens=DEFAULT_STRUCTURED_MAX_TOKENS,
                 caller="soul.dialogue_insight",
+                **without_core_memory_kwargs(self.registry.complete_structured_task),
             )
         except (LLMProviderError, LLMServiceError) as exc:
             raise DialogueInsightAnalysisError(str(exc)) from exc

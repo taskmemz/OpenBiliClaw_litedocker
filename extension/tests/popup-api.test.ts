@@ -1081,6 +1081,21 @@ test("updateConfig sends PUT with embedding config", async () => {
   assert.equal(result.reloaded, true);
 });
 
+test("updateConfig accepts persisted 202 responses", async () => {
+  globalThis.fetch = (async () => ({
+    ok: true,
+    status: 202,
+    async json() {
+      return { ok: true, apply_state: "queued", apply_revision: 9 };
+    },
+  })) as unknown as typeof fetch;
+
+  const result = await updateConfig({ language: "zh" });
+
+  assert.equal(result.apply_state, "queued");
+  assert.equal(result.apply_revision, 9);
+});
+
 test("updateConfig preserves structured details from validation errors", async () => {
   const details = {
     ok: false,

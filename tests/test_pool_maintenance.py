@@ -770,3 +770,38 @@ def test_recover_suppressed_does_not_oscillate_on_topic_window_misses(
     assert all(result.has_more is False for result in results)
     assert after_statuses == before_statuses
     assert all(after_statuses[bvid] == "suppressed" for bvid in suppressed_ids)
+
+
+def test_raw_ceiling_blocks_recovery_and_stops_on_untrimmable_excess(
+    tmp_path: Path,
+) -> None:
+    """Protected/claimed raw excess must not start a restore/trim livelock."""
+    db = _database(tmp_path)
+    for index in range(2):
+        _seed_ready(db, f"BV_PROTECTED_{index}", topic_group=f"protected-{index}")
+    candidate_ids = _enqueue_candidates(db, 2, prefix="claimed-excess")
+    claimed = db.claim_discovery_candidates_for_eval(limit=2, claim_token="active-owner")
+    assert {int(row["id"]) for row in claimed} == set(candidate_ids)
+    _seed_ready(db, "BV_SUPPRESSED", topic_group="recoverable")
+    _suppress(db, "BV_SUPPRESSED")
+
+    result = db.maintain_pool_inventory(
+        target=3,
+        raw_ceiling=3,
+        source_share_quotas={"bilibili": 3},
+        raw_source_share_quotas={"bilibili": 3},
+        max_mutations=2,
+    )
+
+    assert result.available_before == result.available_after == 2
+    assert result.raw_before == result.raw_after == 4
+    assert result.recovered_suppressed == 0
+    assert result.mutation_count == 0
+    assert result.untrimmed_raw_excess == 1
+    assert result.has_more is False
+    assert (
+        db.conn.execute(
+            "SELECT pool_status FROM content_cache WHERE bvid='BV_SUPPRESSED'"
+        ).fetchone()[0]
+        == "suppressed"
+    )

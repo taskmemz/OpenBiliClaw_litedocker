@@ -74,6 +74,10 @@ test("extractNoteId returns null for non-note / non-24-hex URLs (id-shape bounda
 
 test("detectXiaohongshuPageType classifies search / note / user / home", () => {
   assert.equal(detectXiaohongshuPageType("https://www.xiaohongshu.com/search_result?keyword=x"), "search");
+  assert.equal(
+    detectXiaohongshuPageType(`https://www.xiaohongshu.com/search_result/${NOTE_ID}`),
+    "note",
+  );
   assert.equal(detectXiaohongshuPageType(`https://www.xiaohongshu.com/explore/${NOTE_ID}`), "note");
   assert.equal(
     detectXiaohongshuPageType(`https://www.xiaohongshu.com/discovery/item/${NOTE_ID}`),

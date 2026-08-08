@@ -1998,10 +1998,10 @@ class BilibiliSourceConfigOut(BaseModel):
 
 class XiaohongshuSourceConfigOut(BaseModel):
     enabled: bool = False
-    daily_search_budget: int = 0
+    daily_search_budget: int = 20
     daily_creator_budget: int = 0
-    task_interval_seconds: int = 300
-    min_interval_minutes: int = 3
+    task_interval_seconds: int = 1200
+    min_interval_minutes: int = 20
 
 
 class DouyinSourceConfigOut(BaseModel):
@@ -2106,9 +2106,18 @@ class SchedulerConfigOut(BaseModel):
     extension_disconnect_grace_seconds: int = 90
     discovery_cron: str = "0 */8 * * *"
     pool_target_count: int = 300
+    copy_ready_target_count: int = Field(default=90, ge=0, le=600)
     pool_source_shares: dict[str, int] = Field(default_factory=dict)
     account_sync_interval_hours: int = 6
+    source_incremental_hours: int = 24
+    xhs_incremental_hours: int | None = None
+    douyin_incremental_hours: int | None = None
+    youtube_incremental_hours: int | None = None
+    zhihu_incremental_hours: int | None = None
+    reddit_incremental_hours: int | None = None
     refresh_check_interval_seconds: int = 60
+    eval_min_batch_size: int = Field(default=15, ge=1, le=90)
+    eval_max_wait_seconds: float = Field(default=90.0, ge=0.0, le=600.0)
     signal_event_threshold: int = 6
     feedback_batch_threshold: int = 3
     trending_refresh_minutes: int = 3
@@ -2135,6 +2144,15 @@ class SchedulerConfigOut(BaseModel):
     auto_update_allowed_remotes: list[str] = Field(default_factory=list)
 
 
+class SoulConfigOut(BaseModel):
+    preference_prompt_view: Literal["legacy", "compact-v1"] = "legacy"
+    awareness_prompt_view: Literal["legacy", "compact-v1"] = "compact-v1"
+    insight_prompt_view: Literal["legacy", "compact-v1"] = "legacy"
+    posture_gate_mode: Literal["shadow", "enforce", "off"] = "shadow"
+    posture_gate_force_enforce: bool = False
+    topic_lifecycle_serialization: Literal["off", "on"] = "off"
+
+
 class DiscoveryConfigOut(BaseModel):
     unified_keyword_planner_enabled: bool = True
     kw_cache_high: int = 30
@@ -2146,7 +2164,9 @@ class DiscoveryConfigOut(BaseModel):
     claim_lease_minutes: int = 10
     planner_poll_seconds: int = 120
     plan_ttl_hours: int = 12
+    keyword_digest_grace_hours: int = Field(default=24, ge=0, le=168)
     admission_min_score: float = 0.60
+    eval_prefilter_mode: Literal["off", "shadow", "enforce"] = "shadow"
     candidate_eval_concurrency: int = Field(default=3, ge=1, le=3)
     multimodal_evaluation_enabled: bool = False
     visual_profile_enabled: bool = False
@@ -2276,6 +2296,7 @@ class ConfigResponse(BaseModel):
     saved_sync: SavedSyncConfigOut = Field(default_factory=SavedSyncConfigOut)
     storage: StorageConfigOut = Field(default_factory=StorageConfigOut)
     logging: LoggingConfigOut = Field(default_factory=LoggingConfigOut)
+    soul: SoulConfigOut = Field(default_factory=SoulConfigOut)
     issues: list[ConfigIssueOut] = Field(default_factory=list)
 
 
@@ -2295,6 +2316,7 @@ class ConfigUpdateIn(BaseModel):
     saved_sync: SavedSyncConfigUpdateIn | None = None
     storage: dict[str, object] | None = None
     logging: dict[str, object] | None = None
+    soul: dict[str, object] | None = None
 
     @field_validator("saved_sync", mode="before")
     @classmethod
@@ -2388,6 +2410,19 @@ class ConfigUpdateResponse(BaseModel):
     reloaded: bool = False
     rollback_applied: bool = False
     restart_required: bool = False
+    apply_state: Literal["idle", "queued", "applying", "applied", "failed"] = "idle"
+    apply_revision: int = 0
+
+
+class ConfigApplyStatusResponse(BaseModel):
+    """Non-sensitive status for the latest persisted runtime-config revision."""
+
+    state: Literal["idle", "queued", "applying", "applied", "failed"] = "idle"
+    requested_revision: int = 0
+    applied_revision: int = 0
+    message: str = ""
+    error: str = ""
+    updated_at: str = ""
 
 
 class SourceShareSuggestionResponse(BaseModel):

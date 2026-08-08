@@ -89,6 +89,7 @@ class PlatformStub:
         self.reshuffle_posts: list[dict[str, Any]] = []
         self.append_posts: list[dict[str, Any]] = []
         self.availability_reads = 0
+        self.config_failures_remaining = 0
         self.lock = threading.Lock()
 
 
@@ -102,11 +103,17 @@ def _json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 
         handler.wfile.write(body)
 
 
-@pytest.fixture()
-def platform_server() -> Iterator[tuple[str, PlatformStub]]:
+def _build_platform_app(config_failures: int = 0) -> Iterator[tuple[str, PlatformStub]]:
     state = PlatformStub()
+    state.config_failures_remaining = max(0, int(config_failures))
 
     class Handler(BaseHTTPRequestHandler):
+        # HTTP/1.0 + Connection: close: 水合时会并行发起十几条请求，keep-alive
+        # 连接复用与 ThreadingHTTPServer 的关闭竞态会让其中几条偶发
+        # "TypeError: Failed to fetch"（浏览器侧连接重置）。短连接让每条请求
+        # 独立建连，测试桩的响应时序稳定。
+        protocol_version = "HTTP/1.0"
+
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             return
 
@@ -172,6 +179,9 @@ def platform_server() -> Iterator[tuple[str, PlatformStub]]:
                     },
                 )
             if path == "/api/config":
+                if state.config_failures_remaining > 0:
+                    state.config_failures_remaining -= 1
+                    return _json_response(self, {"error": "config_flaky"}, 503)
                 return _json_response(
                     self,
                     {
@@ -250,6 +260,17 @@ def platform_server() -> Iterator[tuple[str, PlatformStub]]:
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+@pytest.fixture()
+def platform_server() -> Iterator[tuple[str, PlatformStub]]:
+    yield from _build_platform_app()
+
+
+@pytest.fixture()
+def flaky_config_server() -> Iterator[tuple[str, PlatformStub]]:
+    """Startup /api/config fails twice, then succeeds (retry recovery path)."""
+    yield from _build_platform_app(config_failures=2)
 
 
 @pytest.fixture()
@@ -334,6 +355,13 @@ def test_platform_tabs_scope_recommendation_requests_in_chromium(
         lambda: all(chip["count"] not in {"", "—"} for chip in _chips(chromium_page)),
         message="库存快照读取后 chip 仍停留在未知态",
     )
+    # /api/config 与库存快照并行读取；配置快照若瞬断，前端有界重试后 Tab 集合
+    # 收敛（已启用但零库存的平台只由配置快照带来）。断言前先等 Tab 并集完整。
+    _wait_for(
+        lambda: {chip["filter"] for chip in _chips(chromium_page)}
+        == {"全部", "B 站", "YouTube", "知乎", "Reddit"},
+        message="已启用平台 Tab 集合未收敛",
+    )
     chips = _chips(chromium_page)
     assert [chip["filter"] for chip in chips] == ["全部", "B 站", "YouTube", "知乎", "Reddit"]
     assert {chip["filter"]: chip["count"] for chip in chips} == {
@@ -399,6 +427,33 @@ def test_platform_tabs_scope_recommendation_requests_in_chromium(
     assert {card["platform"] for card in _visible_cards(chromium_page)} == {"bilibili", "zhihu"}
 
 
+def test_enabled_zero_stock_platform_survives_config_snapshot_retry(
+    flaky_config_server: tuple[str, PlatformStub],
+    chromium_page: Page,
+) -> None:
+    """已启用但零库存的平台在首次 /api/config 失败后仍必须出现（Tab 并集规则）。
+
+    水合时 /api/config 前两次返回 503：筛选行先按库存快照渲染（B 站 / 知乎 /
+    YouTube），Reddit 只能由配置快照带来。有界重试成功后 Reddit Tab 必须补上，
+    且计数显示 0 —— 而不是被永久藏起来。
+    """
+    base_url, stub = flaky_config_server
+    chromium_page.goto(f"{base_url}/web/")
+    expect(chromium_page.locator("#videoGrid .video-card:not(.is-skeleton)")).to_have_count(
+        5, timeout=8000
+    )
+
+    _wait_for(
+        lambda: {chip["filter"] for chip in _chips(chromium_page)}
+        == {"全部", "B 站", "YouTube", "知乎", "Reddit"},
+        timeout=15.0,
+        message="配置快照重试成功后仍缺少已启用平台 Tab",
+    )
+    assert stub.config_failures_remaining == 0
+    counts = {chip["filter"]: chip["count"] for chip in _chips(chromium_page)}
+    assert counts.get("Reddit") == "0"
+
+
 def test_platform_tabs_keyboard_focus_selection_and_no_horizontal_overflow(
     platform_server: tuple[str, PlatformStub],
     chromium_page: Page,
@@ -411,6 +466,13 @@ def test_platform_tabs_keyboard_focus_selection_and_no_horizontal_overflow(
     _wait_for(
         lambda: all(chip["count"] not in {"", "—"} for chip in _chips(chromium_page)),
         message="库存快照读取后 chip 仍停留在未知态",
+    )
+    # /api/config 与库存快照并行读取；配置快照若瞬断，前端有界重试后 Tab 集合
+    # 收敛（已启用但零库存的平台只由配置快照带来）。断言前先等 Tab 并集完整。
+    _wait_for(
+        lambda: {chip["filter"] for chip in _chips(chromium_page)}
+        == {"全部", "B 站", "YouTube", "知乎", "Reddit"},
+        message="已启用平台 Tab 集合未收敛",
     )
 
     row = chromium_page.locator("#filterRow")

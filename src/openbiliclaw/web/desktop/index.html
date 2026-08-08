@@ -483,18 +483,18 @@
                 </section>
                 <section class="source-seg">
                   <h4>发现分支与每日预算</h4>
-                  <p class="seg-note">预算是该分支每日任务次数上限，0 或留空 = 不限。小红书没有分支级开关，关掉整个来源即停止调度。</p>
+                  <p class="seg-note">预算 = 每日任务次数上限；搜索默认每天 20 次，显式填 0 = 不限；创作者预算 0 或留空 = 不限。关掉整个来源即停止调度。</p>
                   <div class="branch-table" data-branch-toggles="off">
                     <div class="branch-head"><span>分支</span><span>每日预算</span><span>说明</span></div>
-                    <div class="branch-row"><span class="branch-name">搜索</span><input id="xhsDailySearchBudget" class="branch-budget" inputmode="numeric" placeholder="0 = 不限" aria-label="小红书每日搜索预算"><span class="branch-hint">按画像关键词搜索</span></div>
+                    <div class="branch-row"><span class="branch-name">搜索</span><input id="xhsDailySearchBudget" class="branch-budget" inputmode="numeric" placeholder="默认 20" aria-label="小红书每日搜索预算"><span class="branch-hint">按画像关键词搜索</span></div>
                     <div class="branch-row"><span class="branch-name">创作者</span><input id="xhsDailyCreatorBudget" class="branch-budget" inputmode="numeric" placeholder="0 = 不限" aria-label="小红书每日创作者预算"><span class="branch-hint">追踪已关注作者</span></div>
                   </div>
                 </section>
                 <section class="source-seg">
                   <h4>节流</h4>
                   <div class="inline-row">
-                    <label class="settings-field"><span>任务间隔秒数</span><input id="xhsTaskInterval" inputmode="numeric" placeholder="300"></label>
-                    <label class="settings-field"><span>最小调度间隔分钟</span><input id="xhsMinInterval" inputmode="numeric" placeholder="3"></label>
+                    <label class="settings-field"><span>目标任务间隔秒数（±25%）</span><input id="xhsTaskInterval" inputmode="numeric" placeholder="1200"></label>
+                    <label class="settings-field"><span>关键词入队间隔分钟</span><input id="xhsMinInterval" inputmode="numeric" placeholder="20"></label>
                   </div>
                 </section>
                 <section class="source-seg">

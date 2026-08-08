@@ -46,7 +46,18 @@
   // Match the backend's safe hot-reload drain window. The page/popup abort
   // signal still stops retries immediately when its owner goes away.
   const PENDING_OPEN_RETRY_DEADLINE_MS = 25 * 60_000;
-  const DIALOGUE_SCOPES = new Set(["chat", "hypothesis", "confusion"]);
+  // Probe chat is a durable conversational turn too. Keep delight chat out
+  // of the main dialogue because it belongs to the recommendation card's
+  // own contextual history, but show both probe polarities in the shared
+  // dialogue view so closing the message inbox cannot hide the conversation.
+  const DIALOGUE_SCOPES = new Set([
+    "chat",
+    "hypothesis",
+    "confusion",
+    "probe",
+    "avoidance_probe",
+  ]);
+  const DIALOGUE_REPLY_SCOPES = new Set(["chat", "probe", "avoidance_probe"]);
   // Backend refuses settlement when another card owns the dialogue anchor.
   // These outcomes are honest failures — never fall back to the optimistic
   // terminal state, or the UI will claim "已确认" while nothing was written.
@@ -67,6 +78,169 @@
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#39;");
+  }
+
+  function escapeHtmlRaw(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  }
+
+  function markdownSlot(slots, markup) {
+    const token = `\u0000md${slots.length}\u0000`;
+    slots.push(markup);
+    return token;
+  }
+
+  function restoreMarkdownSlots(value, slots) {
+    return value.replace(/\u0000md(\d+)\u0000/g, (_match, index) => slots[Number(index)] || "");
+  }
+
+  function safeMarkdownHref(value) {
+    const href = String(value ?? "").trim();
+    return /^https?:\/\//i.test(href) ? escapeHtmlRaw(href) : "";
+  }
+
+  function renderMarkdownInline(value) {
+    const slots = [];
+    let source = String(value ?? "");
+
+    // Protect escaped punctuation, code spans, and links before escaping the
+    // remaining text. Everything that reaches the formatting replacements is
+    // already HTML-escaped, so raw HTML can never become executable markup.
+    source = source.replace(
+      /\\([\\`*_[\]{}()#+.!~>-])/g,
+      (_match, character) => markdownSlot(slots, escapeHtmlRaw(character)),
+    );
+    source = source.replace(
+      /`([^`\n]+)`/g,
+      (_match, code) => markdownSlot(slots, `<code>${escapeHtmlRaw(code)}</code>`),
+    );
+    source = source.replace(
+      /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/gi,
+      (match, label, href) => {
+        const safeHref = safeMarkdownHref(href);
+        if (!safeHref) return match;
+        return markdownSlot(
+          slots,
+          `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${renderMarkdownInline(label)}</a>`,
+        );
+      },
+    );
+
+    let rendered = escapeHtmlRaw(source);
+    rendered = rendered.replace(/\*\*\*([^*\n]+?)\*\*\*/g, "<strong><em>$1</em></strong>");
+    rendered = rendered.replace(/___([^_\n]+?)___/g, "<strong><em>$1</em></strong>");
+    rendered = rendered.replace(/\*\*([^*\n]+?)\*\*/g, "<strong>$1</strong>");
+    rendered = rendered.replace(/(^|[^\w])__([^_\n]+?)__(?!\w)/g, "$1<strong>$2</strong>");
+    rendered = rendered.replace(/~~([^~\n]+?)~~/g, "<del>$1</del>");
+    rendered = rendered.replace(/(^|[^*])\*([^*\n]+?)\*(?!\*)/g, "$1<em>$2</em>");
+    rendered = rendered.replace(/(^|[^\w])_([^_\n]+?)_(?!\w)/g, "$1<em>$2</em>");
+    rendered = rendered.replace(/ {2,}\n/g, "<br>\n").replace(/\n/g, "<br>\n");
+    return restoreMarkdownSlots(rendered, slots);
+  }
+
+  function renderMarkdown(value) {
+    const source = String(value ?? "").replace(/\r\n?/g, "\n").trim();
+    if (!source) return "";
+
+    const lines = source.split("\n");
+    const blocks = [];
+    let paragraph = [];
+
+    const flushParagraph = () => {
+      if (!paragraph.length) return;
+      const content = paragraph.join("\n").trim();
+      paragraph = [];
+      if (content) blocks.push(`<p>${renderMarkdownInline(content)}</p>`);
+    };
+
+    for (let index = 0; index < lines.length;) {
+      const line = lines[index];
+      if (!line.trim()) {
+        flushParagraph();
+        index += 1;
+        continue;
+      }
+
+      const fence = line.match(/^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_-]*)\s*$/);
+      if (fence) {
+        flushParagraph();
+        const marker = fence[1];
+        const language = fence[2];
+        const codeLines = [];
+        index += 1;
+        while (index < lines.length) {
+          const closing = lines[index].match(/^\s*(`{3,}|~{3,})\s*$/);
+          if (
+            closing &&
+            closing[1][0] === marker[0] &&
+            closing[1].length >= marker.length
+          ) {
+            index += 1;
+            break;
+          }
+          codeLines.push(lines[index]);
+          index += 1;
+        }
+        const languageClass = language ? ` class="language-${escapeHtml(language)}"` : "";
+        blocks.push(`<pre><code${languageClass}>${escapeHtmlRaw(codeLines.join("\n"))}</code></pre>`);
+        continue;
+      }
+
+      const heading = line.match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+      if (heading) {
+        flushParagraph();
+        const level = heading[1].length;
+        blocks.push(`<h${level}>${renderMarkdownInline(heading[2])}</h${level}>`);
+        index += 1;
+        continue;
+      }
+
+      if (/^\s{0,3}>\s?/.test(line)) {
+        flushParagraph();
+        const quoteLines = [];
+        while (index < lines.length && /^\s{0,3}>\s?/.test(lines[index])) {
+          quoteLines.push(lines[index].replace(/^\s{0,3}>\s?/, ""));
+          index += 1;
+        }
+        blocks.push(`<blockquote>${renderMarkdown(quoteLines.join("\n"))}</blockquote>`);
+        continue;
+      }
+
+      const unordered = line.match(/^\s{0,3}[-+*]\s+(.+)$/);
+      const ordered = line.match(/^\s{0,3}\d+[.)]\s+(.+)$/);
+      if (unordered || ordered) {
+        flushParagraph();
+        const tag = unordered ? "ul" : "ol";
+        const items = [];
+        while (index < lines.length) {
+          const item = lines[index].match(
+            unordered ? /^\s{0,3}[-+*]\s+(.+)$/ : /^\s{0,3}\d+[.)]\s+(.+)$/,
+          );
+          if (!item) break;
+          items.push(`<li>${renderMarkdownInline(item[1])}</li>`);
+          index += 1;
+        }
+        blocks.push(`<${tag}>${items.join("")}</${tag}>`);
+        continue;
+      }
+
+      if (/^\s{0,3}(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$/.test(line)) {
+        flushParagraph();
+        blocks.push("<hr>");
+        index += 1;
+        continue;
+      }
+
+      paragraph.push(line);
+      index += 1;
+    }
+    flushParagraph();
+    return blocks.join("");
   }
 
   function cloneTurn(turn) {
@@ -98,6 +272,14 @@
 
   function isQuestionTurn(turn) {
     return isRecord(turn?.payload) && turn.payload.type === "question";
+  }
+
+  function isDialogueTurn(turn) {
+    return isRecord(turn) && DIALOGUE_SCOPES.has(text(turn.scope));
+  }
+
+  function isDialogueReplyTurn(turn) {
+    return isRecord(turn) && DIALOGUE_REPLY_SCOPES.has(text(turn.scope));
   }
 
   function cardActionPath(turnId) {
@@ -538,10 +720,11 @@
     const isUser = role === "user";
     const turnId = escapeHtml(turn?.turn_id);
     const safePart = escapeHtml(part);
+    const renderedContent = isUser ? escapeHtml(cleanContent) : renderMarkdown(cleanContent);
     if (surface === "desktop") {
-      return `<div class="chat-bubble ${isUser ? "user" : "agent"}${extraClass ? ` ${extraClass}` : ""}" data-dialogue-turn-id="${turnId}" data-part="${safePart}">${escapeHtml(cleanContent)}</div>`;
+      return `<div class="chat-bubble ${isUser ? "user" : "agent"}${extraClass ? ` ${extraClass}` : ""}" data-dialogue-turn-id="${turnId}" data-part="${safePart}">${isUser ? renderedContent : `<div class="chat-markdown">${renderedContent}</div>`}</div>`;
     }
-    return `<div class="chat-message${isUser ? " user" : ""}${extraClass ? ` ${extraClass}` : ""}" data-dialogue-turn-id="${turnId}" data-part="${safePart}"><span class="chat-role">${isUser ? "你" : "助手"}</span><p class="chat-content">${escapeHtml(cleanContent)}</p></div>`;
+    return `<div class="chat-message${isUser ? " user" : ""}${extraClass ? ` ${extraClass}` : ""}" data-dialogue-turn-id="${turnId}" data-part="${safePart}"><span class="chat-role">${isUser ? "你" : "助手"}</span><div class="chat-content${isUser ? "" : " chat-markdown"}">${renderedContent}</div></div>`;
   }
 
   function cardActions(payload, state) {
@@ -613,7 +796,7 @@
     const list = Array.isArray(items) ? items : [];
     return list
       .map((turn, index) => ({ turn, index }))
-      .filter(({ turn }) => isRecord(turn) && DIALOGUE_SCOPES.has(text(turn.scope)))
+      .filter(({ turn }) => isDialogueTurn(turn))
       .sort((left, right) => {
         const byTime = text(left.turn.created_at).localeCompare(text(right.turn.created_at));
         return byTime || left.index - right.index;
@@ -638,12 +821,15 @@
     contextStorageKey,
     normalizeContextPreview,
     isCardTurn,
+    isDialogueReplyTurn,
+    isDialogueTurn,
     isTerminalCardTurn,
     isQuestionTurn,
     pendingConfirmationOpenPath,
     readableEvidenceValues,
     replaceContextSelection,
     replyQuoteMarkup,
+    renderMarkdown,
     renderPendingListMarkup,
     renderTurnMarkup,
     writeContextSelection,

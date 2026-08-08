@@ -329,6 +329,15 @@ class EmbeddingCache:
             row = self.conn.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()
         return row[0] if row else 0
 
+    def close(self) -> None:
+        """Close the persistent cache connection idempotently."""
+
+        with self._lock:
+            if self._conn is None:
+                return
+            self._conn.close()
+            self._conn = None
+
 
 class EmbeddingService:
     """Cached embedding service for semantic similarity operations.

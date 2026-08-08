@@ -130,6 +130,7 @@ async def test_same_key_concurrent_callers_use_one_upstream() -> None:
 
     tasks = [asyncio.create_task(coordinator.fetch(url)) for _ in range(6)]
     await _wait_until(lambda: fetcher.calls[url] == 1)
+    await _wait_until(lambda: coordinator.status_payload()["image_fetch_singleflight_joins"] == 5)
     assert coordinator.status_payload()["image_fetch_singleflight_joins"] == 5
 
     fetcher.release.set()

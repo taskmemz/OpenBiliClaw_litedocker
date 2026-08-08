@@ -1,0 +1,498 @@
+{
+  "active_insights": [
+    {
+      "confidence": 0.7,
+      "evidence": [
+        "旧证据-0"
+      ],
+      "hypothesis": "旧假设-0",
+      "validated": false
+    },
+    {
+      "confidence": 0.7,
+      "evidence": [
+        "旧证据-1"
+      ],
+      "hypothesis": "旧假设-1",
+      "validated": true
+    },
+    {
+      "confidence": 0.7,
+      "evidence": [
+        "旧证据-2"
+      ],
+      "hypothesis": "旧假设-2",
+      "validated": false
+    },
+    {
+      "confidence": 0.7,
+      "evidence": [
+        "旧证据-3"
+      ],
+      "hypothesis": "旧假设-3",
+      "validated": true
+    },
+    {
+      "confidence": 0.7,
+      "evidence": [
+        "旧证据-4"
+      ],
+      "hypothesis": "旧假设-4",
+      "validated": false
+    },
+    {
+      "confidence": 0.7,
+      "evidence": [
+        "旧证据-5"
+      ],
+      "hypothesis": "旧假设-5",
+      "validated": true
+    }
+  ],
+  "cognitive_style": [
+    "结构化",
+    "证据优先"
+  ],
+  "context": {
+    "session_type": "deep_dive",
+    "time_of_day_patterns": "",
+    "weekday_patterns": "",
+    "weekend_patterns": ""
+  },
+  "core_traits": [
+    "理性",
+    "好奇",
+    "克制"
+  ],
+  "current_phase": "整理信息源",
+  "deep_needs": [
+    "确定性",
+    "掌控感"
+  ],
+  "disliked_topics": [
+    "不喜欢-0",
+    "不喜欢-1",
+    "不喜欢-2",
+    "不喜欢-3",
+    "不喜欢-4",
+    "不喜欢-5",
+    "不喜欢-6",
+    "不喜欢-7",
+    "不喜欢-8",
+    "不喜欢-9",
+    "不喜欢-10",
+    "不喜欢-11"
+  ],
+  "exploration_openness": 0.55,
+  "interest_domains": [
+    {
+      "domain": "类别-0",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "source": "behavior",
+      "specifics": [
+        "标签-0",
+        "标签-6",
+        "标签-12",
+        "标签-18",
+        "标签-24"
+      ],
+      "weight": 1.0
+    },
+    {
+      "domain": "类别-1",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "source": "behavior",
+      "specifics": [
+        "标签-1",
+        "标签-7",
+        "标签-13",
+        "标签-19",
+        "标签-25"
+      ],
+      "weight": 0.98
+    },
+    {
+      "domain": "类别-2",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "source": "behavior",
+      "specifics": [
+        "标签-2",
+        "标签-8",
+        "标签-14",
+        "标签-20",
+        "标签-26"
+      ],
+      "weight": 0.96
+    },
+    {
+      "domain": "类别-3",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "source": "behavior",
+      "specifics": [
+        "标签-3",
+        "标签-9",
+        "标签-15",
+        "标签-21",
+        "标签-27"
+      ],
+      "weight": 0.94
+    },
+    {
+      "domain": "类别-4",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "source": "behavior",
+      "specifics": [
+        "标签-4",
+        "标签-10",
+        "标签-16",
+        "标签-22",
+        "标签-28"
+      ],
+      "weight": 0.92
+    },
+    {
+      "domain": "类别-5",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "source": "behavior",
+      "specifics": [
+        "标签-5",
+        "标签-11",
+        "标签-17",
+        "标签-23",
+        "标签-29"
+      ],
+      "weight": 0.9
+    }
+  ],
+  "interests": [
+    {
+      "category": "类别-0",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-0",
+      "source": "behavior",
+      "weight": 1.0
+    },
+    {
+      "category": "类别-1",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-1",
+      "source": "behavior",
+      "weight": 0.98
+    },
+    {
+      "category": "类别-2",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-2",
+      "source": "behavior",
+      "weight": 0.96
+    },
+    {
+      "category": "类别-3",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-3",
+      "source": "behavior",
+      "weight": 0.94
+    },
+    {
+      "category": "类别-4",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-4",
+      "source": "behavior",
+      "weight": 0.92
+    },
+    {
+      "category": "类别-5",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-5",
+      "source": "behavior",
+      "weight": 0.9
+    },
+    {
+      "category": "类别-0",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-6",
+      "source": "behavior",
+      "weight": 0.88
+    },
+    {
+      "category": "类别-1",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-7",
+      "source": "behavior",
+      "weight": 0.86
+    },
+    {
+      "category": "类别-2",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-8",
+      "source": "behavior",
+      "weight": 0.84
+    },
+    {
+      "category": "类别-3",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-9",
+      "source": "behavior",
+      "weight": 0.82
+    },
+    {
+      "category": "类别-4",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-10",
+      "source": "behavior",
+      "weight": 0.8
+    },
+    {
+      "category": "类别-5",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-11",
+      "source": "behavior",
+      "weight": 0.78
+    },
+    {
+      "category": "类别-0",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-12",
+      "source": "behavior",
+      "weight": 0.76
+    },
+    {
+      "category": "类别-1",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-13",
+      "source": "behavior",
+      "weight": 0.74
+    },
+    {
+      "category": "类别-2",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-14",
+      "source": "behavior",
+      "weight": 0.72
+    },
+    {
+      "category": "类别-3",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-15",
+      "source": "behavior",
+      "weight": 0.7
+    },
+    {
+      "category": "类别-4",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-16",
+      "source": "behavior",
+      "weight": 0.68
+    },
+    {
+      "category": "类别-5",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-17",
+      "source": "behavior",
+      "weight": 0.66
+    },
+    {
+      "category": "类别-0",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-18",
+      "source": "behavior",
+      "weight": 0.64
+    },
+    {
+      "category": "类别-1",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-19",
+      "source": "behavior",
+      "weight": 0.62
+    },
+    {
+      "category": "类别-2",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-20",
+      "source": "behavior",
+      "weight": 0.6
+    },
+    {
+      "category": "类别-3",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-21",
+      "source": "behavior",
+      "weight": 0.58
+    },
+    {
+      "category": "类别-4",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-22",
+      "source": "behavior",
+      "weight": 0.56
+    },
+    {
+      "category": "类别-5",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-23",
+      "source": "behavior",
+      "weight": 0.54
+    },
+    {
+      "category": "类别-0",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-24",
+      "source": "behavior",
+      "weight": 0.52
+    },
+    {
+      "category": "类别-1",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-25",
+      "source": "behavior",
+      "weight": 0.5
+    },
+    {
+      "category": "类别-2",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-26",
+      "source": "behavior",
+      "weight": 0.48
+    },
+    {
+      "category": "类别-3",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-27",
+      "source": "behavior",
+      "weight": 0.46
+    },
+    {
+      "category": "类别-4",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-28",
+      "source": "behavior",
+      "weight": 0.44
+    },
+    {
+      "category": "类别-5",
+      "first_seen": "2026-01-01",
+      "last_seen": "2026-06-27",
+      "name": "标签-29",
+      "source": "behavior",
+      "weight": 0.42
+    }
+  ],
+  "life_stage": "工作稳定期",
+  "mbti": {
+    "confidence": 0.6,
+    "dimensions": {
+      "EI": {
+        "pole": "I",
+        "strength": 0.7
+      }
+    },
+    "inferred_from": [
+      "历史观看"
+    ],
+    "type": "INTP"
+  },
+  "motivational_drivers": [
+    "理解底层",
+    "降噪"
+  ],
+  "recent_awareness": [
+    {
+      "date": "2026-06-01",
+      "emotion_guess": "旧情绪-0",
+      "observation": "旧观察-0",
+      "trend": "旧趋势-0"
+    },
+    {
+      "date": "2026-06-02",
+      "emotion_guess": "旧情绪-1",
+      "observation": "旧观察-1",
+      "trend": "旧趋势-1"
+    },
+    {
+      "date": "2026-06-03",
+      "emotion_guess": "旧情绪-2",
+      "observation": "旧观察-2",
+      "trend": "旧趋势-2"
+    },
+    {
+      "date": "2026-06-04",
+      "emotion_guess": "旧情绪-3",
+      "observation": "旧观察-3",
+      "trend": "旧趋势-3"
+    },
+    {
+      "date": "2026-06-05",
+      "emotion_guess": "旧情绪-4",
+      "observation": "旧观察-4",
+      "trend": "旧趋势-4"
+    },
+    {
+      "date": "2026-06-06",
+      "emotion_guess": "旧情绪-5",
+      "observation": "旧观察-5",
+      "trend": "旧趋势-5"
+    },
+    {
+      "date": "2026-06-07",
+      "emotion_guess": "旧情绪-6",
+      "observation": "旧观察-6",
+      "trend": "旧趋势-6"
+    },
+    {
+      "date": "2026-06-08",
+      "emotion_guess": "旧情绪-7",
+      "observation": "旧观察-7",
+      "trend": "旧趋势-7"
+    }
+  ],
+  "source_platform_mix": {
+    "bilibili": 0.8,
+    "youtube": 0.2
+  },
+  "style": {
+    "depth_preference": 0.6,
+    "humor_preference": 0.5,
+    "preferred_duration": "medium",
+    "preferred_pace": "moderate",
+    "quality_sensitivity": 0.6
+  },
+  "values": [
+    "真实",
+    "自主"
+  ]
+}

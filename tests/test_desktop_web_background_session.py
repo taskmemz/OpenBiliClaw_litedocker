@@ -41,6 +41,7 @@ def test_backgrounding_closes_stream_and_cancels_retry_loops() -> None:
         "desktopRecommendationRecoveryTimer",
         "desktopRuntimeRecoveryTimer",
         "platformAvailabilityRetryTimer",
+        "configSnapshotRetryTimer",
         "activityPageRefreshTimer",
         "desktopRuntimeReconnectTimer",
     ):
@@ -67,6 +68,7 @@ def test_runtime_stream_heartbeat_and_close_use_reconnecting_state() -> None:
 def test_retry_schedulers_are_visibility_gated() -> None:
     for name in (
         "schedulePlatformAvailabilityRetry",
+        "scheduleConfigSnapshotRetry",
         "scheduleDesktopRecommendationRecovery",
         "scheduleDesktopRuntimeRecovery",
         "scheduleInitStatusRefresh",

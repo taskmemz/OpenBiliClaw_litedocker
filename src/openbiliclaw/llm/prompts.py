@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from openbiliclaw.discovery.style_keys import STYLE_KEY_PROMPT_TEXT, normalize_style_key
 from openbiliclaw.llm.json_utils import parse_llm_json_tolerant
+from openbiliclaw.soul.event_prompt_views import (
+    build_cognition_event_view_v1,
+    normalize_cognition_input_view,
+)
+from openbiliclaw.soul.profile_views import build_cognition_profile_view_v1
 
 if TYPE_CHECKING:
     from openbiliclaw.soul.tone import ToneProfile
@@ -16,6 +22,21 @@ _PLATFORM_DISPLAY_NAMES: dict[str, str] = {
     "bilibili": "B 站",
     "xiaohongshu": "小红书",
 }
+
+
+def content_evaluation_clock(*, now: datetime | None = None) -> tuple[str, str]:
+    """Return the exact UTC evaluation time and its cache-friendly hour bucket.
+
+    The prompt receives the exact timestamp so current-hour publications never
+    look futuristic. The separate hour bucket keeps repeated discovery passes
+    cacheable while ensuring a long-lived daemon revisits content as it ages.
+    """
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    evaluated_at = current.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    evaluation_bucket = (
+        current.replace(minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z")
+    )
+    return evaluated_at, evaluation_bucket
 
 
 def _platform_content_label(source_platform: str) -> str:
@@ -192,6 +213,13 @@ def build_socratic_dialogue_prompt(
     dialogue turns. Multi-user deployments would want to refactor this
     further, but for the current single-user model leaving the system
     prompt user-specific is the simpler and equally-effective approach.
+
+    ``core_memory_text`` is a documented injection seam: it lets tests feed
+    a core-memory block directly, but in production the dialogue caller
+    passes ``""`` and the real core-memory injection happens downstream in
+    ``LLMService.complete_with_core_memory`` (and its ``complete_with_tools``
+    sibling), not here. Do not resurrect any per-service core-memory-block
+    getattr probe at the dialogue call site.
     """
     friend_label = _friend_label_from_mix(source_platform_mix)
     system_prompt = "\n\n".join(
@@ -316,6 +344,7 @@ def build_preference_analysis_prompt(
     existing_preference: dict[str, object],
     awareness_notes: list[dict[str, object]] | None = None,
     active_insights: list[dict[str, object]] | None = None,
+    input_view: str = "legacy",
 ) -> list[dict[str, str]]:
     """Build a structured prompt for extracting user preferences from events.
 
@@ -331,6 +360,61 @@ def build_preference_analysis_prompt(
     from openbiliclaw.sources.event_format import render_retraction_marked_events
 
     system_prompt = _PREFERENCE_ANALYSIS_SYSTEM_PROMPT
+    selected_view = normalize_cognition_input_view(input_view)
+    rendered_events = render_retraction_marked_events(events)
+    if selected_view == "compact-v1":
+        profile_view = build_cognition_profile_view_v1(
+            preference_summary=existing_preference,
+            recent_awareness=awareness_notes,
+            active_insights=active_insights,
+        )
+        sections = [
+            "<existing_preference>",
+            json.dumps(
+                profile_view.stable_preference,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</existing_preference>",
+        ]
+        if profile_view.recent_awareness:
+            sections += [
+                "<recent_awareness>",
+                json.dumps(
+                    profile_view.recent_awareness,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "</recent_awareness>",
+            ]
+        if profile_view.active_insights:
+            sections += [
+                "<active_insights>",
+                json.dumps(
+                    profile_view.active_insights,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "</active_insights>",
+            ]
+        sections += [
+            "<event_batch>",
+            json.dumps(
+                build_cognition_event_view_v1(rendered_events).as_list(),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</event_batch>",
+        ]
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": "\n\n".join(sections)},
+        ]
+
     sections = [
         "<existing_preference>",
         json.dumps(existing_preference, ensure_ascii=False, indent=2),
@@ -351,7 +435,7 @@ def build_preference_analysis_prompt(
     sections += [
         "<event_batch>",
         json.dumps(
-            render_retraction_marked_events(events),
+            rendered_events,
             ensure_ascii=False,
             indent=2,
         ),
@@ -744,9 +828,72 @@ def build_awareness_prompt(
     events: list[dict[str, object]],
     preference_summary: dict[str, object],
     soul_profile: dict[str, object],
+    input_view: str = "legacy",
 ) -> list[dict[str, str]]:
     """Build a structured prompt for recent awareness-note generation."""
     from openbiliclaw.sources.event_format import render_retraction_marked_events
+
+    selected_view = normalize_cognition_input_view(input_view)
+    rendered_events = render_retraction_marked_events(events)
+    if selected_view == "compact-v1":
+        profile_view = build_cognition_profile_view_v1(
+            soul_profile=soul_profile,
+            preference_summary=preference_summary,
+        )
+        sections = [
+            "<soul_profile>",
+            json.dumps(
+                profile_view.stable_soul,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</soul_profile>",
+            "<preference_summary>",
+            json.dumps(
+                profile_view.stable_preference,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</preference_summary>",
+        ]
+        if profile_view.recent_awareness:
+            sections += [
+                "<recent_awareness>",
+                json.dumps(
+                    profile_view.recent_awareness,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "</recent_awareness>",
+            ]
+        if profile_view.active_insights:
+            sections += [
+                "<active_insights>",
+                json.dumps(
+                    profile_view.active_insights,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "</active_insights>",
+            ]
+        sections += [
+            "<recent_events>",
+            json.dumps(
+                build_cognition_event_view_v1(rendered_events).as_list(),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</recent_events>",
+        ]
+        return [
+            {"role": "system", "content": _AWARENESS_SYSTEM_PROMPT},
+            {"role": "user", "content": "\n\n".join(sections)},
+        ]
 
     user_prompt = "\n\n".join(
         [
@@ -758,7 +905,7 @@ def build_awareness_prompt(
             "</preference_summary>",
             "<recent_events>",
             json.dumps(
-                render_retraction_marked_events(events),
+                rendered_events,
                 ensure_ascii=False,
                 indent=2,
                 sort_keys=True,
@@ -825,6 +972,7 @@ def build_awareness_with_confusions_prompt(
     events: list[dict[str, object]],
     preference_summary: dict[str, object],
     soul_profile: dict[str, object],
+    input_view: str = "legacy",
 ) -> list[dict[str, str]]:
     """Build the awareness+confusions prompt (Phase 2).
 
@@ -837,6 +985,68 @@ def build_awareness_with_confusions_prompt(
     """
     from openbiliclaw.sources.event_format import render_retraction_marked_events
 
+    selected_view = normalize_cognition_input_view(input_view)
+    rendered_events = render_retraction_marked_events(events)
+    if selected_view == "compact-v1":
+        profile_view = build_cognition_profile_view_v1(
+            soul_profile=soul_profile,
+            preference_summary=preference_summary,
+        )
+        sections = [
+            "<soul_profile>",
+            json.dumps(
+                profile_view.stable_soul,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</soul_profile>",
+            "<preference_summary>",
+            json.dumps(
+                profile_view.stable_preference,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</preference_summary>",
+        ]
+        if profile_view.recent_awareness:
+            sections += [
+                "<recent_awareness>",
+                json.dumps(
+                    profile_view.recent_awareness,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "</recent_awareness>",
+            ]
+        if profile_view.active_insights:
+            sections += [
+                "<active_insights>",
+                json.dumps(
+                    profile_view.active_insights,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "</active_insights>",
+            ]
+        sections += [
+            "<recent_events>",
+            json.dumps(
+                build_cognition_event_view_v1(rendered_events).as_list(),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</recent_events>",
+        ]
+        return [
+            {"role": "system", "content": _AWARENESS_WITH_CONFUSIONS_SYSTEM_PROMPT},
+            {"role": "user", "content": "\n\n".join(sections)},
+        ]
+
     user_prompt = "\n\n".join(
         [
             "<soul_profile>",
@@ -847,7 +1057,7 @@ def build_awareness_with_confusions_prompt(
             "</preference_summary>",
             "<recent_events>",
             json.dumps(
-                render_retraction_marked_events(events),
+                rendered_events,
                 ensure_ascii=False,
                 indent=2,
                 sort_keys=True,
@@ -861,22 +1071,7 @@ def build_awareness_with_confusions_prompt(
     ]
 
 
-def build_insight_prompt(
-    *,
-    awareness_notes: list[dict[str, object]],
-    preference_summary: dict[str, object],
-    soul_profile: dict[str, object],
-    existing_hypotheses: list[dict[str, object]] | None = None,
-) -> list[dict[str, str]]:
-    """Build a structured prompt for insight-hypothesis generation.
-
-    ``existing_hypotheses`` (optional) is the set of currently-active
-    hypotheses passed as read-only context so an incremental run — which
-    only sees *new* awareness notes — can refine or avoid restating them
-    instead of regenerating from the full awareness history every time.
-    See rules 5 / 6 below.
-    """
-    system_prompt = """
+_INSIGHT_SYSTEM_PROMPT = """
 <task>
 你要基于近期觉察、偏好摘要和用户画像，生成谨慎的解释性假设。
 </task>
@@ -900,6 +1095,71 @@ def build_insight_prompt(
 ]
 </output_schema>
 """.strip()
+
+
+def build_insight_prompt(
+    *,
+    awareness_notes: list[dict[str, object]],
+    preference_summary: dict[str, object],
+    soul_profile: dict[str, object],
+    existing_hypotheses: list[dict[str, object]] | None = None,
+    input_view: str = "legacy",
+) -> list[dict[str, str]]:
+    """Build a structured prompt for insight-hypothesis generation.
+
+    ``existing_hypotheses`` (optional) is the set of currently-active
+    hypotheses passed as read-only context so an incremental run — which
+    only sees *new* awareness notes — can refine or avoid restating them
+    instead of regenerating from the full awareness history every time.
+    See rules 5 / 6 below.
+    """
+    selected_view = normalize_cognition_input_view(input_view)
+    if selected_view == "compact-v1":
+        profile_view = build_cognition_profile_view_v1(
+            soul_profile=soul_profile,
+            preference_summary=preference_summary,
+            recent_awareness=awareness_notes,
+            active_insights=existing_hypotheses,
+        )
+        sections = [
+            "<soul_profile>",
+            json.dumps(
+                profile_view.stable_soul,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</soul_profile>",
+            "<preference_summary>",
+            json.dumps(
+                profile_view.stable_preference,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</preference_summary>",
+            "<existing_hypotheses>",
+            json.dumps(
+                profile_view.active_insights,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</existing_hypotheses>",
+            "<awareness_notes>",
+            json.dumps(
+                profile_view.recent_awareness,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</awareness_notes>",
+        ]
+        return [
+            {"role": "system", "content": _INSIGHT_SYSTEM_PROMPT},
+            {"role": "user", "content": "\n\n".join(sections)},
+        ]
+
     user_prompt = "\n\n".join(
         [
             "<awareness_notes>",
@@ -917,7 +1177,7 @@ def build_insight_prompt(
         ]
     )
     return [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": _INSIGHT_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -1240,16 +1500,30 @@ def build_posture_gate_prompt(
 # 100% static system prompt for single-item content evaluation.
 # All variables (source_context, source_platform, profile, content)
 # go in user_prompt — see ``build_content_evaluation_prompt``.
+# Reason-diet floor (v0.3.171): the "< 0.5 → empty reason" threshold below is a
+# fixed 0.5 baked into the static prompt text, NOT the runtime
+# ``admission_min_score``. It must stay a literal constant for two reasons:
+# (1) cache convention — the system prompt has to be byte-identical across
+# calls, so it cannot interpolate a per-call/config value; (2) safety margin —
+# 0.5 is strictly below every admission path (0.60 default, 0.58 explore per
+# ``discovery/admission.py``), so omitting low-score diagnostic text cannot
+# affect admission. Reopen this only if an admission path ever drops at/below
+# 0.5.
 _SINGLE_CONTENT_EVALUATION_SYSTEM_PROMPT = (
     "<task>\n"
     "你要评估一个候选内容与一个用户画像的匹配度。下面 user 消息会给出 "
     "<source_context>(发现路径)、<source_platform>(平台)、"
-    "<profile_summary>(画像)、<content_summary>(候选),你按下面规则打分。\n"
+    "<profile_summary>(画像)、<evaluation_context>(评估时间)、"
+    "<content_summary>(候选),你按下面规则打分。\n"
     "</task>\n\n"
     "<rules>\n"
     "1. 输出必须是严格 JSON,不要附带解释。\n"
     "2. score 范围必须在 0 到 1 之间。\n"
-    "3. reason 只写一句中文,解释为什么这个人会喜欢或不喜欢这个内容。\n"
+    "3. reason 仅供内部诊断,不是面向用户的推荐文案。写法(省 token):"
+    "score 严格低于 0.5 的条目,reason 必须写成空串 "
+    '""(这些条目达不到准入门槛、会被直接丢弃,写理由是纯浪费);'
+    "score 大于等于 0.5 的条目,reason 写一句精炼中文,"
+    "不超过 30 个 Unicode 字符,说明内容与画像匹配或不匹配的依据。\n"
     '4. 不要只说"因为热门"或"因为看过类似的",要结合用户画像。\n'
     "5. 除 explore 外，发现路径和平台只提供上下文，不得影响评分标准:"
     "search、trending、hot、feed、related_chain、channel、creator 等所有非 explore 候选"
@@ -1280,11 +1554,15 @@ _SINGLE_CONTENT_EVALUATION_SYSTEM_PROMPT = (
     "   - 同一 IP 必须用相同写法,不要在「原神」「Genshin」「米哈游 原神」之间切换。\n"
     "9. 不同 source_platform(bilibili / xiaohongshu / 其他)的内容标签同 schema,"
     "不要因为来源不同特殊处理评分逻辑。\n"
+    "10. published_at 是来源提供的权威发布时间，evaluation_context.evaluated_at 是本次评估的"
+    "权威时间基准。不得根据模型知识截止时间或标题中的年份推测发布时间；对热点、时事、版本更新"
+    "等时效性内容，应比较 published_at 与 evaluated_at 判断内容是否仍然新鲜，"
+    "但不得仅因内容较新就覆盖与用户画像的真实匹配度。字段缺失或无效时保持中性，不得武断降分。\n"
     "</rules>\n\n"
     "<output_schema>\n"
     "{\n"
     '  "score": 0.78,\n'
-    '  "reason": "这个视频的选题角度新颖,节奏轻快,契合你对该领域的好奇心。",\n'
+    '  "reason": "主题契合画像中的长期兴趣,内容角度有增量",\n'
     '  "topic_group": "生活方式",\n'
     '  "style_key": "social_chat",\n'
     '  "franchise_key": ""\n'
@@ -1299,6 +1577,7 @@ def build_content_evaluation_prompt(
     content_summary: dict[str, object],
     source_context: str = "",
     source_platform: str = "bilibili",
+    evaluated_at: str = "",
 ) -> list[dict[str, str]]:
     """Build a structured prompt for single-item content relevance evaluation.
 
@@ -1307,6 +1586,7 @@ def build_content_evaluation_prompt(
         content_summary: Content metadata.
         source_context: Discovery context hint (e.g. search / trending / explore).
         source_platform: Platform identifier for dynamic prompt wording.
+        evaluated_at: Authoritative UTC evaluation-time bucket for freshness comparisons.
 
     v0.3.28+ cache-friendly: ``system_prompt`` is the module-level
     constant ``_SINGLE_CONTENT_EVALUATION_SYSTEM_PROMPT`` (100% static).
@@ -1323,6 +1603,14 @@ def build_content_evaluation_prompt(
             "<profile_summary>",
             json.dumps(profile_summary, ensure_ascii=False, indent=2, sort_keys=True),
             "</profile_summary>",
+            "<evaluation_context>",
+            json.dumps(
+                {"evaluated_at": evaluated_at or "(unspecified)"},
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</evaluation_context>",
             "<content_summary>",
             json.dumps(
                 _normalize_content_style_fields(content_summary),
@@ -1345,20 +1633,31 @@ def build_content_evaluation_prompt(
 # profile data — all of those go in user_prompt). Provider-side prompt
 # cache (DeepSeek 90% / OpenAI 50% / Claude 90% / Gemini 75% off) only
 # fires when the prefix is byte-identical across calls.
+#
+# Reason-diet floor (v0.3.171): rule 3a bakes a fixed 0.5 skip threshold (see
+# the single-eval constant above for the full rationale) — a literal constant,
+# never the runtime ``admission_min_score``, so the prefix stays byte-stable and
+# stays strictly below every admission path (0.60 default, 0.58 explore).
 _BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT = (
     "<task>\n"
     "你要批量评估多个候选内容与一个用户画像的匹配度。"
     "下面 user 消息会按稳定性顺序给出画像层(<profile_core>、<profile_life_context>、"
     "<profile_interests>、<profile_style_context>、<profile_recent_context>)、"
     "<source_platform>(平台)、"
-    "<source_context>(发现路径)、<content_batch>(本批候选),你按下面规则打分。\n"
+    "<source_context>(发现路径)、<evaluation_context>(评估时间)、"
+    "<content_batch>(本批候选),你按下面规则打分。\n"
     "</task>\n\n"
     "<rules>\n"
     '1. 输出必须是严格 JSON 对象,不要附带解释。顶层只包含 "results" 数组。\n'
     "2. results 数组长度必须与输入内容数量一致,顺序一一对应。\n"
     "3. 每项必须原样带回输入里的 bvid 或 content_id,并包含 score(0-1)、"
-    "reason(一句中文)、topic_group(2-4词粗分类)、style_key(13选1)、"
+    "reason、topic_group(2-4词粗分类)、style_key(13选1)、"
     "franchise_key(可空)。\n"
+    "3a. reason 仅供内部诊断,不是面向用户的推荐文案。写法(省 token):"
+    "score 严格低于 0.5 的条目,reason 必须写成空串 "
+    '""(这些条目达不到准入门槛、会被直接丢弃,写理由是纯浪费);'
+    "score 大于等于 0.5 的条目,reason 写一句精炼中文,"
+    "不超过 30 个 Unicode 字符,说明内容与画像匹配的依据。\n"
     "4. 除 explore 外，发现路径和平台只提供上下文，不得影响评分标准:"
     "search、trending、hot、feed、related_chain、channel、creator 等所有非 explore 候选"
     "都必须按内容与用户画像的真实匹配度统一评分;"
@@ -1419,6 +1718,11 @@ _BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT = (
     "与 title、body_text、description、tags、互动指标一起判断主题、风格、视觉质感和点击诱因;"
     "如果图片与文本存在冲突,把可见图像证据作为辅助修正,但不要仅凭封面热闹给高分。"
     "没有 cover_image_ref 的条目表示没有可用图片,只按文本字段判断,不要猜测缺失图片。\n"
+    "10c. content_batch 中的 published_at 是来源提供的权威发布时间，"
+    "evaluation_context.evaluated_at 是本次评估的权威时间基准。不得根据模型知识截止时间"
+    "或标题中的年份推测发布时间；对热点、时事、版本更新等时效性内容，应比较 published_at"
+    "与 evaluated_at 判断内容是否仍然新鲜，但不得仅因内容较新就覆盖与用户画像的真实匹配度。字段缺失或无效时"
+    "保持中性，不得武断降分。\n"
     "11. 当 user 消息携带 `<negative_examples>` 时,把这些标题视为用户最近"
     "**明确不喜欢**的样本——理由可能是快速划走 (`quick_exit`) 或显式负反馈"
     " (`explicit_negative`)。\n"
@@ -1436,12 +1740,77 @@ _BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT = (
     '"style_key": "deep_focus", "franchise_key": ""},\n'
     '    {"bvid": "BV2xxx", "score": 0.72, "reason": "...", "topic_group": "游戏摄影", '
     '"style_key": "aesthetic_browse", "franchise_key": "原神"},\n'
-    '    {"bvid": "BV3xxx", "score": 0.45, "reason": "...", "topic_group": "美食", '
+    '    {"bvid": "BV3xxx", "score": 0.45, "reason": "", "topic_group": "美食", '
     '"style_key": "social_chat", "franchise_key": ""}\n'
     "  ]\n"
     "}\n"
     "</output_schema>"
 )
+
+
+def _build_sparse_batch_evaluation_system_prompt() -> str:
+    """Return the static local-ID contract shared by sparse transports."""
+
+    replacements = (
+        (
+            "3. 每项必须原样带回输入里的 bvid 或 content_id,并包含 score(0-1)、"
+            "reason、topic_group(2-4词粗分类)、style_key(13选1)、"
+            "franchise_key(可空)。\n",
+            "3. content_batch 编码一个 canonical batch,可能是含 defaults/items 的 JSON,"
+            "也可能是 ROW-WIRE-V1 表；表中的 defaults、columns、row 与同名 canonical "
+            "字段完全等价。defaults 是所有 items/rows 共享的默认值,每项同名字段优先。"
+            "每项包含请求内局部 id、title、author,以及非空的内容/互动字段。"
+            "每项必须原样带回输入里的 id,并包含 score(0-1)、reason、"
+            "topic_group(2-4词粗分类)、style_key(13选1)、franchise_key(可空)。\n",
+        ),
+        (
+            "10. When content_batch items include source_platform/source_strategy/content_type, "
+            "use those per-item fields as the authoritative platform context. "
+            "Do not lower or raise preference score merely because content comes from a "
+            "different platform; score every item against the same Soul-profile rubric. ",
+            "10. Resolve source_platform, content_type and mode from each canonical item, "
+            "falling back to content_batch.defaults when the item omits that field. "
+            "Only mode=explore receives the explore exception; mode=normal covers every "
+            "other discovery path. Do not lower or raise preference score merely because "
+            "content comes from a different platform; score every item against the same "
+            "Soul-profile rubric. ",
+        ),
+        (
+            "它的值形如 cover:<content_id>,对应同一 user 消息中紧随文字锚点"
+            " `Cover image cover:<content_id> ...` 后面的图片。评分时必须结合该头图 / 封面图",
+            "它的值形如 cover:<id>,对应同一 user 消息中紧随文字锚点"
+            " `Cover image cover:<id> ...` 后面的图片。评分时必须结合该头图 / 封面图",
+        ),
+        (
+            '    {"bvid": "BV1xxx", "score": 0.78, "reason": "...", '
+            '"topic_group": "认知科学", '
+            '"style_key": "deep_focus", "franchise_key": ""},\n'
+            '    {"bvid": "BV2xxx", "score": 0.72, "reason": "...", '
+            '"topic_group": "游戏摄影", '
+            '"style_key": "aesthetic_browse", "franchise_key": "原神"},\n'
+            '    {"bvid": "BV3xxx", "score": 0.45, "reason": "", '
+            '"topic_group": "美食", '
+            '"style_key": "social_chat", "franchise_key": ""}\n',
+            '    {"id": "0", "score": 0.78, "reason": "...", '
+            '"topic_group": "认知科学", '
+            '"style_key": "deep_focus", "franchise_key": ""},\n'
+            '    {"id": "1", "score": 0.72, "reason": "...", '
+            '"topic_group": "游戏摄影", '
+            '"style_key": "aesthetic_browse", "franchise_key": "原神"},\n'
+            '    {"id": "2", "score": 0.45, "reason": "", '
+            '"topic_group": "美食", '
+            '"style_key": "social_chat", "franchise_key": ""}\n',
+        ),
+    )
+    prompt = _BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT
+    for production_text, sparse_text in replacements:
+        if prompt.count(production_text) != 1:
+            raise RuntimeError("sparse evaluator system prompt is stale")
+        prompt = prompt.replace(production_text, sparse_text, 1)
+    return prompt
+
+
+_SPARSE_BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT = _build_sparse_batch_evaluation_system_prompt()
 
 
 def build_batch_content_evaluation_prompt(
@@ -1452,6 +1821,10 @@ def build_batch_content_evaluation_prompt(
     source_context: str = "",
     source_platform: str = "bilibili",
     negative_examples: list[dict[str, object]] | None = None,
+    evaluated_at: str = "",
+    compact_json: bool = False,
+    candidate_block: str | None = None,
+    local_result_ids: bool = False,
 ) -> list[dict[str, str]]:
     """Build a prompt that evaluates multiple content items in one LLM call.
 
@@ -1475,18 +1848,44 @@ def build_batch_content_evaluation_prompt(
     prefix unchanged for cold-start users). System prompt picks up two
     permanent rules about how to consume the block (rules 10 + 11) and
     stays call-invariant after that one-time template change.
+
+    v0.3.x: discovery evaluation may include item-level ``related_interests``
+    entries inside ``content_items``. They are per-candidate name-string recall
+    hints from the tail interest pool (ranks beyond the compact block's top
+    64), intentionally kept out of the stable profile blocks so provider
+    prompt-cache prefixes remain byte-stable.
+
+    ``compact_json`` is an experiment seam for deterministic JSON whitespace
+    removal. It never changes field names or values, and defaults to the
+    historical indented rollback bytes.
+
+    ``candidate_block`` and ``local_result_ids`` carry the production sparse
+    candidate wire and request-local result identity. The block is already
+    rendered by the shared transport layer; the static local-ID system contract
+    is shared by production sparse JSON and replay-only row wire. Leaving both
+    arguments disabled preserves the historical explicit-``production``
+    rollback prompt bytes.
     """
+
+    if (candidate_block is not None) != local_result_ids:
+        raise ValueError("candidate_block and local_result_ids must be enabled together")
+
+    def render_json(value: object) -> str:
+        if compact_json:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+
     user_blocks: list[str] = (
         list(profile_blocks)
         if profile_blocks
         else [
             "<profile_summary>",
-            json.dumps(
-                profile_summary,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            ),
+            render_json(profile_summary),
             "</profile_summary>",
         ]
     )
@@ -1504,30 +1903,38 @@ def build_batch_content_evaluation_prompt(
         user_blocks.extend(
             [
                 "<negative_examples>",
-                json.dumps(
-                    negative_examples,
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                ),
+                render_json(negative_examples),
                 "</negative_examples>",
             ]
         )
     user_blocks.extend(
         [
+            "<evaluation_context>",
+            render_json({"evaluated_at": evaluated_at or "(unspecified)"}),
+            "</evaluation_context>",
+        ]
+    )
+    user_blocks.extend(
+        [
             "<content_batch>",
-            json.dumps(
-                [_normalize_content_style_fields(item) for item in content_items],
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
+            (
+                candidate_block
+                if candidate_block is not None
+                else render_json([_normalize_content_style_fields(item) for item in content_items])
             ),
             "</content_batch>",
         ]
     )
     user_prompt = "\n\n".join(user_blocks)
     return [
-        {"role": "system", "content": _BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": (
+                _SPARSE_BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT
+                if local_result_ids
+                else _BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT
+            ),
+        },
         {"role": "user", "content": user_prompt},
     ]
 
@@ -2076,7 +2483,7 @@ _AVOIDANCE_GENERATION_SYSTEM_PROMPT = """
 
 def build_avoidance_generation_prompt(
     *,
-    profile_summary: dict[str, object],
+    profile_summary: str | dict[str, object],
     existing_avoidances: list[str],
     existing_avoidance_details: list[dict[str, object]] | None = None,
     cooldown_domains: list[str],
@@ -2125,8 +2532,8 @@ _PROFILE_CONSOLIDATION_SYSTEM_PROMPT = (
     "<task>\n"
     "你是用户画像的整理器。输入是若干「嫌疑重复」的主题簇（cluster），\n"
     "分为 likes（兴趣主题）和 dislikes（避雷主题）两组。\n"
-    "你要对每个簇内的主题做出裁决：哪些是同一概念的措辞变体（应合并），\n"
-    "哪些是真正不同的概念（应保留）。\n"
+    "你要对每个簇内的主题做出裁决：哪些在用户画像里表达相同的推荐意图、\n"
+    "继续并存只会重复占位（应合并），哪些能带来不同推荐结果（应保留）。\n"
     "</task>\n"
     "\n"
     "<rules>\n"
@@ -2134,25 +2541,28 @@ _PROFILE_CONSOLIDATION_SYSTEM_PROMPT = (
     "2. merge 的 members 必须从该簇的 members 中【逐字原样复制】；普通成员可用字符串，\n"
     '   同名异类成员必须用 {"name": 原名, "category": 原分类} 精确引用。\n'
     "3. 每个簇内的每个主题，必须被 merge 或 keep 恰好覆盖一次，不能遗漏、不能重复。\n"
-    "4. merge 至少 2 个 members。canonical 是合并后的代表性 item 名：如果某个\n"
-    "   member 已能准确代表整个合并组，可以选它；如果 members 分别只覆盖一部分，\n"
-    "   应起一个更准确的组合概念名，让它能代表所有 members。新名必须与 members\n"
-    "   同等具体或更精确，不得更宽泛。\n"
-    "   不要默认选择第一个 member 或最短 member；只有当旧 member 能覆盖所有被合并成员时才可作为 canonical。\n"
-    "   如果旧 member 只是上位词、短词或只覆盖一个侧面，必须起一个组合概念名。\n"
-    "5. 「合并」只适用于同一概念的措辞变体（如「智能体开发」vs「智能体开发与实现」）。\n"
-    "   子集/包含关系不是同义（如「篮球」vs「NBA」、「游戏」vs「手机游戏」），必须分别 keep。\n"
+    "4. merge 至少 2 个 members。canonical 是合并后的代表性 item 名。优先选择能准确\n"
+    "   覆盖整组的简洁旧 member；只有旧 member 都只覆盖一部分时才起具体组合名。\n"
+    "   新名必须与 members 同等具体或更精确，不得为了看似完整而堆砌近义词。\n"
+    "5. likes 的目标是减少画像槽位重复，不限于字典意义上的严格同义词。措辞变体、\n"
+    "   同粒度且推荐/搜索结果高度重叠的标签、以及加了空泛前后缀但没有新增选择价值的\n"
+    "   标签都应 merge（如「搞笑」vs「娱乐搞笑」）。\n"
+    "   真正的父子兴趣若会带来不同推荐结果仍须 keep（如「篮球」vs「NBA」、\n"
+    "   「AI技术」vs「AI视频技术」、「游戏」vs「手机游戏」）。\n"
     "6. dislikes 组的标准更严：只合并语义几乎相同的真同义项；【严禁向上泛化】——\n"
     "   canonical 绝不能比 members 更宽泛（如把「一个案例反复切悬念拖时长」归并成\n"
     "   「低质内容」是严重错误，会误伤大量正常内容）。拿不准时一律 keep。\n"
-    "7. likes 组可以稍宽松，但同样不允许把具体兴趣合并成大类。\n"
+    "7. likes 可以按「是否重复占用同一推荐意图」从宽合并，但同样不允许把具体兴趣\n"
+    "   向上合并成会改变召回范围的大类。拿不准两项能否产生不同结果时才 keep。\n"
     "8. likes 成员带 category（一级分类）。同名/近名但 category 不同且语义不同的条目\n"
     "   是【同名异义】（如 苹果(科技) vs 苹果(美食)），必须分别 keep，严禁合并。\n"
     "   只有确认它们是同一概念被误标了不同分类时才 merge；此时 merge.members 和\n"
     "   keep.member 都必须使用 {name, category}，使每个同名条目可被逐一追踪。\n"
-    "9. 输出严格 JSON，不要附带解释文本。\n"
-    "10. 各变量见 user 消息：likes_clusters / dislikes_clusters（各簇带 cluster_id、\n"
-    "   members 及其权重 / category 元数据）。\n"
+    "9. 每个簇可带 known_distinct_pairs；这些 pair 是用户回滚或当前策略下已确认要分开\n"
+    "   的成员，严禁在任何 merge 中放到一起，也无需重新裁决它们之间的关系。\n"
+    "10. 输出严格 JSON，不要附带解释文本。\n"
+    "11. 各变量见 user 消息：likes_clusters / dislikes_clusters（各簇带 cluster_id、\n"
+    "   members、known_distinct_pairs 及权重 / category 元数据）。\n"
     "</rules>\n"
     "\n"
     "<output_schema>\n"
@@ -2182,8 +2592,9 @@ def build_profile_consolidation_prompt(
 ) -> list[dict[str, str]]:
     """Build the prompt for LLM-judged consolidation of like/dislike topics.
 
-    Each cluster dict carries ``cluster_id`` and ``members`` (list of dicts
-    with name + weight + category metadata for likes, plain strings for dislikes).
+    Each cluster dict carries ``cluster_id``, ``known_distinct_pairs`` and
+    ``members`` (list of dicts with name + weight + category metadata for
+    likes, plain strings for dislikes).
     System prompt is fully static (cache-friendly per CLAUDE.md convention);
     all per-call data lives in the user message with deterministic
     serialization.
@@ -2417,7 +2828,13 @@ Rules:
    appear in allocation_targets.
 10. Keep axes grounded in fresh_evidence. evidence_refs should point to the provided URL or compact
    evidence identifier when available.
-11. Keep JSON compact and valid. No markdown, no commentary, no trailing prose.
+11. A keyword's ``interest`` MUST exactly name one item from selected_interests. Its core_concept
+   must be supported by fresh_evidence or an existing axis for that SAME interest. Never copy a
+   work, person, event, controversy, or mechanism from another interest's evidence and relabel it.
+   If the same-interest evidence cannot support a concrete query, omit that keyword instead.
+12. Treat recent_keywords as query families, not exact strings: adding only a generic suffix such
+   as 复盘 / 解析 / 分析 / 教程 / 盘点 / review / explained is still a duplicate and must be omitted.
+13. Keep JSON compact and valid. No markdown, no commentary, no trailing prose.
 """.strip()
 
 

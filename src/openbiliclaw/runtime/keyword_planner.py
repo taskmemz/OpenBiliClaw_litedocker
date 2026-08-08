@@ -6,17 +6,18 @@ backpressure model (design spec §5.2). It runs as its own background object
 controller's ``run_forever``) and, when the
 ``[discovery].unified_keyword_planner_enabled`` flag is on, periodically:
 
-1. Finds the ``due`` platforms — those whose keyword cache (``pending`` rows
-   for the current ``profile_kw_digest``) is below ``kw_cache_low`` **and**
+1. Reconciles bounded, recent, safe regular ``pending`` rows across profile
+   digest churn, then finds the ``due`` platforms — those whose usable keyword
+   cache is below ``kw_cache_low`` **and**
    that have a real search deficit (the controller's existing pool-replenish
    口径, including raw-material headroom + in-flight rows — NOT just visible
    pool rows). B站 additionally enters ``due`` on its existing catalysts
    (pool-below-target or ≥ ``signal_event_threshold`` pending signal events),
    even when its cache is not below low.
-2. For every due platform, expires any stale-digest ``pending`` rows, then
-   builds one merged ``<platforms>`` block and issues a **single** structured
+2. Builds one merged ``<platforms>`` block and issues a **single** structured
    LLM call covering all due platforms. Parsed keywords are inserted as
-   ``pending`` per platform under the current digest.
+   ``pending`` per platform under the current digest. Reused rows keep their
+   original digest and generation provenance.
 3. Decline vs failure (P2.2). When the merged call **succeeds**, a platform the
    model explicitly returned an empty list ``[]`` for is an **intentional
    decline** (its supply advantage doesn't fit the user) — it is skipped this
@@ -25,12 +26,12 @@ controller's ``run_forever``) and, when the
    falls back. When the merged call **fails entirely** (raised / no usable
    response), ALL due platforms fall back to deterministic interest names.
 4. Rotation polish (P2.3). ``claim_keywords`` is FIFO (oldest pending first), so
-   generated words rotate fairly. After a generation cycle, a non-declined due
-   platform whose pending is still below ``kw_cache_low`` is conservatively
-   topped up from its oldest ``used`` words via ``recycle_oldest_used`` (no
-   extra LLM call) so variety keeps flowing; a declined platform is left alone.
-   The sparse-profile recycle (generation + fallback produced nothing new)
-   stays as the deeper safety valve.
+   generated words rotate fairly. Recent words participate in the generation
+   cache key and are enforced again before insert, so a stable profile cannot
+   replay one cached batch for the whole plan TTL. After a generation cycle, a
+   non-declined due platform whose pending is still below ``kw_cache_low`` may
+   reuse an old ``used`` word only after the configured history window has
+   elapsed; a declined platform is left alone.
 
 It never fetches — fetch (claim → search) is P1.7. Single-flight is enforced
 through the DB-level planner lock, whose write transaction is released
@@ -801,6 +802,10 @@ class KeywordPlanner:
         # ``{platform: {"generated": n, "yield": y}}`` snapshot emitted by a
         # generation pass. Empty until the first pass that generates anything.
         self.last_cycle_ledger: dict[str, dict[str, int]] = {}
+        # Aggregate-only digest-grace observability. This deliberately stores
+        # counts rather than keyword/profile/digest text.
+        self.last_digest_grace_ledger: dict[str, dict[str, int]] = {}
+        self._grace_inventory_ready: set[str] = set()
         # Phase 2.3 telemetry: True when the last coexist explore round fell back
         # from rich axis-library generation to the flat ``explore_domains``
         # queries (rich-gen degraded / empty). Reset each explore attempt.
@@ -1114,22 +1119,21 @@ class KeywordPlanner:
             return await self._run_once_locked()
 
     async def _run_once_locked(self) -> dict[str, int]:
+        self.last_digest_grace_ledger = {}
+        self._grace_inventory_ready.clear()
         profile = await self._load_profile()
         if profile is None:
             return {}
 
         digest = profile_kw_digest(profile)
+        hints_by_platform = self._avoid_hints(profile)
+        self._reconcile_pending_inventory(
+            digest=digest,
+            hints_by_platform=hints_by_platform,
+        )
         due = self._due_platforms(digest)
         if not due:
             return {}
-
-        # Flush stale-digest pending for every due platform up front so the
-        # cache count below low / the merged need both reflect the live digest.
-        for platform in due:
-            try:
-                self._db.expire_pending_by_digest(platform, digest)
-            except Exception:
-                logger.exception("expire_pending_by_digest failed for %s", platform)
 
         # Single-flight: short CAS lock, released BEFORE the LLM call.
         lease_seconds = max(1.0, float(self._discovery.claim_lease_minutes) * 60.0)
@@ -1139,7 +1143,12 @@ class KeywordPlanner:
 
         ledger: dict[str, int] = {}
         try:
-            ledger = await self._generate_for(due, profile=profile, digest=digest)
+            ledger = await self._generate_for(
+                due,
+                profile=profile,
+                digest=digest,
+                hints_by_platform=hints_by_platform,
+            )
         finally:
             self._release_lock()
         return ledger
@@ -1150,8 +1159,8 @@ class KeywordPlanner:
         *,
         profile: SoulProfile,
         digest: str,
+        hints_by_platform: dict[str, dict[str, object]],
     ) -> dict[str, int]:
-        hints_by_platform = self._avoid_hints(profile)
         supply_by_platform = self._supply_hints(hints_by_platform)
         blocks: list[dict[str, object]] = []
         needs: dict[str, int] = {}
@@ -1440,6 +1449,14 @@ class KeywordPlanner:
                 {
                     "platform": str(block.get("platform", "")),
                     "need": int(cast("Any", block.get("need", 0)) or 0),
+                    # The prompt already receives this list. It must also shape
+                    # the cache key: omitting it made a stable profile replay the
+                    # same generated batch for ``plan_ttl_hours`` even after the
+                    # words had been searched and moved into recent history.
+                    "recent_keywords": [
+                        self._match_text(item)
+                        for item in _as_str_list(block.get("recent_keywords"))
+                    ],
                     "avoid_topics": _as_str_list(block.get("avoid_topics")),
                     "avoid_styles": _as_str_list(block.get("avoid_styles")),
                     "avoid_franchises": _as_str_list(block.get("avoid_franchises")),
@@ -1643,15 +1660,124 @@ class KeywordPlanner:
 
     # ── store + snapshot helpers ────────────────────────────────────────
 
+    def _reconcile_pending_inventory(
+        self,
+        *,
+        digest: str,
+        hints_by_platform: dict[str, dict[str, object]],
+    ) -> None:
+        """Prepare safe usable inventory before due calculation.
+
+        Both reconciliation and all-digest counting must be available. Any
+        missing/raising capability falls back to the legacy hard-expiration +
+        exact-digest count path for that platform.
+        """
+        reconcile = getattr(self._db, "reconcile_pending_keyword_digests", None)
+        count_all = getattr(self._db, "count_pending_keywords_all_digests", None)
+        grace_hours = int(getattr(self._discovery, "keyword_digest_grace_hours", 0))
+
+        for platform in _PLANNER_PLATFORMS:
+            if not callable(reconcile) or not callable(count_all):
+                self._legacy_expire_pending(platform, digest)
+                continue
+            avoid_topics = _as_str_list(hints_by_platform.get(platform, {}).get("avoid_topics"))
+            try:
+                raw_ledger = reconcile(
+                    platform,
+                    digest,
+                    grace_hours=grace_hours,
+                    max_pending=self._target_high(platform),
+                    # These are inventory-diversity hints derived from current
+                    # pool saturation, not user dislikes. An ordinary dislike
+                    # constrains recommendation output and must never revoke a
+                    # pending search term.
+                    blocked_terms=avoid_topics,
+                    keyword_kind="regular",
+                )
+                # Validate the companion count while still in the reconciliation
+                # phase. A partial rollout must fail back before due computation.
+                int(count_all(platform, keyword_kind="regular"))
+                if not isinstance(raw_ledger, Mapping):
+                    raise TypeError("keyword digest reconciliation returned a non-mapping ledger")
+                ledger = {
+                    key: max(0, _ledger_int(raw_ledger.get(key, 0)))
+                    for key in (
+                        "current",
+                        "reused",
+                        "expired_aged",
+                        "expired_blocked",
+                        "expired_excess",
+                    )
+                }
+            except Exception:
+                logger.exception(
+                    "keyword digest reconciliation failed for %s; using hard expiration",
+                    platform,
+                )
+                self._legacy_expire_pending(platform, digest)
+                continue
+            self._grace_inventory_ready.add(platform)
+            if any(ledger.values()):
+                self.last_digest_grace_ledger[platform] = ledger
+            if any(ledger[key] for key in ledger if key != "current"):
+                logger.info(
+                    "keyword digest reconciliation: platform=%s current=%d reused=%d "
+                    "expired_aged=%d expired_blocked=%d expired_excess=%d",
+                    platform,
+                    ledger["current"],
+                    ledger["reused"],
+                    ledger["expired_aged"],
+                    ledger["expired_blocked"],
+                    ledger["expired_excess"],
+                )
+
+    def _legacy_expire_pending(self, platform: str, digest: str) -> None:
+        try:
+            self._db.expire_pending_by_digest(platform, digest)
+        except Exception:
+            logger.exception("expire_pending_by_digest failed for %s", platform)
+
     def _count_pending(self, platform: str, digest: str) -> int:
+        if platform in self._grace_inventory_ready:
+            try:
+                return int(
+                    self._db.count_pending_keywords_all_digests(
+                        platform,
+                        keyword_kind="regular",
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "all-digest pending count failed for %s; using hard expiration",
+                    platform,
+                )
+                self._grace_inventory_ready.discard(platform)
+                self._legacy_expire_pending(platform, digest)
         try:
             return int(self._db.count_pending_keywords(platform, digest))
         except Exception:
             logger.exception("count_pending_keywords failed for %s", platform)
             return 0
 
-    def _history(self, platform: str) -> list[str]:
+    def _history(self, platform: str, *, keyword_kind: str = "regular") -> list[str]:
+        include_pending = (
+            keyword_kind == "regular"
+            and platform in self._grace_inventory_ready
+            and int(getattr(self._discovery, "keyword_digest_grace_hours", 0)) > 0
+        )
         try:
+            return list(
+                self._db.history_keywords(
+                    platform,
+                    int(self._discovery.history_window_size),
+                    float(self._discovery.history_window_hours),
+                    keyword_kind=keyword_kind,
+                    include_pending=include_pending,
+                )
+            )
+        except TypeError:
+            if keyword_kind != "regular":
+                return []
             return list(
                 self._db.history_keywords(
                     platform,
@@ -1674,11 +1800,18 @@ class KeywordPlanner:
     ) -> int:
         if not words:
             return 0
+        filtered = self._novel_keywords(
+            platform,
+            words,
+            keyword_kind=keyword_kind,
+        )
+        if not filtered:
+            return 0
         try:
             return int(
                 self._db.insert_pending_keywords(
                     platform,
-                    words,
+                    filtered,
                     digest,
                     keyword_kind=keyword_kind,
                     metadata_by_keyword=metadata_by_keyword,
@@ -1687,20 +1820,123 @@ class KeywordPlanner:
         except TypeError:
             if keyword_kind != "regular":
                 return 0
-            return int(self._db.insert_pending_keywords(platform, words, digest))
+            return int(self._db.insert_pending_keywords(platform, filtered, digest))
         except Exception:
             logger.exception("insert_pending_keywords failed for %s", platform)
             return 0
+
+    def _novel_keywords(
+        self,
+        platform: str,
+        words: Sequence[str],
+        *,
+        keyword_kind: str = "regular",
+    ) -> list[str]:
+        """Remove exact and suffix-only variants of recently consumed queries."""
+
+        recent = {
+            self._keyword_family_key(item)
+            for item in self._history(platform, keyword_kind=keyword_kind)
+            if self._keyword_family_key(item)
+        }
+        filtered: list[str] = []
+        seen: set[str] = set()
+        for word in words:
+            key = self._keyword_family_key(word)
+            if not key or key in recent or key in seen:
+                continue
+            seen.add(key)
+            filtered.append(str(word))
+        if len(filtered) != len(words):
+            logger.info(
+                "keyword planner novelty filter: platform=%s kind=%s input=%d kept=%d",
+                platform,
+                keyword_kind,
+                len(words),
+                len(filtered),
+            )
+        return filtered
 
     def _recycle(self, platform: str, n: int, digest: str) -> int:
         recycle = getattr(self._db, "recycle_oldest_used", None)
         if not callable(recycle) or n <= 0:
             return 0
         try:
+            return int(
+                recycle(
+                    platform,
+                    n,
+                    digest,
+                    min_age_hours=float(self._discovery.history_window_hours),
+                )
+            )
+        except TypeError:
             return int(recycle(platform, n, digest))
         except Exception:
             logger.exception("recycle_oldest_used failed for %s", platform)
             return 0
+
+    @staticmethod
+    def _keyword_novelty_key(value: object) -> str:
+        """Normalize formatting-only query differences for exact cooldown.
+
+        This is deliberately conservative: it collapses case, spaces and
+        punctuation but does not attempt semantic similarity, which could hide
+        genuinely different long-tail searches under the same broad interest.
+        """
+        return re.sub(r"[\W_]+", "", str(value or "").strip().casefold())
+
+    @classmethod
+    def _keyword_family_key(cls, value: object) -> str:
+        """Collapse a query plus generic trailing style markers to one family.
+
+        The rule stays intentionally narrow: only suffixes that add no new
+        search subject are stripped. Different entities or mechanisms remain
+        distinct, while ``同一事件 争议`` and ``同一事件 争议 复盘`` share a
+        cooldown family.
+        """
+
+        key = cls._keyword_novelty_key(value)
+        if not key:
+            return ""
+        suffixes = (
+            "深度解析",
+            "技术解析",
+            "原理解析",
+            "复盘分析",
+            "实测评测",
+            "入门教程",
+            "完整教程",
+            "详细教程",
+            "教程",
+            "复盘",
+            "解析",
+            "分析",
+            "盘点",
+            "解说",
+            "科普",
+            "测评",
+            "评测",
+            "实测",
+            "推荐",
+            "攻略",
+            "教学",
+            "explained",
+            "tutorial",
+            "analysis",
+            "review",
+            "guide",
+            "tips",
+        )
+        changed = True
+        while changed:
+            changed = False
+            for suffix in suffixes:
+                if key.endswith(suffix) and len(key) > len(suffix):
+                    key = key[: -len(suffix)]
+                    changed = True
+                    break
+        return key
 
     def _avoid_hints(self, profile: SoulProfile | None = None) -> dict[str, dict[str, object]]:
         """Per-platform topic avoid + global style/franchise avoid (P3.1).

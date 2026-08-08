@@ -3556,6 +3556,22 @@
       white-space: pre-wrap;
     }
 
+    .chat-markdown {
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+    .chat-markdown > :first-child { margin-top: 0; }
+    .chat-markdown > :last-child { margin-bottom: 0; }
+    .chat-markdown p { margin: 0 0 0.65em; }
+    .chat-markdown h1, .chat-markdown h2, .chat-markdown h3, .chat-markdown h4, .chat-markdown h5, .chat-markdown h6 { margin: 0 0 0.5em; font-size: 1em; line-height: 1.35; }
+    .chat-markdown ul, .chat-markdown ol { margin: 0 0 0.65em; padding-left: 1.35em; }
+    .chat-markdown li + li { margin-top: 0.25em; }
+    .chat-markdown blockquote { margin: 0 0 0.65em; padding-left: 0.8em; border-left: 3px solid rgba(104, 128, 166, 0.5); color: var(--text-soft, var(--text-main)); }
+    .chat-markdown pre { margin: 0 0 0.65em; padding: 8px 10px; overflow-x: auto; border-radius: 8px; background: rgba(229, 237, 248, 0.72); font-size: 0.9em; }
+    .chat-markdown code { padding: 0.08em 0.28em; border-radius: 4px; background: rgba(229, 237, 248, 0.72); font-size: 0.92em; }
+    .chat-markdown pre code { padding: 0; background: transparent; }
+    .chat-markdown a { color: var(--brand-strong); text-decoration: underline; text-underline-offset: 2px; }
+
     .chat-thinking-content {
       display: inline-flex;
       align-items: center;
@@ -6316,20 +6332,20 @@
         </div>
         <div class="settings-field">
           <label for="cfgXhsDailySearchBudget">小红书每日搜索任务</label>
-          <input id="cfgXhsDailySearchBudget" type="number" min="0" step="1" placeholder="0 = 不限">
+          <input id="cfgXhsDailySearchBudget" type="number" min="0" step="1" placeholder="默认 20">
         </div>
         <div class="settings-field">
           <label for="cfgXhsDailyCreatorBudget">小红书每日创作者任务</label>
           <input id="cfgXhsDailyCreatorBudget" type="number" min="0" step="1" placeholder="0 = 不限">
         </div>
-        <p class="settings-hint" data-budget-note>预算 = 每日任务次数上限，不是开关；填 1 表示每天只允许 1 次。0 或留空 = 不限。</p>
+        <p class="settings-hint" data-budget-note>预算 = 每日任务次数上限；搜索默认每天 20 次，显式填 0 = 不限；创作者预算 0 或留空 = 不限。</p>
         <div class="settings-field">
-          <label for="cfgXhsTaskInterval">小红书任务间隔秒数</label>
-          <input id="cfgXhsTaskInterval" type="number" min="0" step="1" placeholder="300">
+          <label for="cfgXhsTaskInterval">小红书目标任务间隔秒数（±25%）</label>
+          <input id="cfgXhsTaskInterval" type="number" min="0" step="1" placeholder="1200">
         </div>
         <div class="settings-field">
-          <label for="cfgXhsMinInterval">小红书最小调度间隔分钟</label>
-          <input id="cfgXhsMinInterval" type="number" min="0" step="1" placeholder="3">
+          <label for="cfgXhsMinInterval">小红书关键词入队间隔分钟</label>
+          <input id="cfgXhsMinInterval" type="number" min="0" step="1" placeholder="20">
         </div>
       </div>
       </div>

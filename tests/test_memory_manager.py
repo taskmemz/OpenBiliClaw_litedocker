@@ -351,6 +351,180 @@ def test_render_core_memory_prompt_uses_stable_section_order(tmp_path: Path) -> 
     assert prompt.index("## 近期观察") < prompt.index("## 当前洞察")
 
 
+def _build_onion_core_memory_fixture(memory_dir: Path) -> MemoryManager:
+    """Populate a manager with the same onion profile as the (c) golden snapshot.
+
+    Kept byte-identical to ``scripts``/``tests/golden/chat_core_memory`` so the
+    section-parity assertions compare like-for-like against the pre-change
+    render captured before the stable/volatile split landed.
+    """
+    memory = MemoryManager(memory_dir)
+    memory.initialize()
+    memory.get_layer("soul").data.update(
+        {
+            "version": 2,
+            "personality_portrait": "一个理性又敏感的深度内容爱好者，偏好结构化叙事。",
+            "core": {
+                "core_traits": ["理性", "敏感", "好奇"],
+                "deep_needs": ["被理解", "掌控感"],
+                "mbti": {
+                    "type": "INTJ",
+                    "dimensions": {},
+                    "confidence": 0.7,
+                    "inferred_from": [],
+                },
+            },
+            "values_layer": {"values": ["成长", "真实"], "motivational_drivers": ["求知"]},
+            "role": {"life_stage": "探索阶段", "current_phase": ""},
+            "interest": {
+                "likes": [
+                    {
+                        "domain": "科技",
+                        "weight": 0.9,
+                        "specifics": [{"name": "AI", "weight": 0.9}],
+                        "first_seen": "",
+                        "last_seen": "",
+                        "source": "ai",
+                    },
+                    {
+                        "domain": "历史",
+                        "weight": 0.8,
+                        "specifics": [],
+                        "first_seen": "",
+                        "last_seen": "",
+                        "source": "ai",
+                    },
+                ],
+                "dislikes": [
+                    {
+                        "domain": "标题党",
+                        "weight": 0.9,
+                        "specifics": [],
+                        "first_seen": "",
+                        "last_seen": "",
+                        "source": "ai",
+                    }
+                ],
+                "favorite_up_users": ["何同学", "影视飓风"],
+            },
+            "surface": {
+                "cognitive_style": [],
+                "style": {},
+                "context": {},
+                "exploration_openness": 0.6,
+            },
+            "source_platform_mix": {},
+        }
+    )
+    memory.get_layer("preference").data.update({"style": {}, "exploration_openness": 0.6})
+    memory.get_layer("awareness").data.update(
+        {
+            "notes": [
+                {"date": "2026-03-08", "observation": "最近更专注。"},
+                {"date": "2026-03-07", "observation": "晚上更容易进入深度浏览。"},
+            ]
+        }
+    )
+    memory.get_layer("insight").data.update(
+        {
+            "hypotheses": [
+                {"hypothesis": "可能在寻找掌控感。", "confidence": 0.7},
+                {"hypothesis": "内容选择偏向结构清晰的表达。", "confidence": 0.62},
+            ]
+        }
+    )
+    return memory
+
+
+def _split_core_memory_sections(rendered: str) -> list[str]:
+    """Split a rendered core-memory block into its ``## …`` sections."""
+    sections: list[str] = []
+    for chunk in rendered.split("\n\n## "):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        sections.append(chunk if chunk.startswith("## ") else "## " + chunk)
+    return sections
+
+
+def test_render_core_memory_prompt_reflects_user_portrait_override(tmp_path: Path) -> None:
+    # (a) Chat must honour a user portrait edit. Pre-split, get_core_memory read
+    # the raw soul layer and ignored profile_overrides.json, so this failed.
+    from openbiliclaw.soul.overrides import ProfileOverrides, apply_edit
+    from openbiliclaw.soul.profile import OnionProfile
+
+    memory = MemoryManager(tmp_path)
+    memory.initialize()
+    memory.get_layer("soul").data.update(
+        OnionProfile(personality_portrait="AI 生成的原始画像").to_dict()
+    )
+    ov, _ = apply_edit(
+        ProfileOverrides(),
+        target="personality_portrait",
+        op="set",
+        value="我手动改写的画像",
+    )
+    memory.save_profile_overrides(ov)
+
+    prompt = memory.render_core_memory_prompt()
+
+    assert "我手动改写的画像" in prompt
+    assert "AI 生成的原始画像" not in prompt
+
+
+def test_render_core_memory_blocks_keep_stable_prefix_across_awareness_churn(
+    tmp_path: Path,
+) -> None:
+    # (b) The system-bound stable block must survive awareness churn (prompt-cache
+    # prefix stability); only the user-bound volatile block may change.
+    memory = MemoryManager(tmp_path)
+    memory.initialize()
+    memory.get_layer("soul").data.update({"personality_portrait": "稳定画像"})
+    memory.get_layer("preference").data.update(
+        {"interests": [{"name": "科技", "category": "知识", "weight": 0.9}]}
+    )
+    memory.get_layer("awareness").data.update(
+        {"notes": [{"date": "2026-03-08", "observation": "第一版观察"}]}
+    )
+
+    stable_before, volatile_before = memory.render_core_memory_blocks()
+
+    memory.get_layer("awareness").data.update(
+        {"notes": [{"date": "2026-03-09", "observation": "完全不同的新观察"}]}
+    )
+    stable_after, volatile_after = memory.render_core_memory_blocks()
+
+    assert stable_before == stable_after
+    assert volatile_before != volatile_after
+    assert "第一版观察" not in stable_before
+    assert "第一版观察" in volatile_before
+
+
+def test_chat_core_memory_split_preserves_prechange_sections(tmp_path: Path) -> None:
+    # (c) Section-parity golden: the split loses no content that the pre-change
+    # single-block render produced, and moves awareness/insights to the volatile
+    # (user-bound) block while identity/preference stay in the stable block.
+    from pathlib import Path as _Path
+
+    memory = _build_onion_core_memory_fixture(tmp_path)
+
+    stable, volatile = memory.render_core_memory_blocks()
+    combined = memory.render_core_memory_prompt()
+
+    golden = (
+        _Path(__file__).parent / "golden" / "chat_core_memory" / "pre_change_render.txt"
+    ).read_text(encoding="utf-8")
+    old_sections = _split_core_memory_sections(golden)
+    assert len(old_sections) == 4
+    for section in old_sections:
+        assert section in combined, f"lost pre-change section: {section!r}"
+
+    assert "## 近期观察" in volatile and "## 近期观察" not in stable
+    assert "## 当前洞察" in volatile and "## 当前洞察" not in stable
+    assert "## 用户画像" in stable and "## 用户画像" not in volatile
+    assert "## 偏好摘要" in stable
+
+
 def test_feedback_state_defaults_when_missing(tmp_path: Path) -> None:
     memory = MemoryManager(tmp_path)
     memory.initialize()
@@ -759,7 +933,13 @@ def test_source_bootstrap_state_defaults_when_missing(tmp_path: Path) -> None:
         "dy_seen_video_keys": [],
         "yt_seen_item_keys": [],
         "zhihu_seen_item_keys": [],
+        "reddit_seen_item_keys": [],
         "last_source_bootstrap_sync_at": "",
+        "source_incremental": {
+            "cursor": "",
+            "last_attempt_at": {},
+            "active_task": None,
+        },
     }
 
 
@@ -773,7 +953,13 @@ def test_source_bootstrap_state_round_trips_to_json(tmp_path: Path) -> None:
             "dy_seen_video_keys": ["dy_collect:dy-1"],
             "yt_seen_item_keys": ["yt_history:yt-1"],
             "zhihu_seen_item_keys": ["zhihu_favorite:zh-1"],
+            "reddit_seen_item_keys": ["t3:reddit-1"],
             "last_source_bootstrap_sync_at": "2026-05-20T12:00:00",
+            "source_incremental": {
+                "cursor": "reddit",
+                "last_attempt_at": {"reddit": "2026-05-20T12:01:00+00:00"},
+                "active_task": {"source": "reddit", "task_id": "task-1"},
+            },
         }
     )
 
@@ -783,7 +969,13 @@ def test_source_bootstrap_state_round_trips_to_json(tmp_path: Path) -> None:
     assert state["dy_seen_video_keys"] == ["dy_collect:dy-1"]
     assert state["yt_seen_item_keys"] == ["yt_history:yt-1"]
     assert state["zhihu_seen_item_keys"] == ["zhihu_favorite:zh-1"]
+    assert state["reddit_seen_item_keys"] == ["t3:reddit-1"]
     assert state["last_source_bootstrap_sync_at"] == "2026-05-20T12:00:00"
+    assert state["source_incremental"] == {
+        "cursor": "reddit",
+        "last_attempt_at": {"reddit": "2026-05-20T12:01:00+00:00"},
+        "active_task": {"source": "reddit", "task_id": "task-1"},
+    }
 
 
 def test_insight_candidates_default_to_empty_list(tmp_path: Path) -> None:

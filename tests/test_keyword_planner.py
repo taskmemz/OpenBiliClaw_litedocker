@@ -1543,6 +1543,94 @@ async def test_preview_and_production_share_materialize_platform_keywords_output
     ]
 
 
+def test_materialize_spreads_platform_cap_across_interests_before_second_axis() -> None:
+    candidates = [
+        MaterializeCandidate(
+            interest=interest,
+            axis_label=axis,
+            platform=_BILI,
+            core_concept=core,
+            decoration="解析",
+            recency_sensitivity="low",
+            origin="test",
+        )
+        for interest, axis, core in (
+            ("兴趣A", "A轴1", "A实体1"),
+            ("兴趣A", "A轴2", "A实体2"),
+            ("兴趣B", "B轴1", "B实体1"),
+            ("兴趣B", "B轴2", "B实体2"),
+        )
+    ]
+    allocation = {
+        "兴趣A": AllocationTarget(platforms=(_BILI,), min_axes=2),
+        "兴趣B": AllocationTarget(platforms=(_BILI,), min_axes=2),
+    }
+
+    realized, _telemetry = materialize_platform_keywords(
+        candidates,
+        allocation,
+        max_keywords_per_platform=2,
+    )
+
+    assert [item.metadata["source_interest"] for item in realized] == ["兴趣A", "兴趣B"]
+
+
+def test_inspiration_rejects_core_anchored_to_another_profile_interest(
+    db: Database,
+) -> None:
+    profile = _profile(("Overlord 故事", 0.95), ("无职转生", 0.9))
+    planner = _make_planner(
+        db,
+        llm=_FakeLLM(payload={}),
+        profile=profile,
+        deficit=_FakeDeficitSource(),
+    )
+    selected = [
+        SecondaryInterest(
+            interest_id="overlord",
+            label="Overlord 故事",
+            weight=0.95,
+        )
+    ]
+    candidates = [
+        MaterializeCandidate(
+            interest="Overlord 故事",
+            axis_label="下架争议",
+            platform=_BILI,
+            core_concept="无职转生 B站下架",
+            decoration="争议 复盘",
+            recency_sensitivity="high",
+            origin="test",
+        ),
+        MaterializeCandidate(
+            interest="Overlord 故事",
+            axis_label="人物解析",
+            platform=_BILI,
+            core_concept="安兹 乌尔 恭",
+            decoration="解析",
+            recency_sensitivity="low",
+            origin="test",
+        ),
+    ]
+
+    kept, rejected = planner._inspiration_pipeline._filter_source_interest_drift(
+        profile,
+        selected,
+        candidates,
+    )
+
+    assert [item.core_concept for item in kept] == ["安兹 乌尔 恭"]
+    assert rejected == [
+        {
+            "keyword": "无职转生 B站下架 争议 复盘",
+            "platform": _BILI,
+            "reason": "source_interest_mismatch",
+            "source_interest": "Overlord 故事",
+            "conflicting_interest": "无职转生",
+        }
+    ]
+
+
 def test_interest_selection_count_cools_down_previously_selected_interests() -> None:
     profile = _profile(
         ("兴趣A", 0.95),
@@ -1724,6 +1812,56 @@ async def test_preview_inspiration_records_preview_interest_selection(
     preview_snapshot = db.get_keyword_interest_coverage_snapshot(selection_scope="preview")
     assert production_snapshot.get("兴趣A", {}).get("interest_selection_count", 0) == 0
     assert preview_snapshot["兴趣A"]["interest_selection_count"] == 2
+
+
+async def test_inspiration_selection_ledger_records_only_realized_interests(
+    db: Database,
+) -> None:
+    profile = _profile(("兴趣A", 0.95), ("兴趣B", 0.94))
+    llm = _SequentialLLM(
+        payloads=[
+            {
+                "axes": [
+                    {
+                        "interest": "兴趣A",
+                        "axis_label": "具体轴",
+                        "axis_kind": "method",
+                        "example_terms": ["具体案例"],
+                    }
+                ],
+                "keywords": [
+                    {
+                        "interest": "兴趣A",
+                        "axis_id_or_label": "具体轴",
+                        "platform": _BILI,
+                        "core_concept": "兴趣A 具体案例",
+                        "decoration": "解析",
+                    }
+                ],
+            }
+        ]
+    )
+    planner = _make_planner(
+        db,
+        llm=llm,
+        profile=profile,
+        deficit=_FakeDeficitSource(),
+        discovery=_discovery_cfg(
+            inspiration_search_enabled=True,
+            inspiration_interest_sample_size=2,
+            inspiration_max_probe_searches_per_stage=2,
+            inspiration_max_keywords_per_platform=2,
+        ),
+        inspiration_provider=_FakeInspirationProvider(previews_by_query={}),
+    )
+
+    report = await planner.preview_inspiration_keywords([_BILI], profile=profile)
+
+    assert [item["label"] for item in report["selected_secondary_interests"]] == ["兴趣A", "兴趣B"]
+    assert report["realized_secondary_interests"] == ["兴趣A"]
+    snapshot = db.get_keyword_interest_coverage_snapshot(selection_scope="preview")
+    assert snapshot["兴趣A"]["interest_selection_count"] == 1
+    assert snapshot.get("兴趣B", {}).get("interest_selection_count", 0) == 0
 
 
 async def test_inspiration_stage_repairs_unparsed_brainstorm_before_fallback(
@@ -2083,8 +2221,7 @@ async def test_planner_requires_bili_deficit_before_requesting_explore_domains(
 
 
 async def test_digest_change_expires_old_and_regenerates(db: Database) -> None:
-    """When the profile digest changes, old-digest pending is expired and new
-    keywords are generated under the new digest."""
+    """The zero-hour rollback expires old-digest pending and regenerates."""
     old_profile = _profile(("露营", 0.9))
     old_digest = profile_kw_digest(old_profile)
     # Seed stale pending under the OLD digest directly in the store.
@@ -2098,7 +2235,13 @@ async def test_digest_change_expires_old_and_regenerates(db: Database) -> None:
 
     llm = _FakeLLM(payload={_XHS: ["新词A", "新词B"]})
     deficit = _FakeDeficitSource(deficits={_XHS: 33})
-    planner = _make_planner(db, llm=llm, profile=new_profile, deficit=deficit)
+    planner = _make_planner(
+        db,
+        llm=llm,
+        profile=new_profile,
+        deficit=deficit,
+        discovery=_discovery_cfg(keyword_digest_grace_hours=0),
+    )
 
     await planner.run_once()
 
@@ -2110,6 +2253,152 @@ async def test_digest_change_expires_old_and_regenerates(db: Database) -> None:
     assert str(old_rows["status"]) == "expired"
     # New keywords under the new digest.
     assert _pending(db, _XHS, new_digest) == ["新词A", "新词B"]
+
+
+async def test_digest_change_keeps_disliked_query_but_respects_supply_avoid(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_profile = _profile(("露营", 0.9))
+    old_digest = profile_kw_digest(old_profile)
+    db.insert_pending_keywords(
+        _XHS,
+        ["AI 教程", "机器学习 入门", "露营路线"],
+        old_digest,
+    )
+
+    new_profile = _profile(("城市规划", 0.9))
+    new_profile.preferences.disliked_topics = ["AI"]
+    llm = _FakeLLM(payload={_XHS: ["不应生成"]})
+    planner = _make_planner(
+        db,
+        llm=llm,
+        profile=new_profile,
+        deficit=_FakeDeficitSource(deficits={_XHS: 20}),
+        discovery=_discovery_cfg(kw_cache_low=1),
+    )
+    hints = planner._avoid_hints(new_profile)
+    hints[_XHS]["avoid_topics"] = ["机器学习"]
+    monkeypatch.setattr(planner, "_avoid_hints", lambda _profile: hints)
+
+    ledger = await planner.run_once()
+
+    assert ledger == {}
+    assert llm.calls == []
+    assert db.count_pending_keywords_all_digests(_XHS) == 2
+    retained = db.conn.execute(
+        """
+        SELECT keyword, status, profile_kw_digest
+        FROM discovery_keywords
+        WHERE keyword IN ('AI 教程', '露营路线')
+        ORDER BY keyword
+        """
+    ).fetchall()
+    assert [str(row["keyword"]) for row in retained] == ["AI 教程", "露营路线"]
+    assert all(str(row["status"]) == "pending" for row in retained)
+    assert all(str(row["profile_kw_digest"]) == old_digest for row in retained)
+    machine_learning = db.conn.execute(
+        "SELECT status FROM discovery_keywords WHERE keyword = '机器学习 入门'"
+    ).fetchone()
+    assert machine_learning is not None
+    assert str(machine_learning["status"]) == "expired"
+    assert planner.last_digest_grace_ledger[_XHS] == {
+        "current": 0,
+        "reused": 2,
+        "expired_aged": 0,
+        "expired_blocked": 1,
+        "expired_excess": 0,
+    }
+
+
+async def test_reused_pending_history_blocks_family_regeneration(db: Database) -> None:
+    old_profile = _profile(("旧主题", 0.9))
+    old_digest = profile_kw_digest(old_profile)
+    db.insert_pending_keywords(_XHS, ["旧主题"], old_digest)
+
+    new_profile = _profile(("城市观察", 0.9))
+    llm = _FakeLLM(payload={_XHS: ["旧主题 解析"]})
+    planner = _make_planner(
+        db,
+        llm=llm,
+        profile=new_profile,
+        deficit=_FakeDeficitSource(deficits={_XHS: 20}),
+        discovery=_discovery_cfg(kw_cache_low=2, kw_cache_high=3, gen_batch=3),
+    )
+
+    ledger = await planner.run_once()
+
+    assert len(llm.calls) == 1
+    assert "旧主题" in llm.calls[0]["user"]
+    assert ledger[_XHS] == 0
+    assert db.count_pending_keywords_all_digests(_XHS) == 1
+    assert _pending(db, _XHS, old_digest) == ["旧主题"]
+
+
+async def test_reconciliation_failure_falls_back_to_hard_expiration(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_profile = _profile(("露营", 0.9))
+    old_digest = profile_kw_digest(old_profile)
+    db.insert_pending_keywords(_XHS, ["旧词"], old_digest)
+    new_profile = _profile(("城市规划", 0.9))
+    new_digest = profile_kw_digest(new_profile)
+    original_reconcile = db.reconcile_pending_keyword_digests
+
+    def fail_xhs(platform: str, *args: object, **kwargs: object) -> dict[str, int]:
+        if platform == _XHS:
+            raise RuntimeError("synthetic reconciliation failure")
+        return original_reconcile(platform, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(db, "reconcile_pending_keyword_digests", fail_xhs)
+    llm = _FakeLLM(payload={_XHS: ["新词"]})
+    planner = _make_planner(
+        db,
+        llm=llm,
+        profile=new_profile,
+        deficit=_FakeDeficitSource(deficits={_XHS: 20}),
+    )
+
+    await planner.run_once()
+
+    assert len(llm.calls) == 1
+    assert db.count_pending_keywords(_XHS, old_digest) == 0
+    assert _pending(db, _XHS, new_digest) == ["新词"]
+    assert _XHS not in planner._grace_inventory_ready
+
+
+async def test_malformed_reconciliation_ledger_falls_back_to_hard_expiration(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_profile = _profile(("露营", 0.9))
+    old_digest = profile_kw_digest(old_profile)
+    db.insert_pending_keywords(_XHS, ["旧词"], old_digest)
+    new_profile = _profile(("城市规划", 0.9))
+    new_digest = profile_kw_digest(new_profile)
+    original_reconcile = db.reconcile_pending_keyword_digests
+
+    def malformed_xhs(platform: str, *args: object, **kwargs: object) -> object:
+        if platform == _XHS:
+            return None
+        return original_reconcile(platform, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(db, "reconcile_pending_keyword_digests", malformed_xhs)
+    llm = _FakeLLM(payload={_XHS: ["新词"]})
+    planner = _make_planner(
+        db,
+        llm=llm,
+        profile=new_profile,
+        deficit=_FakeDeficitSource(deficits={_XHS: 20}),
+    )
+
+    await planner.run_once()
+
+    assert len(llm.calls) == 1
+    assert db.count_pending_keywords(_XHS, old_digest) == 0
+    assert _pending(db, _XHS, new_digest) == ["新词"]
+    assert _XHS not in planner._grace_inventory_ready
 
 
 async def test_single_flight_second_concurrent_run_does_not_double_generate(
@@ -2280,6 +2569,13 @@ async def test_recycle_on_shortfall_tops_up_low_non_declined_platform(db: Databa
     db.insert_pending_keywords(_XHS, ["旧1", "旧2", "旧3"], digest)
     for row in db.claim_keywords(_XHS, 3):
         db.mark_keyword_used(int(row["id"]))
+        db.increment_keyword_yield(int(row["id"]), f"content-{row['id']}")
+    db.conn.execute(
+        "UPDATE discovery_keywords SET used_at=datetime('now', '-72 hours') "
+        "WHERE platform=? AND status='used'",
+        (_XHS,),
+    )
+    db.conn.commit()
     assert db.count_pending_keywords(_XHS, digest) == 0
 
     # low=5; the model returns only 1 NEW word → pending=1 < low → recycle tops
@@ -2297,6 +2593,101 @@ async def test_recycle_on_shortfall_tops_up_low_non_declined_platform(db: Databa
     assert {"旧1", "旧2", "旧3"}.issubset(set(pending))
     # ledger counts the new insert (1) + recycled rows (3) = 4.
     assert ledger[_XHS] == 4
+
+
+async def test_recent_used_keywords_are_not_recycled_on_shortfall(db: Database) -> None:
+    profile = _profile(("露营", 0.9))
+    digest = profile_kw_digest(profile)
+    db.insert_pending_keywords(_XHS, ["刚搜过的词"], digest)
+    [seed] = db.claim_keywords(_XHS, 1)
+    db.mark_keyword_used(int(seed["id"]))
+
+    cfg = _discovery_cfg(kw_cache_low=3, kw_cache_high=30, history_window_hours=48)
+    planner = _make_planner(
+        db,
+        llm=_FakeLLM(payload={_XHS: ["新词"]}),
+        profile=profile,
+        deficit=_FakeDeficitSource(deficits={_XHS: 33}),
+        discovery=cfg,
+    )
+
+    ledger = await planner.run_once()
+
+    assert _pending(db, _XHS, digest) == ["新词"]
+    assert ledger[_XHS] == 1
+
+
+async def test_generation_rejects_recent_keyword_format_variants(db: Database) -> None:
+    profile = _profile(("AI Agent", 0.9))
+    digest = profile_kw_digest(profile)
+    db.insert_pending_keywords(_BILI, ["AI Agent 教程"], digest)
+    [seed] = db.claim_keywords(_BILI, 1)
+    db.mark_keyword_used(int(seed["id"]))
+    llm = _FakeLLM(payload={_BILI: ["ai-agent教程", "AI Agent 工程实战"]})
+    planner = _make_planner(
+        db,
+        llm=llm,
+        profile=profile,
+        deficit=_FakeDeficitSource(deficits={_BILI: 40}),
+    )
+
+    ledger = await planner.run_once()
+
+    assert _pending(db, _BILI, digest) == ["AI Agent 工程实战"]
+    assert ledger[_BILI] == 1
+
+
+async def test_generation_rejects_recent_keyword_suffix_only_variants(db: Database) -> None:
+    profile = _profile(("无职转生", 0.9))
+    digest = profile_kw_digest(profile)
+    db.insert_pending_keywords(_BILI, ["无职转生B站下架 争议"], digest)
+    [seed] = db.claim_keywords(_BILI, 1)
+    db.mark_keyword_used(int(seed["id"]))
+    llm = _FakeLLM(
+        payload={
+            _BILI: [
+                "无职转生B站下架 争议 复盘",
+                "无职转生 鲁迪成长线",
+            ]
+        }
+    )
+    planner = _make_planner(
+        db,
+        llm=llm,
+        profile=profile,
+        deficit=_FakeDeficitSource(deficits={_BILI: 40}),
+    )
+
+    ledger = await planner.run_once()
+
+    assert _pending(db, _BILI, digest) == ["无职转生 鲁迪成长线"]
+    assert ledger[_BILI] == 1
+
+
+def test_generation_cache_key_rotates_with_recent_keyword_history(db: Database) -> None:
+    profile = _profile(("露营", 0.9))
+    planner = _make_planner(
+        db,
+        llm=_FakeLLM(payload={}),
+        profile=profile,
+        deficit=_FakeDeficitSource(),
+    )
+    base = {
+        "platform": _BILI,
+        "need": 10,
+        "recent_keywords": ["露营 装备"],
+        "avoid_topics": [],
+        "avoid_styles": [],
+        "avoid_franchises": [],
+        "prefer_axes": [],
+        "cold_start": False,
+        "supply_hint": [],
+    }
+    changed = {**base, "recent_keywords": ["露营 路线"]}
+
+    assert planner._generation_cache_key("same-digest", [base]) != planner._generation_cache_key(
+        "same-digest", [changed]
+    )
 
 
 async def test_no_recycle_when_pending_already_at_or_above_low(db: Database) -> None:
@@ -2377,9 +2768,7 @@ async def test_bilibili_catalyst_skips_generation_when_cache_full(db: Database) 
 
 
 async def test_sparse_profile_recycles_oldest_used(db: Database) -> None:
-    """A due platform whose generation + fallback yield nothing NEW (sparse
-    profile, all words already in-flight) recycles its oldest ``used`` word
-    back to pending instead of starving."""
+    """A sparse profile may reuse a proven word after the freshness cooldown."""
     profile = _profile(("露营", 0.9))
     digest = profile_kw_digest(profile)
     # Make "露营" a USED historical row (so the interest-name fallback word is
@@ -2388,6 +2777,12 @@ async def test_sparse_profile_recycles_oldest_used(db: Database) -> None:
     claimed = db.claim_keywords(_XHS, 1)
     assert claimed, "expected one claimed row"
     db.mark_keyword_used(int(claimed[0]["id"]))
+    db.increment_keyword_yield(int(claimed[0]["id"]), "historical-content")
+    db.conn.execute(
+        "UPDATE discovery_keywords SET used_at=datetime('now', '-72 hours') WHERE id=?",
+        (int(claimed[0]["id"]),),
+    )
+    db.conn.commit()
     assert db.count_pending_keywords(_XHS, digest) == 0
 
     # LLM also returns only the already-used word → nothing new from generation

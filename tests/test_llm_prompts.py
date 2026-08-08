@@ -1,6 +1,10 @@
 """Tests for prompt builders and core memory rendering."""
 
+import json
+from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 import openbiliclaw.llm.prompts as prompt_module
 from openbiliclaw.discovery.style_keys import VALID_STYLE_KEYS
@@ -21,6 +25,7 @@ from openbiliclaw.llm.prompts import (
     build_socratic_dialogue_prompt,
     build_soul_profile_prompt,
     build_speculation_generation_prompt,
+    content_evaluation_clock,
     parse_merged_keywords,
     parse_merged_keywords_with_presence,
     parse_merged_keywords_with_presence_and_explore_domains,
@@ -525,6 +530,130 @@ def test_batch_content_evaluation_prompt_orders_profile_before_source_and_batch(
     assert user_prompt.index("<source_context>") < user_prompt.index("<content_batch>")
 
 
+def test_batch_content_evaluation_compact_json_changes_whitespace_only() -> None:
+    kwargs = {
+        "profile_summary": {"interests": ["系统 设计"], "values": ["可靠"]},
+        "content_items": [
+            {
+                "content_id": "item-1",
+                "title": "保留 字符串 内部 空格",
+                "tags": ["架构", "测试"],
+            }
+        ],
+        "source_context": "mixed",
+        "source_platform": "mixed",
+        "negative_examples": [{"title": "不要 破坏", "reason": "quick_exit"}],
+        "evaluated_at": "2026-08-04T09:47:31Z",
+    }
+    pretty = build_batch_content_evaluation_prompt(**kwargs)
+    compact = build_batch_content_evaluation_prompt(**kwargs, compact_json=True)
+
+    assert compact[0]["content"] == pretty[0]["content"]
+    assert len(compact[1]["content"]) < len(pretty[1]["content"])
+
+    for tag in (
+        "profile_summary",
+        "negative_examples",
+        "evaluation_context",
+        "content_batch",
+    ):
+        start = f"<{tag}>\n\n"
+        end = f"\n\n</{tag}>"
+        pretty_json = pretty[1]["content"].split(start, 1)[1].split(end, 1)[0]
+        compact_json = compact[1]["content"].split(start, 1)[1].split(end, 1)[0]
+        assert json.loads(compact_json) == json.loads(pretty_json)
+        assert "\n  " not in compact_json
+
+    assert "保留 字符串 内部 空格" in compact[1]["content"]
+
+
+def test_batch_content_evaluation_treatment_seam_preserves_production_bytes() -> None:
+    kwargs = {
+        "profile_summary": {"interests": ["systems"]},
+        "content_items": [{"content_id": "global-1", "title": "candidate"}],
+        "source_context": "search",
+        "source_platform": "bilibili",
+    }
+
+    historical_defaults = build_batch_content_evaluation_prompt(**kwargs)
+    explicit_production = build_batch_content_evaluation_prompt(
+        **kwargs,
+        candidate_block=None,
+        local_result_ids=False,
+    )
+
+    assert explicit_production == historical_defaults
+
+
+def test_batch_content_evaluation_sparse_contract_is_static_and_transport_neutral() -> None:
+    sparse_json = (
+        '{"defaults":{"content_type":"video","mode":"normal",'
+        '"source_platform":"bilibili"},"items":'
+        '[{"author":"u","id":"0","title":"candidate"}]}'
+    )
+    row_wire = "ROW-WIRE-V1\ndefaults\tmode=normal\ncolumns\tid\nrow\t0"
+
+    sparse_messages = build_batch_content_evaluation_prompt(
+        profile_summary={"interests": ["systems"]},
+        content_items=[],
+        candidate_block=sparse_json,
+        local_result_ids=True,
+    )
+    row_messages = build_batch_content_evaluation_prompt(
+        profile_summary={"interests": ["different"]},
+        content_items=[{"content_id": "must-not-render"}],
+        candidate_block=row_wire,
+        local_result_ids=True,
+    )
+
+    system = sparse_messages[0]["content"]
+    assert row_messages[0]["content"] == system
+    assert "ROW-WIRE-V1" in system
+    assert "defaults/items" in system
+    assert "原样带回输入里的 id" in system
+    assert "cover:<id>" in system
+    assert "bvid" not in system
+    assert "content_id" not in system
+    assert "严格低于 0.5" in system
+
+    sparse_block = (
+        sparse_messages[1]["content"]
+        .split("<content_batch>", 1)[1]
+        .split(
+            "</content_batch>",
+            1,
+        )[0]
+    )
+    row_block = (
+        row_messages[1]["content"]
+        .split("<content_batch>", 1)[1]
+        .split(
+            "</content_batch>",
+            1,
+        )[0]
+    )
+    assert sparse_block.strip() == sparse_json
+    assert row_block.strip() == row_wire
+    assert "must-not-render" not in row_messages[1]["content"]
+
+
+@pytest.mark.parametrize(
+    ("candidate_block", "local_result_ids"),
+    [(None, True), ('{"defaults":{},"items":[]}', False)],
+)
+def test_batch_content_evaluation_rejects_mixed_identity_contracts(
+    candidate_block: str | None,
+    local_result_ids: bool,
+) -> None:
+    with pytest.raises(ValueError, match="must be enabled together"):
+        build_batch_content_evaluation_prompt(
+            profile_summary={},
+            content_items=[],
+            candidate_block=candidate_block,
+            local_result_ids=local_result_ids,
+        )
+
+
 def test_content_evaluation_prompts_only_allow_explore_scoring_exception() -> None:
     single_system = build_content_evaluation_prompt(
         profile_summary={"interests": ["音乐", "生活方式"]},
@@ -554,6 +683,71 @@ def test_content_evaluation_prompts_only_allow_explore_scoring_exception() -> No
         assert "trending 来源的内容已经过大众验证" not in system
         assert "search 要求高度匹配" not in system
         assert "related_chain 允许适度偏移" not in system
+
+
+def test_content_evaluation_prompts_define_publication_time_semantics() -> None:
+    single_messages = build_content_evaluation_prompt(
+        profile_summary={"interests": ["人工智能"]},
+        content_summary={"title": "模型更新", "published_at": "2026-08-01T00:00:00Z"},
+        source_context="trending",
+        source_platform="bilibili",
+        evaluated_at="2026-08-04T09:00:00Z",
+    )
+    batch_messages = build_batch_content_evaluation_prompt(
+        profile_summary={"interests": ["人工智能"]},
+        content_items=[
+            {
+                "content_id": "BV1TIME",
+                "title": "模型更新",
+                "published_at": "2026-08-01T00:00:00Z",
+            }
+        ],
+        source_context="trending",
+        source_platform="bilibili",
+        evaluated_at="2026-08-04T09:00:00Z",
+    )
+
+    for messages in (single_messages, batch_messages):
+        system = messages[0]["content"]
+        user = messages[1]["content"]
+        assert "published_at 是来源提供的权威发布时间" in system
+        assert "evaluation_context.evaluated_at 是本次评估的权威时间基准" in system
+        assert "模型知识截止时间" in system
+        assert "字段缺失或无效时保持中性" in system
+        assert '"evaluated_at": "2026-08-04T09:00:00Z"' in user
+        assert '"published_at": "2026-08-01T00:00:00Z"' in user
+
+
+def test_content_evaluation_clock_keeps_exact_time_and_utc_hour_bucket() -> None:
+    assert content_evaluation_clock(now=datetime(2026, 8, 4, 9, 47, 31, 123456, tzinfo=UTC)) == (
+        "2026-08-04T09:47:31Z",
+        "2026-08-04T09:00:00Z",
+    )
+
+
+def test_content_evaluation_prompts_skip_low_score_reason() -> None:
+    """Both eval system prompts bake the 0.5 skip floor + ≤30字 cap (static).
+
+    Reason-diet contract (v0.3.171): ``score`` strictly below the fixed 0.5
+    floor writes an empty ``reason`` (pure waste — never admitted); the rest get
+    one internal diagnostic capped at 30 Unicode code points. The floor is baked
+    constant text, not a per-call value.
+    """
+    single_system = build_content_evaluation_prompt(
+        profile_summary={"interests": ["音乐"]},
+        content_summary={"title": "匿名视频"},
+    )[0]["content"]
+    batch_system = build_batch_content_evaluation_prompt(
+        profile_summary={"interests": ["音乐"]},
+        content_items=[{"content_id": "x", "title": "匿名视频"}],
+    )[0]["content"]
+
+    for system in (single_system, batch_system):
+        assert "严格低于 0.5" in system
+        assert "必须写成空串" in system
+        assert "不超过 30 个 Unicode 字符" in system
+        assert "内部诊断" in system
+        assert "直接展示给用户" not in system
 
 
 def test_batch_content_evaluation_prompt_allows_per_item_platforms() -> None:
@@ -1070,13 +1264,13 @@ def test_soul_profile_prompt_serialization_is_deterministic() -> None:
     assert messages_a[1]["content"] == messages_b[1]["content"]
 
 
-def test_profile_consolidation_prompt_requires_representative_item_names() -> None:
+def test_profile_consolidation_prompt_prefers_concise_representative_names() -> None:
     messages = build_profile_consolidation_prompt(likes_clusters=[], dislikes_clusters=[])
     system_prompt = messages[0]["content"]
 
-    assert "不要默认选择第一个 member 或最短 member" in system_prompt
-    assert "只有当旧 member 能覆盖所有被合并成员时才可作为 canonical" in system_prompt
-    assert "必须起一个组合概念名" in system_prompt
+    assert "优先选择能准确" in system_prompt
+    assert "覆盖整组的简洁旧 member" in system_prompt
+    assert "不得为了看似完整而堆砌近义词" in system_prompt
 
 
 def test_category_mapping_prompt_user_message_carries_vocab_and_histogram() -> None:

@@ -67,9 +67,18 @@ class FakeLLMService:
                 batch_data = _json.loads(
                     user_input.split("<content_batch>")[1].split("</content_batch>")[0]
                 )
-                batch_size = len(batch_data) if isinstance(batch_data, list) else 1
+                batch_items = (
+                    batch_data
+                    if isinstance(batch_data, list)
+                    else batch_data.get("items", [])
+                    if isinstance(batch_data, dict)
+                    else []
+                )
+                batch_size = len(batch_items)
+                local_ids = isinstance(batch_data, dict)
             except Exception:
                 batch_size = 1
+                local_ids = False
             items: list[object] = []
             for _ in range(batch_size):
                 if not self.contents:
@@ -79,6 +88,8 @@ class FakeLLMService:
                 try:
                     parsed = _json.loads(raw)
                     if isinstance(parsed, dict) and "score" in parsed:
+                        if local_ids:
+                            parsed["id"] = str(len(items))
                         items.append(parsed)
                     else:
                         self.contents.insert(0, raw)
@@ -538,5 +549,6 @@ async def test_trending_strategy_caps_llm_eval_candidates_for_small_limit() -> N
         import json as _json
 
         batch = _json.loads(user_input.split("<content_batch>")[1].split("</content_batch>")[0])
-        batch_sizes.append(len(batch))
+        batch_items = batch if isinstance(batch, list) else batch.get("items", [])
+        batch_sizes.append(len(batch_items))
     assert batch_sizes == [6]

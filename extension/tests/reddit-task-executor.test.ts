@@ -7,6 +7,7 @@ import {
   executeRedditTask,
   installRedditMessageListener,
   normalizeRedditListingChild,
+  normalizeRedditSubredditChild,
 } from "../src/content/reddit/task-executor.ts";
 
 test("normalizeRedditListingChild maps Reddit listing posts", () => {
@@ -65,6 +66,75 @@ test("collectRedditListingItems extracts children from listing wrappers", () => 
   assert.equal(rows.length, 2);
   assert.equal(rows[0]?.content_type, "post");
   assert.equal(rows[1]?.content_type, "comment");
+});
+
+test("normalizeRedditListingChild keeps post and comment identities distinct", () => {
+  const context = { scope: "reddit_saved", strategy: "reddit-bootstrap-saved" } as const;
+  const explicitComment = normalizeRedditListingChild(
+    {
+      kind: "t1",
+      data: {
+        id: "comment-a",
+        post_id: "post-1",
+        comment_id: "comment-a",
+        body: "first",
+        permalink: "/r/test/comments/post-1/title/comment-a/",
+      },
+    },
+    context,
+  );
+  const permalinkComment = normalizeRedditListingChild(
+    {
+      kind: "t1",
+      data: {
+        body: "second",
+        permalink: "/r/test/comments/post-1/title/comment-b/",
+      },
+    },
+    context,
+  );
+  const malformedComment = normalizeRedditListingChild(
+    {
+      kind: "t1",
+      data: {
+        post_id: "post-1",
+        body: "missing comment identity",
+        permalink: "/r/test/comments/post-1/title/",
+      },
+    },
+    context,
+  );
+  const mismatchedComment = normalizeRedditListingChild(
+    {
+      kind: "t1",
+      data: { id: "t3_post-1", body: "wrong fullname" },
+    },
+    context,
+  );
+  const mixedMismatchedComment = normalizeRedditListingChild(
+    {
+      kind: "t1",
+      data: { name: "t3_post-1", id: "post-1", body: "wrong fullname plus bare id" },
+    },
+    context,
+  );
+
+  assert.equal(explicitComment?.id, "comment-a");
+  assert.equal(explicitComment?.name, "t1_comment-a");
+  assert.equal(permalinkComment?.id, "comment-b");
+  assert.notEqual(explicitComment?.name, permalinkComment?.name);
+  assert.equal(malformedComment, null);
+  assert.equal(mismatchedComment, null);
+  assert.equal(mixedMismatchedComment, null);
+});
+
+test("normalizeRedditSubredditChild requires a stable community name", () => {
+  assert.equal(normalizeRedditSubredditChild({ data: { title: "mutable title only" } }), null);
+  assert.equal(
+    normalizeRedditSubredditChild({ data: { display_name: "LocalLLaMA", title: "Local LLM" } })
+      ?.id,
+    "LocalLLaMA",
+  );
 });
 
 test("buildRedditJsonUrl builds same-origin task endpoints", () => {
@@ -164,6 +234,76 @@ test("executeRedditTask collects Reddit bootstrap saved, upvoted, and subscribed
     assert.ok(calls.some((url) => url.includes("/user/agent_user/saved.json")));
     assert.ok(calls.some((url) => url.includes("/user/agent_user/upvoted.json")));
     assert.ok(calls.some((url) => url.includes("/subreddits/mine/subscriber.json")));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("executeRedditTask reports authenticated all-empty bootstrap as empty", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const payload = String(input).includes("/api/me.json")
+      ? { data: { name: "empty_user" } }
+      : { data: { children: [] } };
+    return new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    const result = await executeRedditTask({
+      task_id: "reddit-empty",
+      type: "bootstrap_events",
+      max_items_per_scope: 3,
+    });
+    assert.equal(result.status, "empty");
+    assert.deepEqual(result.items, []);
+    assert.deepEqual(result.scope_counts, {});
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("executeRedditTask preserves successful rows across mixed bootstrap fetch failures", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.includes("/api/me.json")) {
+      return new Response(JSON.stringify({ data: { name: "partial_user" } }), { status: 200 });
+    }
+    if (url.includes("/saved.json")) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            children: [
+              {
+                kind: "t3",
+                data: {
+                  id: "saved-ok",
+                  title: "surviving saved row",
+                  permalink: "/r/test/comments/saved-ok/title/",
+                },
+              },
+            ],
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    return new Response("temporary upstream failure", { status: 503 });
+  }) as typeof fetch;
+
+  try {
+    const result = await executeRedditTask({
+      task_id: "reddit-partial",
+      type: "bootstrap_events",
+      max_items_per_scope: 3,
+    });
+    assert.equal(result.status, "ok");
+    assert.equal(result.items.length, 1);
+    assert.equal(result.items[0]?.name, "t3_saved-ok");
+    assert.deepEqual(result.scope_counts, { reddit_saved: 1 });
   } finally {
     globalThis.fetch = originalFetch;
   }

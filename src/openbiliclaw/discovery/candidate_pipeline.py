@@ -214,7 +214,7 @@ class DiscoveryCandidatePipeline:
             discovered_content_to_candidate_write(item, source_context=source_context)
             for item in items
         ]
-        writes, diagnostics = self._filter_known_writes(writes)
+        writes, diagnostics, duplicate_only_keyword_ids = self._filter_known_writes(writes)
         if diagnostics["input"] != diagnostics["kept"]:
             logger.info(
                 "candidate enqueue prefilter: input=%s kept=%s duplicate_in_batch=%s "
@@ -225,6 +225,19 @@ class DiscoveryCandidatePipeline:
                 diagnostics["known_candidate"],
                 diagnostics["known_cache"],
             )
+        if duplicate_only_keyword_ids:
+            retire = getattr(self.database, "retire_duplicate_only_keywords", None)
+            if callable(retire):
+                try:
+                    retired = int(retire(sorted(duplicate_only_keyword_ids)) or 0)
+                except Exception:
+                    logger.debug("duplicate-only keyword retirement failed", exc_info=True)
+                else:
+                    if retired:
+                        logger.info(
+                            "candidate prefilter retired %d duplicate-only keyword(s)",
+                            retired,
+                        )
         if not writes:
             return 0
         enqueue = self.database.enqueue_discovery_candidates
@@ -514,6 +527,36 @@ class DiscoveryCandidatePipeline:
             token = stored_tokens.pop()
         items = tuple(row_to_discovered_content(row) for row in rows)
         return CandidateEvalClaim(token=token, rows=tuple(rows), items=items)
+
+    def claim_ready_batch(self, *, limit: int) -> CandidateEvalClaim | None:
+        """Claim only when the configured coalescing window is ready."""
+
+        batch_size = self._effective_batch_size(limit)
+        if batch_size <= 0:
+            return None
+        if self._waiting_pending_eval_count(batch_size) is not None:
+            return None
+        return self.claim_batch(limit=batch_size)
+
+    def eval_ready_in_seconds(self, *, limit: int) -> float:
+        """Return the remaining coalescing delay for the current pending rows."""
+
+        batch_size = self._effective_batch_size(limit)
+        if batch_size <= 0:
+            return 0.0
+        pending_count = self._pending_eval_count()
+        if pending_count is None or pending_count <= 0:
+            return 0.0
+        min_batch = min(max(1, int(self.min_eval_batch_size)), batch_size)
+        if min_batch <= 1 or pending_count >= min_batch:
+            return 0.0
+        max_wait = max(0.0, float(self.max_eval_wait_seconds or 0.0))
+        if max_wait <= 0:
+            return 0.0
+        first_seen = self._first_pending_eval_seen_at
+        if first_seen is None:
+            return max_wait
+        return max(0.0, max_wait - max(0.0, float(self.time_fn()) - first_seen))
 
     async def evaluate_claim(self, claim: CandidateEvalClaim, profile: Any) -> CandidateEvalOutcome:
         """Run only the LLM evaluation stage; this method performs no writes."""
@@ -1168,7 +1211,7 @@ class DiscoveryCandidatePipeline:
     def _filter_known_writes(
         self,
         writes: list[DiscoveryCandidateWrite],
-    ) -> tuple[list[DiscoveryCandidateWrite], dict[str, int]]:
+    ) -> tuple[list[DiscoveryCandidateWrite], dict[str, int], set[int]]:
         diagnostics = {
             "input": len(writes),
             "kept": 0,
@@ -1177,7 +1220,7 @@ class DiscoveryCandidatePipeline:
             "known_cache": 0,
         }
         if not writes:
-            return [], diagnostics
+            return [], diagnostics, set()
 
         candidate_keys = [write.candidate_key for write in writes if write.candidate_key]
         known_candidate_keys = self._existing_candidate_keys(candidate_keys)
@@ -1197,7 +1240,15 @@ class DiscoveryCandidatePipeline:
 
         seen: set[str] = set()
         kept: list[DiscoveryCandidateWrite] = []
+        keyword_totals: dict[int, int] = {}
+        keyword_novel: set[int] = set()
         for write in writes:
+            try:
+                keyword_id = int(write.source_keyword_id or 0)
+            except (TypeError, ValueError):
+                keyword_id = 0
+            if keyword_id > 0:
+                keyword_totals[keyword_id] = keyword_totals.get(keyword_id, 0) + 1
             key = str(write.candidate_key or "").strip()
             if not key:
                 continue
@@ -1219,8 +1270,11 @@ class DiscoveryCandidatePipeline:
                 diagnostics["known_cache"] += 1
                 continue
             kept.append(write)
+            if keyword_id > 0:
+                keyword_novel.add(keyword_id)
         diagnostics["kept"] = len(kept)
-        return kept, diagnostics
+        duplicate_only_keyword_ids = set(keyword_totals) - keyword_novel
+        return kept, diagnostics, duplicate_only_keyword_ids
 
     def _existing_candidate_keys(self, candidate_keys: list[str]) -> set[str]:
         getter = getattr(self.database, "get_existing_discovery_candidate_keys", None)

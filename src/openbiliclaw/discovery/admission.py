@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Final
 
 DEFAULT_ADMISSION_MIN_SCORE: Final = 0.60
+MIN_ADMISSION_MIN_SCORE: Final = 0.50
 EXPLORE_ADMISSION_MIN_SCORE: Final = 0.58
 EXPLORE_STRATEGY: Final = "explore"
 
@@ -14,14 +15,14 @@ def normalize_admission_score(
     *,
     default: float = DEFAULT_ADMISSION_MIN_SCORE,
 ) -> float:
-    """Return a valid admission score in ``(0, 1]`` or ``default``."""
+    """Return a valid admission score in ``[0.5, 1]`` or ``default``."""
     if isinstance(value, bool):
         return default
     try:
         score = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
-    if score <= 0.0 or score > 1.0:
+    if score < MIN_ADMISSION_MIN_SCORE or score > 1.0:
         return default
     return score
 

@@ -25,7 +25,7 @@ API runtime generation 拥有且只拥有一个 `ExpressionCopyCoordinator`，�
 
 | 任务 | 状态 | 说明 |
 |------|------|------|
-| OpenClaw bootstrap | ✅ | `build_openclaw_adapter_services()` 初始化 database/memory 后立刻用 canonical available 配置共享 LLM gate，再构造任何可调用 provider 的 service；构造 `SoulEngine` 时与 API runtime 一样透传 canonical `database` 和 `[soul.preference].satisfaction_filter_enabled`，避免 integration 面使用分裂的持久化或满意度过滤语义；暴露 adapter 前同步调用 controller 的幂等 `run_startup_maintenance()`。OpenClaw direct adapter 不启动 daemon `run_forever()`，因此不 attach `CandidateEvalCoordinator` 或 `ExpressionCopyCoordinator`、不把 producer 标为 coordinator-owned；`recommend(refresh_if_needed=True)` 专用 controller 把首轮 source supply 与 inline claim 固定限制为 4（fetch oversample=1、min eval batch=4、inline evaluator=1），后续调用再继续补货。每次 durable admission 会在同一请求内 await `RecommendationEngine.drain_pending_expression_copy(profile, limit=4, max_extra_requests=0)`：首 batch 的有效 subset 立刻成为 canonical available，未完成行保持 pending 由下一请求续补，避免在 45 秒交互窗口内递归拆分；若该 subset 非空且推荐历史为空，`recommend(refresh_if_needed=True)` 会直接 serve 已复制 pool。若首 batch 全部无效，本次仍可能返回空池并由后续请求重试。该首批限制是 bootstrap 内部策略，不新增 `config.toml` 字段，API daemon 的 coordinator、每轮 60 条 copy drain 与 4× supply oversample 保持不变。 |
+| OpenClaw bootstrap | ✅ | `build_openclaw_adapter_services()` 初始化 database/memory 后立刻用 canonical available 配置共享 LLM gate，再构造任何可调用 provider 的 service；构造 `SoulEngine` 时与 API runtime 一样透传 canonical `database`、`[soul.preference].satisfaction_filter_enabled`，以及 task-scoped `preference_prompt_view / awareness_prompt_view / insight_prompt_view`（默认 `legacy / compact-v1 / legacy`）；其中 Awareness 值只控制 `soul.awareness_confusions`，普通 `soul.awareness` 固定 `legacy`，避免 integration 面使用分裂的持久化、满意度过滤或 cognition rollout 语义；暴露 adapter 前同步调用 controller 的幂等 `run_startup_maintenance()`。OpenClaw direct adapter 不启动 daemon `run_forever()`，因此不 attach `CandidateEvalCoordinator` 或 `ExpressionCopyCoordinator`、不把 producer 标为 coordinator-owned；`recommend(refresh_if_needed=True)` 专用 controller 把首轮 source supply 与 inline claim 固定限制为 4（fetch oversample=1、min eval batch=4、inline evaluator=1），后续调用再继续补货。每次 durable admission 会在同一请求内 await `RecommendationEngine.drain_pending_expression_copy(profile, limit=4, max_extra_requests=0)`：首 batch 的有效 subset 立刻成为 canonical available，未完成行保持 pending 由下一请求续补，避免在 45 秒交互窗口内递归拆分；若该 subset 非空且推荐历史为空，`recommend(refresh_if_needed=True)` 会直接 serve 已复制 pool。若首 batch 全部无效，本次仍可能返回空池并由后续请求重试。该首批限制是 bootstrap 内部策略，不新增 `config.toml` 字段，API daemon 的 coordinator、每轮 60 条 copy drain 与 4× supply oversample 保持不变。 |
 | OpenClaw 视觉预热配置 | ✅ | bootstrap 构造 `RecommendationEngine` 时透传视觉画像、关键帧 / 弹幕开关、采样帧数、两个 fetch limit、摘要长度和共享 `BilibiliAPIClient`；默认关闭路径保持 no-op，配置模型切换后的 provenance 重建仍由引擎负责 |
 | OpenClaw adapter operations | ✅ | 已提供 `sync_account / get_profile / recommend / submit_feedback / get_runtime_status / chat`；chat 构造点显式固定为 `legacy_direct`，成功回复后仍执行既有 detached direct learning，不提交 API runtime 的 queue、也不持有 worker guard permit；Wave 3 的 HTTP `202 processing` / card poll 不改变 adapter 请求或响应。失败转为携带安全 LLM 分类文案的 `AdapterOperationError`，不暴露原始上游细节。 |
 | 推荐消费后的 durable inventory 同步 | ✅ | API 与 OpenClaw composition 都给真实 `RecommendationEngine` 注入 post-commit callback；独立 serve DB worker 把 recommendation + shown 在同一短事务提交成功后，callback 直接携带 `pool_counts_after` 更新共享 gate，不再同步重读共享连接。写失败不触发 callback，callback 失败也不改写 durable 提交结果；API 另在响应关键路径外读取精确 canonical snapshot 收敛广播。 |
@@ -82,7 +82,11 @@ skills = build_openclaw_skills(adapter)
 当前稳定 operation 包括：
 
 - `sync_account()`
-- `get_profile()`
+- `get_profile()` — 返回的 `ProfileResponse` **有意**携带 `personality_portrait`
+  全文（`integrations/openclaw/operations.py:113`），并把 `core_traits` /
+  `deep_needs` / `top_interests` 各截断为前 5 条（`operations.py:114-120`）。这是画像
+  边界的两个允许暴露画像的外部出口之一（另一个是聊天 core memory），不同于内容管线
+  serializer 一律排除画像；详见 [画像使用登记表](../profile-usage.md)。
 - `recommend(limit=5, refresh_if_needed=True)`
 - `submit_feedback(request)`：trim 后非空、最长 400 字符的 `request_id` 必填，并在 `openclaw` producer namespace 内唯一；adapter 不生成默认值。durable event 首写与 recommendation 投影提交后 operation 即成功，后续认知记录、内容反馈 owner drain 和摘要刷新只决定 `processing=completed/queued`，失败不会撤销或误报已经提交的反馈。相同 ID 携带不同 recommendation/type/note 会返回 validation conflict，绝不覆盖第一份 payload。
 - `get_runtime_status()`

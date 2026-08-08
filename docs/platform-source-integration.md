@@ -235,7 +235,7 @@ Bangumi 暴露了一个容易被忽略的边界：页面上看到 uid / 用户�
 ## 1. 调研和架构选择
 
 1. 查是否有稳定官方 API 能拿到目标信号。需要联网时优先官方文档 / 一手资料。
-2. 没有稳定 API 时，参考 XHS / 抖音 / YouTube / 知乎的浏览器插件任务模式：
+2. 没有稳定 API 时，参考 XHS / 抖音 / YouTube / 知乎 / Reddit 的浏览器插件任务模式：
    - 后端入队任务；
    - 插件打开或复用真实平台 tab；
    - content script 读取 DOM 或同源 JSON endpoint；
@@ -286,7 +286,7 @@ Bangumi 暴露了一个容易被忽略的边界：页面上看到 uid / 用户�
 - 收藏 / 行为 API 如果是 `状态 × 内容类型` 多 lane，分页必须公平轮转：遵守上游单页上限、缓存每 lane 富余行、对稀疏与短页独立终止；全局去重和最终 limit 在预算计数之前执行，避免一个密集 lane 吞光配额。
 - smoke 任务默认不写 memory、不触发画像。
 - init / profile 任务必须显式带当前 init ownership 或 `profile_update=true` 等语义，避免普通 smoke 污染画像。
-- extension source task 的最终结果必须使用两阶段完成：先在单一写事务冻结第一份 canonical payload，并用 staged marker 把非终态 DB row 变成业务 mutation 的逻辑终态；再从该持久 payload 重放 event ingress / seen-key / 来源投影；最后只翻 terminal status，不替换 `result_json`。所有 merge/fail/rate-limit 路径都要在同一锁内检查 marker，但 claim 必须保留普通 lease 的 stale reclaim，避免 dispatcher 丢失非 2xx result 响应后任务永久卡住。验收至少注入 merge→ingress、ingress→marker、marker→terminal 三个崩溃窗口，并证明原 caller 不主动重发时，lease 过期后的重新领取仍用第一份 payload 修复；stable event duplicate 能补 marker、seen-key 写失败不会提前完成。当前交付已迁移 XHS / 抖音 / YouTube / 知乎四个队列；Reddit task-result 尚未接入这套 staged completion，不能从该规范推断为已完成。
+- extension source task 的最终结果必须使用两阶段完成：先在单一写事务冻结第一份 canonical payload，并用 staged marker 把非终态 DB row 变成业务 mutation 的逻辑终态；再从该持久 payload 重放 event ingress / seen-key / 来源投影；最后只翻 terminal status，不替换 `result_json`。所有 merge/fail/rate-limit 路径都要在同一锁内检查 marker，但 claim 必须保留普通 lease 的 stale reclaim，避免 dispatcher 丢失非 2xx result 响应后任务永久卡住。验收至少注入 merge→ingress、ingress→marker、marker→terminal 三个崩溃窗口，并证明原 caller 不主动重发时，lease 过期后的重新领取仍用第一份 payload 修复；stable event duplicate 能补 marker、seen-key 写失败不会提前完成。当前 XHS / 抖音 / YouTube / 知乎 / Reddit 五个账号 bootstrap 队列都已迁移；新插件任务来源必须从接入首版就遵守同一 staged completion 契约。
 - `/api/sources/status` 基于最近任务结果给出 `ready`、`missing`、`partial`、`unverified`、`login_required` 等真实状态，不要硬编码 `no_auth`。
 - 登录态平台要接真实登录指示链路：插件 `extension/src/background/cookie-sync.ts` 监控该平台登录 cookie（只上报 `logged_in` 布尔，绝不传 cookie 值）→ `POST /api/sources/<slug>/login-state` → 后端存 auth_state kv + 时间戳。`/api/sources/status` 优先按登录 cookie 状态判定，任务历史只作无 cookie 信号时的兜底。
 - 插件任务平台通常需要 `/api/sources/<slug>/next-task`、`/task-result`、`/kick`，且必须严格用这个路径形状：init 写保护中间件按 URL 段精确放行 `/api/sources/<slug>/{kick,task-result}` 的 POST（`api/app.py` 的 `_init_write_allowed`），自造别的端点形状会在 init 期间被 409 拦掉（或反过来意外绕过 init 保护）。`identity`、`login-state` 等会影响本轮初始化的 callback 也必须逐条加入精确 allowlist，不能只放行任务结果。

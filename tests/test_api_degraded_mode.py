@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -40,6 +41,15 @@ def _valid_config(tmp_path) -> Config:
 def _save_project_config(monkeypatch: pytest.MonkeyPatch, tmp_path, cfg: Config) -> None:
     monkeypatch.setenv("OPENBILICLAW_PROJECT_ROOT", str(tmp_path))
     save_config(cfg, tmp_path / "config.toml")
+
+
+def _wait_for_config_apply(client: TestClient, expected: str) -> dict[str, object]:
+    for _ in range(200):
+        status = client.get("/api/config/apply-status").json()
+        if status["state"] == expected:
+            return status
+        time.sleep(0.01)
+    pytest.fail(f"后台配置状态未进入 {expected}")
 
 
 def test_build_runtime_context_stays_strict_for_invalid_llm_config(
@@ -127,13 +137,15 @@ def test_degraded_config_put_recovers_runtime_in_process_without_restart(
             },
         )
 
-        assert response.status_code == 200
+        assert response.status_code == 202
         body = response.json()
-        assert body["reloaded"] is True
+        assert body["reloaded"] is False
+        assert body["apply_state"] == "queued"
         assert body["rollback_applied"] is False
         assert body["restart_required"] is False
-        assert "无需重启" in body["message"]
         assert body["config"]["degraded"] is False
+        status = _wait_for_config_apply(client, "applied")
+        assert "无需重启" in status["message"]
         assert app.state.runtime_context.degraded is False
         assert app.state.degraded is False
         assert app.state.degraded_reason == ""
@@ -175,12 +187,14 @@ def test_degraded_config_put_keeps_guard_and_rolls_back_if_in_process_rebuild_fa
             json={"llm": {"openai": {"api_key": "sk-new-valid-key"}}},
         )
 
-        assert response.status_code == 503
+        assert response.status_code == 202
         body = response.json()
-        assert body["ok"] is False
+        assert body["ok"] is True
         assert body["reloaded"] is False
-        assert body["rollback_applied"] is True
+        assert body["rollback_applied"] is False
         assert body["restart_required"] is False
+        status = _wait_for_config_apply(client, "failed")
+        assert "simulated degraded recovery failure" in status["error"]
         assert app.state.runtime_context.degraded is True
         assert client.get("/api/recommendations").status_code == 503
 
@@ -219,14 +233,15 @@ def test_degraded_config_put_keeps_recovered_runtime_if_background_restart_fails
             },
         )
 
-        assert response.status_code == 200
+        assert response.status_code == 202
         body = response.json()
         assert body["ok"] is True
-        assert body["reloaded"] is True
+        assert body["reloaded"] is False
         assert body["rollback_applied"] is False
         assert body["restart_required"] is False
-        assert "无需重启" not in body["message"]
-        assert "不影响继续初始化" in body["message"]
+        status = _wait_for_config_apply(client, "applied")
+        assert "无需重启" not in status["message"]
+        assert "不影响继续初始化" in status["message"]
         assert app.state.runtime_context.degraded is False
         assert client.get("/api/health").json()["status"] == "ok"
 
@@ -558,9 +573,10 @@ def test_in_process_degraded_recovery_stays_normal_after_later_restart(
                 "llm": {"openai": {"api_key": "sk-new-valid-key"}},
             },
         )
-        assert response.status_code == 200
-        assert response.json()["reloaded"] is True
+        assert response.status_code == 202
+        assert response.json()["reloaded"] is False
         assert response.json()["restart_required"] is False
+        _wait_for_config_apply(degraded_client, "applied")
 
     normal_client = TestClient(create_app())
     health = normal_client.get("/api/health").json()

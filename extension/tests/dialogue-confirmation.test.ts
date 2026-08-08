@@ -39,6 +39,7 @@ const dialogue = (globalThis as typeof globalThis & {
     ) => Promise<Record<string, unknown>>;
     pendingConfirmationOpenPath: (ref: string) => string;
     renderPendingListMarkup: (items: Array<Record<string, unknown>>) => string;
+    renderMarkdown: (value: string) => string;
     renderTurnMarkup: (
       turn: Record<string, unknown>,
       options?: { surface?: "popup" | "desktop" },
@@ -164,6 +165,38 @@ test("turns without structured payload keep the text conversation fallback", () 
   assert.match(markup, /我最近更想看深度访谈/);
   assert.match(markup, /记下了，我们继续沿着这个方向聊。/);
   assert.doesNotMatch(markup, /dialogue-card/);
+});
+
+test("assistant turns render safe Markdown while user text stays literal", () => {
+  const markup = dialogue!.renderTurnMarkup(
+    {
+      turn_id: "markdown-1",
+      scope: "chat",
+      message: "我输入 **两个星号**",
+      reply: "**重点**、*补充* 和 `代码`\n\n- 第一项\n- 第二项",
+      status: "completed",
+      payload: {},
+    },
+    { surface: "popup" },
+  );
+
+  assert.match(markup, /我输入 \*\*两个星号\*\*/);
+  assert.match(markup, /<strong>重点<\/strong>/);
+  assert.match(markup, /<em>补充<\/em>/);
+  assert.match(markup, /<code>代码<\/code>/);
+  assert.match(markup, /<ul><li>第一项<\/li><li>第二项<\/li><\/ul>/);
+});
+
+test("Markdown rendering escapes raw HTML and rejects unsafe links", () => {
+  const markup = dialogue!.renderMarkdown(
+    '[安全链接](https://example.com/a?x=1&y=2) [危险链接](javascript:alert(1)) <script>alert(1)</script>',
+  );
+
+  assert.match(markup, /href="https:\/\/example\.com\/a\?x=1&amp;y=2"/);
+  assert.doesNotMatch(markup, /href="javascript:/i);
+  assert.match(markup, /\[危险链接\]\(javascript:alert\(1\)\)/);
+  assert.match(markup, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(markup, /<script>/i);
 });
 
 test("confusion question enters the flow as a pure assistant turn", () => {
@@ -412,7 +445,7 @@ test("anchor_dependency_failed refusal also rolls back to retryable_error", asyn
   assert.doesNotMatch(markup, /已标记不准/);
 });
 
-test("pending list markup opens an encoded ref and selected flow excludes probe/delight turns", () => {
+test("pending list markup opens an encoded ref and dialogue history includes probe turns", () => {
   const markup = dialogue!.renderPendingListMarkup([
     { kind: "hypothesis", ref: "hash/8", title: "喜欢系统分析", confidence: 0.81 },
     { kind: "confusion", ref: "12", title: "收藏后马上退出", confidence: 0.72 },
@@ -428,12 +461,13 @@ test("pending list markup opens an encoded ref and selected flow excludes probe/
 
   const selected = dialogue!.selectDialogueTurns([
     { turn_id: "probe", scope: "probe", created_at: "2026-07-22T08:00:00Z" },
-    { turn_id: "card", scope: "hypothesis", created_at: "2026-07-22T08:02:00Z" },
     { turn_id: "chat", scope: "chat", created_at: "2026-07-22T08:01:00Z" },
+    { turn_id: "avoidance", scope: "avoidance_probe", created_at: "2026-07-22T08:01:30Z" },
+    { turn_id: "card", scope: "hypothesis", created_at: "2026-07-22T08:02:00Z" },
     { turn_id: "question", scope: "confusion", created_at: "2026-07-22T08:03:00Z" },
     { turn_id: "delight", scope: "delight", created_at: "2026-07-22T08:04:00Z" },
   ]);
-  assert.deepEqual(selected.map((turn) => turn.turn_id), ["chat", "card", "question"]);
+  assert.deepEqual(selected.map((turn) => turn.turn_id), ["probe", "chat", "avoidance", "card", "question"]);
 });
 
 test("pending open retries only the explicit dialogue-busy response", async () => {

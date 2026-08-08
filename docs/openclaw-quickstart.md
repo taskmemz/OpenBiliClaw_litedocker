@@ -185,6 +185,9 @@ uv run python -m openbiliclaw.integrations.openclaw.cli <command> [flags]
 ```
 
 每次 CLI bridge 构造 direct adapter 时，会在任何画像、对话或推荐 LLM operation 可调用前，先同步执行一次零 LLM 的候选池历史恢复与原子维护；同一 controller 后续若进入后台 runtime，不会重复执行该启动维护。
+direct adapter 构造推荐引擎时会把 `[scheduler].copy_ready_target_count` 钳到
+`0..pool_target_count`，与 API/普通 CLI 使用同一 copy-ready 水位；配置为 `0` 时明确保留
+legacy drain-all，便于紧急回滚。
 
 已支持的命令：
 

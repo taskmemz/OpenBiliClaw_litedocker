@@ -1,0 +1,235 @@
+{
+  "active_insights": [],
+  "cognitive_style": [
+    "跳跃式"
+  ],
+  "context": {
+    "session_type": "browsing",
+    "time_of_day_patterns": "",
+    "weekday_patterns": "",
+    "weekend_patterns": ""
+  },
+  "core_traits": [
+    "好奇",
+    "随性"
+  ],
+  "current_phase": "刚接触",
+  "deep_needs": [
+    "新鲜感"
+  ],
+  "disliked_topics": [
+    "标题党"
+  ],
+  "exploration_openness": 0.8,
+  "interest_domains": [
+    {
+      "domain": "领域-0",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "source": "behavior",
+      "specifics": [
+        "细分-0-0",
+        "细分-0-1"
+      ],
+      "weight": 0.9
+    },
+    {
+      "domain": "领域-1",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "source": "behavior",
+      "specifics": [
+        "细分-1-0",
+        "细分-1-1"
+      ],
+      "weight": 0.85
+    },
+    {
+      "domain": "领域-2",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "source": "behavior",
+      "specifics": [
+        "细分-2-0",
+        "细分-2-1"
+      ],
+      "weight": 0.8
+    },
+    {
+      "domain": "领域-3",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "source": "behavior",
+      "specifics": [
+        "细分-3-0",
+        "细分-3-1"
+      ],
+      "weight": 0.75
+    },
+    {
+      "domain": "领域-4",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "source": "behavior",
+      "specifics": [
+        "细分-4-0",
+        "细分-4-1"
+      ],
+      "weight": 0.7
+    }
+  ],
+  "interests": [
+    {
+      "category": "领域-0",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "领域-0",
+      "source": "behavior",
+      "weight": 0.9
+    },
+    {
+      "category": "领域-1",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "领域-1",
+      "source": "behavior",
+      "weight": 0.85
+    },
+    {
+      "category": "领域-2",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "领域-2",
+      "source": "behavior",
+      "weight": 0.8
+    },
+    {
+      "category": "领域-0",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "细分-0-0",
+      "source": "behavior",
+      "weight": 0.8
+    },
+    {
+      "category": "领域-1",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "细分-1-0",
+      "source": "behavior",
+      "weight": 0.8
+    },
+    {
+      "category": "领域-2",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "细分-2-0",
+      "source": "behavior",
+      "weight": 0.8
+    },
+    {
+      "category": "领域-3",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "细分-3-0",
+      "source": "behavior",
+      "weight": 0.8
+    },
+    {
+      "category": "领域-4",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "细分-4-0",
+      "source": "behavior",
+      "weight": 0.8
+    },
+    {
+      "category": "领域-3",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "领域-3",
+      "source": "behavior",
+      "weight": 0.75
+    },
+    {
+      "category": "领域-4",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "领域-4",
+      "source": "behavior",
+      "weight": 0.7
+    },
+    {
+      "category": "领域-0",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "细分-0-1",
+      "source": "behavior",
+      "weight": 0.7
+    },
+    {
+      "category": "领域-1",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "细分-1-1",
+      "source": "behavior",
+      "weight": 0.7
+    },
+    {
+      "category": "领域-2",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "细分-2-1",
+      "source": "behavior",
+      "weight": 0.7
+    },
+    {
+      "category": "领域-3",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "细分-3-1",
+      "source": "behavior",
+      "weight": 0.7
+    },
+    {
+      "category": "领域-4",
+      "first_seen": "2026-06-01",
+      "last_seen": "2026-06-20",
+      "name": "细分-4-1",
+      "source": "behavior",
+      "weight": 0.7
+    }
+  ],
+  "life_stage": "探索期",
+  "mbti": {
+    "confidence": 0.4,
+    "dimensions": {
+      "EI": {
+        "pole": "E",
+        "strength": 0.6
+      }
+    },
+    "inferred_from": [
+      "少量早期行为"
+    ],
+    "type": "ENFP"
+  },
+  "motivational_drivers": [
+    "尝试新事物"
+  ],
+  "recent_awareness": [],
+  "source_platform_mix": {
+    "bilibili": 1.0
+  },
+  "speculative_interests": [],
+  "style": {
+    "depth_preference": 0.3,
+    "humor_preference": 0.7,
+    "preferred_duration": "short",
+    "preferred_pace": "fast",
+    "quality_sensitivity": 0.4
+  },
+  "values": [
+    "自由"
+  ]
+}

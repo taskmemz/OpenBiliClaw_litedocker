@@ -1,7 +1,7 @@
 # OpenBiliClaw 隐私权政策
 
 生效日期：2026-05-31
-更新日期：2026-07-27
+更新日期：2026-08-06
 
 OpenBiliClaw 是一个本地优先的跨平台内容发现 AI Agent。浏览器插件的单一用途是：在用户访问 Bilibili、小红书、抖音、YouTube 等受支持内容平台时，采集用户授权范围内的浏览、互动和内容信号，发送到用户自己配置的 OpenBiliClaw 后端，用于构建个人兴趣画像、改进内容推荐、同步收藏 / 稍后再看状态和展示本地通知。
 
@@ -79,6 +79,8 @@ OpenBiliClaw 插件本身不会把数据发送到 OpenBiliClaw 开发者拥有�
 `http://127.0.0.1/*` 和 `http://localhost/*` 用于连接用户自己的本机 OpenBiliClaw 后端。内容采集脚本只声明在受支持内容平台上运行；发布包不声明 `http://*/*`、`https://*/*` 或 `<all_urls>` 这类所有网站权限。
 
 抖音初始化任务需要识别当前登录账号，才能读取该账号公开可见的发布、收藏、点赞和关注分页。插件可从页面公开的 `#RENDER_DATA` 读取显式登录状态与候选 `sec_uid`，但不会把它直接当成最终身份；同页 MAIN world 会以 `credentials: "include"` 调用抖音同源只读 `/aweme/v1/web/user/profile/self/` 接口，只有该接口正面确认的公开 `sec_uid` 才用于分页与同 tab 缓存，冲突时也以它为准。常驻 fetch / XHR tap 不从页面被动请求 URL 提取或记录 `sec_user_id`；只有用户触发 bootstrap 后，页面消息桥才会传递经 `profile/self` 确认的公开 `sec_uid`、请求关联字段和为任务解析出的分页条目。桥不会传递 Cookie、CSRF token，也不会把未裁剪的原始接口响应对象直接转发。两侧 listener 的同窗口同源检查用于减少误接收，不把同页消息误称为可信授权边界。`sec_uid` 仅用于本次用户授权的抖音 bootstrap 分页，结果仍只发送给用户配置的 OpenBiliClaw 后端。
+
+小红书 discover 搜索任务会在后台标签页运行。由于小红书在隐藏标签中可能不挂载搜索结果列表，插件的同页 MAIN world 桥会观察页面自身发出的搜索接口响应，只归一化最多 20 条与页面卡片等价的公开字段（笔记 ID / 链接、标题、作者、封面 URL、发布时间与互动计数）以及既有的内容访问 token，并把这些字段交给该标签页的 isolated task executor；不会修改请求、转发原始响应、读取 Cookie 值或采集搜索结果正文。归一化结果只用于完成用户本地后端下发的 discover 任务，发送目标仍是用户配置的 OpenBiliClaw 后端；DOM 卡片提取保留为接口结构变化时的兜底。
 
 `*://*.bgm.tv/*` 和 `*://*.bangumi.tv/*` 的主机权限仅用于**账号身份识别**：读取页面公开的用户 uid（`CHOBITS_UID`）与导航栏用户名，实现零配置识别你的 Bangumi 账号，供画像初始化时读取你的公开收藏。在这两个站点上插件不读取 Cookie、不采集浏览行为、也不上传任何个人令牌；Bangumi 内容本身由本地后端通过官方匿名只读 API 获取。
 

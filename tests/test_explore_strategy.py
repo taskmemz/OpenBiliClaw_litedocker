@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 
 import pytest
@@ -59,6 +60,16 @@ class FakeLLMService:
             }
         )
         content = self.contents.pop(0) if self.contents else '{"score": 0.0, "reason": ""}'
+        if "<content_batch>" in user_input:
+            parsed = json.loads(content)
+            if isinstance(parsed, list):
+                content = json.dumps(
+                    [
+                        {**item, "id": str(index)} if isinstance(item, dict) else item
+                        for index, item in enumerate(parsed)
+                    ],
+                    ensure_ascii=False,
+                )
         return _FakeResponse(content)
 
 

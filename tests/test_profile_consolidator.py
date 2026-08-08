@@ -81,11 +81,22 @@ class _StubLLM:
         self.payload = payload
         self.calls = 0
         self.last_user_input = ""
+        self.call_kwargs: list[dict[str, Any]] = []
 
     async def complete_structured_task(self, **kwargs: Any) -> Any:
         self.calls += 1
         self.last_user_input = str(kwargs.get("user_input", ""))
+        self.call_kwargs.append(dict(kwargs))
         return SimpleNamespace(content=json.dumps(self.payload, ensure_ascii=False))
+
+
+class _FailingLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete_structured_task(self, **_kwargs: Any) -> Any:
+        self.calls += 1
+        raise RuntimeError("temporary judge outage")
 
 
 def _extract_prompt_json_block(user_input: str, tag: str) -> Any:
@@ -224,6 +235,34 @@ async def test_homonym_not_rule_merged_and_forced_into_cluster(tmp_path: Path) -
     assert report.rule_merges == []
     assert report.clusters_sent == 1
     assert any("llm" in err for err in report.errors)
+
+
+async def test_homonym_member_is_not_reused_by_regular_cluster_same_run(
+    tmp_path: Path,
+) -> None:
+    memory = _FakeMemory(
+        {
+            "interests": [
+                _interest("动漫", 0.9, "动漫"),
+                _interest("动漫", 0.5, "娱乐"),
+                _interest("动漫新番", 0.4, "动漫"),
+            ],
+            "disliked_topics": [],
+        },
+        data_dir=tmp_path,
+    )
+    consolidator = ProfileConsolidator(
+        memory=memory,
+        llm_service=None,
+        embedding_service=_StubEmbedding([["动漫", "动漫新番"]]),
+        data_dir=tmp_path,
+    )
+
+    report = await consolidator.run(dry_run=True)
+
+    # H1 owns both qualified homonyms. The unqualified surface name must not
+    # also appear in L1 and receive two conflicting operations in one apply.
+    assert report.clusters_sent == 1
 
 
 async def test_homonym_keep_both_pins_no_merge_with_qualified_keys(tmp_path: Path) -> None:
@@ -614,6 +653,110 @@ def test_consolidation_system_prompt_has_homonym_keep_rule() -> None:
     assert "category" in _PROFILE_CONSOLIDATION_SYSTEM_PROMPT
 
 
+def test_consolidation_system_prompt_merges_redundant_like_intents() -> None:
+    from openbiliclaw.llm.prompts import _PROFILE_CONSOLIDATION_SYSTEM_PROMPT
+
+    assert "推荐意图" in _PROFILE_CONSOLIDATION_SYSTEM_PROMPT
+    assert "搞笑" in _PROFILE_CONSOLIDATION_SYSTEM_PROMPT
+    assert "known_distinct_pairs" in _PROFILE_CONSOLIDATION_SYSTEM_PROMPT
+
+
+async def test_clustering_uses_transitive_connected_components(tmp_path: Path) -> None:
+    embedding = _VectorEmbedding(
+        {
+            "相似A": [1.0, 0.0],
+            "桥接B": [0.9, 0.4359],
+            "相似C": [0.62, 0.7846],
+        }
+    )
+    consolidator = ProfileConsolidator(
+        memory=_FakeMemory({"interests": [], "disliked_topics": []}),
+        llm_service=None,
+        embedding_service=embedding,
+        data_dir=tmp_path,
+    )
+
+    clusters = await consolidator._cluster(
+        ["相似A", "桥接B", "相似C"],
+        scope="likes",
+        similarity_threshold=0.85,
+    )
+
+    assert [cluster.members for cluster in clusters] == [["相似A", "桥接B", "相似C"]]
+
+
+async def test_known_distinct_edge_does_not_hide_new_neighbor(tmp_path: Path) -> None:
+    embedding = _VectorEmbedding(
+        {
+            "相似A": [1.0, 0.0],
+            "桥接B": [0.9, 0.4359],
+            "新邻居C": [0.62, 0.7846],
+        }
+    )
+    consolidator = ProfileConsolidator(
+        memory=_FakeMemory({"interests": [], "disliked_topics": []}),
+        llm_service=None,
+        embedding_service=embedding,
+        data_dir=tmp_path,
+    )
+
+    clusters = await consolidator._cluster(
+        ["相似A", "桥接B", "新邻居C"],
+        scope="likes",
+        similarity_threshold=0.85,
+        no_merge={"桥接B||相似A"},
+    )
+
+    assert [cluster.members for cluster in clusters] == [["桥接B", "新邻居C"]]
+
+
+async def test_cross_category_shared_suffix_does_not_bridge_components(tmp_path: Path) -> None:
+    consolidator = ProfileConsolidator(
+        memory=_FakeMemory({"interests": [], "disliked_topics": []}),
+        llm_service=None,
+        embedding_service=_StubEmbedding([]),
+        data_dir=tmp_path,
+    )
+
+    clusters = await consolidator._cluster(
+        ["游戏", "游戏资讯", "科技资讯"],
+        scope="likes",
+        category_by_name={"游戏": "游戏", "游戏资讯": "游戏", "科技资讯": "资讯"},
+    )
+
+    assert [cluster.members for cluster in clusters] == [["游戏", "游戏资讯"]]
+
+
+def test_validator_rejects_merge_across_known_distinct_pair(tmp_path: Path) -> None:
+    from openbiliclaw.soul.consolidator import _Cluster
+
+    consolidator = ProfileConsolidator(
+        memory=_FakeMemory({"interests": [], "disliked_topics": []}),
+        llm_service=None,
+        data_dir=tmp_path,
+    )
+    cluster = _Cluster(
+        cluster_id="L1",
+        scope="likes",
+        members=["主题甲", "桥接项", "主题乙"],
+        known_distinct_pairs=[["主题甲", "主题乙"]],
+    )
+
+    problem = consolidator._validate_cluster_ops(
+        cluster,
+        [
+            {
+                "cluster_id": "L1",
+                "op": "merge",
+                "members": ["主题甲", "桥接项", "主题乙"],
+                "canonical": "桥接主题",
+            }
+        ],
+    )
+
+    assert "known-distinct" in problem
+
+
 async def test_full_boundary_surfaces_clusters_beyond_top512(tmp_path: Path) -> None:
     interests = [_interest(f"普通兴趣{i}", 1.0 - i * 0.001) for i in range(530)]
     interests[520]["name"] = "长尾同义A"
@@ -642,15 +785,15 @@ async def test_full_boundary_surfaces_clusters_beyond_top512(tmp_path: Path) -> 
 
 async def test_over_target_likes_lower_similarity_threshold(tmp_path: Path) -> None:
     interests = [
-        _interest("AI工具与技术", 0.95),
-        _interest("AI工具工程实践", 0.9),
+        _interest("候选甲", 0.95),
+        _interest("桥梁乙", 0.9),
         _interest("普通兴趣A", 0.8),
         _interest("普通兴趣B", 0.7),
     ]
     embedding = _VectorEmbedding(
         {
-            "AI工具与技术": [1.0, 0.0],
-            "AI工具工程实践": [0.8, 0.6],
+            "候选甲": [1.0, 0.0],
+            "桥梁乙": [0.74, 0.6726],
             "普通兴趣A": [0.0, 1.0],
             "普通兴趣B": [0.0, -1.0],
         }
@@ -678,8 +821,8 @@ async def test_over_target_likes_lower_similarity_threshold(tmp_path: Path) -> N
                     {
                         "cluster_id": "L1",
                         "op": "merge",
-                        "members": ["AI工具与技术", "AI工具工程实践"],
-                        "canonical": "AI工具工程实践",
+                        "members": ["候选甲", "桥梁乙"],
+                        "canonical": "候选甲",
                     }
                 ],
                 "dislikes": [],
@@ -693,11 +836,11 @@ async def test_over_target_likes_lower_similarity_threshold(tmp_path: Path) -> N
     ).run(dry_run=False)
 
     assert under_target.clusters_sent == 0
-    assert under_target.like_similarity_threshold == 0.85
-    assert over_report.like_similarity_threshold < 0.8
+    assert under_target.like_similarity_threshold == 0.8
+    assert over_report.like_similarity_threshold < 0.75
     assert over_report.clusters_sent == 1
     assert [item["name"] for item in over_memory.get_layer("preference").data["interests"]] == [
-        "AI工具工程实践",
+        "候选甲",
         "普通兴趣A",
         "普通兴趣B",
     ]
@@ -740,6 +883,114 @@ async def test_multi_batch_apply_writes_single_run_record_and_full_revert(tmp_pa
     assert len(memory.get_layer("preference").data["interests"]) == 31
     assert consolidator.revert(report.run_id)
     assert len(memory.get_layer("preference").data["interests"]) == 62
+
+
+async def test_revert_restores_exact_soul_snapshot(tmp_path: Path) -> None:
+    from openbiliclaw.soul.profile import OnionProfile
+
+    soul_before = OnionProfile(
+        personality_portrait="合并前画像原文",
+        source_platform_mix={"bilibili": 0.73, "youtube": 0.27},
+        created_at="2026-01-01T00:00:00",
+        updated_at="2026-08-05T19:49:04",
+    ).to_dict()
+    memory = _FakeMemory(
+        {
+            "interests": [
+                _interest("智能体开发", 0.97),
+                _interest("智能体开发与实现", 0.88),
+            ],
+            "disliked_topics": [],
+        },
+        soul=json.loads(json.dumps(soul_before, ensure_ascii=False)),
+        data_dir=tmp_path,
+    )
+    consolidator = ProfileConsolidator(
+        memory=memory,
+        llm_service=_StubLLM(
+            {
+                "likes": [
+                    {
+                        "cluster_id": "L1",
+                        "op": "merge",
+                        "members": ["智能体开发", "智能体开发与实现"],
+                        "canonical": "智能体开发",
+                    }
+                ],
+                "dislikes": [],
+            }
+        ),
+        embedding_service=_StubEmbedding([["智能体开发", "智能体开发与实现"]]),
+        data_dir=tmp_path,
+    )
+
+    report = await consolidator.run(dry_run=False)
+
+    assert memory.get_layer("soul").data != soul_before
+    record_path = tmp_path / "consolidation_runs" / f"{report.run_id}.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["soul_before"] == soul_before
+
+    assert consolidator.revert(report.run_id)
+    assert memory.get_layer("soul").data == soul_before
+    assert memory.synced_profiles[-1] == soul_before
+
+
+async def test_apply_aborts_when_preference_changes_during_judgement(tmp_path: Path) -> None:
+    memory = _FakeMemory(
+        {
+            "interests": [
+                _interest("智能体开发", 0.97),
+                _interest("智能体开发与实现", 0.88),
+            ],
+            "disliked_topics": [],
+        },
+        data_dir=tmp_path,
+    )
+
+    class _ConcurrentPreferenceWriteLLM(_StubLLM):
+        async def complete_structured_task(self, **kwargs: Any) -> Any:
+            memory.get_layer("preference").data["interests"].append(
+                _interest("刚写入的新兴趣", 0.99)
+            )
+            return await super().complete_structured_task(**kwargs)
+
+    llm = _ConcurrentPreferenceWriteLLM(
+        {
+            "likes": [
+                {
+                    "cluster_id": "L1",
+                    "op": "merge",
+                    "members": ["智能体开发", "智能体开发与实现"],
+                    "canonical": "智能体开发",
+                }
+            ],
+            "dislikes": [],
+        }
+    )
+    consolidator = ProfileConsolidator(
+        memory=memory,
+        llm_service=llm,
+        embedding_service=_StubEmbedding([["智能体开发", "智能体开发与实现"]]),
+        data_dir=tmp_path,
+    )
+
+    report = await consolidator.run(dry_run=False)
+
+    assert report.write_conflict
+    assert report.retry_pending
+    assert not report.applied
+    assert report.likes_before == report.likes_after == 3
+    assert report.merges == []
+    assert report.errors == ["profile changed during consolidation; apply skipped and will retry"]
+    assert [item["name"] for item in memory.get_layer("preference").data["interests"]] == [
+        "智能体开发",
+        "智能体开发与实现",
+        "刚写入的新兴趣",
+    ]
+    assert memory.get_layer("preference").save_count == 0
+    assert not (tmp_path / "consolidation_state.json").exists()
+    assert not (tmp_path / "consolidation_runs").exists()
 
 
 async def test_single_batch_failure_isolated(tmp_path: Path) -> None:
@@ -1332,6 +1583,151 @@ async def test_run_if_due_throttles_and_skips_clean_input(tmp_path: Path) -> Non
     assert dirty.ran
 
 
+async def test_failed_judgement_keeps_same_input_retryable(tmp_path: Path) -> None:
+    memory = _FakeMemory(
+        {
+            "interests": [_interest("重复A", 0.9), _interest("重复B", 0.8)],
+            "disliked_topics": [],
+        },
+        data_dir=tmp_path,
+    )
+    llm = _FailingLLM()
+    consolidator = ProfileConsolidator(
+        memory=memory,
+        llm_service=llm,
+        embedding_service=_StubEmbedding([["重复A", "重复B"]]),
+        data_dir=tmp_path,
+        min_interval_seconds=12 * 3600,
+    )
+    t0 = datetime(2026, 8, 5, 14, 52, 0)
+
+    first = await consolidator.run_if_due(now=t0)
+    state = json.loads((tmp_path / "consolidation_state.json").read_text(encoding="utf-8"))
+    retry = await consolidator.run_if_due(now=t0 + timedelta(hours=13))
+
+    assert first.errors
+    assert first.retry_pending
+    assert not state.get("last_input_digest")
+    assert retry.ran
+    assert not retry.skipped_clean
+    assert llm.calls == 2
+
+
+async def test_policy_upgrade_rejudges_legacy_no_merge_pairs(tmp_path: Path) -> None:
+    memory = _FakeMemory(
+        {
+            "interests": [_interest("搞笑", 0.9, "娱乐"), _interest("娱乐搞笑", 0.8, "娱乐")],
+            "disliked_topics": [],
+        },
+        data_dir=tmp_path,
+    )
+    llm = _StubLLM(
+        {
+            "likes": [
+                {
+                    "cluster_id": "L1",
+                    "op": "merge",
+                    "members": ["搞笑", "娱乐搞笑"],
+                    "canonical": "搞笑",
+                }
+            ],
+            "dislikes": [],
+        }
+    )
+    consolidator = ProfileConsolidator(
+        memory=memory,
+        llm_service=llm,
+        embedding_service=_StubEmbedding([["搞笑", "娱乐搞笑"]]),
+        data_dir=tmp_path,
+    )
+    (tmp_path / "consolidation_state.json").write_text(
+        json.dumps(
+            {
+                "last_run_at": "2026-08-04T00:00:00",
+                "last_input_digest": consolidator._input_digest(),
+                "no_merge_pairs": ["娱乐搞笑||搞笑"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    report = await consolidator.run_if_due(now=datetime(2026, 8, 5, 0, 1, 0))
+
+    assert report.ran
+    assert report.merges
+    assert llm.calls == 1
+    assert [item["name"] for item in memory.get_layer("preference").data["interests"]] == ["搞笑"]
+
+
+async def test_policy_upgrade_preserves_user_reverted_pair(tmp_path: Path) -> None:
+    memory = _FakeMemory(
+        {
+            "interests": [_interest("搞笑", 0.9, "娱乐"), _interest("娱乐搞笑", 0.8, "娱乐")],
+            "disliked_topics": [],
+        },
+        data_dir=tmp_path,
+    )
+    llm = _StubLLM({"likes": [], "dislikes": []})
+    consolidator = ProfileConsolidator(
+        memory=memory,
+        llm_service=llm,
+        embedding_service=_StubEmbedding([["搞笑", "娱乐搞笑"]]),
+        data_dir=tmp_path,
+    )
+    pair = "娱乐搞笑||搞笑"
+    (tmp_path / "consolidation_state.json").write_text(
+        json.dumps(
+            {
+                "last_run_at": "2026-08-04T00:00:00",
+                "last_input_digest": consolidator._input_digest(),
+                "no_merge_pairs": [pair],
+                "protected_no_merge_pairs": [pair],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    report = await consolidator.run_if_due(now=datetime(2026, 8, 5, 0, 1, 0))
+    state = json.loads((tmp_path / "consolidation_state.json").read_text(encoding="utf-8"))
+
+    assert report.ran
+    assert report.clusters_sent == 0
+    assert llm.calls == 0
+    assert state["protected_no_merge_pairs"] == [pair]
+
+
+def test_policy_upgrade_recovers_legacy_revert_from_audit(tmp_path: Path) -> None:
+    memory = _FakeMemory({"interests": [], "disliked_topics": []}, data_dir=tmp_path)
+    consolidator = ProfileConsolidator(memory=memory, llm_service=None, data_dir=tmp_path)
+    runs_dir = tmp_path / "consolidation_runs"
+    runs_dir.mkdir()
+    (runs_dir / "20260801-010203.json").write_text(
+        json.dumps(
+            {
+                "merges": [
+                    {
+                        "scope": "likes",
+                        "members": ["搞笑", "娱乐搞笑"],
+                        "canonical": "搞笑",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "soul_changelog.md").write_text(
+        "\n## 画像整理回滚 20260801-010203（2026-08-02T00:00:00）\n",
+        encoding="utf-8",
+    )
+
+    protected = consolidator._protected_no_merge_pairs({"no_merge_pairs": ["娱乐搞笑||搞笑"]})
+
+    assert protected == {"娱乐搞笑||搞笑"}
+
+
 async def test_apply_rebuilds_onion_tree(tmp_path: Path) -> None:
     from openbiliclaw.soul.profile import OnionProfile
 
@@ -1609,9 +2005,11 @@ async def test_revert_restores_preference_overrides_and_pins_no_merge(tmp_path: 
     # The rolled-back merge is pinned distinct: a fresh run re-clusters the
     # pair but does not re-ask the LLM, so the merge is not redone.
     second = await consolidator.run(dry_run=False)
+    state = json.loads((tmp_path / "consolidation_state.json").read_text(encoding="utf-8"))
     assert second.clusters_sent == 0
     assert llm.calls == 1
     assert len(memory.get_layer("preference").data["interests"]) == 2
+    assert state["protected_no_merge_pairs"] == ["智能体开发||智能体开发与实现"]
 
 
 def test_revert_missing_run_id_returns_false(tmp_path: Path) -> None:
@@ -1709,3 +2107,58 @@ async def test_judge_failed_batch_only_loses_its_own_clusters(tmp_path: Path) ->
     assert len(report.rejected_clusters) == 32
     assert not report.errors
     assert len(memory.get_layer("preference").data["interests"]) == 2 * 32 + 8
+
+
+async def test_consolidation_judge_opts_out_of_core_memory_injection(tmp_path: Path) -> None:
+    """Task 8 audit: the cluster-merge judge must not carry core-memory injection.
+
+    Deterministic op-diff assurance (spec Task 8, Path B — the real ``--dry-run``
+    op list is non-deterministic at temperature 0.2, so a mocked-LLM equivalence
+    check is the honest gate): the judged material is built solely by
+    ``build_profile_consolidation_prompt`` from the cluster payload and never
+    depends on ``inject_core_memory``. This test pins that every judge call opts
+    out (``inject_core_memory=False``) while the recorded user prompt still carries
+    the full cluster payload — so removing the injection cannot change any
+    merge/keep decision.
+    """
+    memory = _FakeMemory(
+        {
+            "interests": [
+                _interest("智能体开发", 0.97, first_seen="2026-03-01T00:00:00"),
+                _interest("智能体开发与实现", 0.88, first_seen="2026-01-15T00:00:00"),
+                _interest("篮球", 0.95, "体育"),
+            ],
+            "disliked_topics": [],
+        },
+        soul={"personality_portrait": "PORTRAIT_SENTINEL_XYZ"},
+        data_dir=tmp_path,
+    )
+    llm = _StubLLM(
+        {
+            "likes": [
+                {
+                    "cluster_id": "L1",
+                    "op": "merge",
+                    "members": ["智能体开发", "智能体开发与实现"],
+                    "canonical": "智能体开发",
+                }
+            ],
+            "dislikes": [],
+        }
+    )
+    consolidator = ProfileConsolidator(
+        memory=memory,
+        llm_service=llm,
+        embedding_service=_StubEmbedding([["智能体开发", "智能体开发与实现"]]),
+        data_dir=tmp_path,
+    )
+
+    report = await consolidator.run(dry_run=False)
+
+    assert llm.calls >= 1
+    for call in llm.call_kwargs:
+        assert call.get("inject_core_memory") is False
+    # Judged payload is the cluster list, independent of the injection flag.
+    assert "智能体开发" in llm.last_user_input
+    assert "PORTRAIT_SENTINEL_XYZ" not in llm.last_user_input
+    assert report.merges and report.merges[0]["canonical"] == "智能体开发"

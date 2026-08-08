@@ -10,7 +10,7 @@
 - 推荐池 `content_cache` 的可换 / raw / pending 计数口径。
 - discovery 待评估池 `discovery_candidates` 的生命周期管理。
 - 跨平台收藏 / 稍后再看的 canonical 本地 membership、元数据快照、native sync 状态和独立任务快照持久化。
-- 事件入口幂等回执，以及小红书 / 抖音 / YouTube / 知乎来源任务首个终态结果的 crash-safe staging。
+- 事件入口幂等回执，以及小红书 / 抖音 / YouTube / 知乎 / Reddit 来源任务首个终态结果的 crash-safe staging。
 
 ## 已实现功能
 
@@ -24,7 +24,7 @@
 | Database facade 跨线程连接隔离 | ✅ | 长生命周期 `Database` 不再把同一条 `check_same_thread=False` 连接同时交给 API event-loop、status reader 与后台 worker；初始化线程保留 primary，其它调用线程各自缓存一条 WAL connection，同一普通 facade 方法在主线程/worker 都保持既有 `foreign_keys=OFF` 语义，只有显式 `open_connection()` 的原子短事务继续 `foreign_keys=ON`。并发写由 SQLite WAL + `busy_timeout` 串行，不用会卡住 event loop 的 process-wide mutex；`_execute_write()` / `_execute_many_write()` 在任何 `OperationalError` 后先 rollback 清理隐式事务，再决定 lock retry 或原样抛出。线程连接会长期复用，因此绕过 helper 的 direct DML 也必须在每次成功 execute 后 commit（即使 `rowcount=0`，SQLite 仍可能已开启隐式写事务），异常则 rollback；XHS token backfill 与 self-info purge 已按该契约收口。`close()` 先排空 facade 自有 worker，再关闭 registry 内全部连接。 |
 | 实时事件并发写隔离 | ✅ | `insert_event()` 不再让 API、账号同步和后台任务跨线程共享 process-wide SQLite 隐式事务；每条事件使用独立短连接，把 event、`seen_items` 与 backfill cursor 在同一事务提交，锁冲突按既有有界策略重试，退出必关闭连接。这样不会再由其它线程的 commit/rollback 触发 `cannot commit - no transaction is active`。 |
 | Durable event ingress 回执 | ✅ | `events.ingest_key TEXT NOT NULL DEFAULT ''` 由旧库迁移幂等补列；`idx_events_ingest_key_unique` 只约束 `ingest_key <> ''`，因此无幂等键的 legacy/internal direct 写入仍保持 append-only。公开 HTTP 边界更严格：`/api/events` 每项 `event_id`、`/api/feedback` 与 `/api/recommendation-click` 的 `request_id` 都先 trim，再要求 1–400 字符；缺失/空白/超长在 route 前 422，不能产生 event、`seen_items` 或 recommendation 投影。CLI feedback 省略 ID 时生成并回显，OpenClaw CLI/skill 必填；这些边界不会把空 key 传到 storage。`EventIngressService` 把非空客户端键规范为 `producer:client_key`（总长 ≤512），逐项拒绝非法输入，再由 `MemoryManager.persist_events_with_receipts()` / `Database.insert_events_with_receipts()` 在一个独立短连接事务中提交全部合法项、同步 `seen_items` 与 cursor，并按原输入位置返回稳定 `event_id / inserted / duplicate`。并发重放只有首写成功，后续回执指回首写行；commit 后的 owner wake 只是延迟提示，失败不会撤销 durable fact。 |
-| 四来源 staged canonical task result | ✅ | `XhsTaskQueue` / `DyTaskQueue` / `YtTaskQueue` / `ZhihuTaskQueue` 共用 `sources.task_result_protocol`：`stage_final_result()` 在 `BEGIN IMMEDIATE` 下把首个 final callback 合并进 `result_json` 并写 `_openbiliclaw_terminal_status`，此时数据库 `status` 刻意保持非终态，普通 claim lease 仍可在请求 5xx / 进程崩溃后回收。marker 已存在即返回冻结结果，晚到 partial / final / failure（以及 XHS rate-limit）均不得改写。调用方只从冻结行重放 durable event ingress、来源投影与严格 bootstrap seen-key checkpoint；全部成功后 `complete_staged_result()` 才原子翻成 `completed`，且不替换 `result_json`。这些步骤是可重放的多次短事务，不宣称跨表原子；任一点崩溃都由下一次 lease reclaim 从首个 canonical result 修复。 |
+| 五来源 staged canonical task result | ✅ | `XhsTaskQueue` / `DyTaskQueue` / `YtTaskQueue` / `ZhihuTaskQueue` / `RedditTaskQueue` 共用 `sources.task_result_protocol`：`stage_final_result()` 在 `BEGIN IMMEDIATE` 下把首个 final callback 合并进 `result_json` 并写 `_openbiliclaw_terminal_status`，此时数据库 `status` 刻意保持非终态，普通 claim lease 仍可在请求 5xx / 进程崩溃后回收。marker 已存在即返回冻结结果，晚到 partial / final / failure（以及 XHS rate-limit）均不得改写。XHS `bootstrap_profile` 还会从该任务的不可变 `payload_json` 重读允许的 `scopes` 与 `max_items_per_scope`，在每次 partial/final/直接完成/风控失败合并时过滤未声明 scope 和非整数计数、按 scope 裁剪累计 canonical notes，并只从已接纳 note 派生 URL，防止分批回传扩大任务预算；同 identity duplicate 仍可只补发布时间与首个有效 tokenized URL，不新增 canonical 行。调用方只从冻结行重放 durable event ingress、来源投影与严格 bootstrap seen-key checkpoint；全部成功后 `complete_staged_result()` 才原子翻成 `completed`，且不替换 `result_json`。这些步骤是可重放的多次短事务，不宣称跨表原子；任一点崩溃都由下一次 lease reclaim 从首个 canonical result 修复。 |
 | 画像更新台账（`profile_update_ledger`，v0.3.174+） | ✅ | 认知画像流水线 Phase 0 的**只追加审计表**。`insert_profile_ledger(*, write_point, source, before_summary, after_summary, diff, source_refs, outcome, turn_id, gate_verdict, held_id, error, effect_key='')` 在动作结束后追加一行（`outcome=success\|failed`，`source_refs` JSON 编码）；空 `effect_key` 保持普通 append，结算 worker 传入固定形状 `dialogue:<ref-sha256>:ledger` / `dialogue:<ref-sha256>:derived:<content-sha256>` 时由 partial unique index + `INSERT OR IGNORE` 保证 observer effect 至多一行。`query_profile_ledger(*, days=30, write_point='', limit=200)` 按时间窗 + 写点过滤返回（newest-first，`source_refs` 解码回列表，并带回 `effect_key`）。其余字段：`write_point`、`source`、before/after 摘要、`diff`（≤2000 字符）、`turn_id`、`gate_verdict`、`held_id`。fresh schema + 旧库 `_ensure_profile_update_ledger_table()` 会幂等补列和索引。写点挂钩清单见 `docs/modules/soul.md`。 |
 | Durable chat payload + 单 worker 对象结算收据（v0.3.182+） | ✅ | `chat_turns.payload` 承载结构化卡片/疑惑提问，列表以 `(created_at,rowid)` 稳定排序。`create_chat_confirmation_turn()` 在 `BEGIN IMMEDIATE` 内先查 `attached_to_turn_id`、再查 `(ref,session)`、最后插入 completed turn，保证并发 open 与“卡片先于用户消息”crash gap 均不重复；跨 session 各自产 turn。卡片 discussion payload 只保存 `state`：worker 直接执行 `pending→discussing`，建锚失败补偿回 `pending`，GET 提交的 reconcile 会校正无活锚 orphan；没有 `attempt_token/discussing_at`、三段 discuss CAS 或 stale scanner。`card_settlements` 只保存 hypothesis/confusion/speculation 的 immutable winner `payload`、`applied/result`、稳定 `event_id` 与时间戳，不再保存 claim lease/token 或三段 CAS。`_migrate_card_settlements_to_wave_2()` 以 table rebuild 保留最早表与旧 claim 表的 winner；旧 `seg_event=1` 或 `applied=1` 仅在 migration 中映射为已记录 event identity，runtime schema 不再暴露这些列。`record_card_settlement_event_once()` 在一个 `BEGIN IMMEDIATE` 事务内插入 event 并标记 receipt；`complete_card_settlement()` 无 token，`project_applied_card_settlement()` 仍只消费 `applied=1` 并批量刷新所有 session。`applied=1` 是对象语义终点：显式同 ref retry 只补跑 ledger observer、projection 与精确 generation 解锚，不再重做 object/derived/rebuild。进程内 `DialogueSettlementQueue` 不落这层 job/inbox 表，重启恢复依赖显式 action 重试或 GET reconcile。 |
 | Turn relation + immutable binding（2026-08-01） | ✅ | `chat_turns.reply_to_turn_id TEXT NOT NULL DEFAULT ''` 与普通索引采用 additive、幂等迁移；旧行保持空 relation。API 在 capture canonical target 后同步写 user row，`payload.dialogue_binding` 只保存 server-owned `bound/ordinary/detached` binding 与完整 digest；客户端同名事实不会直接写入。context preview 是只读查询，retry 比较已存 normalized request，避免同 turn id 改 target、message 或 generation。 |
@@ -36,15 +36,17 @@
 | 规范化保存存储 | ✅ | `saved_items` 以 canonical key 保存跨平台元数据快照，`saved_memberships` 独立表达收藏 / 稍后看归属，`native_save_states` 持久化当前逐项同步状态；`native_save_tasks` / `native_save_task_items` 独立持久化每次请求的 UUID、不可变成员集合和 task-scoped 结果。旧 `watch_later` / `favorites` 由带 marker 的单次事务迁移导入。 |
 | 扩展原生保存 job ledger 与旧状态迁移 | ✅ | `extension_native_save_jobs` 保存脱敏后的六平台扩展任务；task URL 只允许平台 HTTPS host 与默认端口，输出移除 fragment/非导航 query（YouTube 仅保留身份参数 `v`；小红书仅保留打开公开笔记所需的单值非空 `xsec_token/xsec_source`，其它 key 仍剥离）。partial unique index 保证 `(platform, item_key, requested_action)` 只有一个 pending/in-progress row。命名迁移只把六个 canonical 平台的旧 `unsupported`/空 error code 改为 `unsupported_adapter_missing`，绝不改 Bilibili、未知平台或 `unsupported_content_type`。 |
 | 推荐链路 canonical identity | ✅ | `content_cache.item_key` 对**非空值**使用 partial unique index（`WHERE item_key != ''`），另有普通 lookup index，`recommendations.item_key` 使用普通索引；空值只作为 v0.3.166 及更早写入器不知道 additive 列时的兼容窗口，避免旧桌面版与新版源码共用数据库后第二条补池候选开始持续触发 `UNIQUE constraint failed`。当前版本初始化会临时移除旧全量 guard，按平台 + raw `content_id` 回填空 identity，并在恢复 partial unique 前确定性合并 canonical 重复行（优先 canonical storage key、填补非空元数据、重定向 recommendation 引用）。若 loser 仍被旧 `watch_later` / `favorites` 引用，consolidation 会先为真实 legacy schema 补 additive `item_key` 并写入 canonical key；后续 normalized saved migration 在 exact `bvid` 不存在时用该稳定键 join keeper，既保留 membership，也不绕过 Task 2 的单次 marker / no-resurrection 语义。B 站 `bvid` 主键保持 raw BV 兼容，非 B 站 `bvid` 存储键使用 namespaced identity，API 继续从独立字段输出 raw ID 与 authoritative URL。 |
+| 推荐历史避雷证据字段 | ✅ | `get_recommendations()` 在既有 DTO 字段外返回 `description/tags/topic_key/topic_group/pool_topic_label`，供 API 与 OpenClaw 在历史行离开 storage 后按最新 effective dislikes 做与 serve 一致的最终过滤；`exclude_processed=true` 继续同步排除已反馈单卡。 |
 | 来源 raw material 统计 | ✅ | `count_pool_raw_material_by_source()` 合并 `content_cache` raw rows 和 `discovery_candidates` 待评估候选，供 raw ceiling headroom 使用。 |
-| 有界库存维护与历史恢复 | ✅ | `maintain_pool_inventory(max_mutations=50)` 在独立短连接 `BEGIN IMMEDIATE` 中先恢复仍合格且能净增 canonical available 的历史 `suppressed` 结果，再统一 stale / explore / topic / source / raw 维护；单事务最多修改 50 行，返回 `has_more` 供 runtime 分批收敛。已满 topic 不参与恢复，排名窗口试探失败会在同一事务还原，避免恢复/裁剪振荡。维护连接只等写锁 75ms，交互写入优先；每批仍保护 canonical available 底线并在不变量失败时整体回滚。 |
+| 有界库存维护与历史恢复 | ✅ | `maintain_pool_inventory(max_mutations=50)` 在独立短连接 `BEGIN IMMEDIATE` 中先恢复仍合格且能净增 canonical available 的历史 `suppressed` 结果，再统一 stale / explore / topic / source / raw 维护；恢复数受当批 `raw_ceiling - raw_before` headroom 约束，raw 已满或超限时先裁剪、绝不继续恢复。单事务最多修改 50 行，只有确有 deferred victim，或裁剪释放 headroom 后仍可继续恢复时才返回 `has_more=True`；protected/token-owned excess 无可裁剪 victim 时以稳定 WARNING 结束，不再形成恢复/裁剪振荡。已满 topic 不参与恢复，排名窗口试探失败会在同一事务还原。维护连接只等写锁 75ms，交互写入优先；每批仍保护 canonical available 底线并在不变量失败时整体回滚。 |
 | 换批读写隔离 | ✅ | `PoolServeSnapshot` 在专属单线程 serve worker 的一次只读事务中统一读取 readiness、候选、平台补位、持久化已看账本和 curator 信号；同一快照只物化一次 `seen_items`，并按账本最新 event id 缓存结果，写入新浏览事件后自动失效。`persist_pool_serve_async()` 用另一条短事务原子写入 recommendation + shown。serve 与 maintenance 使用不同 executor、不同 SQLite 连接，不把共享 `Database.conn` 直接跨线程并发访问。 |
 | 八平台来源族归一化 | ✅ | `sources.platforms` 以可枚举规则统一 Bilibili、小红书、抖音、YouTube、X、知乎、Reddit、Bangumi 的别名、策略前缀和 URL host；pool accounting、已看身份与 URL 推断共用同一口径。 |
 | discovery 待评估池 | ✅ | `discovery_candidates` 支持 mixed-source enqueue / claim / evaluation / admission，并持久化 `claim_token`、`score_threshold`、`eval_attempts` 与 batch 级 `batch_eval_attempts`；stale-sensitive 完成和释放都匹配 `id + status + claim_token`。 |
+| evaluator prefilter shadow 审计 | ✅ | `evaluator_prefilter_shadow_audit` 用随机 decision id 连接预过滤决策与最终原始 LLM score / admission 结果；只保存 identity hash、类别、数值和 digest，不保存标题、URL、正文、prompt、画像文本或 provider response。每次 insert 同时执行 30 天和 20,000 行双重 retention；任何写入/回填失败由 discovery fail-open，并以 incomplete telemetry 阻断 enforce gate。 |
 | discovery 历史候选查询 | ✅ | `get_existing_discovery_candidate_keys()` 与 `get_existing_content_cache_ids()` 支持 pipeline 在 enqueue 前过滤历史候选和已缓存内容，避免重复 raw 占住 Evo 前供给窗口。 |
 | discovery 状态恢复 | ✅ | 启动初始化会释放过期 `evaluating` 行；terminal 状态有 status guard，避免 stale update 改写 cached / rejected 结果。 |
-| discovery keyword store | ✅ | `discovery_keywords` 用 `keyword_kind` 区分常规 search 词与 explore 词；默认 `regular`，`explore` 词只供 `ExploreStrategy` 专用 claim，不会被普通 B 站 search 消费。`requeue_keyword_after_transient_failure()` 可把 claimed / executing 词无损退回 pending、清理执行时间且不增加 attempts，供小红书平台风控等瞬时故障重试。 |
-| XHS task runtime state | ✅ | `XhsTaskQueue` 幂等创建单行 `xhs_task_runtime_state`，持久化 `next_claim_at / cooldown_until / cooldown_reason`。search / creator claim 在独立短连接事务里读取并推进节流水位；`record_rate_limit()` 只会延长、不会缩短平台冷却，并可在同一事务中终结触发风控的 legacy task。该状态独立于单个任务，因此能跨 FastAPI 与 MV3 service-worker 重启、多个浏览器 profile 生效。 |
+| discovery keyword store | ✅ | `discovery_keywords` 用 `keyword_kind` 区分常规 search 词与 explore 词；默认 `regular`，`explore` 词只供 `ExploreStrategy` 专用 claim，不会被普通 B 站 search 消费。`history_keywords()` 把带 `used_at` 的零产出/全重复 `expired` 词保留在近期冷却内，`recycle_oldest_used(min_age_hours=...)` 只回收超过窗口的历史词；`retire_duplicate_only_keywords()` 接收候选预过滤的真实重复反馈并立即退役无新身份的词。`requeue_keyword_after_transient_failure()` 仍可把 claimed / executing 词无损退回 pending、清理执行时间且不增加 attempts，供平台风控等瞬时故障重试。 |
+| XHS task runtime state | ✅ | `XhsTaskQueue` 幂等创建单行 `xhs_task_runtime_state`，持久化 `next_claim_at / cooldown_until / cooldown_reason / rate_limit_strikes`；旧库会 additive 补 `rate_limit_strikes=0`。search / creator claim 在独立短连接事务里按任务 ID 计算稳定 ±25% 抖动并推进节流水位；`active_task_count()` 给 producer 提供 pending + in-progress 积压门。`record_rate_limit()` 让独立风控轮次按 1/2/4…小时指数退避、24 小时封顶，同一活动冷却内的重复报告复用当前 strike，并可在同一事务中终结触发风控的 legacy task；活动冷却结束后，成功完成一条 search / creator 才清零 strikes，晚到成功不能取消其它任务刚打开的冷却。该状态独立于单个任务，因此能跨 FastAPI 与 MV3 service-worker 重启、多个浏览器 profile 生效。 |
 | discovery inspiration cache | ✅ | 新增 `discovery_inspiration_probe_cache`、`discovery_inspiration_expansion_cache`、`discovery_inspiration_axis` 与 `discovery_interest_selection_ledger`，持久化搜索探针证据、可复用 inspiration 轴、旧横向扩展缓存、yield 反馈计数和二级兴趣抽中事件；`search_local_inspiration_evidence()` 从 `content_cache` 抽取 local-first grounding evidence；`upsert_inspiration_axes()` / `list_inspiration_axes()` 管理轴库复用和轮转；`backfill_inspiration_axis_yield()` 用 trailing-window 全量重算（SET，幂等）把轴的 `yield_score` 从恒 0 变成由真实 `admissions` / `window_uses` 驱动，`apply_inspiration_axis_lifecycle()` 落库 stale / retired 状态迁移并物理清理 90 天陈旧行；`list_inspiration_axes_by_source()` 按 `source`（非 interest_label）过滤 + `min_yield` 高产筛 + 镜像生命周期排序，供跨域 explore 通道复用 `source='explore'` 的高产轴；`get_keyword_interest_coverage_snapshot()` 归一化汇总 keyword / raw candidate / admitted pool 覆盖和 recent selection count，用于下轮二级兴趣抽样降权；`get_keyword_cohort_stats()` 输出 inspiration / merged cohort 对比、local-first stub 字段和 replace 门禁指标。 |
 | keyword interest label migration | ✅ | `migrate_keyword_interest_labels()` 根据画像整理产生的重命名 mapping 迁移 `discovery_keywords.source_interest` 和 `discovery_interest_selection_ledger.source_interest`，降低画像标签漂移造成的 coverage / selection cooldown 死桶。 |
 | 持久化已看去重 | ✅ | `seen_items(item_key)` 保存所有已知 `view / favorite / like / coin` 的 canonical `source_platform:content_id`，B 站同时向旧调用方暴露 raw BVID。单条 `insert_event()` 与批量 `insert_events_batch()` 都通过各自独立短连接在事件事务内同步 upsert 账本；初始化会按 `seen_items_backfill_state` 增量回填旧事件。可换、raw、评估、平台库存与 delight 打分/计数/出队路径读取这份无界账本，`get_recent_viewed_*` 仅作为兼容别名，不再代表“最近 N 条”。`mark_delight_seen()` 供三端“× / 看过了”先写 canonical ledger、再消费惊喜状态。 |
@@ -90,7 +92,7 @@ assert first.duplicate is False
 
 数据库保留空 `ingest_key` 只为旧库迁移、历史 append-only 调用与不暴露重试语义的内部 direct writer；它不是公开客户端的“可选幂等”契约。新增用户动作入口必须在进入 storage 前取得稳定非空 ID，并为同一动作的响应丢失/网络重试复用该 ID。
 
-### 四来源任务结果 staging
+### 五来源任务结果 staging
 
 ```python
 canonical = xhs_queue.stage_final_result(
@@ -103,7 +105,7 @@ canonical = xhs_queue.stage_final_result(
 xhs_queue.complete_staged_result(task_id)
 ```
 
-上述协议适用于 `XhsTaskQueue`、`DyTaskQueue`、`YtTaskQueue` 与 `ZhihuTaskQueue`。`stage_final_result()` 的首写 winner 是逻辑终态，但仍可由原 claim lease 回收；`complete_staged_result()` 只允许存在 staged marker 的非失败任务翻成 `completed`。业务层不得在两者之间信任重试 callback 的新字段，也不得先翻 terminal 再做事件或 seen-key 投影，否则中途崩溃将失去自动修复入口。
+上述协议适用于 `XhsTaskQueue`、`DyTaskQueue`、`YtTaskQueue`、`ZhihuTaskQueue` 与 `RedditTaskQueue`。`stage_final_result()` 的首写 winner 是逻辑终态，但仍可由原 claim lease 回收；`complete_staged_result()` 只允许存在 staged marker 的非失败任务翻成 `completed`。XHS bootstrap 的 `complete()`、`merge_result_with_enrichment()`、`stage_final_result()` 与 `record_rate_limit()` 都必须使用任务行保存的同一 scope policy，不能信任 callback 自报的 scope 或剩余额度。业务层不得在 staging 前自行扩大 canonical 结果，也不得在 stage 与 complete 之间信任重试 callback 的新字段或先翻 terminal 再做事件 / seen-key 投影，否则会破坏预算或失去崩溃自动修复入口。
 
 ### Durable chat reply 状态
 
@@ -377,6 +379,20 @@ known_content_ids = db.get_existing_content_cache_ids(["BV1xx411c7mD"])
 - `mark_discovery_candidate_cached()` / `reject_discovery_candidate(..., status=...)` 只改写 `evaluating` / `evaluated` 行；terminal rows 不会被 stale caller 复活或覆盖。常见 rejection status 包括 `rejected_low_score`、`rejected_duplicate`、`rejected_cache_admission`、`rejected_recently_viewed`、`rejected_franchise_quota`。
 - `count_discovery_candidates_by_status()` 与 `count_discovery_candidates_by_source_status()` 用于诊断待评估池生命周期分布。
 - `count_pool_readiness()["evaluated_pending"]` 是 `discovery_candidates(status='evaluated')` 的 durable 数量；`admitted_pending_copy` 与 `get_pool_candidates_needing_copy()` 共用 `_load_admitted_pending_copy_rows_on()`，不会用宽泛的 `pending` 差值推算。
+
+### Evaluator Prefilter Shadow Audit
+
+```python
+inserted = db.record_prefilter_shadow_decisions(decision_records)
+updated = db.complete_prefilter_shadow_decisions(outcome_records)
+rows = db.query_prefilter_shadow_audit()
+counts = db.prefilter_shadow_audit_counts()
+```
+
+- `record_prefilter_shadow_decisions()` 在落库前拒绝非 SHA-256 candidate identity、未净化平台/上下文、非 digest namespace/profile 和非法数值，避免调用方把原始候选或画像误写进审计表。
+- `complete_prefilter_shadow_decisions()` 只按随机 `decision_id` 回填一次，并校验 `admission_result == (llm_score >= admission_threshold)`；进程在两步之间退出，或 provider / parse 没有产生 production-valid raw score，都会留下 incomplete row，gate 的 telemetry coverage 因而不能静默达到 100%。产品路径为兼容性生成的 synthetic 0 不进入该表。
+- retention 常量来自 Phase 2 多日 shadow 校准窗口：30 天保证真实波次可跨日分层，20,000 行 ceiling 在 evaluator 90 条 hard cap 下仍覆盖 220 轮以上，同时为长期 daemon 提供与流量无关的硬上界。
+- `query_prefilter_shadow_audit()` 只返回 privacy-safe 列；只读 gate 命令在 SQLite read transaction 中冻结当前最大 audit id，输出聚合 count/recall/strata/fail-open 结果，不初始化数据库、不调用 provider、也不写配置。
 - `get_existing_discovery_candidate_keys(keys)` 返回任意 lifecycle status 下已经出现过的 `candidate_key`；`get_existing_content_cache_ids(ids)` 返回已经进入正式 `content_cache` 的 BVID / `content_id`。两者用于 `DiscoveryCandidatePipeline` 在 enqueue 前过滤历史重复，而不是等 SQLite `INSERT OR IGNORE` 静默吞掉后才发现供给不足。
 
 ### Bangumi Producer Ledger
@@ -409,6 +425,14 @@ db.insert_pending_keywords(
 
 regular = db.claim_keywords("bilibili", 5)
 explore = db.claim_keywords("bilibili", 5, keyword_kind="explore")
+grace_ledger = db.reconcile_pending_keyword_digests(
+    "bilibili",
+    current_digest,
+    grace_hours=24,
+    max_pending=30,
+    blocked_terms=["明确避雷主题"],
+)
+pending_all_digests = db.count_pending_keywords_all_digests("bilibili")
 coverage = db.get_keyword_interest_coverage_snapshot()
 db.record_keyword_interest_selection(["独立游戏叙事"], query_kind="regular")
 stats = db.get_keyword_cohort_stats(window_days=14)
@@ -422,10 +446,12 @@ db.migrate_keyword_interest_labels({"AI 工具": "AI 工程化"})
 - `keyword_kind="explore"` 是 `KeywordPlanner` 写入的 B 站探索 query 候选池，只有 `ExploreStrategy` 的 planner-backed 分支会 claim。
 - 在途唯一约束包含 `(platform, keyword, profile_kw_digest, keyword_kind)`；同一个 query 可分别作为 regular 与 explore 生命周期存在，互不抢占。
 - `history_keywords()` 与 `recycle_oldest_used()` 也默认只读 `regular` 池；需要查看 / 回收探索池时必须显式传 `keyword_kind="explore"`。
+- `reconcile_pending_keyword_digests()` 在短 `BEGIN IMMEDIATE` 事务内整理指定平台和 kind 的 pending 库存：当前 digest 行优先；旧 digest 行按“宽限时间 → blocked term → 归一化重复 → 总 cap”顺序保留或过期。保留行不重写 `profile_kw_digest`、创建时间或 inspiration/axis/interest 等溯源；只触碰 `pending`，不会复活或改写 `claimed/executing/used/failed/expired`。返回值只有 `current/reused/expired_aged/expired_blocked/expired_excess` 聚合计数。
+- `count_pending_keywords_all_digests()` 是完成上述整理后的水位口径；旧的 `count_pending_keywords(platform, digest)` 保留给 grace=0 与能力缺失时的硬过期回退。`history_keywords(..., include_pending=True)` 只由成功完成 grace 整理的 regular planner 使用，防止尚可领取的旧库存被同族新词重复生成；默认仍为 `False`。
 - `pending → claimed → used/failed/executing` 状态机保持不变；租约回收和失败回滚对两类 keyword 都生效。平台瞬时故障可通过 `requeue_keyword_after_transient_failure(keyword_id)` 把 claimed / executing 原子退回 pending，且不消耗 attempts；当前 XHS `rate_limited` 回调使用该入口。
 - `metadata_by_keyword` 是可选溯源字段，不参与唯一约束；同一个 in-flight query 的去重仍只看 `(platform, keyword, profile_kw_digest, keyword_kind)`。当前支持记录 `aspect_id`、`inspiration_backend`、`inspiration_id`、`inspiration_terms`、`expansion_id`、`angle_id`、`query_kind`、`source_domain`、`source_interest`、`grounding_source`、`generation_reason` 和 `normalized_keyword` 等字段，供 query 丰富度诊断和后续反馈学习使用。
 - `search_local_inspiration_evidence(query, limit=..., lookback_days=...)` 是 local-first inspiration grounding 的 Phase 1 DAO：它只读 `content_cache`，用 CJK 2-gram / token overlap 做相关性筛选，并在 B站 legacy 行缺少 `content_url` 时用 `bvid` 合成视频 URL；返回值只作为灵感 evidence，不写候选池。
-- `record_keyword_interest_selection(labels, query_kind=..., selection_scope=...)` 在 planner 抽中二级兴趣后立即写入 selection ledger；production 运行使用 `selection_scope="production"`，`keyword-inspiration-dry-run` 使用独立的 `preview` scope，因此多次 dry-run 可以验证冷却轮转，但不会污染正式运行的抽样状态。写入时会清理 30 天前的 selection ledger 行，coverage snapshot 默认只统计最近 14 天。
+- `record_keyword_interest_selection(labels, query_kind=..., selection_scope=...)` 在灵感词完成装配与近期 query-family 过滤后，只为真正留下关键词的 realized interests 写入 selection ledger；被平台配额挤掉、错误归因或只生成重复词的兴趣不会被虚假降权。production 运行使用 `selection_scope="production"`，`keyword-inspiration-dry-run` 使用独立的 `preview` scope，因此多次 dry-run 可以验证冷却轮转，但不会污染正式运行的抽样状态。写入时会清理 30 天前的 selection ledger 行，coverage snapshot 默认只统计最近 14 天。
 - `get_keyword_interest_coverage_snapshot()` 返回以 `source_interest` / `pool_topic_label` / `topic_group` 为 key 的 coverage bucket，包括 `interest_selection_count`、`generated_keyword_count`、`selected_keyword_count`、`yield_count`、`candidate_count`、`candidate_share`、`admitted_count`、`admitted_share`、候选 dominant platform / content type 和入池 dominant content type 信息。join 前会统一走 `_normalize_match_text()` 折叠大小写和空白漂移，但输出仍保留可读 display label。`KeywordPlanner` 用它降低已抽中过、已生成过很多词、raw candidate 高频或最终入池占比高的二级兴趣下一轮被抽中的概率；只在 raw candidate 层高频、但尚未 admit 的兴趣也会提前被识别出来。
 - `migrate_keyword_interest_labels(mapping)` 会按同一归一化规则匹配现有 keyword `source_interest` 和 selection ledger `source_interest`，把画像整理后的旧标签迁到新标签；`ProfileConsolidator` 在 `--apply` 时记录被迁移行，`--revert` 会按行恢复，避免简单反向 mapping 误伤原本就叫新标签的 keyword / selection 记录。
 - `get_keyword_cohort_stats(window_days=14)` 按 `inspiration_id` 溯源把窗口内关键词分为 `inspiration` 与 `merged` 两组，输出 generated / claimed / claimed_rate、yield-attributed admissions、admissions_per_claimed_keyword、mean_delight、distinct_topics 和 topic_diversity_per_100_admissions；同时输出 `interest_selection.production/preview` 的 total、distinct、by_source_interest、by_query_kind 和 last_selected_at，用于诊断抽样轮转；机械 replace gate 在样本不足、准入率低于 `0.8x`、delight 低于 `0.95x` 或 topic 多样性没有严格更高时均不允许开启 replace。
@@ -588,7 +614,7 @@ result = db.maintain_pool_inventory(
 
 若 `BEGIN IMMEDIATE` 遇到交互 writer，75ms 后抛出 `PoolMaintenanceDeferredError`，runtime 把本轮维护延后而不是等待进程默认的 30 秒。其它 canonical snapshot 读取在 `available_before` 建立前失败时抛出 `PoolMaintenanceSnapshotUnavailableError`，不会返回伪造的零库存结果。只有 snapshot 已取得后的 victim/invariant 失败才返回 `rolled_back=True`，其中 `available_before` 保留真实事务前值。
 
-raw ceiling 同时统计 `content_cache` 和 `discovery_candidates` active 行，victim 顺序为 unready content → 未领取 `pending_eval` → 未领取 `evaluated` → 非保护 ready reserve。候选不删除，而是 terminalize 为 `trimmed_capacity`，`eval_error='pool_raw_ceiling'`；`evaluating` 与任意 token-owned 行永不裁剪。若保护行加 active claim 已超过 ceiling，保留所有权与可用库存、报告 `untrimmed_raw_excess` 并记录 ERROR。提交前重新计算 canonical available，必须满足 `available_after >= min(available_before, target)`，否则整笔 `BEGIN IMMEDIATE` 回滚。
+raw ceiling 同时统计 `content_cache` 和 `discovery_candidates` active 行，victim 顺序为 unready content → 未领取 `pending_eval` → 未领取 `evaluated` → 非保护 ready reserve。候选不删除，而是 terminalize 为 `trimmed_capacity`，`eval_error='pool_raw_ceiling'`；`evaluating` 与任意 token-owned 行永不裁剪。若保护行加 active claim 已超过 ceiling，保留所有权与可用库存、报告 `untrimmed_raw_excess` 并记录一次稳定 WARNING；当完整 raw plan 已无 victim 时 `has_more=False`，等 claim 完成或库存指纹变化后再维护。提交前重新计算 canonical available，必须满足 `available_after >= min(available_before, target)`，否则整笔 `BEGIN IMMEDIATE` 回滚。
 
 ### Recommendation Serve Snapshot
 

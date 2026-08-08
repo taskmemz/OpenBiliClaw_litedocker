@@ -940,6 +940,7 @@ async def test_analyze_events_count_chunking_avoids_whole_batch_prompt_build(
         existing_preference: dict[str, object],
         awareness_notes: list[dict[str, object]] | None = None,
         active_insights: list[dict[str, object]] | None = None,
+        input_view: str = "legacy",
     ) -> list[dict[str, str]]:
         if len(events) > 1:
             raise AssertionError("count-based chunking must not build a whole-batch prompt")
@@ -948,6 +949,7 @@ async def test_analyze_events_count_chunking_avoids_whole_batch_prompt_build(
             existing_preference=existing_preference,
             awareness_notes=awareness_notes,
             active_insights=active_insights,
+            input_view=input_view,
         )
 
     monkeypatch.setattr(
@@ -1258,6 +1260,114 @@ async def test_analyze_events_splits_by_prompt_budget_without_explicit_chunk_siz
 
 
 @pytest.mark.asyncio
+async def test_automatic_budget_uses_independent_request_shape_without_false_split() -> None:
+    events = [
+        {
+            "event_type": "view",
+            "title": f"完整保留事件 {idx}",
+            "metadata": {"source_platform": "bilibili", "bvid": f"BV_PACK_{idx}"},
+        }
+        for idx in range(4)
+    ]
+    independent_messages = build_preference_analysis_prompt(
+        events=events,
+        existing_preference={},
+    )
+    budget = sum(len(message["content"]) for message in independent_messages)
+    oversized_existing = {"legacy_padding": "旧偏好上下文" * 2_000}
+    whole_messages = build_preference_analysis_prompt(
+        events=events,
+        existing_preference=oversized_existing,
+    )
+    assert sum(len(message["content"]) for message in whole_messages) > budget
+
+    service = BudgetCapturingStructuredService(max_prompt_chars=budget)
+    analyzer = PreferenceAnalyzer(service, max_prompt_chars=budget)
+    await analyzer.analyze_events(
+        events=events,
+        existing_preference=oversized_existing,
+    )
+
+    assert len(service.calls) == 1
+    user_input = service.calls[0]["user_input"]
+    assert all(event["title"] in user_input for event in events)
+
+
+def test_automatic_budget_finds_largest_fitting_event_prefix() -> None:
+    events = [
+        {
+            "event_type": "view",
+            "title": f"装箱事件 {idx}",
+            "context": "不同长度上下文" * (idx + 1) * 10,
+            "metadata": {"source_platform": "bilibili"},
+        }
+        for idx in range(4)
+    ]
+    two_event_messages = build_preference_analysis_prompt(
+        events=events[:2],
+        existing_preference={},
+    )
+    budget = sum(len(message["content"]) for message in two_event_messages)
+    three_event_messages = build_preference_analysis_prompt(
+        events=events[:3],
+        existing_preference={},
+    )
+    assert sum(len(message["content"]) for message in three_event_messages) > budget
+
+    analyzer = PreferenceAnalyzer(FakeStructuredService(), max_prompt_chars=budget)
+
+    assert (
+        analyzer._largest_fitting_independent_chunk_size(
+            events=events,
+            awareness_notes=None,
+            active_insights=None,
+        )
+        == 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_automatic_budget_repacks_after_skewed_oversized_event() -> None:
+    small_events = [
+        {
+            "event_type": "view",
+            "title": f"小事件 {idx}",
+            "context": "小段上下文" * 60,
+            "metadata": {"source_platform": "bilibili", "bvid": f"BV_SMALL_{idx}"},
+        }
+        for idx in range(4)
+    ]
+    events = [
+        *small_events[:2],
+        {
+            "event_type": "view",
+            "title": "局部超长事件",
+            "context": "超长上下文" * 5_000,
+            "metadata": {"source_platform": "bilibili", "bvid": "BV_LARGE"},
+        },
+        *small_events[2:],
+    ]
+    two_small_messages = build_preference_analysis_prompt(
+        events=small_events[:2],
+        existing_preference={},
+    )
+    budget = sum(len(message["content"]) for message in two_small_messages)
+    service = BudgetCapturingStructuredService(max_prompt_chars=budget)
+    analyzer = PreferenceAnalyzer(service, max_prompt_chars=budget)
+
+    await analyzer.analyze_events(events=events, existing_preference={})
+
+    assert len(service.calls) == 3
+    assert all(
+        len(call["system_instruction"]) + len(call["user_input"]) <= budget
+        for call in service.calls
+    )
+    assert all(event["title"] in service.calls[0]["user_input"] for event in small_events[:2])
+    assert "局部超长事件" in service.calls[1]["user_input"]
+    assert all(event["title"] in service.calls[2]["user_input"] for event in small_events[2:])
+
+
+@pytest.mark.asyncio
 async def test_single_oversized_preference_event_is_compacted_before_llm_call() -> None:
     from openbiliclaw.llm.prompts import build_preference_analysis_prompt
     from openbiliclaw.soul.preference_analyzer import PreferenceAnalyzer
@@ -1313,6 +1423,7 @@ async def test_single_event_is_skipped_when_compact_prompt_still_exceeds_budget(
         existing_preference: dict[str, object],
         awareness_notes: list[dict[str, object]] | None = None,
         active_insights: list[dict[str, object]] | None = None,
+        input_view: str = "legacy",
     ) -> list[dict[str, str]]:
         if len(events) == 1 and events[0].get("title"):
             compact_prompt_events.append(dict(events[0]))
@@ -1321,6 +1432,7 @@ async def test_single_event_is_skipped_when_compact_prompt_still_exceeds_budget(
             existing_preference=existing_preference,
             awareness_notes=awareness_notes,
             active_insights=active_insights,
+            input_view=input_view,
         )
 
     monkeypatch.setattr(

@@ -5,24 +5,39 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
 import pytest
 
+import openbiliclaw.llm.prompts as prompt_module
+from openbiliclaw.discovery import engine as discovery_engine_module
 from openbiliclaw.discovery.engine import (
+    _DEFAULT_EVALUATION_CANDIDATE_TRANSPORT,
     ContentDiscoveryEngine,
     DiscoveredContent,
     DiscoveryConcurrencyController,
     _prompt_visible_content_fields,
     compact_evaluation_profile_summary,
     discovery_raw_candidate_mode_enabled,
+    evaluation_profile_prompt_layers,
     llm_eval_candidate_limit,
 )
 from openbiliclaw.discovery.pool_snapshot import PoolDistributionSnapshot
+from openbiliclaw.discovery.strategies._utils import build_profile_summary
+from openbiliclaw.llm.prompt_cache import PromptLayerRenderCache
 from openbiliclaw.llm.service import LLMProviderExecutionError
-from openbiliclaw.soul.profile import AwarenessNote, InterestTag, SoulProfile
+from openbiliclaw.soul.profile import (
+    AwarenessNote,
+    InsightHypothesis,
+    InterestDomain,
+    InterestSpecific,
+    InterestTag,
+    OnionProfile,
+    SoulProfile,
+)
 from openbiliclaw.storage.database import Database
 
 from .test_explore_strategy import (
@@ -121,18 +136,271 @@ class _DynamicBatchLLMService:
     ) -> object:
         self.user_inputs.append(user_input)
         self.max_tokens.append(max_tokens)
+        items = _batch_prompt_items(user_input)
+        local_ids = _batch_prompt_uses_local_ids(user_input)
+        identity_field = "id" if local_ids else "content_id"
+        payload: list[dict[str, object]] = []
+        for index, item in enumerate(items):
+            identity = (
+                item.get("id")
+                if local_ids
+                else item.get("content_id") or item.get("bvid") or str(index)
+            )
+            payload.append(
+                {
+                    identity_field: identity,
+                    "score": 0.8,
+                    "reason": "ok",
+                    "style_key": "deep_dive",
+                }
+            )
+        return _SlowResponse(json.dumps(payload, ensure_ascii=False))
+
+
+class _CountingEmbeddingService:
+    similarity_threshold = 0.82
+
+    def __init__(
+        self,
+        vectors: dict[str, list[float]],
+        *,
+        failures: set[str] | None = None,
+    ) -> None:
+        self.vectors = vectors
+        self.failures = failures or set()
+        self.calls: list[str] = []
+
+    async def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        if text in self.failures:
+            raise RuntimeError(f"embedding failed for {text}")
+        return self.vectors.get(text, [])
+
+    def lookup_cached(self, text: str) -> list[float]:
+        return self.vectors.get(text, [])
+
+
+class _NamespacedEmbeddingService(_CountingEmbeddingService):
+    def __init__(
+        self,
+        vectors: dict[str, list[float]],
+        *,
+        fingerprint: str,
+        failures: set[str] | None = None,
+    ) -> None:
+        super().__init__(vectors, failures=failures)
+        self.embedding_fingerprint = fingerprint
+
+
+_MATCH_VEC = [1.0, 0.0]
+_LOW_SIM_VEC = [0.1, 0.9949874371]
+
+
+def _prefilter_vectors(*, low_texts: list[str] | None = None) -> dict[str, list[float]]:
+    vectors = {
+        "纪录片": _MATCH_VEC,
+        "摄影": _MATCH_VEC,
+        "知识": _MATCH_VEC,
+        "创作": _MATCH_VEC,
+        "匹配内容 深度纪录片解析": _MATCH_VEC,
+    }
+    for text in low_texts or []:
+        vectors[text] = _LOW_SIM_VEC
+    return vectors
+
+
+def _batch_prompt_items(user_input: str) -> list[dict[str, object]]:
+    batch_json = user_input.split("<content_batch>", 1)[1].split("</content_batch>", 1)[0]
+    raw_items = json.loads(batch_json.strip())
+    if isinstance(raw_items, list):
+        return [item for item in raw_items if isinstance(item, dict)]
+    assert isinstance(raw_items, dict)
+    defaults = raw_items.get("defaults")
+    items = raw_items.get("items")
+    assert isinstance(defaults, dict)
+    assert isinstance(items, list)
+    return [{**defaults, **item} for item in items if isinstance(item, dict)]
+
+
+def _batch_prompt_uses_local_ids(user_input: str) -> bool:
+    batch_json = user_input.split("<content_batch>", 1)[1].split("</content_batch>", 1)[0]
+    return isinstance(json.loads(batch_json.strip()), dict)
+
+
+def _sparse_batch_prompt_envelope(user_input: str) -> dict[str, object]:
+    batch_json = user_input.split("<content_batch>", 1)[1].split("</content_batch>", 1)[0]
+    raw_envelope = json.loads(batch_json.strip())
+    assert isinstance(raw_envelope, dict)
+    assert set(raw_envelope) == {"defaults", "items"}
+    return raw_envelope
+
+
+def _single_prompt_content_summary(user_input: str) -> dict[str, object]:
+    summary_json = user_input.split("<content_summary>", 1)[1].split(
+        "</content_summary>",
+        1,
+    )[0]
+    raw_summary = json.loads(summary_json.strip())
+    assert isinstance(raw_summary, dict)
+    return raw_summary
+
+
+def _profile_block_prefix(user_input: str) -> str:
+    return user_input.split("<source_platform>", 1)[0]
+
+
+def _maxed_onion_profile() -> OnionProfile:
+    profile = OnionProfile()
+    profile.core.core_traits = [f"trait-{index}" for index in range(35)]
+    profile.core.deep_needs = [f"need-{index}" for index in range(35)]
+    profile.values_layer.values = [f"value-{index}" for index in range(35)]
+    profile.values_layer.motivational_drivers = [f"driver-{index}" for index in range(35)]
+    profile.surface.cognitive_style = [f"style-{index}" for index in range(35)]
+    profile.recent_awareness = [
+        AwarenessNote(
+            date=f"2026-07-{(index % 28) + 1:02d}",
+            observation=f"awareness-{index}-" + ("x" * 40),
+            trend=f"trend-{index}",
+        )
+        for index in range(30)
+    ]
+    profile.active_insights = [
+        InsightHypothesis(
+            hypothesis=f"insight-{index}-" + ("y" * 40),
+            evidence=[f"evidence-{index}-{item}-" + ("z" * 24) for item in range(30)],
+            created_at=f"2026-07-{(index % 28) + 1:02d}T12:00:00",
+        )
+        for index in range(30)
+    ]
+    profile.interest.likes = [
+        InterestDomain(
+            domain=f"domain-{domain:02d}-" + ("wide" * 4),
+            weight=1.0 - domain / 100,
+            specifics=[
+                InterestSpecific(
+                    name=f"specific-{domain:02d}-{specific:02d}-" + ("tail" * 4),
+                    weight=1.0 - (specific / 1000),
+                )
+                for specific in range(20)
+            ],
+            first_seen=f"2026-06-{(domain % 28) + 1:02d}",
+            last_seen=f"2026-07-{(domain % 28) + 1:02d}",
+            source="test",
+        )
+        for domain in range(40)
+    ]
+    profile.interest.dislikes = [
+        InterestDomain(domain=f"avoid-{index}", weight=0.9) for index in range(110)
+    ]
+    return profile
+
+
+def _profile_with_ranked_interests(count: int = 48) -> SoulProfile:
+    profile = SoulProfile()
+    profile.preferences.interests = [
+        InterestTag(
+            name=f"头部兴趣{index:02d}",
+            category="共同领域",
+            weight=1.0 - index / 1000,
+        )
+        for index in range(count)
+    ]
+    return profile
+
+
+def _profile_with_tail_interest(*, category: str = "模型") -> SoulProfile:
+    profile = _profile_with_ranked_interests()
+    profile.preferences.interests.append(
+        InterestTag(name="稀有铁路模型", category=category, weight=0.01)
+    )
+    return profile
+
+
+class _SplitRetryBatchLLMService:
+    """Controllable batch fake for split-retry tests."""
+
+    def __init__(
+        self,
+        *,
+        invalid_batch_calls: set[int] | None = None,
+        invalid_all_batches: bool = False,
+        count_mismatch_batch_calls: set[int] | None = None,
+        rate_limit_batch_calls: set[int] | None = None,
+    ) -> None:
+        self.invalid_batch_calls = invalid_batch_calls or set()
+        self.invalid_all_batches = invalid_all_batches
+        self.count_mismatch_batch_calls = count_mismatch_batch_calls or set()
+        self.rate_limit_batch_calls = rate_limit_batch_calls or set()
+        self.batch_call_sizes: list[int] = []
+        self.single_calls = 0
+
+    async def complete_structured_task(
+        self,
+        *,
+        system_instruction: str,
+        user_input: str,
+        history: list[dict[str, str]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        caller: str = "",
+        reasoning_effort: str | None = None,
+    ) -> object:
+        if "<content_batch>" not in user_input:
+            self.single_calls += 1
+            return _SlowResponse('{"score": 0.51, "reason": "single"}')
+
         batch_json = user_input.split("<content_batch>", 1)[1].split("</content_batch>", 1)[0]
         items = json.loads(batch_json.strip())
-        payload = [
-            {
-                "content_id": item.get("content_id") or item.get("bvid") or str(index),
-                "score": 0.8,
-                "reason": "ok",
-                "style_key": "deep_dive",
+        self.batch_call_sizes.append(len(items))
+        call_index = len(self.batch_call_sizes)
+        if call_index in self.rate_limit_batch_calls:
+            raise LLMProviderExecutionError("Provider returned 429 rate limit")
+        if self.invalid_all_batches or call_index in self.invalid_batch_calls:
+            return _SlowResponse("not json")
+
+        payload_items = items
+        include_ids = True
+        if call_index in self.count_mismatch_batch_calls:
+            payload_items = items[:-1]
+            include_ids = False
+        payload: list[dict[str, object]] = []
+        style_keys = (
+            "deep_focus",
+            "quick_scan",
+            "hands_on",
+            "decision_support",
+            "story_immersion",
+            "opinion_sparring",
+            "social_chat",
+            "daily_wander",
+            "mood_release",
+            "aesthetic_browse",
+            "ambient_companion",
+            "live_pulse",
+            "curiosity_spark",
+        )
+        for index, item in enumerate(payload_items):
+            result: dict[str, object] = {
+                "score": 0.73,
+                "reason": "batch",
+                "style_key": style_keys[index % len(style_keys)],
             }
-            for index, item in enumerate(items)
-        ]
+            if include_ids:
+                result["content_id"] = item.get("content_id") or item.get("bvid") or str(index)
+            payload.append(result)
         return _SlowResponse(json.dumps(payload, ensure_ascii=False))
+
+
+def _split_retry_contents(count: int, *, prefix: str) -> list[DiscoveredContent]:
+    return [
+        DiscoveredContent(
+            bvid=f"BV{prefix}{index:04d}",
+            title=f"candidate {index}",
+            up_name="u",
+            source_strategy="trending",
+        )
+        for index in range(count)
+    ]
 
 
 class _ConcurrentBatchLLMService(_DynamicBatchLLMService):
@@ -241,11 +509,12 @@ def test_compact_evaluation_profile_summary_keeps_high_signal_context() -> None:
     compacted = compact_evaluation_profile_summary(profile_summary)
 
     assert len(compacted["core_traits"]) == 20
-    assert len(compacted["interests"]) == 64
+    assert len(compacted["interests"]) == 48
     assert compacted["interests"][0]["name"] == "interest-0"
+    assert compacted["interests"][-1]["name"] == "interest-47"
     assert compacted["disliked_topics"] == profile_summary["disliked_topics"]
     assert len(compacted["interest_domains"]) == 32
-    assert len(compacted["interest_domains"][0]["specifics"]) == 12
+    assert len(compacted["interest_domains"][0]["specifics"]) == 16
     assert [item["observation"] for item in compacted["recent_awareness"][:2]] == [
         "awareness-8",
         "awareness-9",
@@ -253,6 +522,130 @@ def test_compact_evaluation_profile_summary_keeps_high_signal_context() -> None:
     assert len(compacted["active_insights"]) == 12
     assert len(compacted["active_insights"][0]["evidence"]) == 8
     assert len(compacted["speculative_interests"]) == 12
+
+
+def test_content_prompt_profile_compactor_is_eval_backcompat_alias() -> None:
+    from openbiliclaw.discovery.strategies._utils import compact_content_prompt_profile_summary
+
+    profile_summary = {
+        "core_traits": [f"trait-{index}" for index in range(30)],
+        "interests": [
+            {"name": f"interest-{index}", "weight": 1.0 - index / 100} for index in range(110)
+        ],
+        "disliked_topics": ["avoid"],
+    }
+
+    assert compact_evaluation_profile_summary is compact_content_prompt_profile_summary
+    assert compact_content_prompt_profile_summary(profile_summary) == (
+        compact_evaluation_profile_summary(profile_summary)
+    )
+
+
+def test_evaluation_profile_summary_uses_compactor_and_preserves_dislikes() -> None:
+    profile = _maxed_onion_profile()
+
+    summary = ContentDiscoveryEngine._evaluation_profile_summary(profile)
+    expected = compact_evaluation_profile_summary(build_profile_summary(profile))
+    full_summary = build_profile_summary(profile)
+
+    assert summary == expected
+    assert summary["disliked_topics"] == full_summary["disliked_topics"]
+    assert len(summary["disliked_topics"]) == len(full_summary["disliked_topics"])
+
+
+def test_evaluation_profile_digest_covers_tail_recall_pool() -> None:
+    engine = ContentDiscoveryEngine(llm_service=None)
+    base = _profile_with_ranked_interests()
+    tail = _profile_with_tail_interest(category="共同领域")
+
+    assert engine._evaluation_profile_summary(base) == engine._evaluation_profile_summary(tail)
+    assert engine._evaluation_profile_digest(base) != engine._evaluation_profile_digest(tail)
+
+
+def test_evaluation_profile_digest_changes_when_compacted_domain_changes() -> None:
+    engine = ContentDiscoveryEngine(llm_service=None)
+    base = _profile_with_ranked_interests()
+    changed = _profile_with_ranked_interests()
+    changed.preferences.interests.append(
+        InterestTag(name="新增高权重领域", category="新增高权重领域", weight=2.0)
+    )
+
+    assert engine._evaluation_profile_digest(base) != engine._evaluation_profile_digest(changed)
+
+
+def test_evaluation_profile_digest_ignores_recent_context_timestamps() -> None:
+    engine = ContentDiscoveryEngine(llm_service=None)
+    profile_a = _profile_with_ranked_interests()
+    profile_b = _profile_with_ranked_interests()
+    profile_a.recent_awareness = [
+        AwarenessNote(date="2026-07-05T10:00:00", observation="最近反复看铁路模型")
+    ]
+    profile_b.recent_awareness = [
+        AwarenessNote(date="2026-07-05T11:30:00", observation="最近反复看铁路模型")
+    ]
+    profile_a.active_insights = [
+        InsightHypothesis(
+            hypothesis="偏好慢节奏结构拆解",
+            evidence=["多次看完长视频"],
+            created_at="2026-07-05T10:00:00",
+        )
+    ]
+    profile_b.active_insights = [
+        InsightHypothesis(
+            hypothesis="偏好慢节奏结构拆解",
+            evidence=["多次看完长视频"],
+            created_at="2026-07-05T11:30:00",
+        )
+    ]
+
+    assert engine._evaluation_profile_digest(profile_a) == engine._evaluation_profile_digest(
+        profile_b
+    )
+
+
+def test_compact_evaluation_profile_summary_strips_recent_context_volatile_fields() -> None:
+    compacted = compact_evaluation_profile_summary(
+        {
+            "recent_awareness": [
+                {
+                    "date": "2026-07-05T10:00:00",
+                    "observation": "偏好铁路模型",
+                    "session_context": "run-a",
+                }
+            ],
+            "active_insights": [
+                {
+                    "created_at": "2026-07-05T10:00:00",
+                    "hypothesis": "偏好慢节奏结构拆解",
+                    "session_context": "run-a",
+                    "evidence": ["看完长视频"],
+                }
+            ],
+        }
+    )
+
+    recent = compacted["recent_awareness"][0]
+    insight = compacted["active_insights"][0]
+    assert isinstance(recent, dict)
+    assert isinstance(insight, dict)
+    assert "date" not in recent
+    assert "session_context" not in recent
+    assert "created_at" not in insight
+    assert "session_context" not in insight
+
+
+def test_evaluation_profile_prompt_block_shrinks_by_at_least_sixty_percent() -> None:
+    profile = _maxed_onion_profile()
+    full_summary = build_profile_summary(profile)
+    compacted = ContentDiscoveryEngine._evaluation_profile_summary(profile)
+    full_block = "\n\n".join(
+        PromptLayerRenderCache().render_json_layers(evaluation_profile_prompt_layers(full_summary))
+    )
+    compact_block = "\n\n".join(
+        PromptLayerRenderCache().render_json_layers(evaluation_profile_prompt_layers(compacted))
+    )
+
+    assert len(compact_block) <= len(full_block) * 0.40
 
 
 class _RecentViewedDatabase:
@@ -481,6 +874,7 @@ async def test_evaluate_content_single_passes_text_metrics_and_tags_to_prompt() 
             content_id="tweet-1",
             title="正文首行",
             body_text="完整 thread 正文",
+            published_at="2026-08-01T12:30:00+00:00",
             tags=["systems", "async"],
             source_platform="twitter",
             content_type="thread",
@@ -501,6 +895,8 @@ async def test_evaluate_content_single_passes_text_metrics_and_tags_to_prompt() 
 
     user_input = str(llm_service.calls[0]["user_input"])
     assert '"body_text": "完整 thread 正文"' in user_input
+    assert '"evaluated_at": "' in user_input
+    assert '"published_at": "2026-08-01T12:30:00+00:00"' in user_input
     assert '"tags": [' in user_input
     assert '"like_count": 100' in user_input
     assert '"favorite_count": 90' in user_input
@@ -511,6 +907,178 @@ async def test_evaluate_content_single_passes_text_metrics_and_tags_to_prompt() 
     assert '"reply_count": 40' in user_input
     assert '"retweet_count": 30' in user_input
     assert '"bookmark_count": 20' in user_input
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_cache_invalidates_when_published_at_changes() -> None:
+    llm_service = FakeLLMService(
+        '{"score": 0.82, "reason": "匹配", "topic_group": "系统", "style_key": "deep_dive"}'
+    )
+    engine = ContentDiscoveryEngine(llm_service=llm_service)
+    profile = _build_profile()
+
+    await engine.evaluate_content(
+        DiscoveredContent(bvid="BV1TIME", title="模型更新", source_strategy="search"),
+        profile,
+    )
+    await engine.evaluate_content(
+        DiscoveredContent(
+            bvid="BV1TIME",
+            title="模型更新",
+            published_at="2026-08-04T08:00:00Z",
+            source_strategy="search",
+        ),
+        profile,
+    )
+
+    assert len(llm_service.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_single_preserves_full_body_text() -> None:
+    llm_service = FakeLLMService(
+        '{"score": 0.82, "reason": "匹配", "topic_group": "系统", "style_key": "deep_dive"}'
+    )
+    engine = ContentDiscoveryEngine(llm_service=llm_service)
+    body_text = "H" * 300 + "T" * 200
+
+    await engine.evaluate_content(
+        DiscoveredContent(
+            content_id="tweet-long",
+            title="长文首行",
+            body_text=body_text,
+            source_platform="twitter",
+            content_type="thread",
+            source_strategy="x-search",
+        ),
+        _build_profile(),
+    )
+
+    user_input = str(llm_service.calls[0]["user_input"])
+    assert body_text in user_input
+
+
+@pytest.mark.asyncio
+async def test_related_interests_returns_tail_match_and_degrades_without_embedding() -> None:
+    profile = _profile_with_tail_interest()
+    content = DiscoveredContent(
+        bvid="BVTAIL",
+        title="稀有铁路模型",
+        description="开箱评测",
+        source_strategy="search",
+    )
+    content_text = "稀有铁路模型 开箱评测"
+    vectors = {
+        content_text: _MATCH_VEC,
+        "稀有铁路模型": _MATCH_VEC,
+        **{f"头部兴趣{index:02d}": _LOW_SIM_VEC for index in range(48)},
+    }
+    engine = ContentDiscoveryEngine(
+        llm_service=None,
+        embedding_service=_CountingEmbeddingService(vectors),
+    )
+
+    related = await engine._related_interests_for_content(content, profile, top_k=3)
+
+    assert related[0] == "稀有铁路模型"
+    assert len(related) <= 3
+    assert all(isinstance(entry, str) for entry in related)
+    engine_without_init = ContentDiscoveryEngine.__new__(ContentDiscoveryEngine)
+    assert await engine_without_init._related_interests_for_content(content, profile) == []
+
+
+@pytest.mark.asyncio
+async def test_related_interests_returns_empty_when_embedding_fails() -> None:
+    profile = _profile_with_tail_interest()
+    content = DiscoveredContent(
+        bvid="BVFAIL",
+        title="稀有铁路模型",
+        description="开箱评测",
+        source_strategy="search",
+    )
+    content_text = "稀有铁路模型 开箱评测"
+    engine = ContentDiscoveryEngine(
+        llm_service=None,
+        embedding_service=_CountingEmbeddingService({}, failures={content_text}),
+    )
+
+    assert await engine._related_interests_for_content(content, profile) == []
+
+
+@pytest.mark.asyncio
+async def test_evaluate_batch_adds_related_interests_without_changing_profile_prefix() -> None:
+    profile = _profile_with_tail_interest()
+    content = DiscoveredContent(
+        bvid="BVTAIL",
+        title="稀有铁路模型",
+        description="开箱评测",
+        source_strategy="search",
+    )
+    content_text = "稀有铁路模型 开箱评测"
+    vectors = {
+        content_text: _MATCH_VEC,
+        "稀有铁路模型": _MATCH_VEC,
+        **{f"头部兴趣{index:02d}": _LOW_SIM_VEC for index in range(48)},
+    }
+    llm_with_recall = _DynamicBatchLLMService()
+    engine_with_recall = ContentDiscoveryEngine(
+        llm_service=llm_with_recall,
+        embedding_service=_CountingEmbeddingService(vectors),
+        eval_prefilter_mode="off",
+    )
+    llm_without_recall = _DynamicBatchLLMService()
+    engine_without_recall = ContentDiscoveryEngine(
+        llm_service=llm_without_recall,
+        embedding_service=None,
+        eval_prefilter_mode="off",
+    )
+
+    await engine_with_recall._evaluate_batch([content], profile)
+    await engine_without_recall._evaluate_batch([content], profile)
+
+    with_recall_input = llm_with_recall.user_inputs[0]
+    without_recall_input = llm_without_recall.user_inputs[0]
+    related = _batch_prompt_items(with_recall_input)[0]["related_interests"]
+    assert isinstance(related, list)
+    assert related[0] == "稀有铁路模型"
+    assert len(related) <= 3
+    assert "related_interests" not in _batch_prompt_items(without_recall_input)[0]
+    assert _profile_block_prefix(with_recall_input) == _profile_block_prefix(without_recall_input)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_single_adds_related_interests_to_content_summary() -> None:
+    profile = _profile_with_tail_interest()
+    content = DiscoveredContent(
+        bvid="BVTAILSINGLE",
+        title="稀有铁路模型",
+        description="开箱评测",
+        source_strategy="search",
+    )
+    content_text = "稀有铁路模型 开箱评测"
+    llm_service = FakeLLMService(
+        '{"score": 0.82, "reason": "匹配", "topic_group": "模型", "style_key": "deep_dive"}'
+    )
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        embedding_service=_CountingEmbeddingService(
+            {
+                content_text: _MATCH_VEC,
+                "稀有铁路模型": _MATCH_VEC,
+                **{f"头部兴趣{index:02d}": _LOW_SIM_VEC for index in range(48)},
+            }
+        ),
+        eval_prefilter_mode="off",
+    )
+
+    await engine.evaluate_content(content, profile)
+
+    user_input = str(llm_service.calls[0]["user_input"])
+    content_summary = _single_prompt_content_summary(user_input)
+    related = content_summary["related_interests"]
+    assert isinstance(related, list)
+    assert related[0] == "稀有铁路模型"
+    assert len(related) <= 3
 
 
 @pytest.mark.asyncio
@@ -545,7 +1113,8 @@ async def test_evaluate_content_batch_skips_recently_viewed_before_llm() -> None
     assert scores == [0.0, 0.88]
     assert len(llm_service.calls) == 1
     user_input = str(llm_service.calls[0]["user_input"])
-    assert "BV1FRESH" in user_input
+    assert "新内容" in user_input
+    assert "BV1FRESH" not in user_input
     assert "BV1VIEWED" not in user_input
     assert "已经看过" not in user_input
 
@@ -615,7 +1184,8 @@ async def test_evaluate_content_batch_skips_recently_viewed_non_bilibili_before_
     assert scores == [0.0, 0.82]
     assert len(llm_service.calls) == 1
     user_input = str(llm_service.calls[0]["user_input"])
-    assert "fresh-yt" in user_input
+    assert "新的 YouTube" in user_input
+    assert "fresh-yt" not in user_input
     assert "seen-yt" not in user_input
     assert "已经看过的 YouTube" not in user_input
 
@@ -665,19 +1235,570 @@ async def test_evaluate_content_batch_omits_duplicate_text_description() -> None
     )
 
     assert scores == [0.8, 0.8]
-    batch_json = (
-        llm_service.user_inputs[0]
-        .split("<content_batch>", 1)[1]
-        .split(
-            "</content_batch>",
-            1,
-        )[0]
-    )
-    items = json.loads(batch_json.strip())
+    items = _batch_prompt_items(llm_service.user_inputs[0])
     assert items[0]["body_text"] == summary
-    assert items[0]["description"] == ""
+    assert "description" not in items[0]
     assert items[1]["body_text"] == "完整推文正文"
     assert items[1]["description"] == "短描述补充"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_preserves_full_body_text() -> None:
+    llm_service = _DynamicBatchLLMService()
+    engine = ContentDiscoveryEngine(llm_service=llm_service)
+    body_text = "H" * 300 + "T" * 200
+
+    scores = await engine.evaluate_content_batch(
+        [
+            DiscoveredContent(
+                content_id="twitter:tweet:long",
+                source_platform="twitter",
+                content_type="thread",
+                title="Long tweet first line",
+                body_text=body_text,
+                source_strategy="x-feed",
+            )
+        ],
+        _build_profile(),
+        batch_size=1,
+    )
+
+    assert scores == [0.8]
+    items = _batch_prompt_items(llm_service.user_inputs[0])
+    assert items[0]["body_text"] == body_text
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_prefilter_enforce_filters_cache_and_excludes_llm(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    low_text = "不相关内容 厨房技巧"
+    embedding = _CountingEmbeddingService(_prefilter_vectors(low_texts=[low_text]))
+    llm_service = _DynamicBatchLLMService()
+    database = Database(tmp_path / "prefilter-enforce.db")
+    database.initialize()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        database=database,
+        embedding_service=embedding,
+        eval_prefilter_mode="enforce",
+    )
+    profile = _build_profile()
+    filtered = DiscoveredContent(
+        bvid="BVFILTER",
+        title="不相关内容",
+        description="厨房技巧",
+        source_strategy="trending",
+    )
+    relevant = DiscoveredContent(
+        bvid="BVKEEP",
+        title="匹配内容",
+        description="深度纪录片解析",
+        source_strategy="trending",
+    )
+
+    with caplog.at_level("INFO", logger="openbiliclaw.discovery.engine"):
+        scores = await engine.evaluate_content_batch([filtered, relevant], profile, batch_size=2)
+
+    assert scores == [0.05, 0.8]
+    assert filtered.relevance_score == 0.05
+    assert filtered.relevance_reason == ""
+    assert len(llm_service.user_inputs) == 1
+    llm_items = _batch_prompt_items(llm_service.user_inputs[0])
+    assert [(item["id"], item["title"]) for item in llm_items] == [("0", "匹配内容")]
+
+    profile_digest = engine._evaluation_profile_digest(profile)
+    negative_digest = engine._negative_examples_digest(None)
+    cache_key = engine._batch_eval_cache_key(
+        filtered,
+        profile_digest=profile_digest,
+        negative_digest=negative_digest,
+    )
+    cached = engine._get_eval_cache_entry(cache_key)
+    assert cached is not None
+    assert cached[:2] == (0.05, "")
+    assert database.prefilter_shadow_audit_counts() == {
+        "total": 2,
+        "joined": 1,
+        "incomplete": 1,
+    }
+    assert any(
+        "eval_batch embedding prefilter" in record.message
+        and "in=2" in record.message
+        and "prefiltered=1" in record.message
+        and "to_llm=1" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_enforce_prefilter_keeps_cold_and_warm_style_caps_identical(
+    tmp_path: Path,
+) -> None:
+    llm_service = _DynamicBatchLLMService()
+    database = Database(tmp_path / "prefilter-style-caps.db")
+    database.initialize()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        database=database,
+        embedding_service=_CountingEmbeddingService(_prefilter_vectors(low_texts=["候选 0"])),
+        eval_prefilter_mode="enforce",
+    )
+
+    def candidates() -> list[DiscoveredContent]:
+        return [
+            DiscoveredContent(
+                bvid="BVPREFILTER" if index == 0 else f"BVSTYLE{index}",
+                title=f"候选 {index}",
+                source_strategy="trending",
+            )
+            for index in range(11)
+        ]
+
+    cold = candidates()
+    cold_scores = await engine.evaluate_content_batch(cold, _build_profile(), batch_size=10)
+    warm = candidates()
+    warm_scores = await engine.evaluate_content_batch(warm, _build_profile(), batch_size=10)
+
+    assert cold_scores == [0.05, *([0.8] * 8), 0.0, 0.8]
+    assert warm_scores == cold_scores
+    assert len(llm_service.user_inputs) == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_evaluation_empty_metadata_clears_stale_object_values_on_cold_and_warm() -> (
+    None
+):
+    class _EmptyMetadataBatchLLMService(_DynamicBatchLLMService):
+        async def complete_structured_task(self, **kwargs: object) -> object:
+            user_input = str(kwargs["user_input"])
+            self.user_inputs.append(user_input)
+            items = _batch_prompt_items(user_input)
+            local_ids = _batch_prompt_uses_local_ids(user_input)
+            identity_field = "id" if local_ids else "content_id"
+            return _SlowResponse(
+                json.dumps(
+                    [
+                        {
+                            identity_field: (
+                                item.get("id")
+                                if local_ids
+                                else item.get("content_id") or item.get("bvid")
+                            ),
+                            "score": 0.8,
+                            "reason": "内部诊断",
+                            "topic_group": "",
+                            "style_key": "",
+                            "franchise_key": "",
+                        }
+                        for item in items
+                    ],
+                    ensure_ascii=False,
+                )
+            )
+
+    llm_service = _EmptyMetadataBatchLLMService()
+    engine = ContentDiscoveryEngine(llm_service=llm_service)
+
+    def stale_candidate() -> DiscoveredContent:
+        return DiscoveredContent(
+            bvid="BVCLEAR",
+            title="无分类候选",
+            source_strategy="trending",
+            topic_group="stale-topic",
+            style_key="deep_dive",
+            franchise_key="stale-franchise",
+        )
+
+    cold = stale_candidate()
+    assert await engine.evaluate_content_batch([cold], _build_profile()) == [0.8]
+    assert (cold.topic_group, cold.style_key, cold.franchise_key) == ("", "", "")
+
+    warm = stale_candidate()
+    assert await engine.evaluate_content_batch([warm], _build_profile()) == [0.8]
+    assert (warm.topic_group, warm.style_key, warm.franchise_key) == ("", "", "")
+    assert len(llm_service.user_inputs) == 1
+
+
+@pytest.mark.asyncio
+async def test_embedding_prefilter_clamps_negative_cosine_to_zero() -> None:
+    profile = SoulProfile()
+    profile.preferences.interests = [InterestTag(name="正向兴趣", category="测试", weight=1.0)]
+    embedding = _CountingEmbeddingService(
+        {
+            "正向兴趣": [1.0, 0.0],
+            "反向内容 完全相反": [-1.0, 0.0],
+        }
+    )
+    engine = ContentDiscoveryEngine(
+        llm_service=_DynamicBatchLLMService(),
+        embedding_service=embedding,
+        eval_prefilter_mode="enforce",
+    )
+
+    filtered = await engine._embedding_prefilter(  # noqa: SLF001
+        [DiscoveredContent(bvid="BVNEG", title="反向内容", description="完全相反")],
+        profile,
+    )
+
+    assert filtered == {0: 0.0}
+
+
+@pytest.mark.asyncio
+async def test_embedding_prefilter_includes_long_tail_recall_interests() -> None:
+    profile = SoulProfile()
+    profile.preferences.interests = [
+        InterestTag(
+            name=f"头部兴趣{index}",
+            category="测试",
+            weight=1.0 - index / 1000,
+        )
+        for index in range(48)
+    ]
+    profile.preferences.interests.append(
+        InterestTag(name="第49项长尾", category="测试", weight=0.5)
+    )
+    vectors = {f"头部兴趣{index}": [1.0, 0.0] for index in range(48)}
+    vectors.update(
+        {
+            "第49项长尾": [0.0, 1.0],
+            "长尾命中 只匹配第49项": [0.0, 1.0],
+        }
+    )
+    engine = ContentDiscoveryEngine(
+        llm_service=_DynamicBatchLLMService(),
+        embedding_service=_CountingEmbeddingService(vectors),
+        eval_prefilter_mode="enforce",
+    )
+
+    filtered = await engine._embedding_prefilter(  # noqa: SLF001
+        [DiscoveredContent(bvid="BVTAIL", title="长尾命中", description="只匹配第49项")],
+        profile,
+    )
+
+    assert filtered == {}
+
+
+@pytest.mark.asyncio
+async def test_embedding_prefilter_required_set_matches_weight_ranked_top_256() -> None:
+    profile = SoulProfile()
+    profile.preferences.interests = [
+        InterestTag(name="排序外低权重", category="测试", weight=0.0),
+        *[
+            InterestTag(name=f"中权重兴趣{index}", category="测试", weight=0.5)
+            for index in range(255)
+        ],
+        InterestTag(name="末位高权重必需兴趣", category="测试", weight=1.0),
+    ]
+    vectors = {f"中权重兴趣{index}": [1.0, 0.0] for index in range(255)}
+    vectors["低相似候选 厨房技巧"] = _LOW_SIM_VEC
+    engine = ContentDiscoveryEngine(
+        llm_service=_DynamicBatchLLMService(),
+        embedding_service=_CountingEmbeddingService(vectors),
+        eval_prefilter_mode="enforce",
+    )
+
+    filtered = await engine._embedding_prefilter(  # noqa: SLF001
+        [DiscoveredContent(bvid="BVRANKED", title="低相似候选", description="厨房技巧")],
+        profile,
+    )
+
+    assert filtered == {}
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_prefilter_shadow_logs_but_sends_all(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    low_text = "不相关内容 厨房技巧"
+    embedding = _CountingEmbeddingService(_prefilter_vectors(low_texts=[low_text]))
+    llm_service = _DynamicBatchLLMService()
+    engine = ContentDiscoveryEngine(llm_service=llm_service, embedding_service=embedding)
+    content = DiscoveredContent(
+        bvid="BVSHADOW",
+        title="不相关内容",
+        description="厨房技巧",
+        source_strategy="trending",
+    )
+
+    with caplog.at_level("INFO", logger="openbiliclaw.discovery.engine"):
+        scores = await engine.evaluate_content_batch([content], _build_profile())
+
+    assert scores == [0.8]
+    assert content.relevance_score == 0.8
+    assert content.relevance_reason == "ok"
+    assert len(llm_service.user_inputs) == 1
+    assert _batch_prompt_items(llm_service.user_inputs[0])[0]["title"] == "不相关内容"
+    assert any(
+        "prefilter-shadow" in record.message
+        and "不相关内容" in record.message
+        and "max_sim=0.1000" in record.message
+        and "strategy=trending" in record.message
+        for record in caplog.records
+    )
+    assert any(
+        "eval_batch embedding prefilter" in record.message
+        and "would_filter=1" in record.message
+        and "to_llm=1" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_prefilter_off_still_sends_item_to_llm() -> None:
+    low_text = "不相关内容 厨房技巧"
+    embedding = _CountingEmbeddingService(_prefilter_vectors(low_texts=[low_text]))
+    llm_service = _DynamicBatchLLMService()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        embedding_service=embedding,
+        eval_prefilter_mode="off",
+    )
+
+    scores = await engine.evaluate_content_batch(
+        [
+            DiscoveredContent(
+                bvid="BVOFF",
+                title="不相关内容",
+                description="厨房技巧",
+                source_strategy="trending",
+            )
+        ],
+        _build_profile(),
+    )
+
+    assert scores == [0.8]
+    assert len(llm_service.user_inputs) == 1
+    assert _batch_prompt_items(llm_service.user_inputs[0])[0]["title"] == "不相关内容"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_prefilter_exempts_explore_in_enforce() -> None:
+    low_text = "跨域内容 厨房技巧"
+    embedding = _CountingEmbeddingService(_prefilter_vectors(low_texts=[low_text]))
+    llm_service = _DynamicBatchLLMService()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        embedding_service=embedding,
+        eval_prefilter_mode="enforce",
+    )
+    content = DiscoveredContent(
+        bvid="BVEXPLORE",
+        title="跨域内容",
+        description="厨房技巧",
+        source_strategy="explore",
+    )
+
+    scores = await engine.evaluate_content_batch([content], _build_profile())
+
+    assert scores == [0.8]
+    assert len(llm_service.user_inputs) == 1
+    assert _batch_prompt_items(llm_service.user_inputs[0])[0]["title"] == "跨域内容"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_prefilter_enforce_kill_rate_guard(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    low_texts = ["低相似 A 厨房技巧", "低相似 B 家务技巧"]
+    embedding = _CountingEmbeddingService(_prefilter_vectors(low_texts=low_texts))
+    llm_service = _DynamicBatchLLMService()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        embedding_service=embedding,
+        eval_prefilter_mode="enforce",
+    )
+    contents = [
+        DiscoveredContent(bvid="BVA", title="低相似 A", description="厨房技巧"),
+        DiscoveredContent(bvid="BVB", title="低相似 B", description="家务技巧"),
+        DiscoveredContent(bvid="BVC", title="匹配内容", description="深度纪录片解析"),
+    ]
+
+    with caplog.at_level("WARNING", logger="openbiliclaw.discovery.engine"):
+        scores = await engine.evaluate_content_batch(contents, _build_profile(), batch_size=3)
+
+    assert scores == [0.8, 0.8, 0.8]
+    assert len(llm_service.user_inputs) == 1
+    assert [item["title"] for item in _batch_prompt_items(llm_service.user_inputs[0])] == [
+        "低相似 A",
+        "低相似 B",
+        "匹配内容",
+    ]
+    assert any("embedding prefilter kill-rate guard" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_prefilter_skips_without_service_or_interests() -> None:
+    llm_without_service = _DynamicBatchLLMService()
+    engine_without_service = ContentDiscoveryEngine(
+        llm_service=llm_without_service,
+        eval_prefilter_mode="enforce",
+    )
+
+    scores_without_service = await engine_without_service.evaluate_content_batch(
+        [DiscoveredContent(bvid="BVNOSVC", title="不相关内容", description="厨房技巧")],
+        _build_profile(),
+    )
+
+    assert scores_without_service == [0.8]
+    assert len(llm_without_service.user_inputs) == 1
+
+    low_text = "不相关内容 厨房技巧"
+    embedding = _CountingEmbeddingService(_prefilter_vectors(low_texts=[low_text]))
+    llm_empty_interests = _DynamicBatchLLMService()
+    engine_empty_interests = ContentDiscoveryEngine(
+        llm_service=llm_empty_interests,
+        embedding_service=embedding,
+        eval_prefilter_mode="enforce",
+    )
+
+    scores_empty_interests = await engine_empty_interests.evaluate_content_batch(
+        [DiscoveredContent(bvid="BVEMPTY", title="不相关内容", description="厨房技巧")],
+        SoulProfile(),
+    )
+
+    assert scores_empty_interests == [0.8]
+    assert embedding.calls == []
+    assert len(llm_empty_interests.user_inputs) == 1
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_prefilter_item_embedding_failure_fails_open() -> None:
+    failing_text = "异常内容 厨房技巧"
+    embedding = _CountingEmbeddingService(
+        _prefilter_vectors(),
+        failures={failing_text},
+    )
+    llm_service = _DynamicBatchLLMService()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        embedding_service=embedding,
+        eval_prefilter_mode="enforce",
+    )
+
+    scores = await engine.evaluate_content_batch(
+        [
+            DiscoveredContent(
+                bvid="BVFAILOPEN",
+                title="异常内容",
+                description="厨房技巧",
+                source_strategy="trending",
+            )
+        ],
+        _build_profile(),
+    )
+
+    assert scores == [0.8]
+    assert len(llm_service.user_inputs) == 1
+    assert _batch_prompt_items(llm_service.user_inputs[0])[0]["title"] == "异常内容"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_prefilter_all_filtered_batch_of_one_skips_llm(
+    tmp_path: Path,
+) -> None:
+    low_text = "不相关内容 厨房技巧"
+    embedding = _CountingEmbeddingService(_prefilter_vectors(low_texts=[low_text]))
+    llm_service = _DynamicBatchLLMService()
+    database = Database(tmp_path / "prefilter-all-filtered.db")
+    database.initialize()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        database=database,
+        embedding_service=embedding,
+        eval_prefilter_mode="enforce",
+    )
+
+    scores = await engine.evaluate_content_batch(
+        [
+            DiscoveredContent(
+                bvid="BVONLY",
+                title="不相关内容",
+                description="厨房技巧",
+                source_strategy="trending",
+            )
+        ],
+        _build_profile(),
+    )
+
+    assert scores == [0.05]
+    assert llm_service.user_inputs == []
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_prefilter_shadow_single_path_uses_llm() -> None:
+    low_text = "不相关内容 厨房技巧"
+    embedding = _CountingEmbeddingService(_prefilter_vectors(low_texts=[low_text]))
+    llm_service = FakeLLMService('{"score": 0.84, "reason": "llm kept it"}')
+    engine = ContentDiscoveryEngine(llm_service=llm_service, embedding_service=embedding)
+    content = DiscoveredContent(
+        bvid="BVSINGLE",
+        title="不相关内容",
+        description="厨房技巧",
+        source_strategy="trending",
+    )
+
+    score = await engine.evaluate_content(content, _build_profile())
+
+    assert score == 0.84
+    assert content.relevance_reason == "llm kept it"
+    assert len(llm_service.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_prefilter_enforce_single_without_audit_sink_fails_open() -> None:
+    low_text = "不相关内容 厨房技巧"
+    llm_service = FakeLLMService('{"score": 0.84, "reason": "llm kept it"}')
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        embedding_service=_CountingEmbeddingService(_prefilter_vectors(low_texts=[low_text])),
+        eval_prefilter_mode="enforce",
+    )
+    content = DiscoveredContent(
+        bvid="BVSINGLEFAILOPEN",
+        title="不相关内容",
+        description="厨房技巧",
+        source_strategy="trending",
+    )
+
+    score = await engine.evaluate_content(content, _build_profile())
+
+    assert score == 0.84
+    assert content.relevance_reason == "llm kept it"
+    assert len(llm_service.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_prefilter_enforce_single_with_audit_sink_filters(
+    tmp_path: Path,
+) -> None:
+    low_text = "不相关内容 厨房技巧"
+    database = Database(tmp_path / "prefilter-single-enforce.db")
+    database.initialize()
+    llm_service = FakeLLMService('{"score": 0.84, "reason": "should not run"}')
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        database=database,
+        embedding_service=_CountingEmbeddingService(_prefilter_vectors(low_texts=[low_text])),
+        eval_prefilter_mode="enforce",
+    )
+    content = DiscoveredContent(
+        bvid="BVSINGLEFILTER",
+        title="不相关内容",
+        description="厨房技巧",
+        source_strategy="trending",
+    )
+
+    score = await engine.evaluate_content(content, _build_profile())
+
+    assert score == 0.05
+    assert llm_service.calls == []
+    assert database.prefilter_shadow_audit_counts() == {
+        "total": 1,
+        "joined": 0,
+        "incomplete": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -707,7 +1828,8 @@ async def test_multimodal_evaluation_uses_configured_smaller_batch_size() -> Non
 
     assert scores == [0.8, 0.8, 0.8, 0.8, 0.8]
     assert len(llm_service.user_inputs) == 3
-    assert [prompt.count('"content_id"') for prompt in llm_service.user_inputs] == [2, 2, 1]
+    assert [len(_batch_prompt_items(prompt)) for prompt in llm_service.user_inputs] == [2, 2, 1]
+    assert all("cover-" not in prompt for prompt in llm_service.user_inputs)
     assert engine.multimodal_unavailable_reason == ""
 
 
@@ -805,14 +1927,158 @@ async def test_multimodal_evaluation_sends_prepared_cover_images(monkeypatch) ->
     assert llm_service.image_inputs == [
         [
             {
-                "content_id": "cover-0",
+                "content_id": "0",
                 "data_url": "data:image/jpeg;base64,/9j/4AAQSkZJRg==",
                 "mime_type": "image/jpeg",
             }
         ]
     ]
-    assert '"cover_image_ref": "cover:cover-0"' in llm_service.user_inputs[0]
+    assert '"cover_image_ref":"cover:0"' in llm_service.user_inputs[0]
+    assert "cover-0" not in llm_service.user_inputs[0]
     assert llm_service.max_tokens == [4096]
+
+
+@pytest.mark.asyncio
+async def test_sparse_multimodal_evaluation_localizes_only_prepared_image_anchors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openbiliclaw.discovery.multimodal import PreparedCoverImage
+
+    prepared = [
+        PreparedCoverImage(
+            content_id="GLOBAL-C",
+            data_url="data:image/jpeg;base64,third",
+            mime_type="image/jpeg",
+        ),
+        PreparedCoverImage(
+            content_id="GLOBAL-A",
+            data_url="data:image/png;base64,first",
+            mime_type="image/png",
+        ),
+    ]
+
+    async def fake_prepare_cover_image_inputs(
+        *_args: object,
+        **_kwargs: object,
+    ) -> list[PreparedCoverImage]:
+        return prepared
+
+    monkeypatch.setattr(
+        "openbiliclaw.discovery.multimodal.prepare_cover_image_inputs",
+        fake_prepare_cover_image_inputs,
+    )
+
+    class _SparseMultimodalLLMService:
+        supports_image_input = True
+
+        def __init__(self) -> None:
+            self.user_inputs: list[str] = []
+            self.image_inputs: list[list[dict[str, str]]] = []
+
+        async def complete_structured_task(self, **_kwargs: object) -> object:
+            raise AssertionError("prepared images must use the multimodal evaluator")
+
+        async def complete_multimodal_structured_task(
+            self,
+            *,
+            system_instruction: str,
+            user_input: str,
+            image_inputs: list[dict[str, str]],
+            history: list[dict[str, str]] | None = None,
+            temperature: float = 0.7,
+            max_tokens: int = 4096,
+            caller: str = "",
+            reasoning_effort: str | None = None,
+        ) -> object:
+            self.user_inputs.append(user_input)
+            self.image_inputs.append(image_inputs)
+            envelope = _sparse_batch_prompt_envelope(user_input)
+            items = envelope["items"]
+            assert isinstance(items, list)
+            return _SlowResponse(
+                json.dumps(
+                    [
+                        {
+                            "id": str(index),
+                            "score": 0.7 + index / 100,
+                            "reason": "ok",
+                            "topic_group": "visual",
+                            "style_key": "aesthetic_browse",
+                            "franchise_key": "",
+                        }
+                        for index in range(len(items))
+                    ]
+                )
+            )
+
+    llm = _SparseMultimodalLLMService()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        evaluation_candidate_transport="sparse-json",
+        multimodal_evaluation_enabled=True,
+    )
+    contents = [
+        DiscoveredContent(
+            content_id="GLOBAL-A",
+            title="first",
+            author_name="u",
+            cover_url="https://example.com/a.jpg",
+            source_platform="youtube",
+            content_type="video",
+            source_strategy="search",
+        ),
+        DiscoveredContent(
+            content_id="GLOBAL-B",
+            title="text fallback",
+            author_name="u",
+            cover_url="https://example.com/b.jpg",
+            source_platform="youtube",
+            content_type="video",
+            source_strategy="search",
+        ),
+        DiscoveredContent(
+            content_id="GLOBAL-C",
+            title="third",
+            author_name="u",
+            cover_url="https://example.com/c.jpg",
+            source_platform="youtube",
+            content_type="video",
+            source_strategy="search",
+        ),
+    ]
+
+    scores = await engine._evaluate_batch(
+        contents,
+        _build_profile(),
+        normal_cache_enabled=False,
+        apply_batch_caps=False,
+    )
+
+    assert scores == [0.7, 0.71, 0.72]
+    envelope = _sparse_batch_prompt_envelope(llm.user_inputs[0])
+    items = envelope["items"]
+    assert isinstance(items, list)
+    assert items[0]["cover_image_ref"] == "cover:0"
+    assert "cover_image_ref" not in items[1]
+    assert items[2]["cover_image_ref"] == "cover:2"
+    assert llm.image_inputs == [
+        [
+            {
+                "content_id": "2",
+                "data_url": "data:image/jpeg;base64,third",
+                "mime_type": "image/jpeg",
+            },
+            {
+                "content_id": "0",
+                "data_url": "data:image/png;base64,first",
+                "mime_type": "image/png",
+            },
+        ]
+    ]
+    candidate_wire = json.dumps(envelope, ensure_ascii=False)
+    assert "GLOBAL-A" not in candidate_wire
+    assert "GLOBAL-B" not in candidate_wire
+    assert "GLOBAL-C" not in candidate_wire
 
 
 async def test_multimodal_evaluation_e2e_binds_cached_cover_to_content_id(
@@ -863,7 +2129,7 @@ async def test_multimodal_evaluation_e2e_binds_cached_cover_to_content_id(
                 content=json.dumps(
                     [
                         {
-                            "content_id": image_content_id,
+                            "id": "0",
                             "score": 0.81,
                             "reason": "封面和标题都指向视觉向内容，和画像匹配。",
                             "topic_group": "视觉分析",
@@ -871,7 +2137,7 @@ async def test_multimodal_evaluation_e2e_binds_cached_cover_to_content_id(
                             "franchise_key": "",
                         },
                         {
-                            "content_id": text_content_id,
+                            "id": "1",
                             "score": 0.42,
                             "reason": "纯文本候选只有正文线索，匹配度一般。",
                             "topic_group": "社交动态",
@@ -944,12 +2210,14 @@ async def test_multimodal_evaluation_e2e_binds_cached_cover_to_content_id(
         "image_url",
     ]
     user_text = str(user_parts[0]["text"])
-    content_batch = json.loads(
-        user_text.split("<content_batch>", 1)[1].split("</content_batch>", 1)[0].strip()
-    )
-    expected_ref = f"cover:{image_content_id}"
-    assert content_batch[0]["cover_image_ref"] == expected_ref
-    assert "cover_image_ref" not in content_batch[1]
+    content_batch = _sparse_batch_prompt_envelope(user_text)
+    items = content_batch["items"]
+    assert isinstance(items, list)
+    expected_ref = "cover:0"
+    assert items[0]["cover_image_ref"] == expected_ref
+    assert "cover_image_ref" not in items[1]
+    assert image_content_id not in user_text
+    assert text_content_id not in user_text
 
     assert user_parts[1] == {
         "type": "text",
@@ -2305,7 +3573,10 @@ async def test_evaluate_batch_accepts_fenced_json_without_single_eval_fallback()
             )
 
     llm_service = _FencedBatchLLMService()
-    engine = ContentDiscoveryEngine(llm_service=llm_service)
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        evaluation_candidate_transport="production",
+    )
     batch = [
         DiscoveredContent(bvid="BVF1", title="t1", up_name="u1", source_strategy="trending"),
         DiscoveredContent(bvid="BVF2", title="t2", up_name="u2", source_strategy="trending"),
@@ -2354,6 +3625,76 @@ async def test_evaluate_batch_propagates_provider_cooldown_without_single_fallba
 
 
 @pytest.mark.asyncio
+async def test_evaluate_content_batch_splits_once_after_first_parse_failure() -> None:
+    llm_service = _SplitRetryBatchLLMService(invalid_batch_calls={1})
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        evaluation_candidate_transport="production",
+    )
+    contents = _split_retry_contents(45, prefix="SPLIT")
+
+    scores = await engine.evaluate_content_batch(contents, _build_profile(), batch_size=45)
+
+    assert llm_service.batch_call_sizes == [45, 22, 23]
+    assert llm_service.single_calls == 0
+    assert scores == [0.73] * 45
+    assert all(content.relevance_score == 0.73 for content in contents)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_persistent_parse_failure_bounded_retry_zeroes() -> None:
+    llm_service = _SplitRetryBatchLLMService(invalid_all_batches=True)
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        evaluation_candidate_transport="production",
+    )
+    contents = _split_retry_contents(16, prefix="FAIL")
+
+    scores = await engine.evaluate_content_batch(contents, _build_profile(), batch_size=16)
+
+    # Missing-member retry is bounded (1 initial + max_extra_requests) and
+    # never degrades into a per-item single-call storm; exhausted members
+    # settle at 0.0 with an explicit reason.
+    assert llm_service.batch_call_sizes[0] == 16
+    assert len(llm_service.batch_call_sizes) == 7
+    assert llm_service.single_calls == 0
+    assert scores == [0.0] * 16
+    assert all(c.relevance_reason == "evaluation_response_missing" for c in contents)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_rate_limit_propagates_without_split_retry() -> None:
+    llm_service = _SplitRetryBatchLLMService(rate_limit_batch_calls={1})
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        evaluation_candidate_transport="production",
+    )
+    contents = _split_retry_contents(16, prefix="LIMIT")
+
+    with pytest.raises(LLMProviderExecutionError):
+        await engine.evaluate_content_batch(contents, _build_profile(), batch_size=16)
+
+    assert llm_service.batch_call_sizes == [16]
+    assert llm_service.single_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_splits_idless_count_mismatch() -> None:
+    llm_service = _SplitRetryBatchLLMService(count_mismatch_batch_calls={1})
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        evaluation_candidate_transport="production",
+    )
+    contents = _split_retry_contents(45, prefix="COUNT")
+
+    scores = await engine.evaluate_content_batch(contents, _build_profile(), batch_size=45)
+
+    assert llm_service.batch_call_sizes == [45, 22, 23]
+    assert llm_service.single_calls == 0
+    assert scores == [0.73] * 45
+
+
+@pytest.mark.asyncio
 async def test_evaluate_batch_ignores_echoed_prompt_before_result_array() -> None:
     """Some JSON-mode providers echo input JSON before the actual scored array."""
 
@@ -2389,7 +3730,10 @@ async def test_evaluate_batch_ignores_echoed_prompt_before_result_array() -> Non
             )
 
     llm_service = _EchoThenResultLLMService()
-    engine = ContentDiscoveryEngine(llm_service=llm_service)
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        evaluation_candidate_transport="production",
+    )
     batch = [
         DiscoveredContent(bvid="BVE1", title="t1", up_name="u1", source_strategy="trending"),
         DiscoveredContent(bvid="BVE2", title="t2", up_name="u2", source_strategy="trending"),
@@ -2444,7 +3788,10 @@ async def test_evaluate_batch_matches_results_by_bvid_when_response_reorders() -
                 )
             )
 
-    engine = ContentDiscoveryEngine(llm_service=_ReorderedBatchLLMService())
+    engine = ContentDiscoveryEngine(
+        llm_service=_ReorderedBatchLLMService(),
+        evaluation_candidate_transport="production",
+    )
     batch = [
         DiscoveredContent(bvid="BV_EVAL_A", title="A 视频", source_strategy="trending"),
         DiscoveredContent(bvid="BV_EVAL_B", title="B 视频", source_strategy="trending"),
@@ -2458,8 +3805,126 @@ async def test_evaluate_batch_matches_results_by_bvid_when_response_reorders() -
     assert batch[0].topic_group == "A 类"
     assert batch[1].relevance_reason == "B 自己的理由"
     assert batch[1].topic_group == "B 类"
-    assert batch[2].relevance_reason == "C 自己的理由"
+    assert batch[2].relevance_reason == ""
     assert batch[2].topic_group == "C 类"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_batch_normalizes_reason_before_caching_it() -> None:
+    """Runtime enforces the reason diet even when model output ignores the prompt."""
+
+    class _EmptyReasonLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete_structured_task(self, *, user_input: str, **kwargs: object) -> object:
+            self.calls += 1
+            return _SlowResponse(
+                json.dumps(
+                    [
+                        # A low-score reason is discarded even when the model emits one.
+                        {
+                            "bvid": "BV_EMPTY",
+                            "score": 0.31,
+                            "reason": "这段低分诊断不应被保留",
+                            "style_key": "deep_dive",
+                        },
+                        # missing reason key entirely — parser must still tolerate it
+                        {"bvid": "BV_MISSING", "score": 0.2, "style_key": "deep_dive"},
+                        # A high-score reason is stripped and capped at 30 code points.
+                        {
+                            "bvid": "BV_KEPT",
+                            "score": 0.72,
+                            "reason": "  " + ("长" * 35) + "  ",
+                            "style_key": "deep_dive",
+                        },
+                    ],
+                    ensure_ascii=False,
+                )
+            )
+
+    llm = _EmptyReasonLLM()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        evaluation_candidate_transport="production",
+    )
+    batch = [
+        DiscoveredContent(bvid="BV_EMPTY", title="空理由", source_strategy="trending"),
+        DiscoveredContent(bvid="BV_MISSING", title="缺理由", source_strategy="trending"),
+        DiscoveredContent(bvid="BV_KEPT", title="入池", source_strategy="trending"),
+    ]
+    profile = _build_profile()
+
+    scores = await engine._evaluate_batch(batch, profile)
+
+    assert scores == [0.31, 0.2, 0.72]
+    assert batch[0].relevance_reason == ""
+    assert batch[1].relevance_reason == ""
+    assert batch[2].relevance_reason == "长" * 30
+    assert llm.calls == 1
+
+    # The empty/missing-reason items are valid eval cache entries — reading the
+    # stored tuple back must yield an empty reason string (not a rejected or
+    # coerced value), so a later ``evaluate_content_batch`` pass reuses them.
+    profile_digest = engine._evaluation_profile_digest(profile)
+    negative_digest = engine._negative_examples_digest(None)
+    for content, expected_reason in (
+        (batch[0], ""),
+        (batch[1], ""),
+        (batch[2], "长" * 30),
+    ):
+        cache_key = engine._batch_eval_cache_key(
+            content,
+            profile_digest=profile_digest,
+            negative_digest=negative_digest,
+        )
+        cached = engine._get_eval_cache_entry(cache_key)
+        assert cached is not None
+        assert cached[1] == expected_reason
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_normalizes_reason_before_caching_it() -> None:
+    profile = _build_profile()
+
+    high_llm = FakeLLMService(
+        json.dumps(
+            {
+                "score": 0.5,
+                "reason": "  " + ("好" * 35) + "  ",
+                "topic_group": "systems",
+                "style_key": "deep_dive",
+            },
+            ensure_ascii=False,
+        )
+    )
+    high_engine = ContentDiscoveryEngine(llm_service=high_llm, eval_prefilter_mode="off")
+
+    def high_candidate() -> DiscoveredContent:
+        return DiscoveredContent(
+            bvid="BV_SINGLE_REASON_HIGH",
+            title="高分理由边界",
+            source_strategy="search",
+        )
+
+    first = high_candidate()
+    cached_copy = high_candidate()
+    assert await high_engine.evaluate_content(first, profile) == 0.5
+    assert await high_engine.evaluate_content(cached_copy, _build_profile()) == 0.5
+    assert first.relevance_reason == "好" * 30
+    assert cached_copy.relevance_reason == "好" * 30
+    assert len(high_llm.calls) == 1
+
+    low_llm = FakeLLMService('{"score": 0.49, "reason": "模型不应保留这段低分诊断"}')
+    low_engine = ContentDiscoveryEngine(llm_service=low_llm, eval_prefilter_mode="off")
+    low = DiscoveredContent(
+        bvid="BV_SINGLE_REASON_LOW",
+        title="低分理由边界",
+        source_strategy="search",
+    )
+
+    assert await low_engine.evaluate_content(low, profile) == 0.49
+    assert low.relevance_reason == ""
 
 
 @pytest.mark.asyncio
@@ -2489,7 +3954,10 @@ async def test_evaluate_batch_retries_only_missing_keyed_members() -> None:
             )
 
     llm = _PartialLLM()
-    engine = ContentDiscoveryEngine(llm_service=llm)
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        evaluation_candidate_transport="production",
+    )
     batch = [
         DiscoveredContent(bvid=key, title=key, source_strategy="trending")
         for key in ("A", "B", "C", "D")
@@ -2519,7 +3987,10 @@ async def test_evaluate_batch_retries_duplicate_key_without_overwriting_valid_si
             return _SlowResponse(json.dumps(payload))
 
     llm = _DuplicateKeyLLM()
-    engine = ContentDiscoveryEngine(llm_service=llm)
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        evaluation_candidate_transport="production",
+    )
     batch = [DiscoveredContent(bvid=key, title=key) for key in ("A", "B")]
     assert await engine._evaluate_batch(batch, _build_profile()) == [0.7, 0.8]
     assert llm.request_ids == [("A", "B"), ("A",)]
@@ -2557,7 +4028,10 @@ async def test_evaluate_batch_accepts_newline_delimited_json_objects() -> None:
             )
 
     llm_service = _NdjsonBatchLLMService()
-    engine = ContentDiscoveryEngine(llm_service=llm_service)
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        evaluation_candidate_transport="production",
+    )
     batch = [
         DiscoveredContent(bvid="BVN1", title="t1", up_name="u1", source_strategy="trending"),
         DiscoveredContent(bvid="BVN2", title="t2", up_name="u2", source_strategy="trending"),
@@ -2608,7 +4082,10 @@ async def test_evaluate_batch_accepts_identifier_keyed_object_response() -> None
             )
 
     llm_service = _KeyedObjectBatchLLMService()
-    engine = ContentDiscoveryEngine(llm_service=llm_service)
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        evaluation_candidate_transport="production",
+    )
     batch = [
         DiscoveredContent(bvid="BVKEY1", title="t1", up_name="u1", source_strategy="trending"),
         DiscoveredContent(bvid="BVKEY2", title="t2", up_name="u2", source_strategy="trending"),
@@ -2618,7 +4095,7 @@ async def test_evaluate_batch_accepts_identifier_keyed_object_response() -> None
 
     assert scores == [0.88, 0.42]
     assert batch[0].relevance_reason == "A reason"
-    assert batch[1].relevance_reason == "B reason"
+    assert batch[1].relevance_reason == ""
     assert llm_service.calls == 1
 
 
@@ -2635,6 +4112,9 @@ async def test_evaluate_batch_intra_batch_franchise_cap() -> None:
     import json
 
     class _FrancheseClumpLLMService:
+        def __init__(self) -> None:
+            self.calls = 0
+
         async def complete_structured_task(
             self,
             *,
@@ -2646,6 +4126,7 @@ async def test_evaluate_batch_intra_batch_franchise_cap() -> None:
             caller: str = "",
             reasoning_effort: str | None = None,
         ) -> object:
+            self.calls += 1
             # 6 items, all "张雪机车" franchise, with descending scores.
             results = [
                 {
@@ -2659,17 +4140,25 @@ async def test_evaluate_batch_intra_batch_franchise_cap() -> None:
             ]
             return _SlowResponse(json.dumps(results, ensure_ascii=False))
 
-    engine = ContentDiscoveryEngine(llm_service=_FrancheseClumpLLMService())
-    batch = [
-        DiscoveredContent(
-            bvid=f"BVZX{i}",
-            title=f"张雪机车第{i}集",
-            up_name="张雪机车",
-            description="d",
-            source_strategy="related_chain",
-        )
-        for i in range(6)
-    ]
+    llm = _FrancheseClumpLLMService()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        evaluation_candidate_transport="production",
+    )
+
+    def candidates() -> list[DiscoveredContent]:
+        return [
+            DiscoveredContent(
+                bvid=f"BVZX{i}",
+                title=f"张雪机车第{i}集",
+                up_name="张雪机车",
+                description="d",
+                source_strategy="related_chain",
+            )
+            for i in range(6)
+        ]
+
+    batch = candidates()
 
     scores = await engine._evaluate_batch(batch, _build_profile())
 
@@ -2682,6 +4171,83 @@ async def test_evaluate_batch_intra_batch_franchise_cap() -> None:
     zero_indices = [i for i, s in enumerate(scores) if s == 0.0]
     for idx in zero_indices:
         assert batch[idx].relevance_score == 0.0
+        assert batch[idx].relevance_reason == ""
+
+    # Cache entries retain raw per-item model scores, then reapply the current
+    # sibling-dependent cap. A full cache hit must not resurrect the overflow.
+    cached_batch = candidates()
+    cached_scores = await engine.evaluate_content_batch(
+        cached_batch,
+        _build_profile(),
+        batch_size=6,
+    )
+    assert cached_scores == scores
+    assert llm.calls == 1
+    assert sum(score > 0 for score in cached_scores) == 4
+    assert all(
+        cached_batch[index].relevance_reason == ""
+        for index, score in enumerate(cached_scores)
+        if score == 0.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_evaluate_batch_reapplies_style_cap_on_full_cache_hit() -> None:
+    class _StyleClumpLLMService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete_structured_task(self, **_kwargs: object) -> object:
+            self.calls += 1
+            return _SlowResponse(
+                json.dumps(
+                    [
+                        {
+                            "score": 0.99 - index * 0.01,
+                            "reason": "高分内部诊断",
+                            "topic_group": "剧情",
+                            "style_key": "story_immersion",
+                            "franchise_key": "",
+                        }
+                        for index in range(10)
+                    ],
+                    ensure_ascii=False,
+                )
+            )
+
+    llm = _StyleClumpLLMService()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        evaluation_candidate_transport="production",
+    )
+
+    def candidates() -> list[DiscoveredContent]:
+        return [
+            DiscoveredContent(
+                bvid=f"BVSTYLE{index}",
+                title=f"剧情内容 {index}",
+                source_strategy="trending",
+            )
+            for index in range(10)
+        ]
+
+    first = candidates()
+    first_scores = await engine.evaluate_content_batch(first, _build_profile(), batch_size=10)
+    cached = candidates()
+    cached_scores = await engine.evaluate_content_batch(
+        cached,
+        _build_profile(),
+        batch_size=10,
+    )
+
+    assert sum(score > 0 for score in first_scores) == 8
+    assert cached_scores == first_scores
+    assert llm.calls == 1
+    assert all(
+        cached[index].relevance_reason == ""
+        for index, score in enumerate(cached_scores)
+        if score == 0.0
+    )
 
 
 def test_count_pool_by_franchise_returns_lowercased_groups(tmp_path: Path) -> None:
@@ -2833,7 +4399,429 @@ class _RecordingBatchKwargsLLMService(_RecordingBatchLLMService):
 
 
 @pytest.mark.asyncio
-async def test_evaluate_batch_sends_per_item_platform_metadata() -> None:
+async def test_sparse_evaluation_uses_private_local_ids_and_binds_reordered_results() -> None:
+    llm = _RecordingBatchLLMService(
+        response=json.dumps(
+            [
+                {
+                    "id": "1",
+                    "score": 0.83,
+                    "reason": "second",
+                    "topic_group": "life",
+                    "style_key": "daily_wander",
+                    "franchise_key": "",
+                },
+                {
+                    "id": "0",
+                    "score": 0.61,
+                    "reason": "first",
+                    "topic_group": "tech",
+                    "style_key": "deep_focus",
+                    "franchise_key": "",
+                },
+            ],
+            ensure_ascii=False,
+        )
+    )
+    engine = ContentDiscoveryEngine(llm_service=llm)
+    assert engine.evaluation_candidate_transport == "sparse-json"
+    assert engine.evaluation_candidate_transport == _DEFAULT_EVALUATION_CANDIDATE_TRANSPORT
+    contents = [
+        DiscoveredContent(
+            bvid="BV-PRIVATE-A",
+            content_id="GLOBAL-PRIVATE-A",
+            content_url="https://example.com/private-a",
+            title="First candidate",
+            up_name="duplicate author A",
+            author_name="author A",
+            source_platform="bilibili",
+            content_type="video",
+            source_strategy="search",
+        ),
+        DiscoveredContent(
+            content_id="GLOBAL-PRIVATE-B",
+            content_url="https://example.com/private-b",
+            title="Second candidate",
+            author_name="author B",
+            source_platform="twitter",
+            content_type="thread",
+            source_strategy="feed",
+        ),
+    ]
+
+    scores = await engine._evaluate_batch(
+        contents,
+        _build_profile(),
+        source_context="mixed",
+        normal_cache_enabled=False,
+        apply_batch_caps=False,
+    )
+
+    assert scores == [0.61, 0.83]
+    assert contents[0].relevance_reason == "first"
+    assert contents[1].relevance_reason == "second"
+    envelope = _sparse_batch_prompt_envelope(llm.user_inputs[0])
+    assert envelope["defaults"] == {"mode": "normal"}
+    assert envelope["items"] == [
+        {
+            "author": "author A",
+            "content_type": "video",
+            "id": "0",
+            "source_platform": "bilibili",
+            "title": "First candidate",
+        },
+        {
+            "author": "author B",
+            "content_type": "thread",
+            "id": "1",
+            "source_platform": "twitter",
+            "title": "Second candidate",
+        },
+    ]
+    candidate_wire = json.dumps(envelope, ensure_ascii=False)
+    for private_value in (
+        "BV-PRIVATE-A",
+        "GLOBAL-PRIVATE-A",
+        "GLOBAL-PRIVATE-B",
+        "https://",
+        "content_url",
+        "source_strategy",
+        "up_name",
+    ):
+        assert private_value not in candidate_wire
+
+
+@pytest.mark.asyncio
+async def test_row_wire_evaluation_uses_the_same_canonical_local_id_contract() -> None:
+    from openbiliclaw.llm.evaluation_wire import decode_evaluation_row_wire
+
+    class _RowWireLLMService:
+        def __init__(self) -> None:
+            self.candidate_blocks: list[str] = []
+            self.system_instructions: list[str] = []
+
+        async def complete_structured_task(
+            self,
+            *,
+            system_instruction: str,
+            user_input: str,
+            history: list[dict[str, str]] | None = None,
+            temperature: float = 0.7,
+            max_tokens: int = 4096,
+            caller: str = "",
+            reasoning_effort: str | None = None,
+        ) -> object:
+            candidate_block = (
+                user_input.split("<content_batch>", 1)[1]
+                .split(
+                    "</content_batch>",
+                    1,
+                )[0]
+                .removeprefix("\n\n")
+                .removesuffix("\n\n")
+            )
+            envelope = decode_evaluation_row_wire(candidate_block)
+            items = envelope["items"]
+            assert isinstance(items, list)
+            self.candidate_blocks.append(candidate_block)
+            self.system_instructions.append(system_instruction)
+            return _SlowResponse(
+                json.dumps(
+                    [
+                        {
+                            "id": str(index),
+                            "score": 0.76,
+                            "reason": "ok",
+                            "topic_group": "tech",
+                            "style_key": "deep_focus",
+                            "franchise_key": "",
+                        }
+                        for index in range(len(items))
+                    ]
+                )
+            )
+
+    llm = _RowWireLLMService()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        evaluation_candidate_transport="row-wire-v1",
+    )
+
+    scores = await engine._evaluate_batch(
+        [
+            DiscoveredContent(
+                content_id="GLOBAL-ROW-PRIVATE",
+                content_url="https://example.com/private-row",
+                title="row candidate",
+                author_name="author",
+                source_platform="twitter",
+                content_type="thread",
+                source_strategy="search",
+            )
+        ],
+        _build_profile(),
+        normal_cache_enabled=False,
+        apply_batch_caps=False,
+    )
+
+    assert scores == [0.76]
+    assert llm.candidate_blocks[0].startswith("ROW-WIRE-V1\n")
+    assert "GLOBAL-ROW-PRIVATE" not in llm.candidate_blocks[0]
+    assert "https://" not in llm.candidate_blocks[0]
+    assert "ROW-WIRE-V1" in llm.system_instructions[0]
+
+
+@pytest.mark.asyncio
+async def test_sparse_evaluation_repairs_multi_member_results_without_ids() -> None:
+    class _IdlessThenSingletonLLMService:
+        def __init__(self) -> None:
+            self.call_sizes: list[int] = []
+            self.ids_by_call: list[list[str]] = []
+
+        async def complete_structured_task(
+            self,
+            *,
+            system_instruction: str,
+            user_input: str,
+            history: list[dict[str, str]] | None = None,
+            temperature: float = 0.7,
+            max_tokens: int = 4096,
+            caller: str = "",
+            reasoning_effort: str | None = None,
+        ) -> object:
+            envelope = _sparse_batch_prompt_envelope(user_input)
+            items = envelope["items"]
+            assert isinstance(items, list)
+            self.call_sizes.append(len(items))
+            self.ids_by_call.append([str(item["id"]) for item in items if isinstance(item, dict)])
+            if len(items) > 1:
+                # Equal-length positional-looking output must not bind.
+                return _SlowResponse(
+                    json.dumps(
+                        [
+                            {
+                                "score": 0.99,
+                                "reason": "wrong positional first",
+                                "topic_group": "wrong",
+                                "style_key": "deep_focus",
+                                "franchise_key": "",
+                            },
+                            {
+                                "score": 0.01,
+                                "reason": "",
+                                "topic_group": "wrong",
+                                "style_key": "deep_focus",
+                                "franchise_key": "",
+                            },
+                        ]
+                    )
+                )
+            item = items[0]
+            assert isinstance(item, dict)
+            score = 0.62 if item["title"] == "first" else 0.84
+            return _SlowResponse(
+                json.dumps(
+                    [
+                        {
+                            "id": "0",
+                            "score": score,
+                            "reason": "repaired",
+                            "topic_group": "valid",
+                            "style_key": "deep_focus",
+                            "franchise_key": "",
+                        }
+                    ]
+                )
+            )
+
+    llm = _IdlessThenSingletonLLMService()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        evaluation_candidate_transport="sparse-json",
+    )
+
+    scores = await engine._evaluate_batch(
+        [
+            DiscoveredContent(
+                bvid="BVrepair0",
+                title="first",
+                up_name="u",
+                source_strategy="search",
+            ),
+            DiscoveredContent(
+                bvid="BVrepair1",
+                title="second",
+                up_name="u",
+                source_strategy="search",
+            ),
+        ],
+        _build_profile(),
+        normal_cache_enabled=False,
+        apply_batch_caps=False,
+    )
+
+    assert scores == [0.62, 0.84]
+    assert llm.call_sizes == [2, 1, 1]
+    assert llm.ids_by_call == [["0", "1"], ["0"], ["0"]]
+
+
+def test_sparse_evaluation_is_the_v3_cache_default_with_explicit_rollback_seams() -> None:
+    default_engine = ContentDiscoveryEngine()
+    explicit_production_engine = ContentDiscoveryEngine(evaluation_candidate_transport="production")
+    sparse_engine = ContentDiscoveryEngine(evaluation_candidate_transport="sparse-json")
+    row_engine = ContentDiscoveryEngine(evaluation_candidate_transport="row-wire-v1")
+
+    def content(
+        *,
+        bvid: str = "BVcache-transport",
+        content_id: str = "",
+        content_url: str = "https://example.com/a",
+        cover_url: str = "https://example.com/cover-a",
+        body_text: str = "body",
+        view_count: int = 10,
+        source_strategy: str = "search",
+    ) -> DiscoveredContent:
+        return DiscoveredContent(
+            bvid=bvid,
+            content_id=content_id,
+            content_url=content_url,
+            cover_url=cover_url,
+            title="candidate",
+            up_name="u",
+            body_text=body_text,
+            view_count=view_count,
+            source_strategy=source_strategy,
+        )
+
+    kwargs = {
+        "profile_digest": "profile",
+        "negative_digest": "negative",
+        "source_context": "",
+    }
+
+    default_key = default_engine._batch_eval_cache_key(content(), **kwargs)
+    explicit_production_key = explicit_production_engine._batch_eval_cache_key(
+        content(),
+        **kwargs,
+    )
+    sparse_key = sparse_engine._batch_eval_cache_key(content(), **kwargs)
+    row_key = row_engine._batch_eval_cache_key(content(), **kwargs)
+
+    assert _DEFAULT_EVALUATION_CANDIDATE_TRANSPORT == "sparse-json"
+    assert default_engine.evaluation_candidate_transport == "sparse-json"
+    assert default_key == sparse_key
+    assert default_key.startswith("content-eval-v3:batch:")
+    assert default_key.endswith(":transport:sparse-json")
+    assert explicit_production_key.startswith("content-eval-v3:batch:")
+    assert ":transport:" not in explicit_production_key
+    assert explicit_production_key != default_key
+    assert row_key.endswith(":transport:row-wire-v1")
+    assert sparse_key.removesuffix(":transport:sparse-json") == row_key.removesuffix(
+        ":transport:row-wire-v1"
+    )
+
+    missing_attribute_engine = ContentDiscoveryEngine()
+    del missing_attribute_engine.evaluation_candidate_transport
+    assert missing_attribute_engine._batch_eval_cache_key(content(), **kwargs) == default_key
+
+    single_key = default_engine._single_eval_cache_key(
+        content(),
+        profile_digest="profile",
+    )
+    assert single_key.startswith("content-eval-v3:single:")
+    old_batch_key = default_key.replace("content-eval-v3:", "content-eval-v2:", 1)
+    default_engine._set_eval_cache_entry(
+        old_batch_key,
+        (0.9, "old", "old", "deep_focus", ""),
+    )
+    assert default_engine._get_eval_cache_entry(default_key) is None
+
+    changed_global_identity = content(
+        bvid="BVdifferent-global-id",
+        content_id="different-global-content-id",
+    )
+    assert default_engine._batch_eval_cache_key(changed_global_identity, **kwargs) == default_key
+    assert row_engine._batch_eval_cache_key(changed_global_identity, **kwargs) == row_key
+    assert (
+        explicit_production_engine._batch_eval_cache_key(
+            changed_global_identity,
+            **kwargs,
+        )
+        != explicit_production_key
+    )
+
+    changed_runtime_urls_key = sparse_engine._batch_eval_cache_key(
+        content(
+            content_url="https://different.example/item",
+            cover_url="https://different.example/cover",
+        ),
+        **kwargs,
+    )
+    assert changed_runtime_urls_key == sparse_key
+    assert (
+        sparse_engine._batch_eval_cache_key(
+            content(body_text="different body"),
+            **kwargs,
+        )
+        != sparse_key
+    )
+    assert (
+        sparse_engine._batch_eval_cache_key(
+            content(view_count=11),
+            **kwargs,
+        )
+        != sparse_key
+    )
+    assert (
+        sparse_engine._batch_eval_cache_key(
+            content(source_strategy="explore"),
+            **kwargs,
+        )
+        != sparse_key
+    )
+
+
+def test_sparse_normal_cache_requires_homogeneous_content_types() -> None:
+    contents = [
+        DiscoveredContent(
+            bvid="BVtype0",
+            title="video",
+            content_type="video",
+            source_strategy="search",
+        ),
+        DiscoveredContent(
+            bvid="BVtype1",
+            title="thread",
+            content_type="thread",
+            source_strategy="search",
+        ),
+    ]
+
+    assert ContentDiscoveryEngine(
+        evaluation_candidate_transport="production"
+    )._batch_normal_cache_eligible(
+        contents,
+        source_context="",
+    )
+    assert not ContentDiscoveryEngine()._batch_normal_cache_eligible(
+        contents,
+        source_context="",
+    )
+    assert not ContentDiscoveryEngine(
+        evaluation_candidate_transport="sparse-json"
+    )._batch_normal_cache_eligible(contents, source_context="")
+    assert not ContentDiscoveryEngine(
+        evaluation_candidate_transport="row-wire-v1"
+    )._batch_normal_cache_eligible(contents, source_context="")
+
+
+def test_evaluation_candidate_transport_rejects_unknown_values() -> None:
+    with pytest.raises(ValueError, match="unsupported evaluation candidate transport"):
+        ContentDiscoveryEngine(evaluation_candidate_transport="row-wire-v0")
+
+
+@pytest.mark.asyncio
+async def test_explicit_production_rollback_sends_historical_platform_metadata() -> None:
     llm = _RecordingBatchLLMService(
         response=json.dumps(
             [
@@ -2854,19 +4842,25 @@ async def test_evaluate_batch_sends_per_item_platform_metadata() -> None:
             ]
         )
     )
-    engine = ContentDiscoveryEngine(llm_service=llm)
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        evaluation_candidate_transport="production",
+    )
+    assert engine.evaluation_candidate_transport == "production"
 
     await engine._evaluate_batch(
         [
             DiscoveredContent(
                 bvid="BV1",
                 title="Bili",
+                published_at="2026-08-02T08:00:00+00:00",
                 source_platform="bilibili",
                 source_strategy="search",
             ),
             DiscoveredContent(
                 content_id="xhs1",
                 title="XHS",
+                published_at="",
                 source_platform="xiaohongshu",
                 source_strategy="xhs-extension-search",
                 content_url="https://www.xiaohongshu.com/explore/xhs1",
@@ -2877,8 +4871,16 @@ async def test_evaluate_batch_sends_per_item_platform_metadata() -> None:
     )
 
     user = llm.user_inputs[-1]
+    candidate_block = user.split("<content_batch>", 1)[1].split("</content_batch>", 1)[0]
+    assert candidate_block.startswith("\n\n[\n  {")
+    assert '"bvid": "BV1"' in candidate_block
+    assert '"content_id": "xhs1"' in candidate_block
+    assert '"defaults"' not in candidate_block
     assert '"source_platform": "bilibili"' in user
     assert '"source_platform": "xiaohongshu"' in user
+    assert '"published_at": "2026-08-02T08:00:00+00:00"' in user
+    assert '"published_at": ""' in user
+    assert '"evaluated_at": "' in user
     assert '"source_strategy": "xhs-extension-search"' in user
     assert '"content_type": "note"' in user
     assert "<source_platform>\n\nmixed\n\n</source_platform>" in user
@@ -2905,13 +4907,13 @@ def _json_prompt_block(user_input: str, tag: str) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_evaluate_batch_uses_layered_profile_prompt_with_full_interests() -> None:
+async def test_evaluate_batch_uses_layered_profile_prompt_with_compacted_interests() -> None:
     llm = _RecordingBatchLLMService()
     engine = ContentDiscoveryEngine(llm_service=llm)
     profile = _build_profile()
     profile.preferences.interests = [
         InterestTag(name=f"兴趣{index}", category="测试", weight=1.0 - index / 1000)
-        for index in range(80)
+        for index in range(110)
     ]
 
     await engine._evaluate_batch(
@@ -2932,8 +4934,43 @@ async def test_evaluate_batch_uses_layered_profile_prompt_with_full_interests() 
     profile_interests = _json_prompt_block(user_input, "profile_interests")
     interests = profile_interests["interests"]
     assert isinstance(interests, list)
-    assert len(interests) == 80
-    assert interests[-1]["name"] == "兴趣79"
+    assert len(interests) == 48
+    assert interests[-1]["name"] == "兴趣47"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_batch_compact_json_minifies_profile_and_content_blocks() -> None:
+    llm = _RecordingBatchLLMService()
+    engine = ContentDiscoveryEngine(llm_service=llm, compact_evaluation_json=True)
+
+    await engine._evaluate_batch(
+        [
+            DiscoveredContent(
+                bvid="BVcompact",
+                title="保留 标题 内部 空格",
+                up_name="u",
+                source_strategy="search",
+            )
+        ],
+        _build_profile(),
+    )
+
+    user_input = llm.user_inputs[0]
+    for tag in (
+        "profile_core",
+        "profile_life_context",
+        "profile_interests",
+        "profile_style_context",
+        "profile_recent_context",
+        "content_batch",
+    ):
+        start = f"<{tag}>\n\n"
+        end = f"\n\n</{tag}>"
+        block = user_input.split(start, 1)[1].split(end, 1)[0]
+        assert json.loads(block) is not None
+        assert "\n  " not in block
+
+    assert "保留 标题 内部 空格" in user_input
 
 
 @pytest.mark.asyncio
@@ -3006,17 +5043,17 @@ async def test_evaluate_batch_sends_metrics_and_tags() -> None:
         _build_profile(),
     )
 
-    user = llm.user_inputs[0]
-    assert '"tags": [' in user
-    assert '"like_count": 100' in user
-    assert '"favorite_count": 90' in user
-    assert '"collect_count": 80' in user
-    assert '"comment_count": 70' in user
-    assert '"share_count": 60' in user
-    assert '"danmaku_count": 50' in user
-    assert '"reply_count": 40' in user
-    assert '"retweet_count": 30' in user
-    assert '"bookmark_count": 20' in user
+    item = _batch_prompt_items(llm.user_inputs[0])[0]
+    assert item["tags"] == ["tag-a", "tag-b"]
+    assert item["like_count"] == 100
+    assert item["favorite_count"] == 90
+    assert item["collect_count"] == 80
+    assert item["comment_count"] == 70
+    assert item["share_count"] == 60
+    assert item["danmaku_count"] == 50
+    assert "reply_count" not in item
+    assert "retweet_count" not in item
+    assert "bookmark_count" not in item
 
 
 @pytest.mark.asyncio
@@ -3122,6 +5159,59 @@ async def test_eval_cache_rechecks_content_when_negative_exemplars_change() -> N
 
 
 @pytest.mark.asyncio
+async def test_batch_eval_cache_rechecks_content_when_published_at_changes() -> None:
+    db = _StubNegativeExemplarsDatabase(rows=[])
+    llm = _RecordingBatchLLMService()
+    engine = ContentDiscoveryEngine(llm_service=llm, database=db)
+    profile = _build_profile()
+
+    await engine.evaluate_content_batch(
+        [DiscoveredContent(bvid="BVtime", title="模型更新", source_strategy="search")],
+        profile,
+    )
+    await engine.evaluate_content_batch(
+        [
+            DiscoveredContent(
+                bvid="BVtime",
+                title="模型更新",
+                published_at="2026-08-04T08:00:00Z",
+                source_strategy="search",
+            )
+        ],
+        profile,
+    )
+
+    assert len(llm.user_inputs) == 2
+
+
+@pytest.mark.asyncio
+async def test_batch_eval_cache_expires_on_next_evaluation_hour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clocks = iter(
+        [
+            ("2026-08-04T09:47:00Z", "2026-08-04T09:00:00Z"),
+            ("2026-08-04T10:02:00Z", "2026-08-04T10:00:00Z"),
+        ]
+    )
+    monkeypatch.setattr(prompt_module, "content_evaluation_clock", lambda: next(clocks))
+    llm = _RecordingBatchLLMService()
+    engine = ContentDiscoveryEngine(llm_service=llm)
+    profile = _build_profile()
+    content = DiscoveredContent(
+        bvid="BVhour",
+        title="滚动热点",
+        published_at="2026-08-04T08:30:00Z",
+        source_strategy="trending",
+    )
+
+    await engine.evaluate_content_batch([content], profile)
+    await engine.evaluate_content_batch([content], profile)
+
+    assert len(llm.user_inputs) == 2
+
+
+@pytest.mark.asyncio
 async def test_eval_cache_hits_for_equivalent_profile_objects() -> None:
     """Equivalent profile content should reuse the same local eval result.
 
@@ -3177,3 +5267,466 @@ async def test_eval_cache_survives_unrelated_event_id_change() -> None:
     )
 
     assert len(llm.user_inputs) == 1
+
+
+def _eval_cache_value(label: str) -> tuple[float, str, str, str, str]:
+    return (0.7, f"reason-{label}", "topic", "deep_dive", "")
+
+
+def test_eval_cache_lru_cap_evicts_least_recently_used() -> None:
+    engine = ContentDiscoveryEngine()
+    cache_max = discovery_engine_module._EVAL_CACHE_MAX_ENTRIES
+
+    for index in range(cache_max):
+        engine._set_eval_cache_entry(f"key-{index}", _eval_cache_value(str(index)))
+    engine._set_eval_cache_entry("overflow", _eval_cache_value("overflow"))
+
+    assert len(engine._eval_cache) == cache_max
+    assert engine._get_eval_cache_entry("key-0") is None
+    assert engine._get_eval_cache_entry("key-1") == _eval_cache_value("1")
+    assert engine._get_eval_cache_entry("overflow") == _eval_cache_value("overflow")
+
+
+def test_eval_cache_get_refreshes_lru_recency() -> None:
+    engine = ContentDiscoveryEngine()
+    cache_max = discovery_engine_module._EVAL_CACHE_MAX_ENTRIES
+
+    for index in range(cache_max):
+        engine._set_eval_cache_entry(f"key-{index}", _eval_cache_value(str(index)))
+
+    assert engine._get_eval_cache_entry("key-0") == _eval_cache_value("0")
+    engine._set_eval_cache_entry("overflow", _eval_cache_value("overflow"))
+
+    assert engine._get_eval_cache_entry("key-1") is None
+    assert engine._get_eval_cache_entry("key-0") == _eval_cache_value("0")
+
+
+async def test_embedding_prefilter_tolerates_engine_built_without_init() -> None:
+    """E2E tests construct engines via ``__new__``; prefilter must not AttributeError."""
+    engine = ContentDiscoveryEngine.__new__(ContentDiscoveryEngine)
+    profile = _build_profile()
+    content = DiscoveredContent(bvid="BVNOINIT", title="t", up_name="u", source_strategy="search")
+
+    assert await engine._embedding_prefilter([content], profile) == {}
+
+
+def test_eval_cache_tolerates_plain_dict_assignment() -> None:
+    """Tests reset the cache with ``engine._eval_cache = {}``; LRU must self-heal."""
+    engine = ContentDiscoveryEngine()
+    engine._eval_cache = {"seed": _eval_cache_value("seed")}  # type: ignore[assignment]
+
+    engine._set_eval_cache_entry("fresh", _eval_cache_value("fresh"))
+
+    assert engine._get_eval_cache_entry("seed") == _eval_cache_value("seed")
+    assert engine._get_eval_cache_entry("fresh") == _eval_cache_value("fresh")
+    assert isinstance(engine._eval_cache, OrderedDict)
+
+
+@pytest.mark.asyncio
+async def test_eval_cache_reads_legacy_four_tuple_entries() -> None:
+    db = _StubNegativeExemplarsDatabase(rows=[])
+    llm = _RecordingBatchLLMService()
+    engine = ContentDiscoveryEngine(llm_service=llm, database=db)
+    profile = _build_profile()
+    content = DiscoveredContent(
+        bvid="BVlegacy",
+        title="候选",
+        up_name="u",
+        source_strategy="search",
+    )
+    cache_key = engine._batch_eval_cache_key(
+        content,
+        profile_digest=engine._evaluation_profile_digest(profile),
+        negative_digest=engine._negative_examples_digest(None),
+    )
+    engine._set_eval_cache_entry(cache_key, (0.77, "legacy reason", "legacy-topic", "deep_focus"))
+
+    scores = await engine.evaluate_content_batch([content], profile)
+
+    assert scores == [0.77]
+    assert content.relevance_score == 0.77
+    assert content.relevance_reason == "legacy reason"
+    assert content.topic_group == "legacy-topic"
+    assert content.style_key == "deep_focus"
+    assert llm.user_inputs == []
+
+
+@pytest.mark.asyncio
+async def test_single_eval_cache_covers_prompt_visible_content_and_source_context() -> None:
+    llm = FakeLLMService(
+        '{"score": 0.82, "reason": "match", "topic_group": "systems", "style_key": "deep_dive"}'
+    )
+    engine = ContentDiscoveryEngine(llm_service=llm, eval_prefilter_mode="off")
+    profile = _build_profile()
+
+    def candidate(*, body: str = "body-a", likes: int = 10) -> DiscoveredContent:
+        return DiscoveredContent(
+            content_id="same-single",
+            title="same title",
+            body_text=body,
+            tags=["async", "systems"],
+            like_count=likes,
+            source_platform="twitter",
+            content_type="thread",
+            source_strategy="x-search",
+        )
+
+    await engine.evaluate_content(candidate(), profile, source_context="query:alpha")
+    await engine.evaluate_content(candidate(), _build_profile(), source_context="query:alpha")
+    assert len(llm.calls) == 1, "equivalent content/profile values should hit"
+
+    await engine.evaluate_content(candidate(body="body-b"), profile, source_context="query:alpha")
+    await engine.evaluate_content(candidate(body="body-b"), profile, source_context="query:beta")
+    await engine.evaluate_content(
+        candidate(body="body-b", likes=11),
+        profile,
+        source_context="query:beta",
+    )
+
+    assert len(llm.calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_single_evaluation_empty_metadata_clears_stale_values_on_cold_and_warm() -> None:
+    llm = FakeLLMService(
+        '{"score": 0.82, "reason": "internal", "topic_group": "", '
+        '"style_key": "", "franchise_key": ""}'
+    )
+    engine = ContentDiscoveryEngine(llm_service=llm, eval_prefilter_mode="off")
+
+    def stale_candidate() -> DiscoveredContent:
+        return DiscoveredContent(
+            content_id="same-single-metadata",
+            title="same title",
+            source_platform="twitter",
+            source_strategy="x-search",
+            topic_group="stale-topic",
+            style_key="deep_dive",
+            franchise_key="stale-franchise",
+        )
+
+    cold = stale_candidate()
+    assert await engine.evaluate_content(cold, _build_profile()) == 0.82
+    assert (cold.topic_group, cold.style_key, cold.franchise_key) == ("", "", "")
+
+    warm = stale_candidate()
+    assert await engine.evaluate_content(warm, _build_profile()) == 0.82
+    assert (warm.topic_group, warm.style_key, warm.franchise_key) == ("", "", "")
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_eval_cache_covers_prompt_visible_content_and_source_context() -> None:
+    llm = _DynamicBatchLLMService()
+    engine = ContentDiscoveryEngine(llm_service=llm, eval_prefilter_mode="off")
+    profile = _build_profile()
+
+    def candidate(*, body: str = "body-a", views: int = 10) -> DiscoveredContent:
+        return DiscoveredContent(
+            content_id="same-batch",
+            title="same title",
+            body_text=body,
+            tags=["async", "systems"],
+            view_count=views,
+            source_platform="twitter",
+            content_type="thread",
+            source_strategy="x-search",
+        )
+
+    await engine.evaluate_content_batch([candidate()], profile, source_context="query:alpha")
+    await engine.evaluate_content_batch(
+        [candidate()],
+        _build_profile(),
+        source_context="query:alpha",
+    )
+    assert len(llm.user_inputs) == 1, "equivalent content/profile values should hit"
+
+    await engine.evaluate_content_batch(
+        [candidate(body="body-b")],
+        profile,
+        source_context="query:alpha",
+    )
+    await engine.evaluate_content_batch(
+        [candidate(body="body-b")],
+        profile,
+        source_context="query:beta",
+    )
+    await engine.evaluate_content_batch(
+        [candidate(body="body-b", views=11)],
+        profile,
+        source_context="query:beta",
+    )
+
+    assert len(llm.user_inputs) == 4
+
+
+@pytest.mark.asyncio
+async def test_batch_eval_cache_bypasses_heterogeneous_outer_prompt_metadata() -> None:
+    llm = _DynamicBatchLLMService()
+    engine = ContentDiscoveryEngine(llm_service=llm, eval_prefilter_mode="off")
+    profile = _build_profile()
+
+    def twitter_candidate() -> DiscoveredContent:
+        return DiscoveredContent(
+            content_id="same-twitter",
+            title="twitter item",
+            source_platform="twitter",
+            source_strategy="twitter_search",
+        )
+
+    def reddit_candidate() -> DiscoveredContent:
+        return DiscoveredContent(
+            content_id="same-reddit",
+            title="reddit item",
+            source_platform="reddit",
+            source_strategy="reddit_search",
+        )
+
+    # Seed a valid homogeneous cache entry, then include it in a mixed call.
+    # The mixed call must not partially hit and send a one-item prompt carrying
+    # metadata derived from the original two-item batch.
+    await engine.evaluate_content_batch([twitter_candidate()], profile)
+    await engine.evaluate_content_batch([twitter_candidate(), reddit_candidate()], profile)
+    await engine.evaluate_content_batch([twitter_candidate(), reddit_candidate()], profile)
+
+    assert len(llm.user_inputs) == 3
+    for prompt in llm.user_inputs[1:]:
+        assert [item["title"] for item in _batch_prompt_items(prompt)] == [
+            "twitter item",
+            "reddit item",
+        ]
+        assert "<source_platform>\n\nmixed\n\n</source_platform>" in prompt
+
+
+@pytest.mark.asyncio
+async def test_batch_eval_cache_bypasses_actual_multimodal_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openbiliclaw.discovery.multimodal import PreparedCoverImage
+
+    async def fake_prepare_cover_image_inputs(*_args: object, **_kwargs: object) -> list[object]:
+        return [
+            PreparedCoverImage(
+                content_id="vision-cache",
+                data_url="data:image/jpeg;base64,/9j/4AAQSkZJRg==",
+                mime_type="image/jpeg",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "openbiliclaw.discovery.multimodal.prepare_cover_image_inputs",
+        fake_prepare_cover_image_inputs,
+    )
+    llm = _RecordingMultimodalBatchLLMService()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        eval_prefilter_mode="off",
+        multimodal_evaluation_enabled=True,
+    )
+    profile = _build_profile()
+
+    def candidate() -> DiscoveredContent:
+        return DiscoveredContent(
+            content_id="vision-cache",
+            title="vision item",
+            cover_url="https://example.com/cover.jpg",
+            source_platform="youtube",
+            source_strategy="youtube_search",
+        )
+
+    await engine.evaluate_content_batch([candidate()], profile)
+    await engine.evaluate_content_batch([candidate()], profile)
+
+    assert len(llm.user_inputs) == 2
+    assert len(llm.image_inputs) == 2
+
+
+@pytest.mark.asyncio
+async def test_eval_cache_embedding_namespace_change_invalidates_single_and_batch() -> None:
+    embedding = _NamespacedEmbeddingService({}, fingerprint="embedding-v1")
+    single_llm = FakeLLMService(
+        '{"score": 0.82, "reason": "match", "topic_group": "systems", "style_key": "deep_dive"}'
+    )
+    batch_llm = _DynamicBatchLLMService()
+    single_engine = ContentDiscoveryEngine(
+        llm_service=single_llm,
+        embedding_service=embedding,
+        eval_prefilter_mode="off",
+    )
+    batch_engine = ContentDiscoveryEngine(
+        llm_service=batch_llm,
+        embedding_service=embedding,
+        eval_prefilter_mode="off",
+    )
+    profile = _build_profile()
+
+    def candidate() -> DiscoveredContent:
+        return DiscoveredContent(
+            bvid="BVnamespace",
+            title="namespace candidate",
+            source_strategy="search",
+        )
+
+    await single_engine.evaluate_content(candidate(), profile)
+    await single_engine.evaluate_content(candidate(), profile)
+    await batch_engine.evaluate_content_batch([candidate()], profile)
+    await batch_engine.evaluate_content_batch([candidate()], profile)
+    assert len(single_llm.calls) == 1
+    assert len(batch_llm.user_inputs) == 1
+
+    embedding.embedding_fingerprint = "embedding-v2"
+    await single_engine.evaluate_content(candidate(), profile)
+    await batch_engine.evaluate_content_batch([candidate()], profile)
+
+    assert len(single_llm.calls) == 2
+    assert len(batch_llm.user_inputs) == 2
+
+
+@pytest.mark.asyncio
+async def test_batch_eval_cache_preserves_exact_tail_interest_weight_in_digest() -> None:
+    llm = _DynamicBatchLLMService()
+    engine = ContentDiscoveryEngine(llm_service=llm, eval_prefilter_mode="off")
+    first_profile = _profile_with_tail_interest()
+    second_profile = _profile_with_tail_interest()
+    first_profile.preferences.interests[-1].weight = 0.011
+    second_profile.preferences.interests[-1].weight = 0.014
+
+    def candidate() -> DiscoveredContent:
+        return DiscoveredContent(
+            bvid="BVtail-weight",
+            title="tail-weight candidate",
+            source_strategy="search",
+        )
+
+    await engine.evaluate_content_batch([candidate()], first_profile)
+    await engine.evaluate_content_batch([candidate()], second_profile)
+
+    assert len(llm.user_inputs) == 2
+
+
+def _tail_recall_vectors(*content_texts: str) -> dict[str, list[float]]:
+    return {
+        "\u7a00\u6709\u94c1\u8def\u6a21\u578b": _MATCH_VEC,
+        **{content_text: _MATCH_VEC for content_text in content_texts},
+    }
+
+
+@pytest.mark.asyncio
+async def test_single_eval_recall_failure_is_not_cached_and_recovery_re_evaluates() -> None:
+    profile = _profile_with_tail_interest()
+    content_text = "\u7a00\u6709\u94c1\u8def\u6a21\u578b \u5f00\u7bb1\u8bc4\u6d4b"
+    embedding = _NamespacedEmbeddingService(
+        _tail_recall_vectors(content_text),
+        fingerprint="stable-model",
+        failures={content_text},
+    )
+    llm = FakeLLMService(
+        '{"score": 0.82, "reason": "match", "topic_group": "models", "style_key": "deep_dive"}'
+    )
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        embedding_service=embedding,
+        eval_prefilter_mode="off",
+    )
+
+    def candidate() -> DiscoveredContent:
+        return DiscoveredContent(
+            bvid="BVsingle-recovery",
+            title="\u7a00\u6709\u94c1\u8def\u6a21\u578b",
+            description="\u5f00\u7bb1\u8bc4\u6d4b",
+            source_strategy="search",
+        )
+
+    await engine.evaluate_content(candidate(), profile)
+    assert "related_interests" not in _single_prompt_content_summary(
+        str(llm.calls[-1]["user_input"])
+    )
+
+    embedding.failures.clear()
+    await engine.evaluate_content(candidate(), profile)
+    assert _single_prompt_content_summary(str(llm.calls[-1]["user_input"]))[
+        "related_interests"
+    ] == ["\u7a00\u6709\u94c1\u8def\u6a21\u578b"]
+    await engine.evaluate_content(candidate(), profile)
+
+    assert len(llm.calls) == 2, "only the complete recovered result may populate cache"
+
+
+@pytest.mark.asyncio
+async def test_batch_eval_partial_recall_failure_only_skips_failed_item_cache() -> None:
+    profile = _profile_with_tail_interest()
+    healthy_text = "\u7a00\u6709\u94c1\u8def\u6a21\u578b \u5065\u5eb7\u5185\u5bb9"
+    flaky_text = "\u7a00\u6709\u94c1\u8def\u6a21\u578b \u6682\u65f6\u5931\u8d25"
+    embedding = _NamespacedEmbeddingService(
+        _tail_recall_vectors(healthy_text, flaky_text),
+        fingerprint="stable-model",
+        failures={flaky_text},
+    )
+    llm = _DynamicBatchLLMService()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        embedding_service=embedding,
+        eval_prefilter_mode="off",
+    )
+
+    def candidates() -> list[DiscoveredContent]:
+        return [
+            DiscoveredContent(
+                bvid="BVhealthy-recall",
+                title="\u7a00\u6709\u94c1\u8def\u6a21\u578b",
+                description="\u5065\u5eb7\u5185\u5bb9",
+                source_strategy="search",
+            ),
+            DiscoveredContent(
+                bvid="BVflaky-recall",
+                title="\u7a00\u6709\u94c1\u8def\u6a21\u578b",
+                description="\u6682\u65f6\u5931\u8d25",
+                source_strategy="search",
+            ),
+        ]
+
+    await engine.evaluate_content_batch(candidates(), profile)
+    first_items = _batch_prompt_items(llm.user_inputs[0])
+    assert first_items[0]["related_interests"] == ["\u7a00\u6709\u94c1\u8def\u6a21\u578b"]
+    assert "related_interests" not in first_items[1]
+
+    embedding.failures.clear()
+    await engine.evaluate_content_batch(candidates(), profile)
+    second_items = _batch_prompt_items(llm.user_inputs[1])
+    assert [(item["id"], item["description"]) for item in second_items] == [("0", "暂时失败")]
+    assert second_items[0]["related_interests"] == ["\u7a00\u6709\u94c1\u8def\u6a21\u578b"]
+
+    await engine.evaluate_content_batch(candidates(), profile)
+    assert len(llm.user_inputs) == 2
+
+
+@pytest.mark.asyncio
+async def test_batch_eval_empty_interest_vector_is_not_a_stable_zero_recall() -> None:
+    profile = _profile_with_tail_interest()
+    content_text = "\u7a00\u6709\u94c1\u8def\u6a21\u578b \u5411\u91cf\u6062\u590d"
+    vectors = _tail_recall_vectors(content_text)
+    vectors.pop("\u7a00\u6709\u94c1\u8def\u6a21\u578b")
+    embedding = _NamespacedEmbeddingService(vectors, fingerprint="stable-model")
+    llm = _DynamicBatchLLMService()
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        embedding_service=embedding,
+        eval_prefilter_mode="off",
+    )
+
+    def candidate() -> DiscoveredContent:
+        return DiscoveredContent(
+            bvid="BVinterest-vector-recovery",
+            title="\u7a00\u6709\u94c1\u8def\u6a21\u578b",
+            description="\u5411\u91cf\u6062\u590d",
+            source_strategy="search",
+        )
+
+    await engine.evaluate_content_batch([candidate()], profile)
+    assert "related_interests" not in _batch_prompt_items(llm.user_inputs[0])[0]
+
+    embedding.vectors["\u7a00\u6709\u94c1\u8def\u6a21\u578b"] = _MATCH_VEC
+    await engine.evaluate_content_batch([candidate()], profile)
+    await engine.evaluate_content_batch([candidate()], profile)
+
+    assert len(llm.user_inputs) == 2, "partial interest-vector recall must not poison cache"

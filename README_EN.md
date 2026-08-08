@@ -201,12 +201,10 @@ After starting the backend, open `http://127.0.0.1:8420/web` (or just `http://12
 
 ## Recent Updates
 
-📌 Latest: **v0.3.192 (2026-08-03)**
+📌 Latest: **v0.3.201 (2026-08-08)**
 
-- **Multimodal recommendation enhancements are independently controllable** — visual profiles, danmaku semantics, and keyframe weighting have separate switches, with visual features off by default.
-- **Feedback and dialogue submissions are more reliable** — likes, dislikes, chats, and pending-card settlement now use durable asynchronous processing across slow models and restarts.
-- **Advanced settings are easier to use** — the extension save bar stays at the bottom, keyword generation defaults to hybrid, and advanced controls are grouped together.
-- **Connectivity and remote deployment are steadier** — X sessions resync after runtime reconnects, and a Caddy HTTPS Compose entry point is now available.
+- **“Chat more” conversations no longer disappear** — probe chats started from message cards now stay visible in the main dialogue across the extension, desktop Web, and mobile Web.
+- **Dislike feedback takes effect immediately** — recommendation display honors the latest dislike while preserving precise-topic protection without over-blocking broad discovery.
 
 Full changelog: [docs/changelog.md](docs/changelog.md).
 
@@ -581,7 +579,7 @@ The whole loop stays local — OpenClaw just calls the CLI bridge; your profile 
 - ⚡ **Instant, deduplicated reshuffle** — ~0.6s; current cards, recommendation history, and the durable seen ledger are excluded by default
 - 💬 **Warm Recommendations** — friend-like explanations of why you'd enjoy something, not "because you watched similar videos"
 - 🔄 **Continuous Learning** — Socratic dialogue + behavioral analysis + instant feedback; it understands you better over time
-- ⭐ **Local-First Favorites / Watch Later** — cards save to local SQLite first and auto-sync stays off by default; the 2026-07-14 real-account regression completed both actions across all seven platforms as `synced/already_synced`
+- ⭐ **Local-First Favorites / Watch Later** — cards save to local SQLite first and auto-sync stays off by default; desktop Web hydrates the sidebar count badges on first load; the 2026-07-14 real-account regression completed both actions across all seven platforms as `synced/already_synced`
 - 🧩 **Browser Extension** — Chrome / Edge / Brave / Arc / Firefox; side-panel recommendations + cross-site behavior collection, install and go
 - 🚀 **Guided Init in the UI** — the packaged `/setup/` wizard, Desktop Web, and the extension can all initialize with one click; no terminal required
 - 🔬 **Self-Optimizing Eval Loops** — five modules each carry an LLM-as-judge loop that improves prompt quality over rounds
@@ -620,6 +618,7 @@ confirmation entry (pending list/cards) → one anchor(kind+ref+generation) → 
                           ├→ one context digest → prompt/history/event/learn/settlement provenance
                           ├→ action local≤1s: completed 200 / blocked 202 → popup/mobile/desktop poll 1/2/5s, ≤30s
                           └→ confusion FIFO≤5 / head fencing / 12h recovery
+config save: persist → HTTP 202 queued/apply_revision → latest-wins background apply queue → apply-status / final receipt
 config hot reload: accepting drain old worker → atomic pause/revoke → new worker; 25m safety window
 realtime: runtime-stream 20s idle heartbeat → transient close shows reconnecting and retries
 images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3, fg priority)
@@ -646,6 +645,8 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 ├─────────┴──────────┴───────────┴───────────────┤
 │ Events/recommendation clicks → generic durable cursor ─┐ │
 │ Content feedback → content_feedback durable cursor ────┴→ atomic buffer+cursor checkpoint │
+│ dislike: exact card hides synchronously; durable topic → final history/serve/push recheck │
+│ discovery may keep broad search; async semantic purge optimizes inventory, not correctness │
 │ cold start fence+task admission → listener; background recovery → tick_if_buffered │
 │ hot reload pause/drain/recover then rebind; periodic maintenance alone calls tick │
 │ Dialogue → typed settlement worker → learning       │
@@ -661,7 +662,14 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 │ Source-family registry: alias · strategy · URL host │
 │             → pool accounting · durable seen_items ledger │
 │ Bangumi public API → search/ranked/date producer → shared eval │
+│ Eval clock: published_at + exact UTC evaluated_at → hourly cache invalidation │
+│ Evaluator prefilter stays shadow → privacy-safe decision/raw-score join → read-only gate (no auto-enforce) │
+│ Named cognition views → task gate: compact only for awareness_confusions; others legacy │
+│ Token diet: per-offset preference packing; weighted recent/judged/relevant/important insight≤40 → full merge │
+│ Keyword planner → safe 24h cross-digest pending reconcile → deficit/generate/claim (0=hard expiry) │
+│ Admitted backlog → fill copy-ready watermark deficit → async refill after serve (0=legacy drain-all) │
 │ API projected stock → 3×30 workers → serial admit; OpenClaw first batch≤4 → copy≤4/no split retry → UI │
+│ API raw-empty → wake under-share sources now → real progress resets / duplicate-only waves back off │
 │ Delight gate: formal copy/topic ready + seen_items guard → score/snapshot → UI × writes seen ledger │
 │ Inventory API/OpenClaw startup hook → recover/maintain → expose LLM │
 │ Reshuffle: current-card exclusion → PoolServeSnapshot/seen_items → short rec+shown write → one batch event │
@@ -671,7 +679,10 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 │ /api/saved/* · router · Bilibili native save      │
 │ Six adapters → ExtensionNativeSaveBroker → extension_native_save_jobs │
 │ six-platform source task multiplex: xhs / dy / yt / x / zhihu / reddit │
+│ Extension-online periodic re-pull: Runtime → five bootstrap tasks (global serial) → installed extension │
+│ task-result → staged durable ingress → atomic bounded seen keys (5,000/source) → terminal │
 │ XHS auto tasks: source/scheduler gate → SQLite pacing/breaker → no new tab while off/limited │
+│ XHS search: inactive tab → MAIN response normalization → isolated replay / DOM fallback │
 │ extension_native_save_jobs -> /api/sources/<slug>/next-task -> installed extension │
 │ exact OpenBiliClaw / YouTube Watch Later targets → safe task-result    │
 │ trusted-local E2E exact auth → one saved-sync item → six-field callback │
@@ -742,8 +753,8 @@ localhost-only. The two edges are mutually exclusive, and the default HTTP path 
 
 What happens after discovery:
 
-- **Safe fetching** — the backend never logs in for you and never crawls content you can't see; every platform reuses the sessions already in your browser, and first-run profile signals are pulled only after you click "Start initialization".
-- **Continuous unified evaluation** — raw candidates share one eval pool with 3×30 immediate-refill workers; scheduling counts only available, copy-pending, and evaluated durable stock, while serial admission is capped by current headroom.
+- **Safe fetching** — the backend never logs in for you and never crawls content you can't see; every platform reuses the sessions already in your browser, and first-run profile signals are pulled only after you click "Start initialization." Once the profile exists, enabled XHS, Douyin, YouTube, Zhihu, and Reddit account signals are re-pulled on schedule only while the extension is online.
+- **Continuous unified evaluation** — raw candidates share one eval pool and are scored against your Soul profile, content text, and recent negative feedback. The default 3×30 workers refill immediately, scheduling counts only durable stock, and serial admission is capped by current headroom. Optional embedding prefiltering starts in shadow mode before enforce may skip clearly low-similarity items.
 - **Diversity selection** — platform quotas → topic dedup → style balancing → cross-platform interleaving → count caps; only Bilibili is enabled out of the box, other platforms are switched on in settings.
 
 > Per-platform task pipelines, pool accounting, and fallback strategies are documented in the [Discovery Engine docs](docs/modules/discovery.md).
@@ -789,7 +800,7 @@ OpenBiliClaw/
 | Browser Extension | TypeScript + Chrome Extension (Manifest V3) |
 | LLM | Multiple independent Base URL / token / model instances per provider type, with ordered global and per-module failover chains; first migration keeps a permanent legacy backup and `config-export-legacy` creates an old-version copy; built-in Gemini / DeepSeek / OpenAI / Claude / OpenRouter / Ollama; any OpenAI-compatible endpoint works; OpenAI can experimentally reuse Codex CLI OAuth |
 | Bilibili API | Custom client (WBI signing · v_voucher auto-recovery · rate control) |
-| Xiaohongshu | Extension DOM/state extraction + task dispatch; scrolling init imports open `/explore` in the foreground, click the page's profile entry, then use bounded scrolling and partial batches; no backend crawling |
+| Xiaohongshu | Extension DOM/state extraction + task dispatch; search/creator run in background tabs and search uses a MAIN-world page-response bridge when hidden virtual DOM is absent; only scrolling init opens `/explore` in the foreground and clicks the profile entry; no backend crawling |
 | Douyin | Extension DOM + MAIN-world passive fetch tap + task dispatch; init imports post / favorite / like / follow signals; search / hot / feed discovery starts from the Douyin home page and uses DOM interactions to trigger loading; search/feed passively collect page responses / rendered results, and hot can use a hot-board `group_id` seed as a logged-in related fallback; no backend login crawling |
 | YouTube | Extension DOM task dispatch reads watch history / subscriptions / likes; Google Takeout can import older data offline |
 | X (Twitter) | Server-side cookie replay via default-installed `twitter-cli` (lazy-imported, read-only); the extension captures your engagement and syncs the x.com cookie; tweets render as text cards |

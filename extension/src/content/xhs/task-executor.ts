@@ -2,13 +2,14 @@
  * xhs task executor — content-script side.
  *
  * When the background dispatcher opens a tab with a search or creator
- * page, this module waits for note cards to render (MutationObserver,
- * 5 s hard cap), extracts up to 20 note URLs from the initial viewport
- * plus immediately adjacent DOM, and emits `XHS_TASK_RESULT` back to
- * the service worker.
+ * page, this module extracts up to 20 notes and emits `XHS_TASK_RESULT`
+ * back to the service worker. Search tasks prefer normalized page API
+ * responses so hidden tabs do not depend on the virtualized DOM mounting;
+ * rendered cards remain the fallback for schema drift and creator pages.
  *
  * Bootstrap profile imports can optionally scroll when the backend requests
- * it, but passive search/creator collection still only reads rendered cards.
+ * it. Search/creator discovery remains passive: it never scrolls or mutates
+ * the page, and search only observes the page's own response.
  */
 
 import { attachCoverData, backfillCoverUrlsFromState } from "./cover-harvest.js";
@@ -52,16 +53,24 @@ import {
   type XhsBootstrapScope,
 } from "./bootstrap.js";
 import {
+  detectXhsTaskLoginRequired,
   detectXhsTaskRiskControl,
   type XhsRiskControlDetection,
 } from "./risk-control.js";
+import { NOTE_ANCHOR_SELECTOR } from "./selectors.ts";
+import {
+  readXhsSearchResponseNotes,
+  requestXhsSearchResponseReplay,
+} from "./search-response-buffer.js";
 
 const MAX_URLS = 20;
-const RENDER_WAIT_MS = 5_000;
+// Remote background-tab traces on 2026-08-03 showed the old 5s ceiling could
+// expire before the SPA mounted its cards. 12s remains comfortably below the
+// dispatcher's 30s task timeout while avoiding extra page loads or scrolling.
+const RENDER_WAIT_MS = 12_000;
 const CHECK_INTERVAL_MS = 300;
 const PROFILE_CLICK_DELAY_MS = 150;
 const PROFILE_CONTENT_WAIT_MS = 8_000;
-const ANCHOR_SELECTOR = 'a[href*="/explore/"], a[href*="/discovery/item/"]';
 
 export interface TaskExecuteMessage {
   task_id: string;
@@ -118,7 +127,7 @@ interface ProfileScrollRoundDebug extends BootstrapScrollMetrics {
 // ---------------------------------------------------------------------------
 
 export function snapshotAllAnchors(root: Document): AnchorLike[] {
-  const nodes = root.querySelectorAll<HTMLAnchorElement>(ANCHOR_SELECTOR);
+  const nodes = root.querySelectorAll<HTMLAnchorElement>(NOTE_ANCHOR_SELECTOR);
   const out: AnchorLike[] = [];
   nodes.forEach((node) => {
     out.push({ href: node.href, rect: node.getBoundingClientRect() });
@@ -133,6 +142,86 @@ export function buildLargeViewport(win: Window): ViewportRect {
   return { top: -500, bottom: height + 500, height: height + 1000 };
 }
 
+function safeSelectorCount(doc: Document, selector: string): number {
+  try {
+    return doc.querySelectorAll(selector).length;
+  } catch {
+    return 0;
+  }
+}
+
+function pathnameOnly(rawUrl: string): string {
+  try {
+    return new URL(rawUrl).pathname;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Build an intentionally content-free empty-page diagnostic.
+ *
+ * Counts and lifecycle flags are enough to distinguish selector drift,
+ * background-tab throttling, and a genuinely empty result. Never include the
+ * search keyword, title, body text, href values, cookie, or page state.
+ */
+function emptySearchTaskResult(
+  msg: TaskExecuteMessage,
+  win: Window,
+  doc: Document,
+  reason: "no_note_anchor_after_wait" | "no_urls_in_viewport",
+): TaskResultPayload {
+  const state = extractBootstrapStateFromDocument(doc);
+  return {
+    task_id: msg.task_id,
+    urls: [],
+    notes: [],
+    status: "empty",
+    error: "xhs_empty_result",
+    debug: {
+      xhs_search_empty: {
+        reason,
+        task_type: msg.type,
+        pathname: pathnameOnly(win.location.href),
+        ready_state: doc.readyState,
+        visibility_state: doc.visibilityState,
+        hidden: doc.hidden,
+        viewport_width: Math.max(0, Math.floor(win.innerWidth || 0)),
+        viewport_height: Math.max(0, Math.floor(win.innerHeight || 0)),
+        body_child_count: doc.body?.childElementCount ?? 0,
+        state_available: state !== null,
+        anchor_counts: {
+          all: safeSelectorCount(doc, "a[href]"),
+          note: safeSelectorCount(doc, NOTE_ANCHOR_SELECTOR),
+          explore: safeSelectorCount(doc, 'a[href*="/explore/"]'),
+          discovery_item: safeSelectorCount(doc, 'a[href*="/discovery/item/"]'),
+          search_result: safeSelectorCount(doc, 'a[href*="/search_result/"]'),
+        },
+      },
+    },
+  };
+}
+
+function loginRequiredTaskResult(
+  msg: TaskExecuteMessage,
+  win: Window,
+): TaskResultPayload {
+  return {
+    task_id: msg.task_id,
+    urls: [],
+    notes: [],
+    status: "error",
+    error: "xhs_login_required",
+    debug: {
+      xhs_auth: {
+        reason: "visible_login_overlay",
+        task_type: msg.type,
+        pathname: pathnameOnly(win.location.href),
+      },
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Chrome integration
 // ---------------------------------------------------------------------------
@@ -140,14 +229,14 @@ export function buildLargeViewport(win: Window): ViewportRect {
 function waitForCards(doc: Document): Promise<boolean> {
   return new Promise((resolve) => {
     // Quick check — cards may already be present.
-    if (doc.querySelectorAll(ANCHOR_SELECTOR).length > 0) {
+    if (doc.querySelectorAll(NOTE_ANCHOR_SELECTOR).length > 0) {
       resolve(true);
       return;
     }
 
     let settled = false;
     const observer = new MutationObserver(() => {
-      if (doc.querySelectorAll(ANCHOR_SELECTOR).length > 0) {
+      if (doc.querySelectorAll(NOTE_ANCHOR_SELECTOR).length > 0) {
         settled = true;
         observer.disconnect();
         resolve(true);
@@ -164,7 +253,7 @@ function waitForCards(doc: Document): Promise<boolean> {
         clearInterval(interval);
         return;
       }
-      if (doc.querySelectorAll(ANCHOR_SELECTOR).length > 0) {
+      if (doc.querySelectorAll(NOTE_ANCHOR_SELECTOR).length > 0) {
         settled = true;
         observer.disconnect();
         clearInterval(interval);
@@ -178,10 +267,28 @@ function waitForCards(doc: Document): Promise<boolean> {
         settled = true;
         observer.disconnect();
         clearInterval(interval);
-        resolve(doc.querySelectorAll(ANCHOR_SELECTOR).length > 0);
+        resolve(doc.querySelectorAll(NOTE_ANCHOR_SELECTOR).length > 0);
       }
     }, RENDER_WAIT_MS);
   });
+}
+
+async function waitForSearchResponseOrCards(
+  doc: Document,
+  win: Window,
+): Promise<"response" | "cards" | "empty"> {
+  requestXhsSearchResponseReplay(win);
+  const deadline = Date.now() + RENDER_WAIT_MS;
+  while (Date.now() < deadline) {
+    if (readXhsSearchResponseNotes().length > 0) return "response";
+    if (doc.querySelectorAll(NOTE_ANCHOR_SELECTOR).length > 0) return "cards";
+    await sleep(CHECK_INTERVAL_MS);
+  }
+  return readXhsSearchResponseNotes().length > 0
+    ? "response"
+    : doc.querySelectorAll(NOTE_ANCHOR_SELECTOR).length > 0
+      ? "cards"
+      : "empty";
 }
 
 function waitForBootstrapProfileContent(doc: Document): Promise<boolean> {
@@ -678,6 +785,9 @@ async function executeTaskInPage(
   doc: Document,
 ): Promise<TaskResultPayload> {
   try {
+    if (detectXhsTaskLoginRequired(doc)) {
+      return loginRequiredTaskResult(msg, win);
+    }
     if (msg.type === "bootstrap_profile") {
       const immediateRisk = detectXhsTaskRiskControl(doc);
       if (immediateRisk) {
@@ -699,25 +809,37 @@ async function executeTaskInPage(
     if (immediateRisk) {
       return rateLimitedTaskResult(msg.task_id, immediateRisk);
     }
-    const found = await waitForCards(doc);
-    if (!found) {
+    const source =
+      msg.type === "search"
+        ? await waitForSearchResponseOrCards(doc, win)
+        : (await waitForCards(doc))
+          ? "cards"
+          : "empty";
+    if (source === "empty") {
+      if (detectXhsTaskLoginRequired(doc)) {
+        return loginRequiredTaskResult(msg, win);
+      }
       const emptyPageRisk = detectXhsTaskRiskControl(doc, {
         includePageText: true,
       });
       if (emptyPageRisk) {
         return rateLimitedTaskResult(msg.task_id, emptyPageRisk);
       }
-      return { task_id: msg.task_id, urls: [], notes: [], status: "empty" };
+      return emptySearchTaskResult(msg, win, doc, "no_note_anchor_after_wait");
     }
 
-    const anchors = snapshotAllAnchors(doc);
-    const viewport = buildLargeViewport(win);
     const baseUrl = win.location.href;
-    const urls = collectInViewportNoteUrls(anchors, viewport, {
-      baseUrl,
-      toleranceBelowPx: 500,
-      toleranceAbovePx: 500,
-    });
+    const responseNotes = source === "response" ? readXhsSearchResponseNotes() : [];
+    const anchors = source === "cards" ? snapshotAllAnchors(doc) : [];
+    const viewport = buildLargeViewport(win);
+    const urls =
+      source === "response"
+        ? responseNotes.map((note) => note.url).slice(0, MAX_URLS)
+        : collectInViewportNoteUrls(anchors, viewport, {
+            baseUrl,
+            toleranceBelowPx: 500,
+            toleranceAbovePx: 500,
+          });
 
     if (urls.length === 0) {
       const emptyPageRisk = detectXhsTaskRiskControl(doc, {
@@ -726,20 +848,22 @@ async function executeTaskInPage(
       if (emptyPageRisk) {
         return rateLimitedTaskResult(msg.task_id, emptyPageRisk);
       }
-      return { task_id: msg.task_id, urls: [], notes: [], status: "empty" };
+      return emptySearchTaskResult(msg, win, doc, "no_urls_in_viewport");
     }
 
     // Extract metadata from DOM for each discovered URL
     const urlSet = new Set(urls.slice(0, MAX_URLS));
-    const notes: XhsNoteMetadata[] = [];
-    const anchorEls = doc.querySelectorAll<HTMLAnchorElement>(ANCHOR_SELECTOR);
-    anchorEls.forEach((el) => {
-      const meta = extractNoteMetadataFromAnchor(el, baseUrl);
-      if (meta && urlSet.has(meta.url)) {
-        notes.push(meta);
-        urlSet.delete(meta.url);
-      }
-    });
+    const notes: XhsNoteMetadata[] = responseNotes.map((note) => ({ ...note }));
+    if (source === "cards") {
+      const anchorEls = doc.querySelectorAll<HTMLAnchorElement>(NOTE_ANCHOR_SELECTOR);
+      anchorEls.forEach((el) => {
+        const meta = extractNoteMetadataFromAnchor(el, baseUrl);
+        if (meta && urlSet.has(meta.url)) {
+          notes.push(meta);
+          urlSet.delete(meta.url);
+        }
+      });
+    }
 
     // v0.3.10+: search / creator pages expose the same logged-in
     // user fingerprint via __INITIAL_STATE__. Capture + scrape-time
@@ -762,6 +886,12 @@ async function executeTaskInPage(
       urls: urls.slice(0, MAX_URLS),
       notes: filteredNotes,
       status: "ok",
+      debug: {
+        xhs_discovery: {
+          source: source === "response" ? "search_api" : "rendered_dom",
+          task_type: msg.type,
+        },
+      },
     };
     if (selfInfo) {
       result.self_info = selfInfo;

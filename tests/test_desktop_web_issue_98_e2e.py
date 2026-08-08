@@ -88,6 +88,7 @@ class Issue98Stub:
         self.probe_status = 200
         self.delight_response_status = 200
         self.delight_response_received = threading.Event()
+        self.saved_list_reads: list[str] = []
 
 
 def _json_response(
@@ -150,6 +151,12 @@ def issue_98_server() -> tuple[str, Issue98Stub]:
                 return _json_response(self, {"ok": True, "embedding_ready": True})
             if path == "/api/auth/status":
                 return _json_response(self, {"enabled": False, "authenticated": True})
+            if path == "/api/saved/watch_later":
+                state.saved_list_reads.append("watch_later")
+                return _json_response(self, {"items": [], "total": 3})
+            if path == "/api/saved/favorite":
+                state.saved_list_reads.append("favorite")
+                return _json_response(self, {"items": [], "total": 2})
             if path == "/api/recommendations":
                 state.recommendation_reads += 1
                 if state.recommendation_delay_seconds:
@@ -427,6 +434,141 @@ def _delight_geometry(page: Page) -> dict[str, Any]:
 def _assert_delight_fits_available_width(geometry: dict[str, Any]) -> None:
     assert geometry["delightRight"] <= geometry["layoutRight"] + 1
     assert geometry["docScroll"] <= geometry["docClient"] + 1
+
+
+def test_saved_badges_hydrate_before_tabs_are_opened(
+    issue_98_server: tuple[str, Issue98Stub],
+    chromium_page: Page,
+) -> None:
+    base_url, stub = issue_98_server
+
+    chromium_page.goto(f"{base_url}/web/", wait_until="domcontentloaded")
+
+    watch_later_badge = chromium_page.locator("#watchLaterCountBadge")
+    favorites_badge = chromium_page.locator("#favoritesCountBadge")
+    expect(watch_later_badge).to_be_visible(timeout=3000)
+    expect(watch_later_badge).to_have_text("3")
+    expect(favorites_badge).to_be_visible(timeout=3000)
+    expect(favorites_badge).to_have_text("2")
+    assert set(stub.saved_list_reads) == {"watch_later", "favorite"}
+
+
+def test_saved_badge_hydration_failure_does_not_block_home(
+    issue_98_server: tuple[str, Issue98Stub],
+    chromium_page: Page,
+) -> None:
+    base_url, _ = issue_98_server
+    failed_reads: list[str] = []
+
+    def fail_saved_list(route: Any) -> None:
+        if "/status?" in route.request.url:
+            route.continue_()
+            return
+        failed_reads.append(route.request.url)
+        route.abort("failed")
+
+    chromium_page.route("**/api/saved/**", fail_saved_list)
+    chromium_page.goto(f"{base_url}/web/", wait_until="domcontentloaded")
+
+    expect(chromium_page.locator("#videoGrid .video-card")).to_have_count(3, timeout=3000)
+    chromium_page.wait_for_timeout(1000)
+    expect(chromium_page.locator("#watchLaterCountBadge")).to_be_hidden()
+    expect(chromium_page.locator("#favoritesCountBadge")).to_be_hidden()
+    assert len(failed_reads) == 2
+
+
+def test_opening_saved_page_prevents_older_badge_hydration_from_winning(
+    issue_98_server: tuple[str, Issue98Stub],
+    chromium_page: Page,
+) -> None:
+    base_url, _ = issue_98_server
+    chromium_page.add_init_script(
+        """
+        window.__obcWatchLaterListReads = 0;
+        window.__obcResolveInitialWatchLater = null;
+        const realFetch = window.fetch.bind(window);
+        window.fetch = (input, init) => {
+          const url = typeof input === "string" ? input : input.url;
+          if (!url.includes("/api/saved/watch_later?limit=")) return realFetch(input, init);
+          window.__obcWatchLaterListReads += 1;
+          const response = (total) => new Response(
+            JSON.stringify({ items: [], total }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+          if (window.__obcWatchLaterListReads === 1) {
+            return new Promise((resolve) => {
+              window.__obcResolveInitialWatchLater = () => resolve(response(3));
+            });
+          }
+          return Promise.resolve(response(4));
+        };
+        """
+    )
+
+    chromium_page.goto(f"{base_url}/web/", wait_until="domcontentloaded")
+    chromium_page.wait_for_function(
+        "() => window.__obcWatchLaterListReads === 1 "
+        "&& typeof window.__obcResolveInitialWatchLater === 'function'"
+    )
+    expect(chromium_page.locator("#videoGrid .video-card")).to_have_count(3, timeout=3000)
+
+    chromium_page.locator("#watchLaterBtn").click()
+    expect(chromium_page.locator("#watchLaterCountBadge")).to_have_text("4", timeout=3000)
+
+    chromium_page.evaluate("window.__obcResolveInitialWatchLater()")
+    chromium_page.wait_for_timeout(300)
+    expect(chromium_page.locator("#watchLaterCountBadge")).to_have_text("4")
+
+
+def test_older_full_saved_refresh_cannot_overwrite_newer_badge(
+    issue_98_server: tuple[str, Issue98Stub],
+    chromium_page: Page,
+) -> None:
+    base_url, _ = issue_98_server
+    chromium_page.add_init_script(
+        """
+        window.__obcWatchLaterListReads = 0;
+        window.__obcResolveFirstFullWatchLater = null;
+        const realFetch = window.fetch.bind(window);
+        window.fetch = (input, init) => {
+          const url = typeof input === "string" ? input : input.url;
+          if (!url.includes("/api/saved/watch_later?limit=")) return realFetch(input, init);
+          window.__obcWatchLaterListReads += 1;
+          const response = (total) => new Response(
+            JSON.stringify({ items: [], total }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+          if (window.__obcWatchLaterListReads === 2) {
+            return new Promise((resolve) => {
+              window.__obcResolveFirstFullWatchLater = () => resolve(response(4));
+            });
+          }
+          if (window.__obcWatchLaterListReads === 3) return Promise.resolve(response(5));
+          return realFetch(input, init);
+        };
+        """
+    )
+
+    chromium_page.goto(f"{base_url}/web/", wait_until="domcontentloaded")
+    chromium_page.wait_for_function("() => window.__obcWatchLaterListReads === 1")
+    chromium_page.evaluate(
+        """
+        () => {
+          const button = document.getElementById("watchLaterBtn");
+          button.click();
+          button.click();
+        }
+        """
+    )
+    chromium_page.wait_for_function(
+        "() => window.__obcWatchLaterListReads === 3 "
+        "&& typeof window.__obcResolveFirstFullWatchLater === 'function'"
+    )
+    expect(chromium_page.locator("#watchLaterCountBadge")).to_have_text("5", timeout=3000)
+
+    chromium_page.evaluate("window.__obcResolveFirstFullWatchLater()")
+    chromium_page.wait_for_timeout(300)
+    expect(chromium_page.locator("#watchLaterCountBadge")).to_have_text("5")
 
 
 def test_default_classic_notice_stays_out_of_operational_toast_stack(

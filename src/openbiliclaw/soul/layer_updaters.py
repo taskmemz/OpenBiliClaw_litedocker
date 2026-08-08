@@ -494,6 +494,10 @@ async def _update_role(
     )
 
     try:
+        # Intentionally carries core memory: this updates the profile's own role
+        # layer, and the injected "who the user is" context (portrait / current
+        # traits / awareness) helps the LLM connect new evidence to the user's life
+        # situation before proposing a delta. Kept per the Task 8 audit.
         response = await profile_builder.registry.complete_structured_task(
             system_instruction=messages[0]["content"],
             user_input=messages[1]["content"],
@@ -589,6 +593,10 @@ async def _update_values(
     )
 
     try:
+        # Intentionally carries core memory: values-layer deltas need the user's
+        # core context ("connect evidence to user's life situation", see the
+        # curated 用户背景 above) — portrait / current values / awareness legitimately
+        # inform whether a value should be added or removed. Kept per Task 8 audit.
         response = await profile_builder.registry.complete_structured_task(
             system_instruction=messages[0]["content"],
             user_input=messages[1]["content"],
@@ -700,6 +708,10 @@ async def _update_core(
     )
 
     try:
+        # Intentionally carries core memory: this updates the deepest core layer
+        # (traits / needs / MBTI) under the strongest diff protection, and the
+        # injected core context helps the LLM weigh whether new evidence truly
+        # justifies a core change. Kept per the Task 8 audit.
         response = await profile_builder.registry.complete_structured_task(
             system_instruction=messages[0]["content"],
             user_input=messages[1]["content"],

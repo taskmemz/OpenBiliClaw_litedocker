@@ -29,6 +29,7 @@
       interestProbeRespond: "/interest-probes/respond",
       avoidanceProbeRespond: "/avoidance-probes/respond",
       sourceShareSuggestion: "/config/source-share-suggestion",
+      configApplyStatus: "/config/apply-status",
       sourceCredentials: "/sources/credentials",
       configProbe: "/config/probe-service",
       configModelDiscovery: "/config/discover-models",
@@ -65,6 +66,7 @@
       normalizeContextPreview,
       readContextSelection,
       replyQuoteMarkup,
+      renderMarkdown,
       renderPendingListMarkup,
       renderTurnMarkup,
       selectDialogueTurns,
@@ -315,6 +317,10 @@
       () => refreshDialogueConfirmationSurface(),
       300
     );
+    const scheduleDesktopPendingConfirmationRefresh = debounceAsync(
+      () => refreshDesktopPendingConfirmations().catch(() => {}),
+      300
+    );
 
     let platformAvailabilityRetryAttempt = 0;
     let platformAvailabilityRetryTimer = null;
@@ -370,9 +376,50 @@
       }
     }
 
+    let configSnapshotRetryAttempt = 0;
+    let configSnapshotRetryTimer = null;
+    let configSnapshotRecoveryInFlight = false;
+
+    // 配置快照只在水合时读一次；失败被 requestJson 静默吞掉会让筛选行永久缺失
+    // 已启用但零库存的平台（库存快照不会包含这类平台），设置页也拿不到默认值。
+    // 与平台库存一样做有界重试，成功后由后续保存 / 刷新自然接管。
+    function scheduleConfigSnapshotRetry() {
+      if (document.hidden) return;
+      if (state.config) return;
+      if (configSnapshotRetryTimer !== null) return;
+      if (configSnapshotRetryAttempt >= DESKTOP_RECOVERY_DELAYS_MS.length) return;
+      const delayMs = DESKTOP_RECOVERY_DELAYS_MS[configSnapshotRetryAttempt];
+      configSnapshotRetryAttempt += 1;
+      configSnapshotRetryTimer = window.setTimeout(() => {
+        configSnapshotRetryTimer = null;
+        void loadConfigSnapshot();
+      }, delayMs);
+    }
+
+    async function loadConfigSnapshot() {
+      if (configSnapshotRecoveryInFlight) return;
+      configSnapshotRecoveryInFlight = true;
+      try {
+        const snapshot = await requestJson(ENDPOINTS.config);
+        if (!snapshot) {
+          scheduleConfigSnapshotRetry();
+          return;
+        }
+        configSnapshotRetryAttempt = 0;
+        applyConfigSnapshot(snapshot);
+      } finally {
+        configSnapshotRecoveryInFlight = false;
+      }
+    }
+
     async function runBackendHydration() {
       if (document.hidden) {
         backendHydrationPending = true;
+        return;
+      }
+      if (settingsDirtyFields.size > 0 || settingsFormHasActiveEditor()) {
+        // 事件到真正执行再水合之间有 1 秒防抖；这段时间里用户可能已经开始下一轮编辑。
+        // 执行前再次检查，不能让过期快照清空刚出现的本地草稿。
         return;
       }
       if (backendHydrationInFlight) {
@@ -1548,6 +1595,18 @@
       return { active, pct, label };
     }
 
+    // Embedding download is process-global work and can begin before guided
+    // init reserves a run. It still needs the same status poll while the UI is
+    // idle, otherwise the first CTA click becomes the only refresh trigger.
+    function embeddingPullNeedsPolling(status) {
+      return Boolean(
+        status &&
+          !status.running &&
+          !status.initialized &&
+          embeddingPullProgressView(status).active,
+      );
+    }
+
     function buildInitChecklist(status, selected = null) {
       const prereq = status?.prerequisites || {};
       const enabled = initEnabledPlatforms(status);
@@ -2142,7 +2201,7 @@
           return;
         }
         renderAll(initStatusRenderOptions());
-        if (embeddingPullProgressView(status).active) {
+        if (embeddingPullNeedsPolling(status)) {
           scheduleInitStatusRefresh(schedule ? INIT_STATUS_POLL_MS : INIT_STATUS_WATCHDOG_MS);
         } else if (!status?.running) {
           clearInitPolling();
@@ -2188,6 +2247,12 @@
         state.initReason = status?.partial_success ? initStatusReasonText(status) : "";
         scheduleBackendHydration();
         renderAll();
+        return;
+      }
+      if (embeddingPullNeedsPolling(status)) {
+        state.initBusy = false;
+        renderAll();
+        scheduleInitStatusRefresh(INIT_STATUS_POLL_MS);
         return;
       }
       if (!selected.length) {
@@ -2431,6 +2496,7 @@
       watch_later: window.OpenBiliClawSavedSync.createRetainedSavedListState(),
       favorite: window.OpenBiliClawSavedSync.createRetainedSavedListState()
     };
+    const desktopSavedBadgeSyncGenerations = { watch_later: 0, favorite: 0 };
     const desktopSyncingKeys = {
       watch_later: window.OpenBiliClawSavedSync.createSavedSubmissionFence(),
       favorite: window.OpenBiliClawSavedSync.createSavedSubmissionFence()
@@ -2699,20 +2765,26 @@ ${savedCardFeedbackBarHtml(listKind)}
     }
 
     async function refreshWatchLater() {
+      const generation = ++desktopSavedBadgeSyncGenerations.watch_later;
+      const isCurrent = () => generation === desktopSavedBadgeSyncGenerations.watch_later;
       const retained = desktopSavedListStates.watch_later;
       try {
         const data = await fetchDesktopSaved("watch_later");
+        if (!isCurrent()) return;
         retained.commit({ items: (data?.items || []).map(desktopSavedItem), total: data?.total });
         await desktopSavedTaskRuntimes.watch_later.coordinator.recover(
           retained.snapshot().items,
           desktopRecoveredTaskCallbacks("watch_later", refreshWatchLater),
         );
+        if (!isCurrent()) return;
         const status = document.getElementById("watchLaterSyncStatus");
         if (status?.dataset.loadError === "true") { status.replaceChildren(); status.removeAttribute("role"); delete status.dataset.loadError; }
       } catch (error) {
+        if (!isCurrent()) return;
         retained.fail(error);
         showDesktopSavedLoadError("watch_later", document.getElementById("watchLaterSyncStatus"), retained, refreshWatchLater);
       }
+      if (!isCurrent()) return;
       const { items, total } = retained.snapshot();
       renderSavedList("watch_later", "watchLaterList", "watchLaterEmpty", items, refreshWatchLater);
       bindDesktopSavedBatch("watch_later", items, refreshWatchLater);
@@ -2720,20 +2792,26 @@ ${savedCardFeedbackBarHtml(listKind)}
     }
 
     async function refreshFavorites() {
+      const generation = ++desktopSavedBadgeSyncGenerations.favorite;
+      const isCurrent = () => generation === desktopSavedBadgeSyncGenerations.favorite;
       const retained = desktopSavedListStates.favorite;
       try {
         const data = await fetchDesktopSaved("favorite");
+        if (!isCurrent()) return;
         retained.commit({ items: (data?.items || []).map(desktopSavedItem), total: data?.total });
         await desktopSavedTaskRuntimes.favorite.coordinator.recover(
           retained.snapshot().items,
           desktopRecoveredTaskCallbacks("favorite", refreshFavorites),
         );
+        if (!isCurrent()) return;
         const status = document.getElementById("favoritesSyncStatus");
         if (status?.dataset.loadError === "true") { status.replaceChildren(); status.removeAttribute("role"); delete status.dataset.loadError; }
       } catch (error) {
+        if (!isCurrent()) return;
         retained.fail(error);
         showDesktopSavedLoadError("favorite", document.getElementById("favoritesSyncStatus"), retained, refreshFavorites);
       }
+      if (!isCurrent()) return;
       const { items, total } = retained.snapshot();
       renderSavedList("favorite", "favoritesList", "favoritesEmpty", items, refreshFavorites);
       bindDesktopSavedBatch("favorite", items, refreshFavorites);
@@ -2742,7 +2820,9 @@ ${savedCardFeedbackBarHtml(listKind)}
 
     // Re-sync the pressed state + count badge for all visible ☆/♥ toggles.
     function syncWatchLaterButtons() {
-      fetchDesktopSaved("watch_later").then((data) => {
+      const generation = desktopSavedBadgeSyncGenerations.watch_later;
+      return fetchDesktopSaved("watch_later").then((data) => {
+        if (generation !== desktopSavedBadgeSyncGenerations.watch_later) return;
         const saved = new Set((data?.items || []).map((it) => desktopSavedItem(it).item_key));
         document.querySelectorAll('.video-card [data-action="watch-later"]').forEach((btn) => {
           const card = btn.closest(".video-card");
@@ -2756,7 +2836,9 @@ ${savedCardFeedbackBarHtml(listKind)}
     }
 
     function syncFavoriteButtons() {
-      fetchDesktopSaved("favorite").then((data) => {
+      const generation = desktopSavedBadgeSyncGenerations.favorite;
+      return fetchDesktopSaved("favorite").then((data) => {
+        if (generation !== desktopSavedBadgeSyncGenerations.favorite) return;
         const saved = new Set((data?.items || []).map((it) => desktopSavedItem(it).item_key));
         document.querySelectorAll('.video-card [data-action="favorite"]').forEach((btn) => {
           const card = btn.closest(".video-card");
@@ -5219,7 +5301,10 @@ ${cardFeedbackBarHtml()}`;
       if (!container) return null;
       const bubble = document.createElement("div");
       bubble.className = `inline-chat-bubble ${role}${role === "reply" ? " inline-chat-reply" : ""}`;
-      bubble.textContent = text;
+      if (role === "reply") {
+        bubble.classList.add("chat-markdown");
+        bubble.innerHTML = renderMarkdown(text);
+      } else bubble.textContent = text;
       container.appendChild(bubble);
       return bubble;
     }
@@ -5603,8 +5688,8 @@ ${cardFeedbackBarHtml()}`;
       area.hidden = false;
       if (!turns.length && delight?.chat_reply) {
         const bubble = document.createElement("div");
-        bubble.className = "delight-turn-bubble is-assistant";
-        bubble.textContent = delight.chat_reply;
+        bubble.className = "delight-turn-bubble is-assistant chat-markdown";
+        bubble.innerHTML = renderMarkdown(delight.chat_reply);
         area.append(bubble);
         scheduleActivityRailHeightSync();
         return;
@@ -5619,11 +5704,16 @@ ${cardFeedbackBarHtml()}`;
         const assistantBubble = document.createElement("div");
         const status = String(turn.status || "pending");
         assistantBubble.className = `delight-turn-bubble is-assistant${status === "pending" ? " is-thinking" : ""}${status === "failed" ? " is-error" : ""}`;
-        assistantBubble.textContent = status === "pending"
+        const assistantText = status === "pending"
           ? "阿B 正在品你这句话…"
           : status === "failed"
             ? turn.error || "这句还没发出去，稍后再试。"
             : turn.reply || "后端已完成这轮聊天。";
+        if (status === "pending") assistantBubble.textContent = assistantText;
+        else {
+          assistantBubble.classList.add("chat-markdown");
+          assistantBubble.innerHTML = renderMarkdown(assistantText);
+        }
         area.append(assistantBubble);
       }
       scheduleActivityRailHeightSync();
@@ -5915,12 +6005,32 @@ ${cardFeedbackBarHtml()}`;
       }, 0);
     }
 
+    function desktopChatThinkingMarkup(
+      label = "阿B 正在思考，等待模型回复…"
+    ) {
+      return `<div class="chat-bubble agent chat-thinking" role="status" aria-live="polite" aria-atomic="true" aria-busy="true"><span class="chat-thinking-label">${escapeHtml(label)}</span><span class="chat-thinking-dots" aria-hidden="true"><span></span><span></span><span></span></span></div>`;
+    }
+
+    function desktopTurnIsWaitingForReply(turn) {
+      if (!turn || isCardTurn(turn) || isQuestionTurn(turn)) return false;
+      const status = String(turn.status || "").toLowerCase();
+      const reply = String(turn.reply || turn.assistant_message || "").trim();
+      return !reply && (status === "pending" || status === "processing");
+    }
+
     function chatHtml(messages) {
       return messages.map((msg) => {
         if (msg?.turn) {
-          return `${replyQuoteMarkup(msg.turn, desktopDialogueTurns())}${renderTurnMarkup(msg.turn, { surface: "desktop" })}`;
+          const waiting = desktopTurnIsWaitingForReply(msg.turn)
+            ? desktopChatThinkingMarkup()
+            : "";
+          return `${replyQuoteMarkup(msg.turn, desktopDialogueTurns())}${renderTurnMarkup(msg.turn, { surface: "desktop" })}${waiting}`;
         }
-        return `<div class="chat-bubble ${msg.role === "user" ? "user" : "agent"}">${escapeHtml(msg.text)}</div>`;
+        if (msg?.thinking) return desktopChatThinkingMarkup(msg.text);
+        const body = msg.role === "user"
+          ? escapeHtml(msg.text)
+          : `<div class="chat-markdown">${renderMarkdown(msg.text)}</div>`;
+        return `<div class="chat-bubble ${msg.role === "user" ? "user" : "agent"}">${body}</div>`;
       }).join("");
     }
 
@@ -6302,7 +6412,11 @@ ${cardFeedbackBarHtml()}`;
       const payloadMessage = options.contextPrefix ? `${options.contextPrefix}\n\n${message}` : message;
       const replyToTurnId = dialogueContextSelection?.["reply_to_turn_id"] || "";
       state.chat.push({ role: "user", text: message });
-      state.chat.push({ role: "agent", text: "正在提交给后端，并等待 durable chat turn 完成。" });
+      state.chat.push({
+        role: "agent",
+        text: "阿B 正在思考，等待模型回复…",
+        thinking: true,
+      });
       renderChat({ forceBottom: true });
       const payload = {
         session: SHARED_CHAT_SESSION,
@@ -6822,6 +6936,12 @@ ${cardFeedbackBarHtml()}`;
     // contract yet; `describeAccess()` falls back to the legacy `state` for it.
     const SourceStatus = globalThis.OpenBiliClawSourceStatus;
     const SOURCE_STATUS_KEYS = SourceStatus.SOURCE_KEYS;
+    const SOURCE_STATUS_REFRESH_EVENTS = new Set([
+      "bilibili_cookie_synced",
+      "douyin_cookie_synced",
+      "x_cookie_synced",
+      "reddit_cookie_synced"
+    ]);
     const SOURCE_ENABLE_SELECT_IDS = {
       bilibili: "bilibiliEnabled",
       xiaohongshu: "xhsEnabled",
@@ -7164,12 +7284,11 @@ ${cardFeedbackBarHtml()}`;
     initSourceCards();
 
     // Login happens outside this page (user signs into a platform in another
-    // tab), so a one-shot render on settings open goes stale — re-poll while
-    // the status list is actually visible.
+    // tab). Runtime events make the normal update immediate; this visible-page
+    // poll catches missed events / reconnect gaps and also keeps the dashboard
+    // warning current when the source settings list is closed.
     setInterval(() => {
       if (document.hidden) return;
-      const list = $("#sourceStatusList");
-      if (!list || list.offsetParent === null) return;
       void renderSourcesStatus();
     }, 30000);
 
@@ -8097,6 +8216,14 @@ ${cardFeedbackBarHtml()}`;
       clearSettingsDirty();
     }
 
+    function applyConfigSnapshot(snapshot) {
+      const configSnapshot = snapshot?.config || snapshot;
+      applyConfig(configSnapshot);
+      presentDegradedConfigRecovery(configSnapshot);
+      renderFilters();
+      syncSourceMetric();
+    }
+
     function normalizeDelight(item) {
       if (!item) return null;
       const canonical = window.OpenBiliClawSavedSync.normalizeSavedItem(item);
@@ -8567,11 +8694,31 @@ ${cardFeedbackBarHtml()}`;
 
     function handleRuntimeEvent(event) {
       if (!event?.type) return;
+      let configApplyEventAccepted = true;
+      if (event.type === "config_reloaded") {
+        const revision = Number(event.revision || 0);
+        configApplyEventAccepted = applyConfigApplyStatus({
+          state: "applied",
+          requested_revision: revision,
+          applied_revision: revision,
+        }, { source: "runtime-event" });
+      } else if (event.type === "config_reload_failed") {
+        configApplyEventAccepted = applyConfigApplyStatus({
+          state: "failed",
+          requested_revision: Number(event.revision || 0),
+          applied_revision: 0,
+        }, { source: "runtime-event" });
+      }
+      scheduleDesktopPendingConfirmationRefresh();
       if (event.type === "refresh.pool_updated" && typeof event.pool_available_count === "number") {
         desktopRuntimeGeneration += 1;
         clearDesktopRuntimeRecovery();
       }
       applyRuntimeStatus({ ...event, live_summary: event.message || event.live_summary || event.type });
+      // Credential sync changes the backend-owned source contract. Refresh it
+      // immediately so the dashboard warning does not retain the pre-login
+      // snapshot until settings is opened or the fallback poll runs.
+      if (SOURCE_STATUS_REFRESH_EVENTS.has(event.type)) void renderSourcesStatus();
       // 库存变化事件只刷新 Tab 数字 / 空态 / 自动续页 gate，不碰已加载的推荐卡片。
       if (event.type === "refresh.pool_updated" || event.type === "pool_status") schedulePlatformAvailabilityRefresh();
       if (event.type === "degraded") {
@@ -8586,13 +8733,15 @@ ${cardFeedbackBarHtml()}`;
       // (/api/recommendations only returns the latest top window). Header/pool counts
       // still update via applyRuntimeStatus above; user-initiated 换一批 / 加载更多 replace
       // the list explicitly. Matches recommend.js + popup.js (fix 79042ce).
-      if (["config_reloaded"].includes(event.type)) {
-        // config_reloaded 会触发全量再水合，applyConfig 覆盖设置表单里的每个字段。
-        // 用户正在表单里编辑（焦点在 #settingsForm 内）时跳过，避免未保存的输入
-        // 被后台事件悄悄打回。
-        const settingsForm = document.getElementById("settingsForm");
-        const editingSettings = Boolean(settingsForm && settingsForm.contains(document.activeElement));
-        if (!editingSettings) scheduleBackendHydration();
+      if (event.type === "config_reloaded" && !configApplyEventAccepted) return;
+      if (event.type === "config_reload_failed") {
+        if (!configApplyEventAccepted) return;
+        const message = String(event.message || "后台应用配置失败，已恢复上一次生效配置。");
+        if ($("#configStatus")) {
+          $("#configStatus").setAttribute("role", "alert");
+          $("#configStatus").value = message;
+        }
+        showToast("配置应用失败：请查看配置状态");
       }
       if (["init_progress", "init_failed", "init_completed"].includes(event.type)) {
         void refreshInitStatus({ schedule: event.type === "init_progress" });
@@ -8710,6 +8859,8 @@ ${cardFeedbackBarHtml()}`;
         socket.addEventListener("open", () => {
           $("#statusLabel").textContent = "实时连接正常";
           restartDesktopFailedRecoveries();
+          scheduleDesktopPendingConfirmationRefresh();
+          void refreshConfigApplyStatus();
           // The page may load before the backend binds (frozen-entry launch
           // race): the boot hydrate then swallows every failure into nulls and
           // nothing else ever re-fetches — an uninitialized backend emits no
@@ -8767,6 +8918,7 @@ ${cardFeedbackBarHtml()}`;
         desktopRecommendationRecoveryTimer,
         desktopRuntimeRecoveryTimer,
         platformAvailabilityRetryTimer,
+        configSnapshotRetryTimer,
         activityPageRefreshTimer,
       ]) {
         if (timer !== null) window.clearTimeout(timer);
@@ -8775,6 +8927,7 @@ ${cardFeedbackBarHtml()}`;
       desktopRecommendationRecoveryTimer = null;
       desktopRuntimeRecoveryTimer = null;
       platformAvailabilityRetryTimer = null;
+      configSnapshotRetryTimer = null;
       activityPageRefreshTimer = null;
       clearInitPolling();
       const socket = state.runtimeSocket;
@@ -8904,8 +9057,7 @@ ${cardFeedbackBarHtml()}`;
         // Re-attach the init poll if a run is live at load time. Hydrate only
         // fetches init-status once, while the poll observes quiet heartbeats
         // when runtime events are unavailable.
-        if (snapshot.running
-          || embeddingPullProgressView(snapshot).active) {
+        if (snapshot.running || embeddingPullNeedsPolling(snapshot)) {
           scheduleInitStatusRefresh(INIT_STATUS_POLL_MS);
         }
       }
@@ -8940,19 +9092,10 @@ ${cardFeedbackBarHtml()}`;
       }
 
       function applyChatSnapshot(snapshot) {
-        const chatItems = Array.isArray(snapshot) ? snapshot : asArray(snapshot?.items);
-        if (!chatItems.length) return;
-        state.chat = chatItems.flatMap((turn) => {
-          const failed = String(turn.status || "").toLowerCase() === "failed";
-          const agentText = failed
-            ? turn.error || "这句还没发出去，稍后再试。"
-            : turn.reply || turn.assistant_message || "等待后端回复中。";
-          return [
-            { role: "user", text: turn.message || turn.user_message || "" },
-            { role: "agent", text: agentText }
-          ];
-        }).filter((item) => item.text);
-        renderChat();
+        // Use the same scoped durable-turn renderer as later refreshes. The
+        // initial snapshot must not briefly show delight-only history or
+        // flatten probe turns into an untracked user/assistant pair.
+        applyDialogueChatSnapshot(snapshot);
       }
 
       function applyDelightChatSnapshot(snapshot) {
@@ -8960,14 +9103,6 @@ ${cardFeedbackBarHtml()}`;
         for (const turn of items.filter(Boolean)) {
           applyTurnToDelight({ ...turn, scope: turn.scope || "delight" });
         }
-      }
-
-      function applyConfigSnapshot(snapshot) {
-        const configSnapshot = snapshot?.config || snapshot;
-        applyConfig(configSnapshot);
-        presentDegradedConfigRecovery(configSnapshot);
-        renderFilters();
-        syncSourceMetric();
       }
 
       async function reconcileRuntimeAfterRecommendations() {
@@ -8998,10 +9133,16 @@ ${cardFeedbackBarHtml()}`;
       const pingSnapshot = await requestJson(ENDPOINTS.ping);
       applyHealthSnapshot(pingSnapshot);
       if (pingSnapshot?.degraded === true) {
-        applyConfigSnapshot(await requestJson(ENDPOINTS.config));
+        const configSnapshot = await requestJson(ENDPOINTS.config);
+        applyConfigSnapshot(configSnapshot);
+        if (!configSnapshot) scheduleConfigSnapshotRetry();
         return;
       }
 
+      // The chat badge is tiny but high-signal: start it before recommendation
+      // cards fan out into saved-status reads, otherwise a healthy 10ms request
+      // can sit behind the first-screen connection queue for several seconds.
+      const pendingConfirmationsPromise = refreshDesktopPendingConfirmations();
       const recommendationsPromise = readRecommendationSnapshot();
       const runtimePromise = readRuntimeSnapshot();
 
@@ -9019,15 +9160,18 @@ ${cardFeedbackBarHtml()}`;
       );
 
       const secondaryPromises = [
+        pendingConfirmationsPromise,
+        syncWatchLaterButtons(),
+        syncFavoriteButtons(),
         requestJson(ENDPOINTS.health),
         requestJson(ENDPOINTS.initStatus).then(applyInitStatusSnapshot),
         requestJson(`${ENDPOINTS.activityFeed}?limit=5`).then(applyActivitySnapshot),
         requestJson(ENDPOINTS.profile).then(applyProfileSnapshot),
         requestJson(ENDPOINTS.delightBatch).then(applyDelightSnapshot),
         requestJson(ENDPOINTS.notificationPending).then(applyNotificationSnapshot),
-        requestJson(`${ENDPOINTS.chatTurns}?session=${encodeURIComponent(SHARED_CHAT_SESSION)}&scope=chat&limit=20`).then(applyChatSnapshot),
+        requestJson(`${ENDPOINTS.chatTurns}?session=${encodeURIComponent(SHARED_CHAT_SESSION)}&limit=100`).then(applyChatSnapshot),
         requestJson(`${ENDPOINTS.chatTurns}?session=${encodeURIComponent(SHARED_CHAT_SESSION)}&scope=delight&limit=80`).then(applyDelightChatSnapshot),
-        requestJson(ENDPOINTS.config).then(applyConfigSnapshot),
+        loadConfigSnapshot(),
         refreshPlatformAvailability(),
       ];
 
@@ -9112,10 +9256,10 @@ ${cardFeedbackBarHtml()}`;
           },
           xiaohongshu: {
             enabled: $("#xhsEnabled").value === "on",
-            daily_search_budget: getIntInput("xhsDailySearchBudget", 0),
+            daily_search_budget: getIntInput("xhsDailySearchBudget", 20),
             daily_creator_budget: getIntInput("xhsDailyCreatorBudget", 0),
-            task_interval_seconds: getIntInput("xhsTaskInterval", 300),
-            min_interval_minutes: getIntInput("xhsMinInterval", 3)
+            task_interval_seconds: getIntInput("xhsTaskInterval", 1200),
+            min_interval_minutes: getIntInput("xhsMinInterval", 20)
           },
           douyin: {
             enabled: $("#douyinEnabled").value === "on",
@@ -9989,6 +10133,25 @@ ${cardFeedbackBarHtml()}`;
     // retyping the same input does not inflate the number.
     const settingsDirtyFields = new Set();
     let settingsSaveInFlight = false;
+    let settingsSavePhase = "idle";
+    let settingsPendingApplyRevision = 0;
+    let settingsLastTerminalRevision = 0;
+
+    function settingsFormHasActiveEditor() {
+      const settingsForm = document.getElementById("settingsForm");
+      const active = document.activeElement;
+      return Boolean(
+        settingsForm &&
+        active instanceof Element &&
+        settingsForm.contains(active) &&
+        active.matches('input:not([readonly]), textarea:not([readonly]), select, [contenteditable="true"]')
+      );
+    }
+
+    function scheduleSettingsHydrationIfSafe() {
+      if (settingsDirtyFields.size > 0 || settingsFormHasActiveEditor()) return;
+      scheduleBackendHydration();
+    }
 
     function renderSettingsDirty() {
       const bar = $("#settingsSaveBar");
@@ -9996,10 +10159,107 @@ ${cardFeedbackBarHtml()}`;
       const discard = $("#settingsDiscardBtn");
       const save = $("#settingsSaveBtn");
       const count = settingsDirtyFields.size;
-      if (bar) bar.dataset.dirty = count > 0 ? "true" : "false";
-      if (msg) msg.textContent = count > 0 ? `已修改 ${count} 项，未保存` : "没有未保存的修改";
-      if (discard) discard.disabled = count === 0;
+      const phase = settingsSaveInFlight
+        ? "saving"
+        : count > 0 ? "dirty" : settingsSavePhase;
+      const messages = {
+        idle: "没有未保存的修改",
+        saving: "正在保存配置…",
+        applying: "配置已保存，正在后台应用…",
+        applied: "配置已应用",
+        failed: "配置应用失败，已恢复上一次生效配置",
+      };
+      if (bar) {
+        bar.dataset.dirty = count > 0 ? "true" : "false";
+        bar.dataset.saveState = phase;
+        bar.toggleAttribute("aria-busy", phase === "saving" || phase === "applying");
+      }
+      if (msg) {
+        msg.textContent = phase === "dirty"
+          ? `已修改 ${count} 项，未保存`
+          : (messages[phase] || messages.idle);
+      }
+      if (discard) discard.disabled = settingsSaveInFlight || count === 0;
       if (save) save.disabled = settingsSaveInFlight || count === 0;
+    }
+
+    function applyConfigApplyStatus(snapshot, { source = "status" } = {}) {
+      const applyState = String(snapshot?.state || "");
+      const requested = Number(snapshot?.requested_revision || 0);
+      const applied = Number(snapshot?.applied_revision || 0);
+      const fromRuntimeEvent = source === "runtime-event";
+      const terminalRevision = Math.max(requested, applied);
+      let reachedTerminal = false;
+      if (
+        settingsPendingApplyRevision > 0 &&
+        requested < settingsPendingApplyRevision
+      ) return false;
+      if (
+        terminalRevision > 0 &&
+        ["applied", "failed"].includes(applyState) &&
+        terminalRevision <= settingsLastTerminalRevision
+      ) return false;
+      if (
+        settingsPendingApplyRevision === 0 &&
+        ["queued", "applying"].includes(applyState) &&
+        settingsLastTerminalRevision > 0 &&
+        requested <= settingsLastTerminalRevision
+      ) return false;
+      if (
+        settingsPendingApplyRevision === 0 &&
+        ["applied", "failed"].includes(applyState) &&
+        !fromRuntimeEvent
+      ) return false;
+
+      if (["queued", "applying"].includes(applyState)) {
+        settingsPendingApplyRevision = Math.max(settingsPendingApplyRevision, requested);
+        settingsSavePhase = "applying";
+      } else if (
+        applyState === "applied" &&
+        (
+          (settingsPendingApplyRevision > 0 && applied >= settingsPendingApplyRevision) ||
+          (fromRuntimeEvent && requested > 0)
+        )
+      ) {
+        settingsPendingApplyRevision = 0;
+        settingsSavePhase = "applied";
+        settingsLastTerminalRevision = Math.max(settingsLastTerminalRevision, terminalRevision);
+        reachedTerminal = true;
+      } else if (
+        applyState === "failed" &&
+        (
+          (settingsPendingApplyRevision > 0 && requested >= settingsPendingApplyRevision) ||
+          (fromRuntimeEvent && requested > 0)
+        )
+      ) {
+        settingsPendingApplyRevision = 0;
+        settingsSavePhase = "failed";
+        settingsLastTerminalRevision = Math.max(settingsLastTerminalRevision, terminalRevision);
+        reachedTerminal = true;
+      }
+      renderSettingsDirty();
+      if (reachedTerminal) {
+        if (settingsSavePhase === "failed" && settingsDirtyFields.size > 0) {
+          // Keep a new local draft in the form, but refresh the canonical
+          // snapshot used by Discard. Otherwise a failed save followed by a
+          // second edit would make Discard restore the rejected candidate.
+          void refreshConfigSnapshotOnly();
+        } else {
+          scheduleSettingsHydrationIfSafe();
+        }
+      }
+      return true;
+    }
+
+    async function refreshConfigSnapshotOnly() {
+      const snapshot = await requestJson(ENDPOINTS.config, { cache: "no-store" });
+      const config = snapshot?.config || snapshot;
+      if (config && typeof config === "object") state.config = config;
+    }
+
+    async function refreshConfigApplyStatus() {
+      const snapshot = await requestJson(ENDPOINTS.configApplyStatus, { cache: "no-store" });
+      if (snapshot) applyConfigApplyStatus(snapshot);
     }
 
     function markSettingsDirty(target) {
@@ -10060,19 +10320,40 @@ ${cardFeedbackBarHtml()}`;
         if (result?.config) applyConfig(result.config);
         else clearSettingsDirty();
         const message = result?.message || "配置已保存。";
-        const suffix = result?.restart_required ? "\n当前配置需要重启后端后完全生效。" : result?.reloaded === false ? "\n后端返回未热重载，请检查运行状态。" : "";
+        const queued = result?.apply_state === "queued";
+        if (queued) {
+          settingsPendingApplyRevision = Math.max(
+            settingsPendingApplyRevision,
+            Number(result?.apply_revision || 0),
+          );
+          settingsSavePhase = "applying";
+          renderSettingsDirty();
+        } else if (result?.reloaded === true) {
+          settingsPendingApplyRevision = 0;
+          settingsSavePhase = "applied";
+          renderSettingsDirty();
+        }
+        const suffix = result?.restart_required
+          ? "\n当前配置需要重启后端后完全生效。"
+          : queued
+            ? "\n配置已进入后台应用队列，连续保存会自动合并为最新版本。"
+            : result?.reloaded === false ? "\n后端返回未热重载，请检查运行状态。" : "";
         if ($("#configStatus")) $("#configStatus").value = `${message}${suffix}`;
-        showToast(result?.restart_required ? "配置已保存，需要重启后端" : "配置已保存");
-        void hydrateFromBackend();
+        showToast(
+          result?.restart_required
+            ? "配置已保存，需要重启后端"
+            : queued ? "配置已保存，正在后台应用…" : "配置已保存"
+        );
+        if (queued) void refreshConfigApplyStatus();
         void refreshUpdateStatus();
       } catch (error) {
         if (error?.code === "request_timeout") {
-          const pendingMessage = "保存请求仍可能在后台等待对话整理完成；期间后端功能可继续使用，完成后页面会自动收到热重载事件。";
+          const pendingMessage = "保存请求超时，当前无法确认配置是否已经写入；请稍后查看配置状态，避免立即重复提交。";
           if ($("#configStatus")) {
             $("#configStatus").setAttribute("role", "status");
             $("#configStatus").value = pendingMessage;
           }
-          showToast("配置仍在后台安全热重载", { duration: 5200 });
+          showToast("保存请求超时，请稍后确认配置状态", { duration: 5200 });
           return;
         }
         const message = configErrorMessage(error.details) || error.message || "未知错误";

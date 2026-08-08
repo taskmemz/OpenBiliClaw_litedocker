@@ -162,6 +162,25 @@ def test_effective_candidate_eval_workers_reserves_one_llm_slot() -> None:
     assert effective_candidate_eval_workers(0, 99) == 1
 
 
+def test_coordinator_uses_pipeline_coalescing_claim() -> None:
+    pipeline = _FakeStagedPipeline(candidate_count=3)
+    ready_calls: list[int] = []
+
+    def claim_ready_batch(*, limit: int) -> None:
+        ready_calls.append(limit)
+        return None
+
+    pipeline.claim_ready_batch = claim_ready_batch  # type: ignore[attr-defined]
+    pipeline.eval_ready_in_seconds = lambda *, limit: 42.0  # type: ignore[attr-defined]
+    coordinator = _coordinator(pipeline, worker_count=1)
+
+    delay = coordinator._fill_open_slots()  # noqa: SLF001
+
+    assert ready_calls == [30]
+    assert delay == pytest.approx(42.0)
+    assert pipeline.started == []
+
+
 @pytest.mark.asyncio
 async def test_coordinator_caps_worker_claims_at_three_batches_and_ninety_raw() -> None:
     pipeline = _FakeStagedPipeline(candidate_count=240)
@@ -742,6 +761,42 @@ async def test_productive_supply_resets_ladder() -> None:
     assert coordinator._supply_task is not None
     await coordinator._supply_task
     await coordinator._settle_supply_task()
+
+    assert coordinator._supply_streak == 0
+    assert coordinator._supply_cooldown_until == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"refreshed": True, "supply_inserted_count": 0},
+        {"refreshed": True, "supply_progress_count": 0},
+        {"refreshed": True, "supply_productive": False},
+    ],
+)
+async def test_explicit_zero_supply_progress_backs_off(
+    result: dict[str, object],
+) -> None:
+    coordinator = _coordinator(_FakeStagedPipeline(candidate_count=0))
+    coordinator.time_fn = lambda: 100.0
+    coordinator.supply_callback = lambda reason: result
+
+    coordinator._request_supply("test")
+    assert coordinator._supply_task is not None
+    await coordinator._supply_task
+    await coordinator._settle_supply_task()
+
+    assert coordinator._supply_streak == 1
+    assert coordinator._supply_cooldown_until == 130.0
+
+
+def test_candidate_enqueue_notification_resets_supply_ladder() -> None:
+    coordinator = _coordinator(_FakeStagedPipeline(candidate_count=0))
+    coordinator._record_supply_result(productive=False)
+    coordinator._record_supply_result(productive=False)
+
+    coordinator.notify("candidate_enqueued:pipeline")
 
     assert coordinator._supply_streak == 0
     assert coordinator._supply_cooldown_until == 0.0

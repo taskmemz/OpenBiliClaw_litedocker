@@ -69,6 +69,17 @@ class _FakeHost:
     def _history(self, platform: str) -> list[str]:
         return []
 
+    def _novel_keywords(
+        self,
+        platform: str,
+        words: list[str],
+        *,
+        keyword_kind: str = "regular",
+    ) -> list[str]:
+        """Mirror the planner seam; rotation behaviour has dedicated tests."""
+        del platform, keyword_kind
+        return list(words)
+
     def _insert(
         self,
         platform: str,

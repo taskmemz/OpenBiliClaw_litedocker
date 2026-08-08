@@ -115,7 +115,7 @@ class SourceAuthContract(BaseModel):
 
 **旧 `state` 是承袭的，不是推导的。** 原计划写一个 `derive_legacy_state(contract)`，实施时证明不可能：bilibili 与 douyin 的正交字段完全相同（`present` + `unverified` + `live_probe`），旧值却分别是 `ready`/`True` 与 `unverified`/`False`——B 站因「cookie 字段齐全」获得信任推定，抖音因其分支被写成永不声称成功而没有。**这个不可能性本身就是旧字段语义坍塌的最强证据。** 改由 `legacy.py` 的 `check_legacy_consistency()` 断言两套视图互不矛盾（不是相等：`ready` 合法地对应 `verified` 或 `unverified`）。
 
-**状态端点绝不出网，由作用域强制。** `SourceAuthContext` 只持有 config 与 database，**拿不到 HTTP client**。设置页 30 秒轮询一次，若状态端点自己探测，一个空闲标签页就会每分钟打抖音两次、永不停止——那是自造风控。活体探测只发生在显式的 verify 动作里，状态端点通过 `probe_cache.LiveProbeCache.peek()` 读取上次结论（零 I/O）。
+**状态端点绝不出网，由作用域强制。** `SourceAuthContext` 只持有 config 与 database，**拿不到 HTTP client**。PC Web 收到 `bilibili_cookie_synced`、`douyin_cookie_synced`、`x_cookie_synced` 或 `reddit_cookie_synced` runtime 事件后会立即重读该端点；文档可见时仍每 30 秒轮询一次，作为事件遗漏或 WebSocket 重连空窗的兜底，并同时刷新首页警示与来源卡片。若状态端点自己探测，一个空闲标签页就会每分钟打抖音两次、永不停止——那是自造风控。活体探测只发生在显式的 verify 动作里，状态端点通过 `probe_cache.LiveProbeCache.peek()` 读取上次结论（零 I/O）。
 
 **verify 动作按固定动作表分派，不按 `verify_method`。** 两者不同：`verify_method` 描述「当前这个结论怎么来的」，随状态变化（知乎无心跳时回落 `task_history`）；而一次点击要做的事是平台的固定属性（知乎永远是「请插件重新上报」）。按前者分派会让知乎**在最需要验证时反而没有可执行动作**，还会凭空造出「重跑历史」这种不存在的操作。
 

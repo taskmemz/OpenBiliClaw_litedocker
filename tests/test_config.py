@@ -160,6 +160,13 @@ class TestConfigDefaults:
         config = Config()
 
         assert config.scheduler.pool_target_count == 300
+        assert config.scheduler.copy_ready_target_count == 90
+
+    def test_config_defaults_eval_batch_coalescing_fields(self) -> None:
+        config = Config()
+
+        assert config.scheduler.eval_min_batch_size == 15
+        assert config.scheduler.eval_max_wait_seconds == 90.0
 
     def test_scheduler_pool_source_shares_defaults(self) -> None:
         config = Config()
@@ -196,6 +203,104 @@ class TestConfigDefaults:
         assert config.scheduler.discovery_limit == 30
         assert config.scheduler.proactive_push_interval_seconds == 120
         assert config.scheduler.speculator_idle_interval_minutes == 30
+
+    def test_scheduler_source_incremental_defaults(self) -> None:
+        config = Config()
+
+        assert config.scheduler.source_incremental_hours == 24
+        assert config.scheduler.xhs_incremental_hours is None
+        assert config.scheduler.douyin_incremental_hours is None
+        assert config.scheduler.youtube_incremental_hours is None
+        assert config.scheduler.zhihu_incremental_hours is None
+        assert config.scheduler.reddit_incremental_hours is None
+
+    def test_example_config_keeps_per_source_incremental_intervals_inherited(self) -> None:
+        example_path = Path(__file__).parents[1] / "config.example.toml"
+
+        with example_path.open("rb") as handle:
+            scheduler = tomllib.load(handle)["scheduler"]
+
+        assert scheduler["source_incremental_hours"] == 24
+        assert "xhs_incremental_hours" not in scheduler
+        assert "douyin_incremental_hours" not in scheduler
+        assert "youtube_incremental_hours" not in scheduler
+        assert "zhihu_incremental_hours" not in scheduler
+        assert "reddit_incremental_hours" not in scheduler
+
+    def test_scheduler_source_incremental_config_round_trip(self, tmp_path: Path) -> None:
+        config = Config()
+        config.scheduler.source_incremental_hours = 37
+        config.scheduler.xhs_incremental_hours = 0
+        config.scheduler.douyin_incremental_hours = 168
+        config.scheduler.youtube_incremental_hours = None
+        config.scheduler.zhihu_incremental_hours = 7
+        config.scheduler.reddit_incremental_hours = 42
+
+        target = tmp_path / "config.toml"
+        save_config(config, target)
+        rendered = target.read_text(encoding="utf-8")
+        loaded = load_config(target)
+
+        assert loaded.scheduler.source_incremental_hours == 37
+        assert loaded.scheduler.xhs_incremental_hours == 0
+        assert loaded.scheduler.douyin_incremental_hours == 168
+        assert loaded.scheduler.youtube_incremental_hours is None
+        assert loaded.scheduler.zhihu_incremental_hours == 7
+        assert loaded.scheduler.reddit_incremental_hours == 42
+        assert "xhs_incremental_hours = 0" in rendered
+        assert "youtube_incremental_hours" not in rendered
+
+    def test_scheduler_source_incremental_env_fields_are_filtered_to_flat_keys(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        target = tmp_path / "config.toml"
+        target.write_text("[scheduler]\n", encoding="utf-8")
+        values = {
+            "OPENBILICLAW_SCHEDULER_SOURCE_INCREMENTAL_HOURS": "1",
+            "OPENBILICLAW_SCHEDULER_XHS_INCREMENTAL_HOURS": "2",
+            "OPENBILICLAW_SCHEDULER_DOUYIN_INCREMENTAL_HOURS": "3",
+            "OPENBILICLAW_SCHEDULER_YOUTUBE_INCREMENTAL_HOURS": "4",
+            "OPENBILICLAW_SCHEDULER_ZHIHU_INCREMENTAL_HOURS": "5",
+            "OPENBILICLAW_SCHEDULER_REDDIT_INCREMENTAL_HOURS": "6",
+        }
+        for key, value in values.items():
+            monkeypatch.setenv(key, value)
+
+        loaded = load_config(target)
+
+        assert loaded.scheduler.source_incremental_hours == 1
+        assert loaded.scheduler.xhs_incremental_hours == 2
+        assert loaded.scheduler.douyin_incremental_hours == 3
+        assert loaded.scheduler.youtube_incremental_hours == 4
+        assert loaded.scheduler.zhihu_incremental_hours == 5
+        assert loaded.scheduler.reddit_incremental_hours == 6
+
+    @pytest.mark.parametrize("value", [-1, 169, True, 1.5, "not-an-int"])
+    def test_scheduler_source_incremental_loader_falls_back_for_invalid_values(
+        self, value: object
+    ) -> None:
+        config = _build_config(
+            {
+                "scheduler": {
+                    "source_incremental_hours": value,
+                    "xhs_incremental_hours": value,
+                }
+            }
+        )
+
+        assert config.scheduler.source_incremental_hours == 24
+        assert config.scheduler.xhs_incremental_hours is None
+
+    def test_scheduler_source_incremental_save_rejects_invalid_direct_dataclass_values(
+        self, tmp_path: Path
+    ) -> None:
+        config = Config()
+        config.scheduler.source_incremental_hours = 169
+
+        with pytest.raises(ValueError, match="0..168"):
+            save_config(config, tmp_path / "config.toml")
 
     def test_build_from_empty_dict(self) -> None:
         config = _build_config({})
@@ -281,6 +386,59 @@ manage_ollama = true
         assert isinstance(config.soul, SoulConfig)
         assert isinstance(config.soul.preference, SoulPreferenceConfig)
         assert config.soul.preference.satisfaction_filter_enabled is True
+
+    def test_token_diet_runtime_controls_round_trip(self, tmp_path: Path) -> None:
+        cfg = Config()
+        cfg.scheduler.copy_ready_target_count = 47
+        cfg.soul.preference_prompt_view = "compact-v1"
+        cfg.soul.awareness_prompt_view = "legacy"
+        cfg.soul.insight_prompt_view = "compact-v1"
+        target = tmp_path / "config.toml"
+
+        save_config(cfg, target)
+        rendered = target.read_text(encoding="utf-8")
+        loaded = load_config(target)
+
+        assert "copy_ready_target_count = 47" in rendered
+        assert 'preference_prompt_view = "compact-v1"' in rendered
+        assert 'awareness_prompt_view = "legacy"' in rendered
+        assert 'insight_prompt_view = "compact-v1"' in rendered
+        assert "cognition_prompt_view" not in rendered
+        assert loaded.scheduler.copy_ready_target_count == 47
+        assert loaded.soul.preference_prompt_view == "compact-v1"
+        assert loaded.soul.awareness_prompt_view == "legacy"
+        assert loaded.soul.insight_prompt_view == "compact-v1"
+
+    def test_token_diet_runtime_control_defaults_only_enable_awareness(self) -> None:
+        cfg = Config()
+
+        assert cfg.soul.preference_prompt_view == "legacy"
+        assert cfg.soul.awareness_prompt_view == "compact-v1"
+        assert cfg.soul.insight_prompt_view == "legacy"
+
+    def test_token_diet_runtime_controls_reject_invalid_values(self) -> None:
+        from openbiliclaw.config import _collect_config_issues
+
+        cfg = Config()
+        cfg.scheduler.copy_ready_target_count = 601
+        cfg.soul.preference_prompt_view = "semantic-preference"
+        cfg.soul.awareness_prompt_view = "semantic-awareness"
+        cfg.soul.insight_prompt_view = "semantic-insight"
+
+        fields = {issue.field for issue in _collect_config_issues(cfg)}
+
+        assert "scheduler.copy_ready_target_count" in fields
+        assert "soul.preference_prompt_view" in fields
+        assert "soul.awareness_prompt_view" in fields
+        assert "soul.insight_prompt_view" in fields
+
+    def test_unpublished_global_cognition_prompt_view_is_not_a_compatibility_alias(self) -> None:
+        config = _build_config({"soul": {"cognition_prompt_view": "compact-v1"}})
+
+        assert config.soul.preference_prompt_view == "legacy"
+        assert config.soul.awareness_prompt_view == "compact-v1"
+        assert config.soul.insight_prompt_view == "legacy"
+        assert not hasattr(config.soul, "cognition_prompt_view")
 
     def test_soul_preference_satisfaction_filter_round_trips_false(self, tmp_path: Path) -> None:
         """save_config → load_config preserves an explicit opt-out."""
@@ -849,6 +1007,31 @@ def test_validate_runtime_config_rejects_pool_target_count_above_cap() -> None:
         validate_runtime_config(config)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("eval_min_batch_size", 0),
+        ("eval_min_batch_size", 91),
+        ("eval_max_wait_seconds", -0.1),
+        ("eval_max_wait_seconds", 600.1),
+    ],
+)
+def test_validate_runtime_config_rejects_eval_batch_coalescing_out_of_range(
+    field: str,
+    value: int | float,
+) -> None:
+    config = Config(
+        llm=LLMConfig(
+            default_provider="ollama",
+            ollama=LLMProviderConfig(model="llama3", base_url="http://localhost:11434"),
+        )
+    )
+    setattr(config.scheduler, field, value)
+
+    with pytest.raises(ConfigError, match=f"scheduler.{field}"):
+        validate_runtime_config(config)
+
+
 def test_build_config_supports_account_sync_interval() -> None:
     config = _build_config(
         {
@@ -940,6 +1123,8 @@ def test_load_config_reads_scheduler_runtime_fields(tmp_path: Path) -> None:
         """
 [scheduler]
 refresh_check_interval_seconds = 75
+eval_min_batch_size = 23
+eval_max_wait_seconds = 45.5
 signal_event_threshold = 9
 trending_refresh_minutes = 5
 explore_refresh_minutes = 18
@@ -958,6 +1143,8 @@ avoidance_speculation_max_active = 5
     config = load_config(toml_path)
 
     assert config.scheduler.refresh_check_interval_seconds == 75
+    assert config.scheduler.eval_min_batch_size == 23
+    assert config.scheduler.eval_max_wait_seconds == 45.5
     assert config.scheduler.signal_event_threshold == 9
     assert config.scheduler.trending_refresh_minutes == 5
     assert config.scheduler.explore_refresh_minutes == 18
@@ -976,6 +1163,11 @@ avoidance_speculation_max_active = 5
     [
         ("refresh_check_interval_seconds", "0", 60),
         ("refresh_check_interval_seconds", '"abc"', 60),
+        ("eval_min_batch_size", "0", 15),
+        ("eval_min_batch_size", "91", 15),
+        ("eval_max_wait_seconds", "-1", 90.0),
+        ("eval_max_wait_seconds", "601", 90.0),
+        ("eval_max_wait_seconds", '"abc"', 90.0),
         ("signal_event_threshold", "-1", 6),
         ("trending_refresh_minutes", "0", 3),
         ("explore_refresh_minutes", "0", 3),
@@ -1025,6 +1217,8 @@ def test_save_config_round_trips_scheduler_runtime_fields(tmp_path: Path) -> Non
     config_path = tmp_path / "config.toml"
     config = Config()
     config.scheduler.refresh_check_interval_seconds = 75
+    config.scheduler.eval_min_batch_size = 23
+    config.scheduler.eval_max_wait_seconds = 45.5
     config.scheduler.signal_event_threshold = 9
     config.scheduler.trending_refresh_minutes = 5
     config.scheduler.explore_refresh_minutes = 18
@@ -1041,6 +1235,8 @@ def test_save_config_round_trips_scheduler_runtime_fields(tmp_path: Path) -> Non
     loaded = load_config(config_path)
 
     assert loaded.scheduler.refresh_check_interval_seconds == 75
+    assert loaded.scheduler.eval_min_batch_size == 23
+    assert loaded.scheduler.eval_max_wait_seconds == 45.5
     assert loaded.scheduler.signal_event_threshold == 9
     assert loaded.scheduler.trending_refresh_minutes == 5
     assert loaded.scheduler.explore_refresh_minutes == 18
@@ -1190,9 +1386,10 @@ def test_sources_xiaohongshu_defaults() -> None:
     config = _build_config({})
 
     assert config.sources.xiaohongshu.enabled is False
-    assert config.sources.xiaohongshu.daily_search_budget == 0
+    assert config.sources.xiaohongshu.daily_search_budget == 20
     assert config.sources.xiaohongshu.daily_creator_budget == 0
-    assert config.sources.xiaohongshu.task_interval_seconds == 300
+    assert config.sources.xiaohongshu.task_interval_seconds == 1200
+    assert config.sources.xiaohongshu.min_interval_minutes == 20
 
 
 def test_sources_douyin_defaults() -> None:
@@ -2372,6 +2569,7 @@ class TestDiscoveryConfig:
         assert config.discovery.claim_lease_minutes == 10
         assert config.discovery.planner_poll_seconds == 120
         assert config.discovery.plan_ttl_hours == 12
+        assert config.discovery.keyword_digest_grace_hours == 24
         assert config.discovery.admission_min_score == 0.60
         assert config.discovery.inspiration_search_enabled is True
         assert config.discovery.inspiration_replace_merged_keywords is False
@@ -2382,6 +2580,7 @@ class TestDiscoveryConfig:
             "you",
         )
         assert config.discovery.inspiration_breadth == "high"
+        assert config.discovery.eval_prefilter_mode == "shadow"
         assert config.discovery.multimodal_evaluation_enabled is False
         assert config.discovery.visual_profile_enabled is False
         assert config.discovery.keyframe_enabled is False
@@ -2402,6 +2601,7 @@ class TestDiscoveryConfig:
         assert config.discovery.unified_keyword_planner_enabled is True
         assert config.discovery.kw_cache_high == 30
         assert config.discovery.plan_ttl_hours == 12
+        assert config.discovery.keyword_digest_grace_hours == 24
         assert config.discovery.admission_min_score == 0.60
         assert config.discovery.inspiration_search_enabled is True
         assert config.discovery.inspiration_replace_merged_keywords is False
@@ -2412,6 +2612,7 @@ class TestDiscoveryConfig:
             "you",
         )
         assert config.discovery.inspiration_breadth == "high"
+        assert config.discovery.eval_prefilter_mode == "shadow"
         assert config.discovery.multimodal_evaluation_enabled is False
         assert config.discovery.visual_profile_enabled is False
         assert config.discovery.keyframe_enabled is False
@@ -2477,11 +2678,13 @@ history_window_hours = 72
 claim_lease_minutes = 15
 planner_poll_seconds = 90
 plan_ttl_hours = 6
+keyword_digest_grace_hours = 36
 admission_min_score = 0.72
 inspiration_search_enabled = true
 inspiration_replace_merged_keywords = true
 inspiration_search_backends = ["platform_sources", "exa", "you"]
 inspiration_breadth = "high"
+eval_prefilter_mode = "enforce"
 multimodal_evaluation_enabled = true
 candidate_eval_concurrency = 3
 multimodal_batch_size = 4
@@ -2504,11 +2707,13 @@ multimodal_image_timeout_seconds = 10
         assert config.discovery.claim_lease_minutes == 15
         assert config.discovery.planner_poll_seconds == 90
         assert config.discovery.plan_ttl_hours == 6
+        assert config.discovery.keyword_digest_grace_hours == 36
         assert config.discovery.admission_min_score == 0.72
         assert config.discovery.inspiration_search_enabled is True
         assert config.discovery.inspiration_replace_merged_keywords is True
         assert config.discovery.inspiration_search_backends == ("platform_sources", "exa", "you")
         assert config.discovery.inspiration_breadth == "high"
+        assert config.discovery.eval_prefilter_mode == "enforce"
         assert config.discovery.multimodal_evaluation_enabled is True
         assert config.discovery.candidate_eval_concurrency == 3
         assert config.discovery.multimodal_batch_size == 4
@@ -2569,6 +2774,8 @@ multimodal_image_timeout_seconds = 10
             ("claim_lease_minutes", "0", 10),
             ("planner_poll_seconds", '"nope"', 120),
             ("plan_ttl_hours", "0", 12),
+            ("keyword_digest_grace_hours", "-1", 24),
+            ("keyword_digest_grace_hours", "169", 24),
             ("candidate_eval_concurrency", "0", 3),
             ("candidate_eval_concurrency", "4", 3),
             ("multimodal_batch_size", "0", 8),
@@ -2597,7 +2804,7 @@ multimodal_image_timeout_seconds = 10
 
         assert getattr(config.discovery, field) == expected
 
-    @pytest.mark.parametrize("literal", ["0", "-0.1", "1.1", '"nope"'])
+    @pytest.mark.parametrize("literal", ["0", "0.49", "-0.1", "1.1", '"nope"'])
     def test_discovery_invalid_admission_min_score_falls_back_to_default(
         self, tmp_path: Path, literal: str
     ) -> None:
@@ -2613,6 +2820,31 @@ admission_min_score = {literal}
         config = load_config(toml_path)
 
         assert config.discovery.admission_min_score == 0.60
+
+    def test_discovery_eval_prefilter_mode_normalizes_from_toml(self, tmp_path: Path) -> None:
+        toml_path = tmp_path / "c.toml"
+        toml_path.write_text(
+            """
+[discovery]
+eval_prefilter_mode = "  Shadow  "
+""".strip(),
+            encoding="utf-8",
+        )
+
+        config = load_config(toml_path)
+
+        assert config.discovery.eval_prefilter_mode == "shadow"
+
+    def test_validate_runtime_config_rejects_invalid_eval_prefilter_mode(self) -> None:
+        config = Config()
+        config.llm.default_provider = "ollama"
+        # Main's stricter validation requires an explicit ollama chat model;
+        # satisfy it so validation reaches the prefilter-mode check.
+        config.llm.ollama.model = "qwen2.5:7b"
+        config.discovery.eval_prefilter_mode = "aggressive"
+
+        with pytest.raises(ConfigError, match="discovery\\.eval_prefilter_mode"):
+            validate_runtime_config(config)
 
     def test_discovery_missing_table_uses_defaults(self, tmp_path: Path) -> None:
         toml_path = tmp_path / "c.toml"
@@ -2678,11 +2910,13 @@ admission_min_score = {literal}
         config.discovery.claim_lease_minutes = 12
         config.discovery.planner_poll_seconds = 100
         config.discovery.plan_ttl_hours = 8
+        config.discovery.keyword_digest_grace_hours = 0
         config.discovery.admission_min_score = 0.72
         config.discovery.inspiration_search_enabled = True
         config.discovery.inspiration_replace_merged_keywords = True
         config.discovery.inspiration_search_backends = ("you",)
         config.discovery.inspiration_breadth = "low"
+        config.discovery.eval_prefilter_mode = "enforce"
         config.discovery.multimodal_evaluation_enabled = True
         config.discovery.multimodal_batch_size = 4
         config.discovery.multimodal_image_max_px = 512
@@ -2702,11 +2936,13 @@ admission_min_score = {literal}
         assert loaded.discovery.claim_lease_minutes == 12
         assert loaded.discovery.planner_poll_seconds == 100
         assert loaded.discovery.plan_ttl_hours == 8
+        assert loaded.discovery.keyword_digest_grace_hours == 0
         assert loaded.discovery.admission_min_score == 0.72
         assert loaded.discovery.inspiration_search_enabled is True
         assert loaded.discovery.inspiration_replace_merged_keywords is True
         assert loaded.discovery.inspiration_search_backends == ("you",)
         assert loaded.discovery.inspiration_breadth == "low"
+        assert loaded.discovery.eval_prefilter_mode == "enforce"
         assert loaded.discovery.multimodal_evaluation_enabled is True
         assert loaded.discovery.multimodal_batch_size == 4
         assert loaded.discovery.multimodal_image_max_px == 512
@@ -2722,6 +2958,7 @@ admission_min_score = {literal}
         assert "unified_keyword_planner_enabled = true" in rendered
         assert "kw_cache_high = 30" in rendered
         assert "plan_ttl_hours = 12" in rendered
+        assert "keyword_digest_grace_hours = 24" in rendered
         assert "admission_min_score = 0.6" in rendered
         assert "inspiration_search_enabled = true" in rendered
         assert "inspiration_replace_merged_keywords = false" in rendered
@@ -2730,6 +2967,7 @@ admission_min_score = {literal}
             in rendered
         )
         assert 'inspiration_breadth = "high"' in rendered
+        assert 'eval_prefilter_mode = "shadow"' in rendered
         assert "multimodal_evaluation_enabled = false" in rendered
         assert "multimodal_batch_size = 8" in rendered
         assert "multimodal_image_max_px = 384" in rendered
@@ -3264,12 +3502,9 @@ def test_legacy_refresh_hours_keys_convert_to_minutes_without_crashing() -> None
 class TestUnknownConfigKeysAreTolerated:
     """A config.toml written by a newer build must not brick an older one.
 
-    Real incident: a worktree config carried ``[scheduler].source_incremental_hours``
-    (a field that only exists on another branch). ``SchedulerConfig(**sched_raw)``
-    splatted it straight into the dataclass, so ``load_config()`` died with a bare
-    ``TypeError: unexpected keyword argument`` and every code path that loads config
-    went down with it — including 74 unrelated tests. Downgrading after an upgrade
-    wrote new fields is the same failure in production.
+    ``source_incremental_hours`` is now a supported scheduler field. Keep this
+    regression focused on a genuinely unknown key so future additions do not
+    accidentally weaken the compatibility filter.
     """
 
     def test_unknown_scheduler_key_is_ignored_instead_of_crashing(
@@ -3279,7 +3514,7 @@ class TestUnknownConfigKeysAreTolerated:
         config_path.write_text(
             """
 [scheduler]
-source_incremental_hours = 24
+future_scheduler_field = 24
 discovery_limit = 17
 """.strip(),
             encoding="utf-8",
@@ -3290,8 +3525,8 @@ discovery_limit = 17
 
         # Known siblings keep working — the unknown key is dropped, not the section.
         assert config.scheduler.discovery_limit == 17
-        assert not hasattr(config.scheduler, "source_incremental_hours")
-        assert "source_incremental_hours" in caplog.text
+        assert not hasattr(config.scheduler, "future_scheduler_field")
+        assert "future_scheduler_field" in caplog.text
         assert "scheduler" in caplog.text
 
     def test_unknown_keys_are_tolerated_across_provider_and_plain_sections(
@@ -3336,7 +3571,7 @@ unknown_logging_key = "loud"
             """
 [scheduler]
 enabled = false
-source_incremental_hours = 24
+future_scheduler_field = 24
 refresh_check_interval_seconds = 75
 trending_refresh_minutes = 5
 """.strip(),

@@ -31,13 +31,14 @@ _PROFILE_RECENT_KEYS = (
     "active_insights",
     "speculative_interests",
 )
+_COMPACT_JSON_DIGEST_DOMAIN = b"prompt-layer-compact-json-v1\0"
 
 
-def stable_json_digest(value: object) -> str:
-    """Return a deterministic short digest for prompt-visible values."""
+def _stable_json_text(value: object) -> str:
+    """Return the canonical JSON text used by prompt-visible digests."""
 
     try:
-        text = json.dumps(
+        return json.dumps(
             value,
             ensure_ascii=False,
             sort_keys=True,
@@ -45,8 +46,24 @@ def stable_json_digest(value: object) -> str:
             default=str,
         )
     except TypeError:
-        text = str(value)
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
+        return str(value)
+
+
+def _short_digest(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()[:24]
+
+
+def stable_json_digest(value: object) -> str:
+    """Return a deterministic short digest for prompt-visible values."""
+
+    return _short_digest(_stable_json_text(value).encode("utf-8"))
+
+
+def _layer_digest(payload: object, *, compact: bool) -> str:
+    canonical = _stable_json_text(payload).encode("utf-8")
+    if compact:
+        canonical = _COMPACT_JSON_DIGEST_DOMAIN + canonical
+    return _short_digest(canonical)
 
 
 def profile_prompt_layers(
@@ -96,10 +113,15 @@ class PromptLayerRenderCache:
     def __init__(self) -> None:
         self._entries: dict[str, _LayerEntry] = {}
 
-    def render_json_layer(self, name: str, payload: object) -> str:
-        """Return ``<name>`` JSON block text, reusing unchanged layer text."""
+    def render_json_layer(self, name: str, payload: object, *, compact: bool = False) -> str:
+        """Return ``<name>`` JSON block text, reusing unchanged layer text.
 
-        digest = stable_json_digest(payload)
+        ``compact`` is opt-in. The default preserves the existing indented
+        JSON bytes; compact mode removes JSON-only whitespace while retaining
+        deterministic key order and unescaped Unicode.
+        """
+
+        digest = _layer_digest(payload, compact=compact)
         entry = self._entries.get(name)
         if entry is not None and entry.digest == digest:
             self._entries[name] = _LayerEntry(
@@ -110,10 +132,20 @@ class PromptLayerRenderCache:
             )
             return entry.text
 
+        json_text = (
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if compact
+            else json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        )
         text = "\n\n".join(
             [
                 f"<{name}>",
-                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+                json_text,
                 f"</{name}>",
             ]
         )
@@ -127,10 +159,15 @@ class PromptLayerRenderCache:
         )
         return text
 
-    def render_json_layers(self, layers: Sequence[tuple[str, object]]) -> list[str]:
+    def render_json_layers(
+        self,
+        layers: Sequence[tuple[str, object]],
+        *,
+        compact: bool = False,
+    ) -> list[str]:
         """Render multiple JSON layers in the given order."""
 
-        return [self.render_json_layer(name, payload) for name, payload in layers]
+        return [self.render_json_layer(name, payload, compact=compact) for name, payload in layers]
 
     def layer_digest(self, name: str) -> str:
         """Return the current digest for one layer, or an empty string."""

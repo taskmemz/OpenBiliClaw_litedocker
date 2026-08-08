@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from openbiliclaw.discovery.strategies._utils import (
-    build_profile_summary,
+    build_query_generation_profile_summary,
     search_cooldown_remaining,
 )
 from openbiliclaw.llm.json_utils import parse_llm_json_tolerant
@@ -38,7 +38,9 @@ async def generate_bili_search_keywords(
     """Generate Bilibili search queries for extension fallback tasks."""
 
     try:
-        messages = build_search_queries_prompt(profile_summary=build_profile_summary(profile))
+        messages = build_search_queries_prompt(
+            profile_summary=build_query_generation_profile_summary(profile)
+        )
         complete_structured = llm_service.complete_structured_task
         response = await complete_structured(
             system_instruction=messages[0]["content"],

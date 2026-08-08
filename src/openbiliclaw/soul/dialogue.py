@@ -330,10 +330,11 @@ class SocraticDialogue:
         """
         from openbiliclaw.llm.prompts import build_socratic_dialogue_prompt
 
+        # Core memory is injected downstream by the service itself
+        # (``complete_with_tools`` → ``complete_with_core_memory``), not here.
+        # ``core_memory_text`` stays a documented test seam on the builder; in
+        # production it is always "".
         core_memory = ""
-        build_block = getattr(service, "_build_core_memory_block", None)
-        if callable(build_block):
-            core_memory = build_block()
         tone_profile = None
         build_tone = getattr(service, "_build_dialogue_tone_profile", None)
         if callable(build_tone):

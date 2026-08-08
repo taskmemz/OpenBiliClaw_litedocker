@@ -484,12 +484,14 @@ def test_ensure_embedding_model_async_reports_global_pull_progress(
     cfg.llm.embedding.model = "bge-m3"
     cfg.llm.embedding.base_url = "http://localhost:11434/v1"
     pulled: list[tuple[str, str]] = []
+    running_at_thread_start: list[bool] = []
 
     class _InlineThread:
         def __init__(self, *, target, name=None, daemon=None) -> None:
             self._target = target
 
         def start(self) -> None:
+            running_at_thread_start.append(embedding_progress.snapshot()["running"])
             self._target()
 
     async def fake_pull(base_url: str, model: str, *, on_progress=None, **_kw: object):
@@ -506,6 +508,7 @@ def test_ensure_embedding_model_async_reports_global_pull_progress(
     entry._ensure_embedding_model_async()
 
     snap = embedding_progress.snapshot()
+    assert running_at_thread_start == [True]
     assert pulled == [("http://localhost:11434/v1", "bge-m3")]
     assert snap["running"] is False
     assert snap["done"] is True

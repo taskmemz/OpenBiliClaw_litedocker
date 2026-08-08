@@ -34,7 +34,8 @@ function xiaohongshuRouteId(value: string): string | null {
     if (url.hostname !== "xiaohongshu.com" && !url.hostname.endsWith(".xiaohongshu.com")) {
       return null;
     }
-    return /^\/(?:explore|discovery\/item)\/([A-Za-z0-9_-]+)\/?$/.exec(url.pathname)?.[1] ?? null;
+    return /^\/(?:explore|discovery\/item|search_result)\/([A-Za-z0-9_-]+)\/?$/
+      .exec(url.pathname)?.[1] ?? null;
   } catch {
     return null;
   }
@@ -258,13 +259,12 @@ export function createXiaohongshuBrowserEnvironment(
       return Array.from(errors).some((element) => isEffectivelyVisible(element, root));
     },
     isContentReady() {
-      const contentId = /^\/(?:explore|discovery\/item)\/([^/]+)/.exec(new URL(currentUrl).pathname)?.[1];
-      return contentId !== undefined &&
+      const contentId = xiaohongshuRouteId(currentUrl);
+      return contentId !== null &&
         xiaohongshuContentContainer(root, contentId, currentUrl) !== null;
     },
     rateLimitFingerprint() {
-      const contentId = /^\/(?:explore|discovery\/item)\/([^/]+)/
-        .exec(new URL(currentUrl).pathname)?.[1];
+      const contentId = xiaohongshuRouteId(currentUrl);
       if (!contentId) return "";
       const container = xiaohongshuContentContainer(root, contentId, currentUrl);
       if (!container) return "";
@@ -293,7 +293,7 @@ export function createXiaohongshuBrowserEnvironment(
       return null;
     },
     findFavoriteControls(contentId) {
-      const pageId = /^\/(?:explore|discovery\/item)\/([^/]+)/.exec(new URL(currentUrl).pathname)?.[1];
+      const pageId = xiaohongshuRouteId(currentUrl);
       if (pageId !== contentId) return [];
       const container = xiaohongshuContentContainer(root, contentId, currentUrl);
       if (!container) return [];

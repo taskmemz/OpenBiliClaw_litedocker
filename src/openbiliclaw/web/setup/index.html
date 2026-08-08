@@ -348,6 +348,8 @@
     const SETUP_RESTART_MARKER = "openbiliclaw.setup.resume_after_restart";
     const SETUP_RESTART_MARKER_TTL_MS = 24 * 60 * 60 * 1000;
     const SETUP_RESTART_POLL_MS = Number(window.__OBC_TEST_RESTART_POLL_MS) || 2000;
+    const CONFIG_APPLY_POLL_MS = Number(window.__OBC_TEST_CONFIG_APPLY_POLL_MS) || 250;
+    const CONFIG_APPLY_TIMEOUT_MS = Number(window.__OBC_TEST_CONFIG_APPLY_TIMEOUT_MS) || 60000;
     let step = 0, biliConnected = false, biliPoll = null, initPoll = null, initSocket = null;
     let restartPoll = null;
     let initPollInFlight = false, initPollPending = false, initOffline = false;
@@ -706,6 +708,33 @@
       } catch {}
     }
 
+    async function waitForConfigApply(revision) {
+      if (!revision) return;
+      const deadline = Date.now() + CONFIG_APPLY_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        const response = await fetchWithTimeout(
+          "/api/config/apply-status",
+          { cache: "no-store" },
+          Math.min(10000, Math.max(1000, deadline - Date.now())),
+        );
+        const snapshot = await response.json().catch(() => null);
+        if (!response.ok) {
+          throw new Error(configSaveErrorMessage(response, snapshot));
+        }
+        const requested = Number(snapshot?.requested_revision || 0);
+        const applied = Number(snapshot?.applied_revision || 0);
+        const state = String(snapshot?.state || "");
+        if (requested >= revision && state === "failed") {
+          throw new Error(
+            String(snapshot?.message || snapshot?.error || "后台应用配置失败"),
+          );
+        }
+        if (applied >= revision && state === "applied") return;
+        await new Promise((resolve) => setTimeout(resolve, CONFIG_APPLY_POLL_MS));
+      }
+      throw new Error("后台应用配置等待超时，请稍后刷新页面确认状态");
+    }
+
     function waitForBackendRestart(provider) {
       const btn = $("#saveLlm");
       btn.dataset.waitingRestart = "true";
@@ -809,12 +838,17 @@
           : routing.routes;
         savedBlockingLlmInstanceIds = blockingLlmInstanceIds(result);
         if (apiKey) savedKeyProviders.add(provider);
-        $("#doneLlm").textContent = "已连接 · " + provider;
         if (result?.restart_required === true) {
           writeSetupRestartMarker(provider);
           waitForBackendRestart(provider);
           return;
         }
+        const applyRevision = Number(result?.apply_revision || 0);
+        if (result?.apply_state === "queued" || result?.apply_state === "applying") {
+          $("#doneLlm").textContent = "已保存 · 正在应用配置…";
+          await waitForConfigApply(applyRevision);
+        }
+        $("#doneLlm").textContent = "已连接 · " + provider;
         clearSetupRestartMarker();
         setStep(1);
       } catch (e) {
@@ -1455,7 +1489,7 @@
         // download is running keep polling so the row shows live percent
         // (embedding_check="repairing", detail carries progress).
         renderInitChecklist(status, readSelectedInitSources());
-        if (status?.prerequisites?.embedding_repair_running) {
+        if (embeddingPullProgressView(status).active) {
           scheduleInitPoll(INIT_POLL_MS);
           return;
         }
@@ -1528,6 +1562,11 @@
       }
       if (status.initialized) {
         showInitCompletion(status);
+        return;
+      }
+      if (embeddingPullProgressView(status).active) {
+        renderInitProgress(status);
+        scheduleInitPoll(INIT_POLL_MS);
         return;
       }
       if (!selected.length) {
@@ -1765,6 +1804,16 @@
         }
         if (status.initialized) {
           showInitCompletion(status);
+          return;
+        }
+        // The packaged desktop may start pulling bge-m3 before guided init
+        // owns a run. Attach the wizard to that live progress immediately;
+        // otherwise the first click on “开始初始化” becomes the accidental
+        // status-poll trigger users experience as a frozen download bar.
+        if (embeddingPullProgressView(status).active) {
+          setStep(2);
+          renderInitProgress(status);
+          scheduleInitPoll(INIT_POLL_MS);
           return;
         }
       } catch {}

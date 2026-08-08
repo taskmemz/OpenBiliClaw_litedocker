@@ -314,7 +314,7 @@ function xiaohongshuRouteId(value: string | undefined): string | null {
     if (url.hostname !== "xiaohongshu.com" && !url.hostname.endsWith(".xiaohongshu.com")) {
       return null;
     }
-    return /^\/(?:explore|discovery\/item)\/([A-Za-z0-9_-]+)\/?$/
+    return /^\/(?:explore|discovery\/item|search_result)\/([A-Za-z0-9_-]+)\/?$/
       .exec(url.pathname)?.[1] ?? null;
   } catch {
     return null;

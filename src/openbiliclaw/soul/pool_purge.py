@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 from openbiliclaw.llm.embedding import cosine_similarity
 from openbiliclaw.llm.json_utils import extract_llm_json_object
+from openbiliclaw.llm.task_options import without_core_memory_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +194,10 @@ async def _llm_judge(
         )
 
         try:
+            # The dislike-match judgment is fully specified by the user prompt
+            # (newly-added dislikes + all disliked topics + candidates); the user's
+            # portrait/interests are irrelevant to whether a pooled item matches a
+            # dislike. Opt out of the default core-memory injection.
             response = await llm_service.complete_structured_task(
                 system_instruction=_LLM_PURGE_SYSTEM_PROMPT,
                 user_input=user_input,
@@ -200,6 +205,7 @@ async def _llm_judge(
                 max_tokens=2048,
                 caller="pool_purge.llm_agent",
                 reasoning_effort="",
+                **without_core_memory_kwargs(llm_service.complete_structured_task),
             )
         except Exception:
             logger.debug("LLM purge batch failed", exc_info=True)

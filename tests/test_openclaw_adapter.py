@@ -633,6 +633,38 @@ async def test_get_profile_returns_trimmed_profile_response() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_profile_trims_traits_and_interests_to_five() -> None:
+    """The external ProfileResponse caps each list at 5 items (operations:114-120).
+
+    Guards the ``[:5]`` slices against silently returning the full profile lists;
+    previously never exercised with more than 5 entries.
+    """
+
+    class _EightItemSoulEngine:
+        async def get_profile(self) -> SoulProfile:
+            return SoulProfile(
+                personality_portrait="八项画像。",
+                core_traits=[f"特质-{i}" for i in range(8)],
+                deep_needs=[f"需求-{i}" for i in range(8)],
+                preferences=PreferenceLayer(
+                    interests=[
+                        InterestTag(name=f"兴趣-{i}", category="知识", weight=1.0 - i * 0.1)
+                        for i in range(8)
+                    ]
+                ),
+            )
+
+    services = SimpleNamespace(soul_engine=_EightItemSoulEngine())
+    result = await OpenClawAdapter(services=services).get_profile()
+
+    assert len(result.core_traits) == 5
+    assert len(result.deep_needs) == 5
+    assert len(result.top_interests) == 5
+    assert result.core_traits == [f"特质-{i}" for i in range(5)]
+    assert result.top_interests == [f"兴趣-{i}" for i in range(5)]
+
+
+@pytest.mark.asyncio
 async def test_openclaw_recommend_updates_gate_after_durable_pool_commit(tmp_path: Path) -> None:
     from openbiliclaw.llm.concurrency import InventoryPriorityState, LLMConcurrencyGate
     from openbiliclaw.recommendation.engine import RecommendationEngine
@@ -778,6 +810,20 @@ async def test_recommend_falls_back_to_cached_rows_when_refresh_times_out() -> N
     assert result.items[0].recommendation_id == 31
     assert database.recommendation_list_calls == [3]
     assert recommendation_engine.calls == []
+
+
+@pytest.mark.asyncio
+async def test_recommend_cached_fallback_honors_latest_effective_dislikes() -> None:
+    adapter, soul_engine, _, database, _, _, recommendation_engine = _build_adapter()
+    soul_engine.get_effective_disliked_topics = lambda: [  # type: ignore[attr-defined]
+        "你最近那股想把系统想透的劲头"
+    ]
+
+    result = await adapter.recommend(limit=3, refresh_if_needed=True)
+
+    assert result.items[0].recommendation_id == 11
+    assert database.recommendation_list_calls == [3]
+    assert recommendation_engine.calls == [(None, 3)]
 
 
 @pytest.mark.asyncio
@@ -950,6 +996,9 @@ def test_build_openclaw_adapter_services_forwards_soul_engine_config_and_databas
     cfg.scheduler.feedback_batch_threshold = 6
     cfg.scheduler.unified_interest_line = True
     cfg.soul.preference.satisfaction_filter_enabled = False
+    cfg.soul.preference_prompt_view = "compact-v1"
+    cfg.soul.awareness_prompt_view = "legacy"
+    cfg.soul.insight_prompt_view = "compact-v1"
 
     captured: dict[str, object] = {}
 
@@ -988,11 +1037,22 @@ def test_build_openclaw_adapter_services_forwards_soul_engine_config_and_databas
     assert captured["feedback_batch_threshold"] == 6
     assert captured["unified_interest_line"] is True
     assert captured["satisfaction_filter_enabled"] is False
+    assert captured["preference_prompt_view"] == "compact-v1"
+    assert captured["awareness_prompt_view"] == "legacy"
+    assert captured["insight_prompt_view"] == "compact-v1"
     memory = captured["memory"]
     assert captured["database"] is memory.database
 
 
-def test_build_openclaw_adapter_services_reuses_shared_database(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("configured_copy_target", "expected_copy_target"),
+    [(47, 30), (0, 0)],
+)
+def test_build_openclaw_adapter_services_reuses_shared_database(
+    monkeypatch,
+    configured_copy_target: int,
+    expected_copy_target: int,
+) -> None:
     import openbiliclaw.integrations.openclaw.bootstrap as bootstrap_module
 
     created_databases: list[object] = []
@@ -1065,6 +1125,7 @@ def test_build_openclaw_adapter_services_reuses_shared_database(monkeypatch) -> 
         ) -> None:
             self.llm = llm
             self.database = database
+            self.kwargs = _extras
             self.pool_inventory_commit_callback = None
 
         def set_pool_inventory_commit_callback(self, callback) -> None:
@@ -1083,10 +1144,12 @@ def test_build_openclaw_adapter_services_reuses_shared_database(monkeypatch) -> 
             database: object,
             embedding_service: object = None,
             concurrency: object = None,
+            eval_prefilter_mode: str = "shadow",
         ) -> None:
             self.llm_service = llm_service
             self.database = database
             self.concurrency = concurrency
+            self.eval_prefilter_mode = eval_prefilter_mode
 
         def register_strategy(self, strategy: object) -> None:
             registered_strategies.append(str(getattr(strategy, "name", "")))
@@ -1139,6 +1202,7 @@ def test_build_openclaw_adapter_services_reuses_shared_database(monkeypatch) -> 
         ),
         discovery=SimpleNamespace(
             admission_min_score=0.60,
+            eval_prefilter_mode="enforce",
             visual_profile_enabled=False,
             keyframe_enabled=False,
             keyframe_max_frames=8,
@@ -1151,6 +1215,7 @@ def test_build_openclaw_adapter_services_reuses_shared_database(monkeypatch) -> 
             enabled=True,
             pause_on_extension_disconnect=False,
             pool_target_count=30,
+            copy_ready_target_count=configured_copy_target,
             pool_source_shares={
                 "bilibili": 8,
                 "xiaohongshu": 3,
@@ -1241,6 +1306,10 @@ def test_build_openclaw_adapter_services_reuses_shared_database(monkeypatch) -> 
     assert services.llm_service.module_overrides["evaluation"].model == "gpt-4o-mini"
     assert services.llm_service.concurrency == 3
     assert services.discovery_engine.concurrency.llm_evaluation_concurrency == 2
+    assert services.discovery_engine.eval_prefilter_mode == "enforce"
+    assert services.recommendation_engine.kwargs["copy_ready_target_count"] == (
+        expected_copy_target
+    )
     assert (
         services.llm_service.concurrency_gate is services.soul_engine.kwargs["llm_concurrency_gate"]
     )

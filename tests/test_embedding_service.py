@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from openbiliclaw.llm.embedding import (
     EmbeddingCache,
     EmbeddingService,
@@ -187,6 +189,17 @@ def test_embedding_cache_get_rejects_non_numeric_vectors(tmp_path: Path) -> None
     cache.conn.commit()
 
     assert cache.get("bad-vector") is None
+
+
+def test_embedding_cache_close_is_idempotent(tmp_path: Path) -> None:
+    cache = EmbeddingCache(tmp_path / "embedding-cache.db")
+    cache.initialize()
+
+    cache.close()
+    cache.close()
+
+    with pytest.raises(RuntimeError, match="not initialized"):
+        _ = cache.conn
 
 
 def test_embedding_cache_is_thread_safe_across_threads(tmp_path: Path) -> None:

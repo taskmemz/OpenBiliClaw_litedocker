@@ -11,8 +11,19 @@
  * them changes no matching behavior.
  */
 
-/** Anchors that point at a note detail page (explore or legacy discovery/item). */
-export const NOTE_ANCHOR_SELECTOR = 'a[href*="/explore/"], a[href*="/discovery/item/"]';
+/**
+ * Anchors that point at a note detail page.
+ *
+ * Xiaohongshu search started emitting ``/search_result/{note_id}`` card links
+ * in the 2026-07 rollout. Keep this aligned with the platform adapter's note
+ * identity routes; the query page itself is ``/search_result?keyword=...`` and
+ * therefore cannot match the trailing-slash selector below.
+ */
+export const NOTE_ANCHOR_SELECTOR = [
+  'a[href*="/explore/"]',
+  'a[href*="/discovery/item/"]',
+  'a[href*="/search_result/"]',
+].join(", ");
 
 /** Card container an anchor sits inside — walked up from the `<a>` via `closest`. */
 export const NOTE_CARD_CONTAINER_SELECTOR =

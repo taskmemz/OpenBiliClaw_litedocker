@@ -24,6 +24,7 @@ export const state = {
   messages: { notifications: [], delights: [] },
   profile: null,
   chatTurns: [],
+  pendingConfirmationCount: 0,
   pendingChatPolls: new Set(),
   pendingChatContext: null,
 };

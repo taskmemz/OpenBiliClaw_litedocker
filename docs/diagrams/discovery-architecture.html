@@ -807,7 +807,7 @@
   <text x="800" y="100" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="600">XhsTaskQueue / DyTaskQueue / YtTaskQueue (各自独立 SQLite 表)</text>
   <line x1="515" y1="110" x2="1085" y2="110" stroke="#30363d" stroke-width="1"/>
   <text x="800" y="130" text-anchor="middle" fill="#c9d1d9" font-size="9.5">pending → in_progress (claimed_at) → completed/failed · 卡死 &gt;15min 回收</text>
-  <text x="520" y="152" fill="#8b949e" font-size="9">XHS: daily_search_budget=30 · daily_creator_budget=10 · task_interval=300s</text>
+  <text x="520" y="152" fill="#8b949e" font-size="9">XHS: search/day=20 · creator/day=0 · target=1200s±25%</text>
   <text x="520" y="168" fill="#8b949e" font-size="9">抖音: daily_search_budget=30 (经 DyTaskQueue + 扩展派发)</text>
   <text x="520" y="184" fill="#8b949e" font-size="9">YouTube: daily_search_budget=6 (稳态后端直采，bootstrap 经队列)</text>
 
@@ -816,7 +816,7 @@
   <text x="645" y="234" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="600">XhsTaskProducer (soul 驱动)</text>
   <text x="645" y="253" text-anchor="middle" fill="#8b949e" font-size="9">SoulProfile → generate_xhs_keywords (LLM)</text>
   <text x="645" y="268" text-anchor="middle" fill="#8b949e" font-size="9">每关键词入队一个 search 任务</text>
-  <text x="645" y="285" text-anchor="middle" fill="#8b949e" font-size="9">min_interval_minutes=3 · keywords/cycle=5</text>
+  <text x="645" y="285" text-anchor="middle" fill="#8b949e" font-size="9">min_interval=20m · active queue≤5 · cycle≤5</text>
   <text x="645" y="300" text-anchor="middle" fill="#6e7681" font-size="8.5">Douyin producer 30min · YouTube producer 60min</text>
 
   <!-- Adapters -->
@@ -1121,8 +1121,8 @@
   <div class="src-body">
     <ol>
       <li><b>为什么不一样？</b> 小红书风控严，后端<b>绝不直接调它的接口、也不爬取</b>。所有抓取都在<b>你自己的浏览器</b>里、用你的真实登录态完成。后端的 <code>XiaohongshuAdapter</code>（小红书适配器）是个<b>空壳占位</b>（<code>no-op stub</code>，调用直接返回空），只为让系统「认得」这个来源、不必到处写特例。</li>
-      <li><b>第一步 · 后端出题</b>：<code>XhsTaskProducer</code>（小红书任务生产者）每 1 小时跑一次，读你的画像，让大模型把兴趣改写成小红书风格的搜索词（<code>generate_xhs_keywords</code>）。它<b>只把搜索词当作「任务」入队</b>，存进 <code>XhsTaskQueue</code>（任务队列，一张 SQLite 表，任务状态：待处理 → 进行中 → 完成 / 失败）。</li>
-      <li><b>第二步 · 浏览器答题</b>：Chrome 扩展轮询 <code>GET /api/sources/xhs/next-task</code>（领一个任务）→ 在<b>后台标签页</b>打开小红书搜索结果 → 直接从网页元素 <code>DOM</code> 里读卡片的标题 / 作者 / 封面（<code>extractNoteMetadataFromAnchor</code>，零额外网络请求）→ 通过 <code>POST .../task-result</code> 和 <code>.../observed-urls</code> 回传。<b>⚠ 严禁自动滚动</b> —— 自动滚动是小红书识别机器人的典型信号，扩展只读你自己已经滚到的卡片。</li>
+      <li><b>第一步 · 后端出题</b>：<code>XhsTaskProducer</code>（小红书任务生产者）默认每 20 分钟检查一次，读你的画像，让大模型把兴趣改写成小红书风格的搜索词（<code>generate_xhs_keywords</code>）。它<b>只把搜索词当作「任务」入队</b>，存进 <code>XhsTaskQueue</code>（任务队列，一张 SQLite 表，任务状态：待处理 → 进行中 → 完成 / 失败）；搜索默认每天最多 20 条，pending + in-progress 达 5 条时不再产词，只按空位补齐。</li>
+      <li><b>第二步 · 浏览器答题</b>：Chrome 扩展轮询 <code>GET /api/sources/xhs/next-task</code>（领一个任务）；search / creator 以 20 分钟为目标按 ±25% 抖动后持久化下一次时间。扩展在<b>后台标签页</b>打开小红书搜索结果 → 直接从网页元素 <code>DOM</code> 里读卡片的标题 / 作者 / 封面（<code>extractNoteMetadataFromAnchor</code>，零额外网络请求）→ 通过 <code>POST .../task-result</code> 和 <code>.../observed-urls</code> 回传。可见安全验证 / 操作频繁 / 429 会触发 1/2/4…小时、24 小时封顶的持久冷却。<b>⚠ 严禁自动滚动</b> —— 自动滚动是小红书识别机器人的典型信号，扩展只读你自己已经滚到的卡片。</li>
       <li><b>第三步 · 写入池</b>：后端 <code>_cache_xhs_notes()</code> 把回传的笔记直接写进 <code>content_cache</code>，<b>不经过发现引擎</b>（所以没有引擎里那套打分 / 多样性处理）。</li>
       <li><b>第四步 · 补分类</b>：因为没经引擎，推荐侧用 <code>classify_pool_backlog()</code>（源无关补分类）给这些笔记补上话题 / 风格 / 相关度分。<b>注意：它用的是和发现侧 <code>evaluate_content_batch</code> 完全相同的评估 prompt</b>（<code>build_batch_content_evaluation_prompt</code>），只是调用方变成 RecommendationEngine（caller 标签 <code>recommendation.evaluate_batch</code>）—— 同一把尺子、不同工位，<b>并不是另一套更弱的评估</b>。补完之后就和 B 站内容一视同仁地进推荐。</li>
       <li><b>另外两条补充通道</b>：① <b>被动收集</b> —— 你自己刷小红书时，扩展顺手采集视口里出现的卡片；② <b>创作者订阅</b> —— 每 24 小时去你关注的创作者主页抓最新笔记。</li>

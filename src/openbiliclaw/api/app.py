@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import ipaddress
 import json
@@ -48,6 +49,7 @@ from openbiliclaw.api.models import (
     CognitionUpdateSeenIn,
     CognitionUpdateSeenResponse,
     CognitionUpdateSummary,
+    ConfigApplyStatusResponse,
     ConfigIssueOut,
     ConfigModelDiscoveryIn,
     ConfigModelDiscoveryResponse,
@@ -132,6 +134,7 @@ from openbiliclaw.api.models import (
     SavedSyncItemResponse,
     SavedSyncRequest,
     SchedulerConfigOut,
+    SoulConfigOut,
     SourceCredentialItem,
     SourceCredentialWriteIn,
     SourceCredentialWriteResponse,
@@ -308,6 +311,17 @@ _CONFIRMATION_GLOBAL_COOLDOWN_HOURS = 12
 _CONFIRMATION_OBJECT_COOLDOWN_HOURS = 72
 _RUNTIME_STREAM_HEARTBEAT_SECONDS = 20.0
 _DIALOGUE_EXECUTION_DRAIN_TIMEOUT_SECONDS = 1500.0
+
+
+@dataclass(slots=True)
+class _QueuedConfigApply:
+    """One persisted config revision waiting for a safe runtime handoff."""
+
+    revision: int
+    config: Any
+    saved_path: Path
+    run_post_reload_llm_work: bool
+
 
 # Guided-init owner-lease heartbeat period. A stage can spend minutes inside one
 # provider call, so ``touch()`` proves that the wrapper/event loop still owns the
@@ -502,7 +516,7 @@ def _native_save_e2e_content_id_from_url(
             ):
                 return ""
         match = re.fullmatch(
-            r"/(?:explore|discovery/item)/([A-Za-z0-9_-]+)/?",
+            r"/(?:explore|discovery/item|search_result)/([A-Za-z0-9_-]+)/?",
             parsed.path,
         )
         return match.group(1) if match else ""
@@ -1856,12 +1870,26 @@ def create_app(
     first_page_topup_attempted_at = 0.0
     recommendation_snapshot_cache: RecommendationListResponse | None = None
     recommendation_snapshot_cached_at = 0.0
+    recommendation_snapshot_dislike_digest = ""
     recommendation_snapshot_lock = asyncio.Lock()
 
     def _invalidate_recommendation_snapshot() -> None:
         nonlocal recommendation_snapshot_cache, recommendation_snapshot_cached_at
+        nonlocal recommendation_snapshot_dislike_digest
         recommendation_snapshot_cache = None
         recommendation_snapshot_cached_at = 0.0
+        recommendation_snapshot_dislike_digest = ""
+
+    def _effective_recommendation_dislikes() -> tuple[list[str], str]:
+        """Read the latest output-policy snapshot without waiting for rebuild."""
+
+        from openbiliclaw.recommendation.exclusion import disliked_topics_digest
+
+        getter = getattr(ctx.soul_engine, "get_effective_disliked_topics", None)
+        topics: list[str] = []
+        if callable(getter):
+            topics = [str(item).strip() for item in getter() if str(item).strip()]
+        return topics, disliked_topics_digest(topics)
 
     app.state.degraded = bool(getattr(ctx, "degraded", False))
     app.state.degraded_reason = str(getattr(ctx, "degraded_reason", ""))
@@ -1874,6 +1902,17 @@ def create_app(
     app.state.event_recovery_task = None
     dialogue_execution_coordinator = DialogueExecutionCoordinator()
     app.state.dialogue_execution_coordinator = dialogue_execution_coordinator
+    config_runtime_reload_lock = asyncio.Lock()
+    config_apply_task: asyncio.Task[None] | None = None
+    config_apply_pending: _QueuedConfigApply | None = None
+    config_apply_revision = 0
+    config_applied_revision = 0
+    config_apply_state: Literal["idle", "queued", "applying", "applied", "failed"] = "idle"
+    config_apply_message = ""
+    config_apply_error = ""
+    config_apply_updated_at = ""
+    config_last_good = copy.deepcopy(getattr(ctx, "config", None) or config)
+    app.state.config_apply_task = None
     image_fetch_coordinator = ImageFetchCoordinator()
     app.state.image_fetch_coordinator = image_fetch_coordinator
     chat_reply_scheduler: DurableChatReplyScheduler
@@ -2133,6 +2172,7 @@ def create_app(
             # so the recovery surface must stay reachable while degraded.
             or path in ("/api/update-status", "/api/update/check", "/api/update/apply")
             or (path == "/api/config" and method in {"GET", "PUT"})
+            or (path == "/api/config/apply-status" and method == "GET")
             # Draft-only config helpers are part of the recovery control
             # plane, not business LLM traffic.  Each builds from the submitted
             # form (or config + DB for source shares), so blocking it here made
@@ -2363,7 +2403,7 @@ def create_app(
         task_id: str,
         events_with_keys: list[tuple[dict[str, Any], str]],
         generic_owner: bool,
-    ) -> set[str]:
+    ) -> list[str]:
         """Persist extension source results through the durable ingress.
 
         Guided init owns profile construction, so its events are durable facts
@@ -2422,7 +2462,7 @@ def create_app(
             canonical.append(event)
             keys_by_index.append(bootstrap_key)
         if not canonical:
-            return set()
+            return []
         receipt = await event_ingress.accept_batch(
             canonical,
             producer=f"source-{source}",
@@ -2430,11 +2470,11 @@ def create_app(
         if receipt.rejected:
             reasons = "; ".join(item.error for item in receipt.items if item.error)
             raise RuntimeError(f"source event ingress rejected canonical event: {reasons}")
-        return {
+        return [
             keys_by_index[item.index]
             for item in receipt.items
             if (item.inserted or item.duplicate) and keys_by_index[item.index]
-        }
+        ]
 
     async def _restart_background_tasks_after_event_recovery(
         *,
@@ -2494,40 +2534,268 @@ def create_app(
         after_rebuild: Any = None,
     ) -> None:
         """Quiesce old owners before publishing and recovering a new runtime."""
-        await feedback_batch_scheduler.pause_and_drain()
-        dialogue_paused = False
-        try:
-            await dialogue_execution_coordinator.pause_and_drain(
-                timeout=_DIALOGUE_EXECUTION_DRAIN_TIMEOUT_SECONDS
-            )
-            dialogue_paused = True
-            await ctx.rebuild_from_config(new_config)
-            if callable(after_rebuild):
-                after_rebuild()
-            await _restart_background_tasks_after_event_recovery(
-                run_post_reload_llm_work=run_post_reload_llm_work,
-                resume_execution_lanes=resume_execution_lanes,
-            )
-        except BaseException:
-            # Rebuild is atomic: on construction failure ctx still exposes the
-            # old runtime; after publication it exposes the new one. Resolve at
-            # resume time in both cases and never leave the lane paused.
-            with suppress(Exception):
+        async with config_runtime_reload_lock:
+            await feedback_batch_scheduler.pause_and_drain()
+            dialogue_paused = False
+            try:
+                await dialogue_execution_coordinator.pause_and_drain(
+                    timeout=_DIALOGUE_EXECUTION_DRAIN_TIMEOUT_SECONDS
+                )
+                dialogue_paused = True
+                await ctx.rebuild_from_config(new_config)
+                if callable(after_rebuild):
+                    after_rebuild()
                 await _restart_background_tasks_after_event_recovery(
                     run_post_reload_llm_work=run_post_reload_llm_work,
                     resume_execution_lanes=resume_execution_lanes,
                 )
-            raise
-        finally:
-            # Guided init may keep event owners paused, but the independent
-            # chat lane must always resume against the current/rolled-back ctx.
-            if dialogue_paused:
-                await dialogue_execution_coordinator.resume()
+            except BaseException:
+                # Rebuild is atomic: on construction failure ctx still exposes the
+                # old runtime; after publication it exposes the new one. Resolve at
+                # resume time in both cases and never leave the lane paused.
+                with suppress(Exception):
+                    await _restart_background_tasks_after_event_recovery(
+                        run_post_reload_llm_work=run_post_reload_llm_work,
+                        resume_execution_lanes=resume_execution_lanes,
+                    )
+                raise
+            finally:
+                # Guided init may keep event owners paused, but the independent
+                # chat lane must always resume against the current/rolled-back ctx.
+                if dialogue_paused:
+                    await dialogue_execution_coordinator.resume()
 
     # Stable, app-owned handoff seam used by every internal rebuild caller.
     # Keeping it on app.state also makes drain/publication invariants directly
     # testable without forcing a config.toml write through the HTTP surface.
     app.state._rebuild_runtime_with_lane_handoff = _rebuild_runtime_with_lane_handoff
+
+    def _set_config_apply_status(
+        state: Literal["idle", "queued", "applying", "applied", "failed"],
+        message: str,
+        *,
+        error: str = "",
+    ) -> None:
+        nonlocal config_apply_state, config_apply_message
+        nonlocal config_apply_error, config_apply_updated_at
+        config_apply_state = state
+        config_apply_message = message
+        config_apply_error = error
+        config_apply_updated_at = datetime.now(UTC).isoformat()
+
+    def _config_apply_status_response() -> ConfigApplyStatusResponse:
+        return ConfigApplyStatusResponse(
+            state=config_apply_state,
+            requested_revision=config_apply_revision,
+            applied_revision=config_applied_revision,
+            message=config_apply_message,
+            error=config_apply_error,
+            updated_at=config_apply_updated_at,
+        )
+
+    def _config_apply_busy() -> bool:
+        task_running = config_apply_task is not None and not config_apply_task.done()
+        return (
+            task_running
+            or config_apply_pending is not None
+            or config_apply_state
+            in {
+                "queued",
+                "applying",
+            }
+        )
+
+    def _config_reload_error(exc: BaseException) -> str:
+        if isinstance(exc, TimeoutError):
+            return "后台对话在 25 分钟内仍未整理完成，运行时未能安全切换"
+        return str(exc).strip() or type(exc).__name__
+
+    async def _apply_runtime_config_revision(item: _QueuedConfigApply) -> str:
+        """Apply one persisted revision without owning the config-file lock."""
+        was_degraded = bool(getattr(ctx, "degraded", False))
+        recovered_from_degraded = False
+
+        def _after_config_runtime_rebuilt() -> None:
+            nonlocal recovered_from_degraded
+            if not was_degraded:
+                return
+            _complete_degraded_runtime_recovery()
+            recovered_from_degraded = True
+
+        try:
+            await _rebuild_runtime_with_lane_handoff(
+                item.config,
+                run_post_reload_llm_work=item.run_post_reload_llm_work,
+                after_rebuild=_after_config_runtime_rebuilt,
+            )
+        except Exception:
+            if not recovered_from_degraded:
+                raise
+            logger.exception("Degraded runtime recovered, but background task restart failed")
+            message = (
+                f"配置已保存到 {item.saved_path}。后端已原地恢复；"
+                "部分后台任务启动失败，将在后续配置刷新时重试，"
+                "不影响继续初始化。"
+            )
+        else:
+            message = f"配置已保存到 {item.saved_path}。"
+            message += (
+                " 后端已从降级模式原地恢复，无需重启。"
+                if was_degraded
+                else " 运行时组件已热重载，新配置立即生效。"
+            )
+        logger.info("Config hot-reload succeeded: revision=%d", item.revision)
+        return message
+
+    async def _restore_runtime_after_failed_config_apply() -> None:
+        """Bring the in-memory runtime back to the persisted last-good config.
+
+        ``RuntimeContext.rebuild_from_config`` publishes the new component set
+        before the background-task restart step.  If that later step fails, the
+        config file rollback alone would leave ``ctx.config`` describing the
+        rejected candidate.  Rebuilding the last-good config is best effort: a
+        second failure is logged, while the queue still reports the original
+        apply error and keeps the on-disk rollback semantics.
+        """
+        try:
+            await _rebuild_runtime_with_lane_handoff(
+                copy.deepcopy(config_last_good),
+                run_post_reload_llm_work=False,
+            )
+        except Exception:
+            logger.critical(
+                "Queued config rollback restored the file but not the in-memory runtime",
+                exc_info=True,
+            )
+
+    async def _run_config_apply_queue() -> None:
+        """Apply the newest queued revision; intermediate pending saves coalesce."""
+        nonlocal config_apply_task, config_apply_pending
+        nonlocal config_applied_revision, config_last_good
+        from openbiliclaw.config import save_config
+        from openbiliclaw.network import set_outbound_proxy
+
+        try:
+            while config_apply_pending is not None:
+                item = config_apply_pending
+                config_apply_pending = None
+                _set_config_apply_status(
+                    "applying",
+                    f"正在后台应用配置修订 {item.revision}。",
+                )
+                runtime_apply_started = False
+                try:
+                    proxy_cfg = getattr(item.config, "network", None)
+                    set_outbound_proxy(
+                        str(getattr(proxy_cfg, "proxy", "") or ""),
+                        mode=str(getattr(proxy_cfg, "mode", "system") or "system"),
+                    )
+                    runtime_apply_started = True
+                    message = await _apply_runtime_config_revision(item)
+                except asyncio.CancelledError:
+                    config_apply_pending = item
+                    _set_config_apply_status(
+                        "queued",
+                        f"配置修订 {item.revision} 已保存，将在后端重启后生效。",
+                    )
+                    raise
+                except Exception as exc:
+                    logger.exception(
+                        "Queued config hot-reload failed: revision=%d",
+                        item.revision,
+                    )
+                    error = _config_reload_error(exc)
+                    async with _CONFIG_SAVE_LOCK:
+                        if config_apply_pending is not None:
+                            _set_config_apply_status(
+                                "queued",
+                                (
+                                    f"配置修订 {item.revision} 应用失败；"
+                                    f"正在改用更新的修订 {config_apply_pending.revision}。"
+                                ),
+                                error=error,
+                            )
+                            continue
+                        try:
+                            restored_path = save_config(copy.deepcopy(config_last_good))
+                            _snapshot_config_file(restored_path)
+                            proxy_cfg = getattr(config_last_good, "network", None)
+                            set_outbound_proxy(
+                                str(getattr(proxy_cfg, "proxy", "") or ""),
+                                mode=str(getattr(proxy_cfg, "mode", "system") or "system"),
+                            )
+                            if runtime_apply_started:
+                                await _restore_runtime_after_failed_config_apply()
+                        except Exception as restore_exc:
+                            logger.critical(
+                                "Queued config rollback failed after hot-reload exception",
+                                exc_info=True,
+                            )
+                            failure_message = (
+                                "后台热重载失败，且无法恢复最后一次已生效配置；"
+                                "请检查 config.toml 与后端日志。"
+                            )
+                            _set_config_apply_status(
+                                "failed",
+                                failure_message,
+                                error=str(restore_exc).strip() or type(restore_exc).__name__,
+                            )
+                        else:
+                            failure_message = (
+                                f"配置修订 {item.revision} 热重载失败（{error[:200]}），"
+                                "已恢复最后一次生效配置。"
+                            )
+                            _set_config_apply_status(
+                                "failed",
+                                failure_message,
+                                error=error,
+                            )
+                    with suppress(Exception):
+                        await ctx.event_hub.publish(
+                            {
+                                "type": "config_reload_failed",
+                                "revision": item.revision,
+                                "message": config_apply_message,
+                            }
+                        )
+                else:
+                    config_last_good = copy.deepcopy(item.config)
+                    config_applied_revision = item.revision
+                    if config_apply_pending is None:
+                        _set_config_apply_status("applied", message)
+                    else:
+                        _set_config_apply_status(
+                            "queued",
+                            (
+                                f"配置修订 {item.revision} 已生效；"
+                                f"修订 {config_apply_pending.revision} 等待应用。"
+                            ),
+                        )
+                    with suppress(Exception):
+                        await ctx.event_hub.publish(
+                            {
+                                "type": "config_reloaded",
+                                "revision": item.revision,
+                                "message": message,
+                            }
+                        )
+        finally:
+            config_apply_task = None
+            app.state.config_apply_task = None
+
+    def _enqueue_config_apply(item: _QueuedConfigApply) -> None:
+        nonlocal config_apply_pending, config_apply_task
+        config_apply_pending = item
+        _set_config_apply_status(
+            "queued",
+            f"配置修订 {item.revision} 已保存，后端空闲后自动应用。",
+        )
+        if config_apply_task is None or config_apply_task.done():
+            config_apply_task = asyncio.create_task(
+                _run_config_apply_queue(),
+                name="config-apply",
+            )
+            app.state.config_apply_task = config_apply_task
 
     def _is_feedback_event(event: dict[str, Any]) -> bool:
         return str(event.get("event_type") or event.get("type") or "").strip() == "feedback"
@@ -2552,36 +2820,6 @@ def create_app(
         with suppress(Exception):
             return normalize_source_bootstrap_state(load_state())
         return default_source_bootstrap_state()
-
-    def _save_source_bootstrap_state(
-        state: dict[str, object],
-        *,
-        strict: bool = False,
-    ) -> None:
-        from openbiliclaw.sources.bootstrap_state import normalize_source_bootstrap_state
-
-        save_state = getattr(ctx.memory_manager, "save_source_bootstrap_state", None)
-        if not callable(save_state):
-            if strict:
-                raise RuntimeError("source bootstrap state persistence is unavailable")
-            return
-        normalized = normalize_source_bootstrap_state(state)
-        try:
-            save_state(normalized)
-            if strict:
-                load_state = getattr(ctx.memory_manager, "load_source_bootstrap_state", None)
-                if not callable(load_state):
-                    raise RuntimeError("source bootstrap state verification is unavailable")
-                persisted = normalize_source_bootstrap_state(load_state())
-                for key, expected in normalized.items():
-                    if isinstance(expected, list):
-                        actual = persisted.get(key)
-                        if not isinstance(actual, list) or not set(expected).issubset(actual):
-                            raise RuntimeError(f"source bootstrap state verification failed: {key}")
-        except Exception:
-            if strict:
-                raise
-            logger.warning("Failed to persist source bootstrap state", exc_info=True)
 
     def _filter_new_source_bootstrap_items(
         source: str,
@@ -2616,26 +2854,29 @@ def create_app(
         from datetime import UTC, datetime
 
         from openbiliclaw.sources.bootstrap_state import (
-            as_string_list,
+            SOURCE_SEEN_KEY_CAP,
+            merge_seen_keys,
             source_bootstrap_state_key,
         )
 
-        state = _load_source_bootstrap_state()
         state_key = source_bootstrap_state_key(source)
-        merged = as_string_list(state.get(state_key, []))
-        seen = set(merged)
-        for key in keys:
-            normalized = str(key).strip()
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            merged.append(normalized)
-        state[state_key] = merged
-        state["last_source_bootstrap_sync_at"] = datetime.now(UTC).isoformat()
-        # This marker is the projection checkpoint for source task results.
-        # Terminal completion must not proceed if it cannot be persisted;
-        # retry will replay the staged canonical result and repair it.
-        _save_source_bootstrap_state(state, strict=True)
+        update_state = getattr(ctx.memory_manager, "update_source_bootstrap_state", None)
+        if not callable(update_state):
+            raise RuntimeError("source bootstrap state atomic updater is unavailable")
+
+        def _mutate(state: dict[str, object]) -> dict[str, object]:
+            state[state_key] = merge_seen_keys(
+                state.get(state_key, []),
+                keys,
+                cap=SOURCE_SEEN_KEY_CAP,
+            )
+            state["last_source_bootstrap_sync_at"] = datetime.now(UTC).isoformat()
+            return state
+
+        # This is the projection checkpoint for source task results.  Keep it
+        # strict: terminal completion must not proceed when this write fails;
+        # stale-lease repair will replay the frozen canonical result instead.
+        update_state(_mutate)
 
     fallback_chat_turns: dict[str, dict[str, Any]] = {}
 
@@ -4349,7 +4590,7 @@ def create_app(
         *,
         bangumi_username: str | None = None,
         bangumi_token: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Best-effort: checked guided-init sources become enabled settings.
 
         The run itself uses ``effective_sources`` directly, so a config write
@@ -4361,7 +4602,7 @@ def create_app(
         cfg = getattr(ctx, "config", None)
         sources_cfg = getattr(cfg, "sources", None) if cfg is not None else None
         if sources_cfg is None or not effective_sources:
-            return
+            return False
 
         changed = False
         for source in _INIT_SOURCE_ORDER:
@@ -4391,7 +4632,7 @@ def create_app(
             bangumi_cfg.access_token = bangumi_token
             changed = True
         if not changed:
-            return
+            return False
 
         try:
             from openbiliclaw.config import Config, save_config
@@ -4402,10 +4643,10 @@ def create_app(
                 save_config(cfg)
         except Exception:
             logger.warning("guided init source opt-in save_config failed", exc_info=True)
-            return
+            return False
 
         if bool(getattr(ctx, "degraded", False)):
-            return
+            return False
         try:
             await _rebuild_runtime_with_lane_handoff(
                 cfg,
@@ -4419,8 +4660,12 @@ def create_app(
                         "message": "初始化来源选择已写入配置。",
                     }
                 )
+            return True
         except Exception:
             logger.warning("guided init source opt-in hot-reload failed", exc_info=True)
+            # The handoff attempts a suspended recovery in its own exception
+            # path, so callers must still restore normal owners if init aborts.
+            return True
 
     async def _run_guided_init_wrapper(
         run_id: str,
@@ -4559,6 +4804,14 @@ def create_app(
         if _init_blocked_by_degraded():
             return JSONResponse(
                 {"error": "degraded", "detail": _degraded_init_detail},
+                status_code=409,
+            )
+        if _config_apply_busy():
+            return JSONResponse(
+                {
+                    "error": "config_applying",
+                    "detail": "配置正在后台应用，请等待热重载完成后再开始初始化。",
+                },
                 status_code=409,
             )
         try:
@@ -4790,6 +5043,23 @@ def create_app(
             and not effective_bangumi_token
         ):
             warnings.append("Bangumi 未填写令牌或公开用户名：本次仅启用条目发现，不提供画像信号。")
+
+        # Reserve the init run before source opt-in can hot-reload runtime
+        # components. The durable init-active gate is therefore already
+        # visible to an old controller, and the setup reload keeps the new
+        # controller fully suspended until the guided-init wrapper finishes.
+        run_id = uuid.uuid4().hex
+        if not coord.try_start(run_id):
+            return JSONResponse({"error": "already_running"}, status_code=409)
+
+        setup_runtime_suspended = False
+
+        async def _abort_reserved_start(reason: str) -> None:
+            coord.reset_to_idle(run_id, reason=reason)
+            if setup_runtime_suspended and not bool(getattr(ctx, "degraded", False)):
+                with suppress(Exception):
+                    await _restart_background_tasks_after_event_recovery()
+
         if selected_sources is not None:
             # With a token the username was resolved from /v0/me; persist that so
             # status/config reflect the real account. Otherwise keep the explicit
@@ -4797,15 +5067,11 @@ def create_app(
             username_to_persist = (
                 effective_bangumi_username if effective_bangumi_token else selected_bangumi_username
             )
-            await _persist_guided_init_source_opt_in(
+            setup_runtime_suspended = await _persist_guided_init_source_opt_in(
                 effective_sources,
                 bangumi_username=username_to_persist,
                 bangumi_token=selected_bangumi_token,
             )
-
-        run_id = uuid.uuid4().hex
-        if not coord.try_start(run_id):
-            return JSONResponse({"error": "already_running"}, status_code=409)
 
         # Critical-section revalidation: prereqs may have lapsed between the
         # status poll and now. On a miss, roll the reservation back to idle so
@@ -4814,7 +5080,7 @@ def create_app(
         if "bilibili" in effective_sources:
             bili = await ctx.init_prereqs.bilibili_check()
             if bili != "ok":
-                coord.reset_to_idle(run_id, reason="bilibili_not_logged_in")
+                await _abort_reserved_start("bilibili_not_logged_in")
                 return JSONResponse(
                     {
                         "error": "bilibili_not_logged_in",
@@ -4824,7 +5090,7 @@ def create_app(
                 )
         chat = await ctx.init_prereqs.chat_ready()
         if not chat:
-            coord.reset_to_idle(run_id, reason="llm_not_ready")
+            await _abort_reserved_start("llm_not_ready")
             # Propagate the classified cause the live probe just diagnosed
             # (无效 API Key / 服务不可达 / 模型不存在) so the rejection is
             # actionable rather than a generic "not ready" (project rule 7).
@@ -4832,7 +5098,7 @@ def create_app(
             return JSONResponse({"error": "llm_not_ready", "detail": chat_detail}, status_code=409)
         if _embedding_required_for_init() and not await _health_embedding_ready(strict=True):
             pulling = await _maybe_autostart_embedding_pull()
-            coord.reset_to_idle(run_id, reason="embedding_not_ready")
+            await _abort_reserved_start("embedding_not_ready")
             detail = (
                 _repair_progress_detail()
                 if pulling
@@ -5629,6 +5895,36 @@ def create_app(
             for item in items
         ]
 
+    def _filter_recommendation_objects_for_latest_dislikes(items: list[Any]) -> list[Any]:
+        """Recheck an in-flight serve batch at the final HTTP boundary."""
+
+        if not items:
+            return []
+        from openbiliclaw.recommendation.exclusion import filter_recommendation_rows
+
+        disliked_topics, _digest = _effective_recommendation_dislikes()
+        if not disliked_topics:
+            return items
+        projected = [
+            {
+                "_item_index": index,
+                "title": str(getattr(getattr(item, "content", None), "title", "")),
+                "topic_label": str(getattr(item, "topic_label", "")),
+                "topic_key": str(getattr(getattr(item, "content", None), "topic_key", "")),
+                "topic_group": str(getattr(getattr(item, "content", None), "topic_group", "")),
+                "pool_topic_label": str(
+                    getattr(getattr(item, "content", None), "pool_topic_label", "")
+                ),
+                "description": str(getattr(getattr(item, "content", None), "description", "")),
+                "body_text": str(getattr(getattr(item, "content", None), "body_text", "")),
+                "up_name": str(getattr(getattr(item, "content", None), "up_name", "")),
+                "tags": getattr(getattr(item, "content", None), "tags", []),
+            }
+            for index, item in enumerate(items)
+        ]
+        allowed = filter_recommendation_rows(projected, disliked_topics)
+        return [items[cast("int", row["_item_index"])] for row in allowed]
+
     @app.websocket("/api/runtime-stream")
     async def runtime_stream(websocket: WebSocket) -> None:
         # The http auth middleware does NOT cover the websocket scope, so the
@@ -5890,6 +6186,11 @@ def create_app(
 
     @app.on_event("shutdown")
     async def shutdown_refresh_loop() -> None:
+        apply_task = getattr(app.state, "config_apply_task", None)
+        if apply_task is not None and not apply_task.done():
+            apply_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await apply_task
         reply_scheduler = getattr(app.state, "chat_reply_scheduler", None)
         if reply_scheduler is not None:
             with suppress(Exception):
@@ -6264,6 +6565,7 @@ def create_app(
             )
         except ProfileEditError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        _invalidate_recommendation_snapshot()
 
         try:
             raw = await ctx.soul_engine.get_raw_profile()
@@ -6401,7 +6703,9 @@ def create_app(
             ],
         )
 
-    async def _load_recommendations() -> RecommendationListResponse:
+    async def _load_recommendations(
+        disliked_topics: list[str] | None = None,
+    ) -> RecommendationListResponse:
         nonlocal first_page_topup_attempted_at
 
         def _admission_min_score() -> float:
@@ -6487,6 +6791,10 @@ def create_app(
                         len(rows),
                     )
 
+        if disliked_topics:
+            from openbiliclaw.recommendation.exclusion import filter_recommendation_rows
+
+            rows = filter_recommendation_rows(rows, disliked_topics)
         rows = _cap_by_franchise(rows, max_per_franchise=2)[:20]
         return RecommendationListResponse(
             items=[
@@ -6536,24 +6844,34 @@ def create_app(
         mutations immediately visible through explicit invalidation.
         """
         nonlocal recommendation_snapshot_cache, recommendation_snapshot_cached_at
+        nonlocal recommendation_snapshot_dislike_digest
 
         now = time.monotonic()
+        disliked_topics, dislike_digest = _effective_recommendation_dislikes()
         if (
             recommendation_snapshot_cache is not None
             and now - recommendation_snapshot_cached_at < _RECOMMENDATION_SNAPSHOT_TTL_SECONDS
+            and recommendation_snapshot_dislike_digest == dislike_digest
         ):
             return recommendation_snapshot_cache.model_copy(deep=True)
 
         async with recommendation_snapshot_lock:
             now = time.monotonic()
+            disliked_topics, dislike_digest = _effective_recommendation_dislikes()
             if (
                 recommendation_snapshot_cache is not None
                 and now - recommendation_snapshot_cached_at < _RECOMMENDATION_SNAPSHOT_TTL_SECONDS
+                and recommendation_snapshot_dislike_digest == dislike_digest
             ):
                 return recommendation_snapshot_cache.model_copy(deep=True)
-            snapshot = await _load_recommendations()
+            snapshot = await _load_recommendations(disliked_topics)
+            latest_topics, latest_digest = _effective_recommendation_dislikes()
+            if latest_digest != dislike_digest:
+                snapshot = await _load_recommendations(latest_topics)
+                dislike_digest = latest_digest
             recommendation_snapshot_cache = snapshot.model_copy(deep=True)
             recommendation_snapshot_cached_at = time.monotonic()
+            recommendation_snapshot_dislike_digest = dislike_digest
             return snapshot
 
     # ── Platform-neutral saved memberships and native sync ─────────
@@ -7427,6 +7745,7 @@ def create_app(
             )
             counts_after = {}
             timings = None
+        items = _filter_recommendation_objects_for_latest_dislikes(items)
         if items:
             from openbiliclaw.sources.event_format import SOURCE_WEB, build_event
 
@@ -7523,6 +7842,7 @@ def create_app(
             )
             counts_after = {}
             timings = None
+        items = _filter_recommendation_objects_for_latest_dislikes(items)
         _schedule_exact_pool_status_snapshot()
         available_after = counts_after.get("available")
         await _trigger_replenishment_if_needed(
@@ -7662,12 +7982,32 @@ def create_app(
             if callable(get_notification_candidate):
                 candidate = get_notification_candidate(min_confidence=0.82)
                 if candidate is not None:
-                    item = {
-                        "recommendation_id": int(candidate["id"]),
-                        "bvid": str(candidate.get("bvid", "")),
-                        "title": str(candidate.get("title", "")),
-                        "reason": str(candidate.get("expression", "")),
-                    }
+                    from openbiliclaw.recommendation.exclusion import (
+                        filter_recommendation_rows,
+                    )
+
+                    disliked_topics, _digest = _effective_recommendation_dislikes()
+                    if filter_recommendation_rows(
+                        [candidate],
+                        disliked_topics,
+                        restore_on_total_fuzzy_match=False,
+                    ):
+                        item = {
+                            "recommendation_id": int(candidate["id"]),
+                            "bvid": str(candidate.get("bvid", "")),
+                            "title": str(candidate.get("title", "")),
+                            "reason": str(candidate.get("expression", "")),
+                        }
+        if item is not None:
+            from openbiliclaw.recommendation.exclusion import filter_recommendation_rows
+
+            disliked_topics, _digest = _effective_recommendation_dislikes()
+            if not filter_recommendation_rows(
+                [item],
+                disliked_topics,
+                restore_on_total_fuzzy_match=False,
+            ):
+                item = None
         if item is None:
             return PendingNotificationResponse(item=None)
         return PendingNotificationResponse(item=PendingNotificationOut(**item))
@@ -8425,6 +8765,9 @@ def create_app(
 
         messages = build_probe_sentiment_prompt(domain=domain, user_message=user_message)
         try:
+            # Intentionally carries core memory (chat-adjacent): classifying the
+            # sentiment of a probe reply benefits from knowing who the user is, so
+            # tone/intent is read in the user's own context. Kept per Task 8 audit.
             response = await asyncio.wait_for(
                 llm.complete_with_core_memory(
                     system_instruction=messages[0]["content"],
@@ -11460,17 +11803,15 @@ def create_app(
             _persist_xhs_self_info(self_info_now)
         self_info_for_filter = self_info_now or _load_xhs_self_info()
 
-        # Filter to valid xhs note URLs. Accept both note-detail shapes xhs
-        # exposes — ``/explore/<id>`` and the legacy ``/discovery/item/<id>``
-        # — so the bare-``urls`` branch stops silently dropping discovery/item
-        # links the ``notes`` branch already ingests (both key on the same
-        # note id via sources.identity_keys).
+        # Filter to valid xhs note URLs. Search cards may now expose
+        # ``/search_result/<id>`` in addition to ``/explore/<id>`` and the
+        # legacy ``/discovery/item/<id>``; all three key on the same note id.
         valid_urls = [
             u
             for u in urls_raw
             if isinstance(u, str)
             and u.startswith(xhs_url_prefix)
-            and ("/explore/" in u or "/discovery/item/" in u)
+            and ("/explore/" in u or "/discovery/item/" in u or "/search_result/" in u)
         ]
 
         # Store bare URLs for tracking
@@ -12109,10 +12450,10 @@ def create_app(
         try:
             task_interval_seconds = max(
                 0,
-                int(getattr(xhs_cfg, "task_interval_seconds", 300)),
+                int(getattr(xhs_cfg, "task_interval_seconds", 1200)),
             )
         except (TypeError, ValueError):
-            task_interval_seconds = 300
+            task_interval_seconds = 1200
         task = _xhs_task_queue.next_pending(
             only_ids=_init_owned_ids_filter(),
             min_interval_seconds=task_interval_seconds,
@@ -12320,7 +12661,7 @@ def create_app(
                     events_with_keys=events_with_keys,
                     generic_owner=not _init_busy,
                 )
-                _mark_source_bootstrap_keys("xhs", sorted(accepted_keys))
+                _mark_source_bootstrap_keys("xhs", accepted_keys)
                 if skipped_self > 0:
                     logger.info(
                         "xhs bootstrap propagate: dropped %d self-authored note(s) (%d propagated)",
@@ -12339,7 +12680,20 @@ def create_app(
                     )
                 legacy_queue.complete_staged_result(task_id)
         else:
-            failed = legacy_queue.fail(task_id, error=payload.get("error", ""), debug=debug)
+            # Search/creator ``empty`` is retryable and remains a failed task,
+            # but never persist a blank error: it made real selector drift look
+            # indistinguishable from an unexplained transport failure.
+            failure_error = str(payload.get("error", "") or "").strip()
+            if not failure_error and status == "empty":
+                failure_error = "xhs_empty_result"
+            failed = legacy_queue.fail(task_id, error=failure_error, debug=debug)
+            if failure_error == "xhs_login_required" and hasattr(
+                ctx.database, "set_xhs_login_state"
+            ):
+                # Cookie presence is only a hint: XHS can retain web_session
+                # while the rendered page already presents its login gate.
+                # The task page is fresher, direct browser evidence.
+                ctx.database.set_xhs_login_state(False)
             # Unified keyword planner lifecycle (P1.7): the async search failed →
             # mark its ``source_keyword_id`` word ``failed`` (retry via attempts).
             if failed and task is not None:
@@ -12595,9 +12949,14 @@ def create_app(
         if xhs_item.enabled and bool(xhs_runtime_state.get("rate_limited")):
             remaining_seconds = int(xhs_runtime_state.get("cooldown_remaining_seconds", 0) or 0)
             remaining_minutes = max(1, (remaining_seconds + 59) // 60)
+            rate_limit_strikes = max(
+                1,
+                int(xhs_runtime_state.get("rate_limit_strikes", 1) or 1),
+            )
             xhs_item.state = "rate_limited"
             xhs_item.detail = (
-                f"小红书触发安全验证，后台任务已自动暂停，约 {remaining_minutes} 分钟后恢复领取。"
+                f"小红书连续第 {rate_limit_strikes} 次触发平台风控，后台任务已自动暂停，"
+                f"约 {remaining_minutes} 分钟后恢复领取。"
             )
             xhs_item.feed_paused = True
         # Bangumi's uniform item (built above) is replaced: it carries a
@@ -13223,7 +13582,7 @@ def create_app(
                     events_with_keys=events_with_keys,
                     generic_owner=not _init_busy,
                 )
-                _mark_source_bootstrap_keys("dy", sorted(accepted_keys))
+                _mark_source_bootstrap_keys("dy", accepted_keys)
             if is_final:
                 legacy_queue.complete_staged_result(task_id)
         else:
@@ -13282,7 +13641,11 @@ def create_app(
         return await _kick_source_task("x")
 
     # ── YouTube bootstrap endpoints ────────────────────────────────
-    from openbiliclaw.sources.reddit_tasks import RedditTaskQueue
+    from openbiliclaw.sources.reddit_tasks import (
+        RedditTaskQueue,
+        reddit_bootstrap_item_key,
+        reddit_items_to_events,
+    )
     from openbiliclaw.sources.yt_tasks import (
         YtTaskQueue,
         yt_bootstrap_item_key,
@@ -13327,7 +13690,13 @@ def create_app(
 
     @app.post("/api/sources/reddit/task-result")
     async def reddit_task_result(payload: dict[str, Any]) -> dict[str, Any]:
-        """Accept a Reddit task result from the extension dispatcher."""
+        """Accept a Reddit task result from the extension dispatcher.
+
+        Plain Reddit fetch tasks only persist their canonical result. Bootstrap
+        tasks marked by the backend as ``profile_update`` or ``incremental``
+        additionally replay their accumulated rows through durable event
+        ingress before the staged terminal status is flipped.
+        """
         task_id = str(payload.get("task_id", "") or "").strip()
         if not task_id:
             raise HTTPException(status_code=422, detail="task_id is required")
@@ -13348,16 +13717,85 @@ def create_app(
         legacy_queue = _reddit_task_queue
         if legacy_queue is None:
             raise HTTPException(status_code=409, detail="task_result_conflict")
-        _require_legacy_task(legacy_queue, task_id)
+        task = _require_legacy_task(legacy_queue, task_id)
+        task_type = str(task.get("type", "")).strip()
+        if str(task.get("status", "")).strip() in {"completed", "failed"}:
+            return {"ok": True, "ignored": True}
 
-        if status in {"partial", "ok", "empty"}:
-            legacy_queue.merge_result(
-                task_id,
-                items=items if items else None,
-                scope_counts=scope_counts,
-                debug=debug,
-                complete=status in {"ok", "empty"},
-            )
+        task_payload: dict[str, Any] = {}
+        if task.get("payload_json"):
+            with suppress(Exception):
+                parsed_payload = json.loads(str(task.get("payload_json") or "{}"))
+                if isinstance(parsed_payload, dict):
+                    task_payload = parsed_payload
+        profile_update = bool(task_payload.get("profile_update"))
+        incremental = bool(task_payload.get("incremental"))
+
+        from openbiliclaw.sources.task_result_protocol import (
+            parse_task_result,
+            staged_terminal_status,
+        )
+
+        canonical_result = parse_task_result(task.get("result_json"))
+        staged_status = staged_terminal_status(canonical_result)
+        if staged_status or status in {"partial", "ok", "empty"}:
+            is_final = bool(staged_status) or status in {"ok", "empty"}
+            if staged_status:
+                # Repair exclusively from the first durable final payload;
+                # changed retry fields are intentionally ignored.
+                canonical_result = parse_task_result(task.get("result_json"))
+            elif is_final:
+                canonical_result = legacy_queue.stage_final_result(
+                    task_id,
+                    terminal_status=status,
+                    items=items if items else None,
+                    scope_counts=scope_counts,
+                    debug=debug,
+                )
+            else:
+                legacy_queue.merge_result(
+                    task_id,
+                    items=items if items else None,
+                    scope_counts=scope_counts,
+                    debug=debug,
+                    complete=False,
+                )
+                canonical_task = legacy_queue.get(task_id) or {}
+                canonical_result = parse_task_result(canonical_task.get("result_json"))
+
+            canonical_items = [
+                value for value in canonical_result.get("items", []) if isinstance(value, dict)
+            ]
+            _init_busy = _init_active_now()
+            _skip_profile = _init_busy and not _init_owns_task(task_id)
+            if (
+                task_type == "bootstrap_events"
+                and (profile_update or incremental)
+                and canonical_items
+                and not _skip_profile
+            ):
+                fresh_items, item_keys_by_index = _filter_new_source_bootstrap_items(
+                    "reddit",
+                    canonical_items,
+                    reddit_bootstrap_item_key,
+                )
+                events_with_keys: list[tuple[dict[str, Any], str]] = []
+                for index, item in enumerate(fresh_items):
+                    for event in reddit_items_to_events(
+                        [item],
+                        import_source="reddit_bootstrap_events",
+                    ):
+                        key = item_keys_by_index.get(index, "")
+                        events_with_keys.append((event, key))
+                accepted_keys = await _accept_source_profile_events(
+                    source="reddit",
+                    task_id=task_id,
+                    events_with_keys=events_with_keys,
+                    generic_owner=not _init_busy,
+                )
+                _mark_source_bootstrap_keys("reddit", accepted_keys)
+            if is_final:
+                legacy_queue.complete_staged_result(task_id)
         else:
             legacy_queue.fail(
                 task_id,
@@ -13401,9 +13839,9 @@ def create_app(
         """Accept a Zhihu task result from the extension dispatcher.
 
         Plain ``fetch-zhihu`` smoke tasks only record the task payload. Tasks
-        explicitly marked ``profile_update`` also propagate bootstrap events to
-        memory and, once a profile exists, into the incremental profile-update
-        pipeline.
+        explicitly marked ``profile_update`` or ``incremental`` also propagate
+        bootstrap events to memory and, once a profile exists, into the
+        incremental profile-update pipeline.
         """
         task_id = str(payload.get("task_id", "") or "").strip()
         if not task_id:
@@ -13436,6 +13874,7 @@ def create_app(
                 if isinstance(parsed_payload, dict):
                     task_payload = parsed_payload
         profile_update = bool(task_payload.get("profile_update"))
+        incremental = bool(task_payload.get("incremental"))
 
         from openbiliclaw.sources.task_result_protocol import (
             parse_task_result,
@@ -13474,7 +13913,7 @@ def create_app(
             _skip_profile = _init_busy and not _init_owns_task(task_id)
             if (
                 task_type == "bootstrap_events"
-                and profile_update
+                and (profile_update or incremental)
                 and canonical_items
                 and not _skip_profile
             ):
@@ -13494,7 +13933,7 @@ def create_app(
                     events_with_keys=events_with_keys,
                     generic_owner=not _init_busy,
                 )
-                _mark_source_bootstrap_keys("zhihu", sorted(accepted_keys))
+                _mark_source_bootstrap_keys("zhihu", accepted_keys)
             if is_final:
                 legacy_queue.complete_staged_result(task_id)
         else:
@@ -13626,7 +14065,7 @@ def create_app(
                     events_with_keys=events_with_keys,
                     generic_owner=not _init_busy,
                 )
-                _mark_source_bootstrap_keys("yt", sorted(accepted_keys))
+                _mark_source_bootstrap_keys("yt", accepted_keys)
             if is_final:
                 legacy_queue.complete_staged_result(task_id)
         else:
@@ -14312,11 +14751,20 @@ def create_app(
                 extension_disconnect_grace_seconds=cfg.scheduler.extension_disconnect_grace_seconds,
                 discovery_cron=cfg.scheduler.discovery_cron,
                 pool_target_count=cfg.scheduler.pool_target_count,
+                copy_ready_target_count=cfg.scheduler.copy_ready_target_count,
                 pool_source_shares=_normalized_config_pool_source_shares(
                     cfg.scheduler.pool_source_shares
                 ),
                 account_sync_interval_hours=cfg.scheduler.account_sync_interval_hours,
+                source_incremental_hours=getattr(cfg.scheduler, "source_incremental_hours", 24),
+                xhs_incremental_hours=getattr(cfg.scheduler, "xhs_incremental_hours", None),
+                douyin_incremental_hours=getattr(cfg.scheduler, "douyin_incremental_hours", None),
+                youtube_incremental_hours=getattr(cfg.scheduler, "youtube_incremental_hours", None),
+                zhihu_incremental_hours=getattr(cfg.scheduler, "zhihu_incremental_hours", None),
+                reddit_incremental_hours=getattr(cfg.scheduler, "reddit_incremental_hours", None),
                 refresh_check_interval_seconds=cfg.scheduler.refresh_check_interval_seconds,
+                eval_min_batch_size=cfg.scheduler.eval_min_batch_size,
+                eval_max_wait_seconds=cfg.scheduler.eval_max_wait_seconds,
                 signal_event_threshold=cfg.scheduler.signal_event_threshold,
                 feedback_batch_threshold=cfg.scheduler.feedback_batch_threshold,
                 trending_refresh_minutes=cfg.scheduler.trending_refresh_minutes,
@@ -14363,7 +14811,9 @@ def create_app(
                 claim_lease_minutes=cfg.discovery.claim_lease_minutes,
                 planner_poll_seconds=cfg.discovery.planner_poll_seconds,
                 plan_ttl_hours=cfg.discovery.plan_ttl_hours,
+                keyword_digest_grace_hours=cfg.discovery.keyword_digest_grace_hours,
                 admission_min_score=cfg.discovery.admission_min_score,
+                eval_prefilter_mode=cfg.discovery.eval_prefilter_mode,
                 candidate_eval_concurrency=cfg.discovery.candidate_eval_concurrency,
                 multimodal_evaluation_enabled=cfg.discovery.multimodal_evaluation_enabled,
                 visual_profile_enabled=cfg.discovery.visual_profile_enabled,
@@ -14402,6 +14852,14 @@ def create_app(
                 unmanaged_truncate_mb=cfg.logging.unmanaged_truncate_mb,
                 unmanaged_max_age_days=cfg.logging.unmanaged_max_age_days,
             ),
+            soul=SoulConfigOut(
+                preference_prompt_view=cfg.soul.preference_prompt_view,
+                awareness_prompt_view=cfg.soul.awareness_prompt_view,
+                insight_prompt_view=cfg.soul.insight_prompt_view,
+                posture_gate_mode=cfg.soul.posture_gate_mode,
+                posture_gate_force_enforce=cfg.soul.posture_gate_force_enforce,
+                topic_lifecycle_serialization=cfg.soul.topic_lifecycle_serialization,
+            ),
             issues=issue_list,
         )
 
@@ -14431,6 +14889,11 @@ def create_app(
             degraded=bool(getattr(ctx, "degraded", False)),
             degraded_reason=str(getattr(ctx, "degraded_reason", "")),
         )
+
+    @app.get("/api/config/apply-status", response_model=ConfigApplyStatusResponse)
+    def get_config_apply_status() -> ConfigApplyStatusResponse:
+        """Report whether the latest saved revision is queued, active, or applied."""
+        return _config_apply_status_response()
 
     def _as_bool(value: object) -> bool:
         if isinstance(value, bool):
@@ -15329,14 +15792,18 @@ def create_app(
         from openbiliclaw.config import (
             _DEFAULT_ADMISSION_MIN_SCORE,
             _DEFAULT_CANDIDATE_EVAL_CONCURRENCY,
+            _DEFAULT_COPY_READY_TARGET_COUNT,
             _DEFAULT_DANMAKU_FETCH_LIMIT,
             _DEFAULT_DANMAKU_MAX_CHARS,
             _DEFAULT_DELIGHT_QUEUE_LIMIT,
             _DEFAULT_DISCOVERY_LIMIT,
+            _DEFAULT_EVAL_MAX_WAIT_SECONDS,
+            _DEFAULT_EVAL_MIN_BATCH_SIZE,
             _DEFAULT_EXPLORE_REFRESH_MINUTES,
             _DEFAULT_FEEDBACK_BATCH_THRESHOLD,
             _DEFAULT_KEYFRAME_FETCH_LIMIT,
             _DEFAULT_KEYFRAME_MAX_FRAMES,
+            _DEFAULT_KEYWORD_DIGEST_GRACE_HOURS,
             _DEFAULT_MULTIMODAL_BATCH_SIZE,
             _DEFAULT_MULTIMODAL_IMAGE_MAX_PX,
             _DEFAULT_MULTIMODAL_IMAGE_QUALITY,
@@ -15344,14 +15811,23 @@ def create_app(
             _DEFAULT_PROACTIVE_PUSH_INTERVAL_SECONDS,
             _DEFAULT_REFRESH_CHECK_INTERVAL_SECONDS,
             _DEFAULT_SIGNAL_EVENT_THRESHOLD,
+            _DEFAULT_SOURCE_INCREMENTAL_HOURS,
             _DEFAULT_SPECULATOR_IDLE_INTERVAL_MINUTES,
             _DEFAULT_TRENDING_REFRESH_MINUTES,
+            _MAX_COPY_READY_TARGET_COUNT,
+            _MAX_EVAL_MAX_WAIT_SECONDS,
+            _MAX_EVAL_MIN_BATCH_SIZE,
+            _MIN_COPY_READY_TARGET_COUNT,
+            _MIN_EVAL_MAX_WAIT_SECONDS,
+            _MIN_EVAL_MIN_BATCH_SIZE,
             _collect_config_issues,
             _default_config_path,
             _normalize_extension_disconnect_grace,
             _normalize_pool_source_shares,
             _normalize_probability,
+            _normalize_scheduler_float,
             _normalize_scheduler_int,
+            _normalize_source_incremental_hours,
             _validate_auto_update_check_interval,
             load_config,
             normalize_outbound_proxy,
@@ -15361,6 +15837,10 @@ def create_app(
 
         cfg = load_config()
         update = payload.model_dump(exclude_none=True)
+        # Preserve an explicit ``null`` for optional incremental overrides so
+        # the API can restore inheritance; omitted fields still remain absent.
+        if payload.scheduler is not None:
+            update["scheduler"] = dict(payload.scheduler)
         reset_fields = [str(field) for field in update.pop("reset_fields", [])]
         suppress_background_llm_work = bool(update.pop("suppress_background_llm_work", False))
         unknown_reset_fields = [
@@ -15905,6 +16385,16 @@ def create_app(
                     15,
                     None,
                 ),
+                "eval_min_batch_size": (
+                    _DEFAULT_EVAL_MIN_BATCH_SIZE,
+                    _MIN_EVAL_MIN_BATCH_SIZE,
+                    _MAX_EVAL_MIN_BATCH_SIZE,
+                ),
+                "copy_ready_target_count": (
+                    _DEFAULT_COPY_READY_TARGET_COUNT,
+                    _MIN_COPY_READY_TARGET_COUNT,
+                    _MAX_COPY_READY_TARGET_COUNT,
+                ),
                 "signal_event_threshold": (_DEFAULT_SIGNAL_EVENT_THRESHOLD, 1, None),
                 "trending_refresh_minutes": (_DEFAULT_TRENDING_REFRESH_MINUTES, 1, None),
                 "explore_refresh_minutes": (_DEFAULT_EXPLORE_REFRESH_MINUTES, 1, None),
@@ -15937,8 +16427,17 @@ def create_app(
                 "extension_disconnect_grace_seconds",
                 "discovery_cron",
                 "pool_target_count",
+                "copy_ready_target_count",
                 "account_sync_interval_hours",
+                "source_incremental_hours",
+                "xhs_incremental_hours",
+                "douyin_incremental_hours",
+                "youtube_incremental_hours",
+                "zhihu_incremental_hours",
+                "reddit_incremental_hours",
                 "refresh_check_interval_seconds",
+                "eval_min_batch_size",
+                "eval_max_wait_seconds",
                 "signal_event_threshold",
                 "trending_refresh_minutes",
                 "explore_refresh_minutes",
@@ -15982,6 +16481,50 @@ def create_app(
                         except ValueError as exc:
                             raise HTTPException(status_code=400, detail=str(exc)) from exc
                         setattr(cfg.scheduler, key, interval)
+                    elif key in {
+                        "xhs_incremental_hours",
+                        "douyin_incremental_hours",
+                        "youtube_incremental_hours",
+                        "zhihu_incremental_hours",
+                        "reddit_incremental_hours",
+                    }:
+                        try:
+                            source_interval = _normalize_source_incremental_hours(
+                                sdata[key],
+                                default=None,
+                                allow_none=True,
+                                strict=True,
+                            )
+                        except ValueError as exc:
+                            raise HTTPException(status_code=400, detail=str(exc)) from exc
+                        setattr(cfg.scheduler, key, source_interval)
+                    elif key == "source_incremental_hours":
+                        try:
+                            global_interval = _normalize_source_incremental_hours(
+                                sdata[key],
+                                default=_DEFAULT_SOURCE_INCREMENTAL_HOURS,
+                                allow_none=False,
+                                strict=True,
+                            )
+                        except ValueError as exc:
+                            raise HTTPException(status_code=400, detail=str(exc)) from exc
+                        if global_interval is None:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="source_incremental_hours must be an integer in 0..168",
+                            )
+                        setattr(cfg.scheduler, key, global_interval)
+                    elif key == "eval_max_wait_seconds":
+                        setattr(
+                            cfg.scheduler,
+                            key,
+                            _normalize_scheduler_float(
+                                sdata[key],
+                                default=_DEFAULT_EVAL_MAX_WAIT_SECONDS,
+                                min_value=_MIN_EVAL_MAX_WAIT_SECONDS,
+                                max_value=_MAX_EVAL_MAX_WAIT_SECONDS,
+                            ),
+                        )
                     elif key in scheduler_int_limits:
                         default, min_value, max_value = scheduler_int_limits[key]
                         setattr(
@@ -16010,6 +16553,11 @@ def create_app(
             ddata = update["discovery"]
             if isinstance(ddata, dict):
                 discovery_int_limits = {
+                    "keyword_digest_grace_hours": (
+                        _DEFAULT_KEYWORD_DIGEST_GRACE_HOURS,
+                        0,
+                        168,
+                    ),
                     "candidate_eval_concurrency": (
                         _DEFAULT_CANDIDATE_EVAL_CONCURRENCY,
                         1,
@@ -16055,6 +16603,14 @@ def create_app(
                         ddata["admission_min_score"],
                         default=_DEFAULT_ADMISSION_MIN_SCORE,
                     )
+                if "eval_prefilter_mode" in ddata:
+                    eval_prefilter_mode = str(ddata["eval_prefilter_mode"] or "").strip().lower()
+                    if eval_prefilter_mode not in {"off", "shadow", "enforce"}:
+                        raise HTTPException(
+                            status_code=422,
+                            detail="discovery.eval_prefilter_mode must be off, shadow, or enforce",
+                        )
+                    cfg.discovery.eval_prefilter_mode = eval_prefilter_mode
                 for key, (default, min_value, max_value) in discovery_int_limits.items():
                     if key in ddata:
                         setattr(
@@ -16149,6 +16705,17 @@ def create_app(
         # guard applied just below.
         if "soul" in update and isinstance(update["soul"], dict):
             sdata = update["soul"]
+            for prompt_view_field in (
+                "preference_prompt_view",
+                "awareness_prompt_view",
+                "insight_prompt_view",
+            ):
+                if prompt_view_field in sdata:
+                    setattr(
+                        cfg.soul,
+                        prompt_view_field,
+                        str(sdata[prompt_view_field]).strip().lower(),
+                    )
             if "posture_gate_mode" in sdata:
                 cfg.soul.posture_gate_mode = str(sdata["posture_gate_mode"]).strip().lower()
             if "posture_gate_force_enforce" in sdata:
@@ -16196,7 +16763,7 @@ def create_app(
                 )
             config_path = _default_config_path()
             try:
-                backup_path = _snapshot_config_file(config_path)
+                _snapshot_config_file(config_path)
             except Exception as exc:
                 logger.exception("Config snapshot failed — refusing to overwrite config.toml")
                 return JSONResponse(
@@ -16238,150 +16805,32 @@ def create_app(
                     ) from exc
                 landed.append(slug)
 
-            # Refresh the process-level outbound-proxy mirror BEFORE any runtime
-            # rebuild so the rebuilt LLM registry constructs its clients with the
-            # new proxy. CN-direct clients never read this value.
-            from openbiliclaw.network import set_outbound_proxy
+            nonlocal config_apply_revision
+            config_apply_revision += 1
+            item = _QueuedConfigApply(
+                revision=config_apply_revision,
+                config=copy.deepcopy(cfg),
+                saved_path=saved_path,
+                run_post_reload_llm_work=not suppress_background_llm_work,
+            )
 
-            set_outbound_proxy(cfg.network.proxy, mode=cfg.network.mode)
-
-            # ── Hot-reload: rebuild runtime components ──────────────
-            reload_message = f"配置已保存到 {saved_path}。"
-            was_degraded = bool(getattr(ctx, "degraded", False))
-            recovered_from_degraded = False
-
-            def _after_config_runtime_rebuilt() -> None:
-                nonlocal recovered_from_degraded
-                if not was_degraded:
-                    return
-                _complete_degraded_runtime_recovery()
-                recovered_from_degraded = True
-
-            try:
-                await _rebuild_runtime_with_lane_handoff(
-                    cfg,
-                    run_post_reload_llm_work=not suppress_background_llm_work,
-                    after_rebuild=_after_config_runtime_rebuilt,
-                )
-                reload_message += (
-                    " 后端已从降级模式原地恢复，无需重启。"
-                    if was_degraded
-                    else " 运行时组件已热重载，新配置立即生效。"
-                )
-                logger.info("Config hot-reload succeeded")
-                # Notify WebSocket subscribers so the extension re-fetches data
-                with suppress(Exception):
-                    await ctx.event_hub.publish(
-                        {
-                            "type": "config_reloaded",
-                            "message": "配置已热重载，运行时组件已重建。",
-                        }
-                    )
-                return ConfigUpdateResponse(
-                    ok=True,
-                    config=_config_to_response(cfg, issues, mask_keys=True),
-                    message=reload_message,
-                    reloaded=True,
-                    rollback_applied=False,
-                    restart_required=False,
-                )
-            except Exception as exc:
-                if recovered_from_degraded:
-                    # The complete runtime is already live and matches the
-                    # persisted config; only ancillary background-loop startup
-                    # failed. Rolling config.toml back here would create the
-                    # inverse split-brain (healthy new runtime + broken old
-                    # config on disk). Keep the recovered runtime available;
-                    # setup intentionally suppresses those loops until init.
-                    logger.exception(
-                        "Degraded runtime recovered, but background task restart failed"
-                    )
-                    with suppress(Exception):
-                        await ctx.event_hub.publish(
-                            {
-                                "type": "config_reloaded",
-                                "message": (
-                                    "配置已生效，后端已原地恢复；"
-                                    "部分后台任务启动失败，将在后续配置刷新时重试。"
-                                ),
-                            }
-                        )
-                    return ConfigUpdateResponse(
-                        ok=True,
-                        config=_config_to_response(cfg, issues, mask_keys=True),
-                        message=(
-                            reload_message + " 后端已原地恢复；部分后台任务启动失败，"
-                            "不影响继续初始化。"
-                        ),
-                        reloaded=True,
-                        rollback_applied=False,
-                        restart_required=False,
-                    )
-                logger.exception("Config hot-reload failed — attempting config rollback")
-                reload_error = str(exc).strip()
-                if isinstance(exc, TimeoutError):
-                    reload_error = "后台对话在 25 分钟内仍未整理完成，运行时未能安全切换"
-                elif not reload_error:
-                    reload_error = type(exc).__name__
-                if backup_path is None:
-                    rollback_message = (
-                        f" 热重载失败（{reload_error[:200]}），未找到可回滚的 config.toml.bak。"
-                    )
-                    rollback_cfg = cfg
-                    rollback_applied = False
-                else:
-                    try:
-                        _restore_config_snapshot(backup_path, saved_path)
-                    except Exception as restore_exc:
-                        logger.critical(
-                            "Config rollback failed after hot-reload exception",
-                            exc_info=True,
-                        )
-                        return JSONResponse(
-                            status_code=500,
-                            content={
-                                "error": "config_persistence_corrupted",
-                                "message": (
-                                    "config.toml may be in inconsistent state after hot-reload "
-                                    f"failure and rollback failure: {restore_exc}"
-                                ),
-                                "manual_recovery": (
-                                    "config.toml may be in inconsistent state; if "
-                                    "config.toml.bak exists, manually copy it back."
-                                ),
-                            },
-                        )
-                    rollback_cfg = load_config(saved_path)
-                    rollback_message = (
-                        f" 热重载失败（{reload_error[:200]}），已从 config.toml.bak 回滚。"
-                    )
-                    rollback_applied = True
-
-                failure_response = ConfigUpdateResponse(
-                    ok=True,
-                    config=_config_to_response(
-                        rollback_cfg,
-                        _collect_config_issues(rollback_cfg),
-                        degraded=was_degraded,
-                        degraded_reason=(
-                            str(getattr(ctx, "degraded_reason", "")) if was_degraded else ""
-                        ),
-                    ),
-                    message=reload_message + rollback_message,
-                    reloaded=False,
-                    rollback_applied=rollback_applied,
-                    # With no prior file to restore, the validated config did
-                    # land on disk but could not activate in-process. Retain the
-                    # old restart fallback for this exceptional bootstrap path.
-                    restart_required=bool(was_degraded and backup_path is None),
-                )
-                if was_degraded and rollback_applied:
-                    failure_response.ok = False
-                    return JSONResponse(
-                        status_code=503,
-                        content=failure_response.model_dump(mode="json"),
-                    )
-                return failure_response
+            # 持久化与运行时应用是两个阶段。统一进入已有 latest-wins 队列，
+            # 避免一次后台 LLM 或事件排空把交互式保存请求挂住数十秒。
+            _enqueue_config_apply(item)
+            queued_response = ConfigUpdateResponse(
+                ok=True,
+                config=_config_to_response(cfg, issues, mask_keys=True),
+                message=f"配置已保存到 {saved_path}，正在后台应用。",
+                reloaded=False,
+                rollback_applied=False,
+                restart_required=False,
+                apply_state="queued",
+                apply_revision=item.revision,
+            )
+            return JSONResponse(
+                status_code=202,
+                content=queued_response.model_dump(mode="json"),
+            )
 
     def _normalize_enabled_sources_override(
         raw_enabled: dict[str, bool] | None,

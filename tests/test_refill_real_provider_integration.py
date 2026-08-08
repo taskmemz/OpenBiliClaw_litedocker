@@ -596,6 +596,92 @@ async def test_real_provider_refill_and_interactive_fourth_slot(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_real_provider_copy_watermark_refills_without_draining_backlog(
+    tmp_path: Path,
+) -> None:
+    """Exercise the §6.5 high watermark with a real configured provider."""
+
+    config, registry = _load_live_config_and_registry()
+    db = Database(tmp_path / "live-copy-watermark.db")
+    db.initialize()
+    memory = MemoryManager(tmp_path / "memory", database=db)
+    gate = LLMConcurrencyGate(total_concurrency=4)
+    metrics = _LiveMetrics(gate)
+    monitored_registry = _MonitoredRegistry(registry, metrics)
+    service = LLMService(
+        registry=monitored_registry,
+        memory=memory,
+        concurrency=4,
+        concurrency_gate=gate,
+        module_overrides=module_overrides_from_config(config),
+    )
+    for index in range(5):
+        db.cache_content(
+            f"BV1WMARK{index:04d}",
+            title=f"Production engineering practice {index}",
+            up_name="OpenBiliClaw live gate",
+            source="search",
+            source_platform="bilibili",
+            relevance_score=0.9,
+            style_key="deep_focus",
+            topic_group=f"watermark-{index}",
+        )
+    engine = RecommendationEngine(
+        llm=service,
+        database=db,
+        copy_ready_target_count=2,
+    )
+    profile = _profile()
+
+    async with asyncio.timeout(180):
+        initial_copied = await engine.drain_pending_expression_copy(
+            profile=profile,
+            limit=60,
+        )
+    first = db.count_pool_readiness()
+    serve_started = time.monotonic()
+    served = await engine.serve_with_result(profile, limit=1)
+    serve_elapsed_seconds = time.monotonic() - serve_started
+    after_consume = db.count_pool_readiness()
+    demand_after_consume = engine.count_pending_expression_copy_demand()
+    async with asyncio.timeout(180):
+        refill_copied = await engine.drain_pending_expression_copy(
+            profile=profile,
+            limit=60,
+        )
+    final = db.count_pool_readiness()
+
+    print(
+        "live_copy_watermark_summary "
+        f"initial_copied={initial_copied} "
+        f"initial_copy_ready={first['copy_ready']} "
+        f"initial_pending={first['admitted_pending_copy']} "
+        f"served={len(served.items)} "
+        f"serve_elapsed_seconds={serve_elapsed_seconds:.3f} "
+        f"after_consume_copy_ready={after_consume['copy_ready']} "
+        f"demand_after_consume={demand_after_consume} "
+        f"refill_copied={refill_copied} "
+        f"final_copy_ready={final['copy_ready']} "
+        f"final_pending={final['admitted_pending_copy']} "
+        f"expression_batch_sizes={metrics.expression_batch_sizes} "
+        f"provider_names={sorted(set(metrics.provider_names))}",
+        flush=True,
+    )
+    assert initial_copied == 2
+    assert first["copy_ready"] == 2
+    assert first["admitted_pending_copy"] == 3
+    assert len(served.items) == 1
+    assert all(item.expression.strip() and item.topic_label.strip() for item in served.items)
+    assert after_consume["copy_ready"] == 1
+    assert demand_after_consume == 1
+    assert refill_copied == 1
+    assert final["copy_ready"] == 2
+    assert final["admitted_pending_copy"] == 2
+    assert metrics.expression_batch_sizes[:2] == [2, 1]
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_real_provider_openclaw_one_shot_refill_uses_single_copy_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

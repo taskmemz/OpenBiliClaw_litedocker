@@ -33,7 +33,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
-from openbiliclaw.discovery.strategies._utils import build_profile_summary
+from openbiliclaw.discovery.strategies._utils import build_query_generation_profile_summary
 from openbiliclaw.discovery.x_normalize import normalize_tweet
 from openbiliclaw.llm.json_utils import parse_llm_json_tolerant
 from openbiliclaw.llm.task_options import without_core_memory_kwargs
@@ -240,10 +240,11 @@ class XSearchStrategy:
 
 
 def _build_keyword_user_prompt(profile: SoulProfile, count: int) -> str:
-    # Same canonical structured profile every other discovery prompt sees
-    # (B站 / YouTube query-gen, all-platform evaluation) — no divergent
-    # representation. Deterministic dump keeps the prompt-cache prefix stable.
-    summary = build_profile_summary(profile)
+    # Query-trimmed profile: the same MMR-reduced taste shape the main
+    # search/explore/keyword_planner paths use for query generation — stable
+    # taste, not high-churn full-profile state. Deterministic (no embedding
+    # lookup passed), so the prompt-cache prefix stays byte-stable.
+    summary = build_query_generation_profile_summary(profile)
     return (
         "<profile_summary>\n"
         + json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True)

@@ -21,6 +21,7 @@ from openbiliclaw.llm.json_utils import (
     parse_llm_json_tolerant,
 )
 from openbiliclaw.llm.task_options import without_core_memory_kwargs
+from openbiliclaw.soul import profile_views
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1462,7 +1463,7 @@ class InterestSpeculator:
             return state
 
         messages = build_speculation_generation_prompt(
-            profile_summary=profile.to_llm_context(include_portrait=False),
+            profile_summary=profile_views.speculation(profile),
             existing_speculations=[s.domain for s in state.active],
             cooldown_domains=cooldown_domains,
             confirmed_domains=confirmed_domains,
