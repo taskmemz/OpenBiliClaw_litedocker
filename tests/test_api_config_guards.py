@@ -114,6 +114,47 @@ def test_put_config_writes_real_new_chat_provider_model(monkeypatch, tmp_path) -
     assert load_config_from_path(config_path).llm.openai.model == "gpt-4.1-mini"
 
 
+def test_put_config_persists_data_dir_as_restart_only(monkeypatch, tmp_path) -> None:
+    config = _base_config()
+    active_data = tmp_path / "active-data"
+    next_data = tmp_path / "next-data"
+    config.data_dir = str(active_data)
+    client, _cfg, config_path = _make_client(monkeypatch, tmp_path, config)
+
+    response = client.put("/api/config", json={"data_dir": str(next_data)})
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["restart_required"] is True
+    assert "完全重启后生效" in payload["message"]
+    assert load_config_from_path(config_path).data_dir == str(next_data)
+
+
+def test_pending_data_dir_does_not_redirect_live_credential_reads(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from openbiliclaw.sources.x_auth import XCookieManager
+
+    monkeypatch.delenv("OPENBILICLAW_X_COOKIE", raising=False)
+    config = _base_config()
+    active_data = tmp_path / "active-data"
+    next_data = tmp_path / "next-data"
+    config.data_dir = str(active_data)
+    XCookieManager(active_data).set_cookie("auth_token=active; ct0=AAAA", source="test")
+    XCookieManager(next_data).set_cookie("auth_token=pending; ct0=BBBB", source="test")
+    client, _cfg, _config_path = _make_client(monkeypatch, tmp_path, config)
+
+    response = client.put("/api/config", json={"data_dir": str(next_data)})
+    assert response.status_code == 202
+    assert response.json()["restart_required"] is True
+
+    current = client.get("/api/config").json()
+    assert current["data_dir"] == str(next_data)
+    assert current["sources"]["twitter"]["cookie"].endswith("AAAA")
+    assert not current["sources"]["twitter"]["cookie"].endswith("BBBB")
+
+
 def test_put_config_round_trips_openai_auth_mode(monkeypatch, tmp_path) -> None:
     from openbiliclaw.llm.codex_auth import CodexCredentials
 

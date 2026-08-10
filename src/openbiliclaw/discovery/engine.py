@@ -45,6 +45,11 @@ from openbiliclaw.discovery.strategies._utils import (
     compact_content_prompt_profile_summary,
 )
 from openbiliclaw.discovery.style_keys import normalize_style_key
+from openbiliclaw.discovery.temporal import (
+    TEMPORAL_POLICY_VERSION,
+    TemporalEvaluation,
+    parse_temporal_evaluation,
+)
 from openbiliclaw.llm.evaluation_wire import encode_evaluation_row_wire
 from openbiliclaw.llm.json_utils import (
     extract_llm_json_list,
@@ -73,7 +78,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
-_EvalCacheEntry = tuple[float, str, str, str] | tuple[float, str, str, str, str]
+_EvalCacheEntryV4 = tuple[float, str, str, str, str, str, float, str, str]
+_EvalCacheEntry = tuple[float, str, str, str] | tuple[float, str, str, str, str] | _EvalCacheEntryV4
 _BILIBILI_CONTENT_ID_PATTERN = re.compile(r"^BV[0-9A-Za-z]+$")
 _CANONICAL_STORAGE_KEY_PLATFORMS = frozenset(
     {
@@ -112,7 +118,7 @@ _RAW_CANDIDATE_MODE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "openbiliclaw_discovery_raw_candidate_mode",
     default=False,
 )
-_EVAL_BATCH_CACHE_VERSION = "content-eval-v3"
+_EVAL_BATCH_CACHE_VERSION = "content-eval-v4"
 _EMBEDDING_PREFILTER_DEFAULT_MODE = "shadow"
 _EMBEDDING_PREFILTER_MODES = {"off", "shadow", "enforce"}
 _DEFAULT_EVALUATION_CANDIDATE_TRANSPORT = "sparse-json"
@@ -375,6 +381,56 @@ def _parse_batch_evaluation_payload(raw: str) -> list[dict[str, Any]] | None:
     return [dict(item) for item in payload]
 
 
+def _apply_temporal_evaluation(
+    content: DiscoveredContent,
+    temporal: TemporalEvaluation,
+) -> None:
+    """Copy validated evaluator-owned temporal metadata onto one candidate."""
+
+    content.temporal_class = temporal.temporal_class
+    content.temporal_confidence = temporal.temporal_confidence
+    content.temporal_reason = temporal.temporal_reason
+    content.temporal_policy_version = TEMPORAL_POLICY_VERSION
+
+
+def _decode_eval_cache_entry(
+    cached: _EvalCacheEntry,
+) -> tuple[float, str, str, str, str, TemporalEvaluation]:
+    """Decode current evaluator cache tuples and legacy 4/5-field entries."""
+
+    score, reason, topic_group, style_key = cached[:4]
+    franchise_key = cached[4] if len(cached) >= 5 else ""
+    temporal = TemporalEvaluation()
+    if len(cached) >= 9:
+        current = cast("_EvalCacheEntryV4", cached)
+        temporal = parse_temporal_evaluation(
+            {
+                "temporal_class": current[5],
+                "temporal_confidence": current[6],
+                "temporal_reason": current[7],
+            }
+        )
+    return score, reason, topic_group, style_key, franchise_key, temporal
+
+
+def _eval_cache_entry_for_content(
+    content: DiscoveredContent,
+) -> _EvalCacheEntryV4:
+    """Build the v4 in-memory cache shape from an evaluated candidate."""
+
+    return (
+        content.relevance_score,
+        content.relevance_reason,
+        content.topic_group,
+        content.style_key,
+        content.franchise_key,
+        content.temporal_class,
+        content.temporal_confidence,
+        content.temporal_reason,
+        TEMPORAL_POLICY_VERSION,
+    )
+
+
 def _content_result_keys(content: DiscoveredContent) -> set[str]:
     """Stable keys that may identify a content item in batched LLM results."""
     return {
@@ -576,13 +632,21 @@ class DiscoveredContent:
     published_at: str = ""
     published_label: str = ""
     source_strategy: str = ""  # Which strategy found this
+    # Retrieval-only provenance (for example ``recent``). It can refine the
+    # discovery-candidate ``source_context`` without changing source strategy,
+    # relevance, admission thresholds, or recommendation source-fatigue rules.
+    discovery_lane: str = ""
     relevance_score: float = 0.0  # 0.0 - 1.0 (based on user soul)
     relevance_reason: str = ""  # Why this is relevant to the user
+    temporal_class: str = "unknown"  # Why this content's value may expire
+    temporal_confidence: float = 0.0  # Evaluator confidence in temporal_class
+    temporal_reason: str = ""  # Short diagnostic for the temporal classification
+    temporal_policy_version: str = TEMPORAL_POLICY_VERSION  # Code-owned policy schema
     pool_expression: str = ""  # Precomputed recommendation copy for fast popup paths
     pool_topic_label: str = ""  # Precomputed personalized topic label for fast popup paths
     candidate_tier: str = "primary"  # Primary discovery vs backfill supply
-    discovered_at: str = ""  # Cache timestamp for recency-aware ranking
-    last_scored_at: str = ""  # Last relevance scoring timestamp
+    discovered_at: str = ""  # Cache lifecycle timestamp; never publication time
+    last_scored_at: str = ""  # Evaluation lifecycle timestamp; never publication time
 
     # ── Multi-source fields (Phase 0) ───────────────────────────────
     content_id: str = ""  # Universal content ID; equals bvid for Bilibili content
@@ -664,6 +728,10 @@ class DiscoveredContent:
             "source_rank": self.source_rank,
             "relevance_score": self.relevance_score,
             "relevance_reason": self.relevance_reason,
+            "temporal_class": self.temporal_class,
+            "temporal_confidence": self.temporal_confidence,
+            "temporal_reason": self.temporal_reason,
+            "temporal_policy_version": self.temporal_policy_version,
             "candidate_tier": self.candidate_tier,
             "source": self.source_strategy,
             "item_key": self.item_key,
@@ -710,6 +778,16 @@ _RELATED_CHAIN_PER_UP_CAP: int = 3
 
 class DiscoveryStrategy(ABC):
     """Base class for content discovery strategies."""
+
+    @property
+    def source_platform(self) -> str:
+        """Canonical platform produced by this strategy.
+
+        Bilibili is the historical/default strategy family. Multi-source
+        strategies override this so cache backfill can never leak candidates
+        from another platform into a source-scoped discovery run.
+        """
+        return "bilibili"
 
     @property
     @abstractmethod
@@ -1822,18 +1900,17 @@ class ContentDiscoveryEngine:
         )
         cached = self._get_eval_cache_entry(cache_key)
         if cached is not None:
-            score = cached[0]
-            reason = cached[1]
+            score, reason, topic_group, style_key, franchise_key, temporal = (
+                _decode_eval_cache_entry(cached)
+            )
             normalized_reason = normalize_evaluation_reason(score, reason)
             if normalized_reason is not None:
-                topic_group = cached[2]
-                style_key = normalize_style_key(cached[3])
-                franchise_key = cached[4] if len(cached) == 5 else ""
                 content.relevance_score = score
                 content.relevance_reason = normalized_reason
                 content.topic_group = topic_group
-                content.style_key = style_key
+                content.style_key = normalize_style_key(style_key)
                 content.franchise_key = franchise_key
+                _apply_temporal_evaluation(content, temporal)
                 return score
 
         prefilter_mode = self._normalize_eval_prefilter_mode(
@@ -1877,15 +1954,10 @@ class ContentDiscoveryEngine:
                     content.topic_group = ""
                     content.style_key = ""
                     content.franchise_key = ""
+                    _apply_temporal_evaluation(content, TemporalEvaluation())
                     self._set_eval_cache_entry(
                         cache_key,
-                        (
-                            content.relevance_score,
-                            content.relevance_reason,
-                            "",
-                            "",
-                            "",
-                        ),
+                        _eval_cache_entry_for_content(content),
                     )
                     return content.relevance_score
 
@@ -1942,6 +2014,7 @@ class ContentDiscoveryEngine:
             topic_group = checked_topic_group
             franchise_key = checked_franchise
             style_key = normalize_style_key(payload.get("style_key", ""))
+            temporal = parse_temporal_evaluation(payload)
         except Exception:
             logger.exception("Failed to evaluate discovered content: %s", content.bvid)
             return 0.0
@@ -1951,16 +2024,11 @@ class ContentDiscoveryEngine:
         content.topic_group = topic_group
         content.style_key = style_key
         content.franchise_key = franchise_key
+        _apply_temporal_evaluation(content, temporal)
         if recall.complete:
             self._set_eval_cache_entry(
                 cache_key,
-                (
-                    score,
-                    reason,
-                    topic_group,
-                    style_key,
-                    franchise_key,
-                ),
+                _eval_cache_entry_for_content(content),
             )
         self._complete_prefilter_shadow_decisions(
             shadow_decisions,
@@ -2104,15 +2172,12 @@ class ContentDiscoveryEngine:
             )
             cached = self._get_eval_cache_entry(cache_key) if normal_cache_enabled else None
             if cached is not None:
-                # Cache tuple grew in v0.3.18 to carry franchise_key.
-                # Tolerate the legacy 4-tuple shape so an in-flight
-                # process holding pre-upgrade entries doesn't crash on
-                # the next eval call.
-                if len(cached) == 5:
-                    score, reason, topic_group, style_key, franchise_key = cached
-                else:
-                    score, reason, topic_group, style_key = cached
-                    franchise_key = ""
+                # The cache tuple grew first to carry franchise_key and now
+                # temporal semantics. Keep both legacy 4/5-field shapes safe
+                # for in-flight processes during a rolling upgrade.
+                score, reason, topic_group, style_key, franchise_key, temporal = (
+                    _decode_eval_cache_entry(cached)
+                )
                 normalized_reason = normalize_evaluation_reason(score, reason)
                 if normalized_reason is None:
                     uncached_indices.append(i)
@@ -2123,6 +2188,7 @@ class ContentDiscoveryEngine:
                 content.topic_group = topic_group
                 content.style_key = style_key
                 content.franchise_key = franchise_key
+                _apply_temporal_evaluation(content, temporal)
                 scores[eval_indices[i]] = score
                 cache_hit_count += 1
             else:
@@ -2215,6 +2281,7 @@ class ContentDiscoveryEngine:
                         content.topic_group = ""
                         content.style_key = ""
                         content.franchise_key = ""
+                        _apply_temporal_evaluation(content, TemporalEvaluation())
                         scores[eval_indices[eval_content_index]] = prefilter_score
                         if normal_cache_enabled:
                             cache_key = self._batch_eval_cache_key(
@@ -2226,13 +2293,7 @@ class ContentDiscoveryEngine:
                             )
                             self._set_eval_cache_entry(
                                 cache_key,
-                                (
-                                    prefilter_score,
-                                    content.relevance_reason,
-                                    "",
-                                    "",
-                                    "",
-                                ),
+                                _eval_cache_entry_for_content(content),
                             )
                     uncached_indices = [
                         eval_content_index
@@ -3201,12 +3262,14 @@ class ContentDiscoveryEngine:
                 results.append(None)
                 continue
             style_key = normalize_style_key(item_result.get("style_key", ""))
+            temporal = parse_temporal_evaluation(item_result)
 
             content.relevance_score = score
             content.relevance_reason = reason
             content.topic_group = topic_group
             content.style_key = style_key
             content.franchise_key = franchise_key
+            _apply_temporal_evaluation(content, temporal)
 
             cache_key = self._batch_eval_cache_key(
                 content,
@@ -3218,13 +3281,7 @@ class ContentDiscoveryEngine:
             if normal_cache_enabled and i in recall.complete_indices:
                 self._set_eval_cache_entry(
                     cache_key,
-                    (
-                        score,
-                        reason,
-                        topic_group,
-                        style_key,
-                        franchise_key,
-                    ),
+                    _eval_cache_entry_for_content(content),
                 )
             results.append(score)
 
@@ -3673,6 +3730,13 @@ class ContentDiscoveryEngine:
             self._load_cached_backfill(
                 limit=limit,
                 exclude_bvids={item.bvid for item in merged},
+                source_platforms={
+                    normalize_source_platform(
+                        getattr(strategy, "source_platform", "bilibili"),
+                        default="bilibili",
+                    )
+                    for strategy in strategies
+                },
             )
         )
         return results
@@ -3682,11 +3746,15 @@ class ContentDiscoveryEngine:
         *,
         limit: int,
         exclude_bvids: set[str],
+        source_platforms: set[str],
     ) -> list[DiscoveredContent]:
         if self._database is None:
             return []
 
-        rows = self._database.get_unrecommended_content(limit=limit)
+        rows = self._database.get_unrecommended_content(
+            limit=limit,
+            source_platforms=sorted(source_platforms),
+        )
         candidates: list[DiscoveredContent] = []
         for row in rows:
             bvid = str(row.get("bvid", "")).strip()

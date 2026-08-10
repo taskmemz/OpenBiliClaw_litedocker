@@ -122,6 +122,9 @@ test("popup saved surfaces round-trip through api clients and are wired in the U
     const popupHtml = readFileSync(resolve("popup", "popup.html"), "utf8");
     const popupJs = readFileSync(resolve("popup", "popup.js"), "utf8");
     const popupSavedSync = readFileSync(resolve("popup", "popup-saved-sync.js"), "utf8");
+    assert.match(popupHtml, /id="tabLibrary"[^>]*aria-controls="viewLibrary"/);
+    assert.match(popupHtml, /id="viewLibrary"[^>]*role="tabpanel"/);
+    assert.match(popupHtml, /class="library-tabs"[^>]*role="tablist"/);
     assert.match(popupHtml, /id="tabWatchLater"/);
     assert.match(popupHtml, /id="viewWatchLater"/);
     assert.match(popupHtml, /id="watchLaterList"/);
@@ -130,6 +133,8 @@ test("popup saved surfaces round-trip through api clients and are wired in the U
     assert.match(popupHtml, /id="favoritesList"/);
     assert.match(popupJs, /function loadWatchLater/);
     assert.match(popupJs, /function loadFavorites/);
+    assert.match(popupJs, /normalizePopupLibraryTab/);
+    assert.match(popupJs, /requestedTab[\s\S]*legacyChild[\s\S]*"library"/);
     assert.match(popupJs, /toggleSavedWithFeedback\("稍后再看", item/);
     assert.match(popupJs, /toggleSavedWithFeedback\("收藏", item/);
     // Saved-card removal must stay optimistic (remove first, restore + 重试 on

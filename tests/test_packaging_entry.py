@@ -8,6 +8,7 @@ user data out of the install directory on upgrade — cover it directly.
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -560,6 +561,110 @@ def test_main_source_selftest_does_not_migrate_ignored_project_data(
     assert (source_data / "marker.bin").read_bytes() == data_bytes
     assert not (project_root / "config.toml").exists()
     assert not (project_root / "data" / "marker.bin").exists()
+
+
+def test_main_recovers_apply_journal_before_seeding_or_creating_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after target -> backup must be recovered before normal startup."""
+    from openbiliclaw.storage import migration
+
+    project_root = tmp_path / "userdata"
+    migration_root = project_root / ".openbiliclaw-migration"
+    migration_root.mkdir(parents=True)
+    migration_id = "c" * 32
+    token = migration_id[:12]
+    target_config = project_root / "config.toml"
+    target_local = project_root / "config.local.toml"
+    target_data = project_root / "data"
+    config_backup = project_root / f"config.toml.pre-import-{token}.bak"
+    local_backup = project_root / f"config.local.toml.pre-import-{token}.bak"
+    data_backup = project_root / f"data.pre-import-{token}.bak"
+    prepared_config = project_root / f".config.toml.import-{token}"
+    prepared_data = project_root / f".data.import-{token}"
+    config_backup.write_text('[api]\nhost = "127.0.0.1"\nport = 18420\n', encoding="utf-8")
+    data_backup.mkdir()
+    (data_backup / "restored.txt").write_text("old target data", encoding="utf-8")
+    (migration_root / "apply-journal.json").write_text(
+        json.dumps(
+            {
+                "state": "applying",
+                "migration_id": migration_id,
+                "target_config": str(target_config.resolve()),
+                "target_local": str(target_local.resolve()),
+                "target_data": str(target_data.resolve()),
+                "prepared_config": str(prepared_config.resolve()),
+                "prepared_data": str(prepared_data.resolve()),
+                "config_backup": str(config_backup.resolve()),
+                "local_backup": str(local_backup.resolve()),
+                "data_backup": str(data_backup.resolve()),
+                "target_config_existed": True,
+                "target_local_existed": False,
+                "target_data_existed": True,
+                "new_config_active": False,
+                "new_data_active": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert not target_config.exists()
+    assert not target_data.exists()
+
+    monkeypatch.setenv("OPENBILICLAW_PROJECT_ROOT", str(project_root))
+    monkeypatch.delenv("OPENBILICLAW_SELFTEST", raising=False)
+    monkeypatch.setattr(entry.sys, "frozen", False, raising=False)
+    monkeypatch.setattr(entry, "_redirect_output_to_logfile", lambda _root: None)
+    monkeypatch.setattr(entry, "_notify_starting", lambda: None)
+    monkeypatch.setattr(entry, "_copy_legacy_packaged_user_data", lambda *_args: None)
+    monkeypatch.setattr(entry, "_inject_bundled_ollama_on_path", lambda _resources: False)
+    monkeypatch.setattr(entry.atexit, "register", lambda *_args, **_kwargs: None)
+
+    events: list[str] = []
+    real_apply = migration.apply_pending_migration
+
+    class _Guard:
+        def release(self) -> None:
+            events.append("release")
+
+    def _acquire_guard(root: Path, data_dir: Path) -> _Guard:
+        assert root == project_root.resolve()
+        assert data_dir == target_data.resolve()
+        events.append("guard")
+        return _Guard()
+
+    def _apply_pending(*, project_root: Path, locked_data_dir: Path):
+        # Neither the normal data mkdir nor config seed/repair may have occupied
+        # the restore targets before crash recovery gets its turn.
+        assert not target_config.exists()
+        assert not target_data.exists()
+        events.append("apply")
+        return real_apply(project_root=project_root, locked_data_dir=locked_data_dir)
+
+    def _seed(*_args: object) -> bool:
+        assert target_config.is_file()
+        assert (target_data / "restored.txt").read_text(encoding="utf-8") == "old target data"
+        events.append("seed")
+        return False
+
+    class _StartupObservedError(RuntimeError):
+        pass
+
+    def _repair(*_args: object) -> entry._ConfigRepairResult:
+        assert target_config.is_file()
+        assert (target_data / "restored.txt").is_file()
+        events.append("repair")
+        raise _StartupObservedError
+
+    monkeypatch.setattr(migration, "acquire_migration_runtime_guard", _acquire_guard)
+    monkeypatch.setattr(migration, "apply_pending_migration", _apply_pending)
+    monkeypatch.setattr(entry, "_seed_default_config", _seed)
+    monkeypatch.setattr(entry, "_repair_unloadable_config", _repair)
+
+    with pytest.raises(_StartupObservedError):
+        entry.main()
+
+    assert events == ["guard", "apply", "seed", "repair"]
+    assert not (migration_root / "apply-journal.json").exists()
 
 
 def test_main_uses_configured_api_host_when_env_host_unset(

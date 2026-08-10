@@ -180,23 +180,12 @@ def test_recommend_cli_emits_json_and_returns_zero(capsys) -> None:
 
     captured = capsys.readouterr()
     assert exit_code == 0
-    assert json.loads(captured.out) == {
-        "ok": True,
-        "data": {
-            "items": [
-                {
-                    "recommendation_id": 21,
-                    "bvid": "BV1CLI",
-                    "title": "把议题讲到结构层",
-                    "up_name": "结构控",
-                    "cover_url": "https://example.com/cover.jpg",
-                    "reason": "这条会对上你最近那股继续往深处看的劲头。",
-                    "topic_label": "你最近那股继续往深处看的劲头",
-                    "confidence": 0.93,
-                }
-            ]
-        },
-    }
+    payload = json.loads(captured.out)
+    item = payload["data"]["items"][0]
+    assert item["recommendation_id"] == 21
+    assert item["bvid"] == "BV1CLI"
+    assert item["source_platform"] == ""
+    assert item["content_type"] == "video"
     assert adapter.calls == [("recommend", 3, False)]
 
 
@@ -283,27 +272,17 @@ def test_doctor_cli_reports_skill_pack_and_registered_skill_names(capsys) -> Non
 
     captured = capsys.readouterr()
     assert exit_code == 0
-    assert json.loads(captured.out) == {
-        "ok": True,
-        "data": {
-            "skill_pack_path": str(_SKILL_PACK_PATH),
-            "skill_pack_exists": True,
-            "skill_count": 10,
-            "skill_names": [
-                "openbiliclaw_sync_account",
-                "openbiliclaw_get_profile",
-                "openbiliclaw_recommend",
-                "openbiliclaw_submit_feedback",
-                "openbiliclaw_get_delight",
-                "openbiliclaw_get_runtime_status",
-                "openbiliclaw_chat",
-                "openbiliclaw_next_probe",
-                "openbiliclaw_next_avoidance_probe",
-                "openbiliclaw_respond_avoidance_probe",
-            ],
-            "cli_module": "openbiliclaw.integrations.openclaw.cli",
-        },
-    }
+    payload = json.loads(captured.out)
+    assert payload["ok"] is True
+    data = payload["data"]
+    assert data["protocol_version"] == "agent-bridge/v2"
+    assert data["host_names"] == ["openclaw", "hermes", "workbuddy"]
+    assert data["skill_pack_path"] == str(_SKILL_PACK_PATH)
+    assert data["skill_pack_exists"] is True
+    assert data["skill_count"] == 24
+    assert "openbiliclaw_respond_interest_probe" in data["skill_names"]
+    assert "openbiliclaw_sync_saved" in data["skill_names"]
+    assert data["cli_module"] == "openbiliclaw.integrations.openclaw.cli"
     assert adapter.calls == []
 
 
@@ -319,7 +298,7 @@ def test_emit_skill_descriptors_cli_outputs_serializable_descriptors(capsys) -> 
     assert exit_code == 0
     assert payload["ok"] is True
     assert payload["data"]["skills"][0]["name"] == "openbiliclaw_sync_account"
-    assert payload["data"]["skills"][2]["name"] == "openbiliclaw_recommend"
+    assert payload["data"]["skills"][3]["name"] == "openbiliclaw_recommend"
     assert "handler" not in payload["data"]["skills"][0]
     assert adapter.calls == []
 

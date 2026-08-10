@@ -16,12 +16,11 @@
  *      collected here merge with XHR items, deduped by aweme_id /
  *      creator_sec_uid.
  *
- * Selectors are deliberately tolerant: each anchor type uses href
- * shape as the primary signal (it's the most stable Douyin contract),
- * and per-card metadata pickers fall through several class-name
- * heuristics. Missing fields default to empty string — downstream
- * consumers tolerate empty fields via the existing
- * BootstrapItemSink filter (sees aweme_id or creator_sec_uid).
+ * Selectors are deliberately tolerant: video identity may live on a
+ * normal anchor, a div[href], data-aweme-id, or a video_<id> class token.
+ * Per-card metadata pickers then fall through semantic text heuristics.
+ * Missing fields default to empty string — downstream consumers tolerate
+ * empty fields via the existing BootstrapItemSink filter.
  */
 
 import type {
@@ -69,9 +68,23 @@ export function extractSecUidFromHref(href: string): string {
  * if no parent matches (which still gives the pickers something to
  * search inside).
  */
-function findCardContainer(anchor: HTMLElement): HTMLElement {
-  const card = anchor.closest<HTMLElement>(
+const VIDEO_CARD_TARGET_SELECTOR = [
+  'a[href*="/video/"]',
+  '[href*="/video/"]',
+  "[data-aweme-id]",
+  "[data-video-id]",
+  "[data-content-id]",
+  '[class*="video_"]',
+].join(",");
+
+function findCardContainer(target: HTMLElement): HTMLElement {
+  const card = target.closest<HTMLElement>(
     [
+      "[data-aweme-id]",
+      "[data-video-id]",
+      "[data-content-id]",
+      'div[class*="waterfall-videoCard"]',
+      'div[class*="jingxuanVideoCard"]',
       'li[class*="ec-card"]',
       'li[class*="card"]',
       'div[class*="ec-card"]',
@@ -85,14 +98,14 @@ function findCardContainer(anchor: HTMLElement): HTMLElement {
       "section",
     ].join(","),
   );
-  return card ?? anchor;
+  return card ?? target;
 }
 
-function pickCardTitle(card: HTMLElement, anchor: HTMLAnchorElement): string {
-  // Anchor's own aria-label / title is often the cleanest source.
-  const aria = anchor.getAttribute("aria-label")?.trim() ?? "";
+function pickCardTitle(card: HTMLElement, target: HTMLElement): string {
+  // Target's own aria-label / title is often the cleanest source.
+  const aria = target.getAttribute("aria-label")?.trim() ?? "";
   if (aria) return aria;
-  const title = anchor.getAttribute("title")?.trim() ?? "";
+  const title = target.getAttribute("title")?.trim() ?? "";
   if (title) return title;
 
   const candidates = [
@@ -109,8 +122,10 @@ function pickCardTitle(card: HTMLElement, anchor: HTMLAnchorElement): string {
     const text = el?.textContent?.trim() ?? "";
     if (text) return text;
   }
-  // Last resort: first non-empty text node inside the anchor.
-  return anchor.textContent?.trim() ?? "";
+  const semanticText = pickSemanticCardDescription(card);
+  if (semanticText) return semanticText;
+  // Last resort: first non-empty text inside the target.
+  return target.textContent?.trim() ?? "";
 }
 
 function pickAuthorName(card: HTMLElement): string {
@@ -125,7 +140,70 @@ function pickAuthorName(card: HTMLElement): string {
     const text = el?.textContent?.trim() ?? "";
     if (text) return text;
   }
+  const semanticAuthors = Array.from(card.querySelectorAll<HTMLElement>("span"))
+    .map((element) => element.textContent?.replace(/\s+/g, " ").trim() ?? "")
+    .filter((text) => /^@\s*\S/.test(text))
+    .map((text) => text.replace(/^@\s*/, "").split(/\s*·\s*/, 1)[0]?.trim() ?? "")
+    .filter(Boolean)
+    .sort((left, right) => left.length - right.length);
+  if (semanticAuthors[0]) return semanticAuthors[0];
   return "";
+}
+
+function pickSemanticCardDescription(card: HTMLElement): string {
+  const ignoredExact = new Set([
+    "重播",
+    "点击按住可拖动视频",
+    "暂停",
+    "进入全屏",
+    "截图",
+    "画中画",
+    "直播",
+    "/",
+  ]);
+  const values: string[] = [];
+  for (const element of Array.from(card.querySelectorAll<HTMLElement>("span,div,p"))) {
+    const childNodes = Array.from(element.childNodes ?? []);
+    const text = childNodes
+      .filter((node) => node.nodeType === 3)
+      .map((node) => node.textContent ?? "")
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text || ignoredExact.has(text)) continue;
+    if (/^@/.test(text) || /^·/.test(text)) continue;
+    if (/^\d{1,2}:\d{2}$/.test(text)) continue;
+    if (/^\d+(?:\.\d+)?(?:万|亿)?$/.test(text)) continue;
+    values.push(text);
+  }
+  values.sort((left, right) => right.length - left.length);
+  return values[0] ?? "";
+}
+
+function extractAwemeIdFromTarget(target: HTMLElement): string {
+  const ownHref = target.getAttribute("href") ?? "";
+  const hrefId = extractAwemeIdFromHref(ownHref);
+  if (hrefId) return hrefId;
+  for (const name of ["data-aweme-id", "data-video-id", "data-content-id"]) {
+    const value = target.getAttribute(name)?.trim() ?? "";
+    if (/^\d{10,}$/.test(value)) return value;
+  }
+  const className = typeof target.className === "string" ? target.className : "";
+  for (const token of className.split(/\s+/)) {
+    const match = token.match(/^video_(\d{10,})$/);
+    if (match?.[1]) return match[1];
+  }
+  const nestedHref = target.querySelector<HTMLElement>('[href*="/video/"]');
+  return extractAwemeIdFromHref(nestedHref?.getAttribute("href") ?? "");
+}
+
+function extractVideoHrefFromTarget(target: HTMLElement, awemeId: string): string {
+  const ownHref = target.getAttribute("href") ?? "";
+  if (extractAwemeIdFromHref(ownHref)) return ownHref;
+  const nestedHref = target
+    .querySelector<HTMLElement>('[href*="/video/"]')
+    ?.getAttribute("href") ?? "";
+  return extractAwemeIdFromHref(nestedHref) ? nestedHref : `/video/${awemeId}`;
 }
 
 function pickAuthorSecUid(card: HTMLElement): string {
@@ -205,28 +283,30 @@ export function extractDouyinSearchItemsFromDocument(
   doc: Document,
   baseUrl: string,
   maxItems: number,
+  includeRenderedFeedCards: boolean = false,
 ): DouyinSearchItem[] {
   const cap = Math.max(0, Math.floor(maxItems));
   if (cap === 0) return [];
 
   const items: DouyinSearchItem[] = [];
   const seen = new Set<string>();
-  const anchors = Array.from(
-    doc.querySelectorAll<HTMLAnchorElement>('a[href*="/video/"]'),
-  );
-  for (const anchor of anchors) {
+  const selector = includeRenderedFeedCards
+    ? VIDEO_CARD_TARGET_SELECTOR
+    : 'a[href*="/video/"]';
+  const targets = Array.from(doc.querySelectorAll<HTMLElement>(selector));
+  for (const target of targets) {
     if (items.length >= cap) break;
-    const href = anchor.getAttribute("href") ?? anchor.href ?? "";
-    const awemeId = extractAwemeIdFromHref(href);
+    const awemeId = extractAwemeIdFromTarget(target);
     if (!awemeId || seen.has(awemeId)) continue;
     seen.add(awemeId);
 
-    const card = findCardContainer(anchor);
+    const href = extractVideoHrefFromTarget(target, awemeId);
+    const card = findCardContainer(target);
     items.push({
       scope: "dy_search",
       aweme_id: awemeId,
       url: absolutize(href, baseUrl),
-      title: pickCardTitle(card, anchor),
+      title: pickCardTitle(card, target),
       author: pickAuthorName(card),
       author_sec_uid: pickAuthorSecUid(card),
       cover_url: pickCoverUrl(card),
@@ -252,10 +332,10 @@ const SCROLLABLE_OVERFLOW_TOLERANCE_PX = 4;
  * back to window scrolling.
  */
 export function pickSearchScrollTarget(doc: Document): Element | null {
-  const anchor = doc.querySelector<HTMLElement>('a[href*="/video/"]');
-  if (!anchor) return null;
+  const target = doc.querySelector<HTMLElement>('a[href*="/video/"]');
+  if (!target) return null;
   const view = doc.defaultView;
-  let node: Element | null = anchor.parentElement;
+  let node: Element | null = target.parentElement;
   while (node) {
     if (isScrollableContainer(node, view)) return node;
     node = node.parentElement;
@@ -284,24 +364,24 @@ function extractVideoItems(
 ): DouyinBootstrapItem[] {
   const items: DouyinBootstrapItem[] = [];
   const seen = new Set<string>();
-  const anchors = Array.from(
-    doc.querySelectorAll<HTMLAnchorElement>('a[href*="/video/"]'),
+  const targets = Array.from(
+    doc.querySelectorAll<HTMLElement>('a[href*="/video/"]'),
   );
-  for (const anchor of anchors) {
+  for (const target of targets) {
     if (items.length >= cap) break;
-    const href = anchor.getAttribute("href") ?? anchor.href ?? "";
-    const awemeId = extractAwemeIdFromHref(href);
+    const awemeId = extractAwemeIdFromTarget(target);
     if (!awemeId || seen.has(awemeId)) continue;
     seen.add(awemeId);
 
-    const card = findCardContainer(anchor);
+    const href = extractVideoHrefFromTarget(target, awemeId);
+    const card = findCardContainer(target);
     const url = absolutize(href, baseUrl);
     items.push({
       scope,
       aweme_id: awemeId,
       creator_sec_uid: "",
       url,
-      title: pickCardTitle(card, anchor),
+      title: pickCardTitle(card, target),
       author: pickAuthorName(card),
       author_sec_uid: pickAuthorSecUid(card),
       cover_url: pickCoverUrl(card),

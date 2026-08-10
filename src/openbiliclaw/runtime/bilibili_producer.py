@@ -13,6 +13,7 @@ from openbiliclaw.discovery.strategies._utils import (
     build_query_generation_profile_summary,
     search_cooldown_remaining,
 )
+from openbiliclaw.discovery.strategies.search import RECENT_SUPPLY_LANE_PAGE_SIZE
 from openbiliclaw.llm.json_utils import parse_llm_json_tolerant
 from openbiliclaw.llm.prompts import build_search_queries_prompt
 from openbiliclaw.llm.task_options import without_core_memory_kwargs
@@ -71,6 +72,8 @@ class BilibiliExtensionSearchProducer:
     min_interval_minutes: int = 3
     keywords_per_cycle: int = 3
     page_size: int = 20
+    recent_lane_tasks_per_cycle: int = 0
+    recent_lane_page_size: int = RECENT_SUPPLY_LANE_PAGE_SIZE
     presence_grace_seconds: int = 90
     candidate_pipeline: Any | None = None
     keyword_fetch: Any | None = None
@@ -143,10 +146,13 @@ class BilibiliExtensionSearchProducer:
 
     def _enqueue_keywords(self, keywords: list[str]) -> dict[str, object]:
         enqueued = 0
-        for keyword in keywords:
+        for index, keyword in enumerate(keywords):
             task_id = self.task_queue.enqueue_with_id(
                 "search",
-                self._task_payload(keyword),
+                self._task_payload(
+                    keyword,
+                    recent_lane=index < max(0, int(self.recent_lane_tasks_per_cycle)),
+                ),
                 daily_budget=self.daily_budget,
             )
             if task_id is None:
@@ -158,10 +164,14 @@ class BilibiliExtensionSearchProducer:
     def _enqueue_claimed_keywords(self, claimed: list[Any]) -> dict[str, object]:
         coordinator = self.keyword_fetch
         enqueued = 0
-        for item in claimed:
+        for index, item in enumerate(claimed):
             task_id = self.task_queue.enqueue_with_id(
                 "search",
-                self._task_payload(item.keyword, source_keyword_id=int(item.id)),
+                self._task_payload(
+                    item.keyword,
+                    source_keyword_id=int(item.id),
+                    recent_lane=index < max(0, int(self.recent_lane_tasks_per_cycle)),
+                ),
                 daily_budget=self.daily_budget,
             )
             if task_id is not None:
@@ -182,14 +192,26 @@ class BilibiliExtensionSearchProducer:
         )
         return {"enqueued": enqueued, "attempted": len(claimed), "reason": "ok"}
 
-    def _task_payload(self, query: str, *, source_keyword_id: int | None = None) -> dict[str, Any]:
+    def _task_payload(
+        self,
+        query: str,
+        *,
+        source_keyword_id: int | None = None,
+        recent_lane: bool = False,
+    ) -> dict[str, Any]:
+        page_size = (
+            max(1, int(self.recent_lane_page_size)) if recent_lane else max(1, int(self.page_size))
+        )
         payload: dict[str, Any] = {
             "query": query,
-            "limit": self.page_size,
+            "limit": page_size,
             "page": 1,
-            "page_size": self.page_size,
+            "page_size": page_size,
             "source": "bili-extension-search",
         }
+        if recent_lane:
+            payload["order"] = "pubdate"
+            payload["discovery_lane"] = "recent"
         if source_keyword_id is not None:
             payload["source_keyword_id"] = int(source_keyword_id)
         return payload

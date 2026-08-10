@@ -213,6 +213,39 @@ def test_projected_inventory_excludes_unscored_raw() -> None:
     assert CandidateEvalCoordinator._projected_inventory(snapshot) == 9
 
 
+def test_projected_inventory_counts_only_pending_copy_that_can_become_available() -> None:
+    snapshot = CandidateEvalSnapshot(
+        available=2,
+        target=10,
+        pending_eval=500,
+        evaluating=60,
+        evaluated_pending_admission=3,
+        admitted_pending_copy=40,
+        admitted_pending_available=1,
+    )
+
+    assert CandidateEvalCoordinator._projected_inventory(snapshot) == 6
+
+
+def test_admission_headroom_counts_only_pending_copy_that_can_become_available() -> None:
+    pipeline = _FakeStagedPipeline(candidate_count=0)
+    pipeline.evaluated_pending_admission = 10
+    coordinator = _coordinator(pipeline, target=10)
+    snapshot = CandidateEvalSnapshot(
+        available=4,
+        target=10,
+        pending_eval=0,
+        evaluating=0,
+        evaluated_pending_admission=10,
+        admitted_pending_copy=40,
+        admitted_pending_available=2,
+    )
+
+    coordinator._admit_evaluated(snapshot)  # noqa: SLF001
+
+    assert pipeline.admit_limits == [4]
+
+
 @pytest.mark.asyncio
 async def test_three_workers_refill_fast_slot_without_waiting_for_slow_slots() -> None:
     pipeline = _FakeStagedPipeline(candidate_count=120)

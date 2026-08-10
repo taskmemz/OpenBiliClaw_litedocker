@@ -3327,6 +3327,41 @@ async def test_discovery_engine_caches_final_results() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bilibili_discovery_cache_backfill_never_leaks_other_platforms() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test.db")
+        db.initialize()
+        db.cache_content(
+            "reddit:high-score",
+            content_id="high-score",
+            content_url="https://www.reddit.com/r/test/comments/high-score",
+            title="Reddit cached item",
+            source="reddit-hot",
+            source_platform="reddit",
+            relevance_score=0.99,
+        )
+        db.cache_content(
+            "BV1ONLY",
+            title="Bilibili cached item",
+            source="trending",
+            source_platform="bilibili",
+            relevance_score=0.80,
+        )
+
+        engine = ContentDiscoveryEngine(database=db, target_primary_count=2)
+        engine.register_strategy(_RecordingStrategy("trending", []))
+
+        results = await engine.discover(
+            _build_profile(),
+            strategies=["trending"],
+            limit=2,
+        )
+
+        assert [item.bvid for item in results] == ["BV1ONLY"]
+        assert {item.source_platform for item in results} == {"bilibili"}
+
+
+@pytest.mark.asyncio
 async def test_discovery_engine_cache_results_preserves_multi_source_fields() -> None:
     """Regression: rescoring xhs rows must not overwrite source_platform.
 
@@ -4665,7 +4700,7 @@ async def test_sparse_evaluation_repairs_multi_member_results_without_ids() -> N
     assert llm.ids_by_call == [["0", "1"], ["0"], ["0"]]
 
 
-def test_sparse_evaluation_is_the_v3_cache_default_with_explicit_rollback_seams() -> None:
+def test_sparse_evaluation_is_the_v4_cache_default_with_explicit_rollback_seams() -> None:
     default_engine = ContentDiscoveryEngine()
     explicit_production_engine = ContentDiscoveryEngine(evaluation_candidate_transport="production")
     sparse_engine = ContentDiscoveryEngine(evaluation_candidate_transport="sparse-json")
@@ -4710,9 +4745,9 @@ def test_sparse_evaluation_is_the_v3_cache_default_with_explicit_rollback_seams(
     assert _DEFAULT_EVALUATION_CANDIDATE_TRANSPORT == "sparse-json"
     assert default_engine.evaluation_candidate_transport == "sparse-json"
     assert default_key == sparse_key
-    assert default_key.startswith("content-eval-v3:batch:")
+    assert default_key.startswith("content-eval-v4:batch:")
     assert default_key.endswith(":transport:sparse-json")
-    assert explicit_production_key.startswith("content-eval-v3:batch:")
+    assert explicit_production_key.startswith("content-eval-v4:batch:")
     assert ":transport:" not in explicit_production_key
     assert explicit_production_key != default_key
     assert row_key.endswith(":transport:row-wire-v1")
@@ -4728,8 +4763,8 @@ def test_sparse_evaluation_is_the_v3_cache_default_with_explicit_rollback_seams(
         content(),
         profile_digest="profile",
     )
-    assert single_key.startswith("content-eval-v3:single:")
-    old_batch_key = default_key.replace("content-eval-v3:", "content-eval-v2:", 1)
+    assert single_key.startswith("content-eval-v4:single:")
+    old_batch_key = default_key.replace("content-eval-v4:", "content-eval-v3:", 1)
     default_engine._set_eval_cache_entry(
         old_batch_key,
         (0.9, "old", "old", "deep_focus", ""),
@@ -5349,6 +5384,161 @@ async def test_eval_cache_reads_legacy_four_tuple_entries() -> None:
     assert content.topic_group == "legacy-topic"
     assert content.style_key == "deep_focus"
     assert llm.user_inputs == []
+
+
+@pytest.mark.asyncio
+async def test_eval_cache_reads_legacy_five_tuple_entries_with_neutral_temporal_data() -> None:
+    db = _StubNegativeExemplarsDatabase(rows=[])
+    llm = _RecordingBatchLLMService()
+    engine = ContentDiscoveryEngine(llm_service=llm, database=db)
+    profile = _build_profile()
+    content = DiscoveredContent(
+        bvid="BVlegacy5",
+        title="候选",
+        up_name="u",
+        source_strategy="search",
+        temporal_class="current",
+        temporal_confidence=0.9,
+        temporal_reason="stale value",
+    )
+    cache_key = engine._batch_eval_cache_key(
+        content,
+        profile_digest=engine._evaluation_profile_digest(profile),
+        negative_digest=engine._negative_examples_digest(None),
+    )
+    engine._set_eval_cache_entry(
+        cache_key,
+        (0.78, "legacy reason", "legacy-topic", "deep_focus", "legacy-franchise"),
+    )
+
+    scores = await engine.evaluate_content_batch([content], profile)
+
+    assert scores == [0.78]
+    assert content.franchise_key == "legacy-franchise"
+    assert content.temporal_class == "unknown"
+    assert content.temporal_confidence == 0.0
+    assert content.temporal_reason == ""
+    assert content.temporal_policy_version == "v1"
+    assert llm.user_inputs == []
+
+
+@pytest.mark.asyncio
+async def test_single_evaluation_parses_and_caches_temporal_metadata() -> None:
+    llm = FakeLLMService(
+        json.dumps(
+            {
+                "score": 0.82,
+                "reason": "match",
+                "topic_group": "systems",
+                "style_key": "deep_focus",
+                "franchise_key": "",
+                "temporal_class": "versioned",
+                "temporal_confidence": 0.88,
+                "temporal_reason": "内容依赖具体产品版本",
+                "temporal_policy_version": "model-owned-value-is-ignored",
+            },
+            ensure_ascii=False,
+        )
+    )
+    engine = ContentDiscoveryEngine(llm_service=llm, eval_prefilter_mode="off")
+
+    def candidate() -> DiscoveredContent:
+        return DiscoveredContent(
+            content_id="single-temporal",
+            title="Python 3.8 安装教程",
+            source_platform="youtube",
+            source_strategy="search",
+        )
+
+    cold = candidate()
+    warm = candidate()
+    assert await engine.evaluate_content(cold, _build_profile()) == 0.82
+    assert await engine.evaluate_content(warm, _build_profile()) == 0.82
+
+    for item in (cold, warm):
+        assert item.temporal_class == "versioned"
+        assert item.temporal_confidence == 0.88
+        assert item.temporal_reason == "内容依赖具体产品版本"
+        assert item.temporal_policy_version == "v1"
+    assert len(llm.calls) == 1
+    assert {len(entry) for entry in engine._eval_cache.values()} == {9}
+    assert {entry[-1] for entry in engine._eval_cache.values()} == {"v1"}
+
+
+@pytest.mark.asyncio
+async def test_single_evaluation_keeps_valid_relevance_when_temporal_fields_are_missing() -> None:
+    llm = FakeLLMService(
+        json.dumps(
+            {
+                "score": 0.79,
+                "reason": "match",
+                "topic_group": "systems",
+                "style_key": "deep_focus",
+                "franchise_key": "",
+            }
+        )
+    )
+    engine = ContentDiscoveryEngine(llm_service=llm, eval_prefilter_mode="off")
+    content = DiscoveredContent(
+        content_id="single-temporal-missing",
+        title="模型仍给出有效相关性",
+        source_platform="twitter",
+        source_strategy="search",
+        temporal_class="current",
+        temporal_confidence=0.9,
+        temporal_reason="stale metadata must be cleared",
+    )
+
+    assert await engine.evaluate_content(content, _build_profile()) == 0.79
+    assert content.relevance_reason == "match"
+    assert content.temporal_class == "unknown"
+    assert content.temporal_confidence == 0.0
+    assert content.temporal_reason == ""
+    assert content.temporal_policy_version == "v1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["production", "sparse-json"])
+async def test_batch_evaluation_keeps_valid_relevance_when_temporal_fields_are_invalid(
+    transport: str,
+) -> None:
+    llm = _RecordingBatchLLMService(
+        response=json.dumps(
+            [
+                {
+                    "id": "0",
+                    "score": 0.81,
+                    "reason": "匹配用户兴趣",
+                    "topic_group": "人工智能",
+                    "style_key": "deep_focus",
+                    "franchise_key": "",
+                    "temporal_class": "current",
+                    "temporal_confidence": "high",
+                    "temporal_reason": "依赖近期语境",
+                }
+            ],
+            ensure_ascii=False,
+        )
+    )
+    engine = ContentDiscoveryEngine(
+        llm_service=llm,
+        eval_prefilter_mode="off",
+        evaluation_candidate_transport=transport,
+    )
+    content = DiscoveredContent(
+        bvid="BVTEMPORAL",
+        title="标题含最新但不能单独决定分类",
+        source_strategy="trending",
+    )
+
+    scores = await engine.evaluate_content_batch([content], _build_profile())
+
+    assert scores == [0.81]
+    assert content.relevance_reason == "匹配用户兴趣"
+    assert content.temporal_class == "unknown"
+    assert content.temporal_confidence == 0.0
+    assert content.temporal_reason == ""
+    assert content.temporal_policy_version == "v1"
 
 
 @pytest.mark.asyncio

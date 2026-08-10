@@ -710,6 +710,8 @@ class RuntimeContext:
             DiscoveryConcurrencyController,
         )
         from openbiliclaw.discovery.strategies.strategies import (
+            RECENT_SUPPLY_LANE_PAGE_SIZE,
+            RECENT_SUPPLY_LANE_QUERIES,
             ExploreStrategy,
             RelatedChainStrategy,
             SearchStrategy,
@@ -913,6 +915,10 @@ class RuntimeContext:
             task_registry=self.task_registry,
             xhs_self_info_provider=_xhs_self_info_provider,
             copy_ready_target_count=effective_copy_target,
+            pool_available_target_count=max(
+                0,
+                int(getattr(new_config.scheduler, "pool_target_count", 0) or 0),
+            ),
             visual_profile_enabled=bool(
                 getattr(getattr(new_config, "discovery", None), "visual_profile_enabled", False)
             ),
@@ -982,6 +988,8 @@ class RuntimeContext:
             concurrency=concurrency,
             database=self.database,
             embedding_service=new_embedding_service,
+            recent_lane_queries_per_run=RECENT_SUPPLY_LANE_QUERIES,
+            recent_lane_page_size=RECENT_SUPPLY_LANE_PAGE_SIZE,
         )
         trending_strategy = TrendingStrategy(
             bilibili_client=new_bilibili_client,
@@ -1126,6 +1134,8 @@ class RuntimeContext:
                 min_interval_minutes=int(getattr(bili_cfg, "min_interval_minutes", 3)),
                 keywords_per_cycle=int(getattr(bili_cfg, "keywords_per_cycle", 3)),
                 page_size=int(getattr(bili_cfg, "page_size", 20)),
+                recent_lane_tasks_per_cycle=RECENT_SUPPLY_LANE_QUERIES,
+                recent_lane_page_size=RECENT_SUPPLY_LANE_PAGE_SIZE,
                 presence_grace_seconds=int(
                     getattr(sched_cfg, "extension_disconnect_grace_seconds", 90)
                 ),
@@ -1151,6 +1161,10 @@ class RuntimeContext:
                 discovery_engine=new_discovery_engine,
                 candidate_pipeline=new_candidate_pipeline,
                 keyword_fetch=new_keyword_fetch,
+                presence=self.presence,
+                presence_grace_seconds=int(
+                    getattr(sched_cfg, "extension_disconnect_grace_seconds", 90)
+                ),
             )
             new_youtube_producer = build_youtube_discovery_producer(
                 config=new_config,
@@ -1359,6 +1373,7 @@ class RuntimeContext:
                 evaluating=int(status_counts.get("evaluating", 0)),
                 evaluated_pending_admission=int(status_counts.get("evaluated", 0)),
                 admitted_pending_copy=int(readiness.get("admitted_pending_copy", 0)),
+                admitted_pending_available=int(readiness.get("admitted_pending_available", 0)),
             )
 
         async def _request_candidate_supply(reason: str) -> dict[str, object]:

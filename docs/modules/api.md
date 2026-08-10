@@ -2,11 +2,11 @@
 
 ## 概述
 
-`src/openbiliclaw/api/` 暴露本地 FastAPI 契约，并把 UI 请求编排到 durable storage、Soul、Dialogue 与 runtime。本文记录对话确认入口新增的公开端点；通用鉴权见 [api-auth.md](api-auth.md)，初始化端点见 [init.md](init.md)。
+`src/openbiliclaw/api/` 暴露本地 FastAPI 契约，并把 UI 请求编排到 durable storage、Soul、Dialogue 与 runtime。本文记录配置、迁移、推荐和对话等公开端点；通用鉴权见 [api-auth.md](api-auth.md)，初始化端点见 [init.md](init.md)。
 
 ## 初始化期间的配置探测
 
-`POST /api/config/probe-service` 只在内存副本上应用设置页草稿并真实探测 LLM、默认链、embedding 或网络策略，不写 `config.toml`、不热重载 runtime。它因此不受 guided init 的 HTTP 写端 409 门控；初始化运行时仍可测试，LLM 请求继续经过进程级稳定 total gate。`PUT /api/config` 仍在初始化期间返回 `409 init_running`，避免替换本轮任务正在使用的组件。
+`POST /api/config/probe-service` 只在内存副本上应用设置页草稿并真实探测 LLM、默认链、embedding 或网络策略，不写 `config.toml`、不热重载 runtime。它因此不受 guided init 的 HTTP 写端 409 门控；初始化运行时仍可测试，LLM 请求继续经过进程级稳定 total gate。LLM 实例 / 链探测的 outer deadline 按草稿 `[llm].timeout` 取值并夹在 10–120 秒，超时以 `ok=false` 和稳定错误文案返回；图形客户端使用 125 秒预算，覆盖本地模型冷启动而不允许无界挂起。`PUT /api/config` 仍在初始化期间返回 `409 init_running`，避免替换本轮任务正在使用的组件。
 
 视觉预热配置也属于同一事务契约：`PUT /api/config` 对 `keyframe_max_frames (1..12)`、
 `keyframe_fetch_limit (1..200)`、`danmaku_fetch_limit (1..200)` 和
@@ -21,6 +21,8 @@ runtime apply。`0` 是只关闭跨 digest 关键词复用的回滚值，不会�
 
 `PUT /api/config` 把“持久化成功”和“运行时已经切换”分成两个明确阶段。请求仍在 `_CONFIG_SAVE_LOCK` 内完成校验、`config.toml.bak` 快照、`config.toml` 写入和凭据存储，然后统一立即返回 `202 apply_state="queued"`、`apply_revision` 与已脱敏配置快照；运行时 lane 由 app-owned latest-wins 队列在后台安全应用，前端通过 `GET /api/config/apply-status` 或 runtime event 观察终态，不把 202 当作失败。
 
+`general.data_dir` 不支持热切换。若保存值的 canonical 路径与当前 runtime 已打开、已持有进程级锁的 active data dir 不同，磁盘配置仍记录新值，但 202 返回 `restart_required=true`；后台只把其它字段应用到继续绑定旧 active data dir 的 `RuntimeContext`。同一次请求涉及的抖音 / X 外部凭据也读写旧 active 目录，避免在尚未持有新目录锁时写入。完整退出并重新启动、取得新 canonical data-dir lock 后才启用新路径；因此 apply status 的 `applied` 不代表目录已切换。
+
 Phase 2 cognition rollout 在配置 API 中也是 task-scoped：`soul` GET/PUT 模型公开
 `preference_prompt_view`、`awareness_prompt_view`、`insight_prompt_view` 三个
 `legacy|compact-v1` 字段，默认分别为 `legacy / compact-v1 / legacy`。旧的聚合
@@ -32,10 +34,27 @@ Phase 2 cognition rollout 在配置 API 中也是 task-scoped：`soul` GET/PUT �
 
 | 方法与路径 | 状态 | 契约 |
 |---|---|---|
-| `PUT /api/config` | ✅ | 持久化成功后统一返回 `202 queued`；响应新增 `apply_state`、`apply_revision`，原有 `reloaded` / `rollback_applied` / `restart_required` 保持兼容。 |
-| `GET /api/config/apply-status` | ✅ | 返回 `state`、最新请求修订、最后已应用修订、消息、非敏感错误分类和更新时间；不包含配置内容或凭据。 |
+| `PUT /api/config` | ✅ | 持久化成功后统一返回 `202 queued`；响应新增 `apply_state`、`apply_revision`，原有 `reloaded` / `rollback_applied` / `restart_required` 保持兼容。改变 canonical `data_dir` 时 `restart_required=true`，新路径仅在完整重启后启用。 |
+| `GET /api/config/apply-status` | ✅ | 返回 `state`、最新请求修订、最后已应用修订、消息、非敏感错误分类和更新时间；不包含配置内容或凭据。`applied` 只确认本进程可应用部分，不取消 PUT 已返回的目录重启要求。 |
 
 guided init 不与待应用配置并行：队列为 `queued/applying` 时 `POST /api/init` 返回 `409 config_applying`；init 已开始时 `PUT /api/config` 仍返回既有 `409 init_running`。
+
+## 本机数据迁移
+
+桌面 Web 的「设置 → 通用 → 数据迁移」使用四条独立 API。它们在正常和 `llm_registry_unavailable` 降级态都保持可达，但不继承“已登录即可远程管理”的范围：每次请求必须由后端真实解析为 loopback transport（直接连接，或可信代理正确报告的 loopback client）并显式携带 `X-OBC-Auth: 1`；浏览器请求还必须通过 Origin / Host 同源检查，扩展 Origin 明确拒绝，无 Origin 的本机 CLI / curl 仍可使用。迁移判定独立于 `[api.auth].trust_loopback`，远端 Bearer / Cookie、局域网客户端，以及由 Caddy / TLS Proxy / 容器转发过来的非 loopback 客户端都不能借密码门禁绕过。guided init 活动期间导出 / 导入返回 `409 init_active`；状态查询与取消暂存继续可用，便于对账或撤销此前已经暂存的导入。
+
+| 方法与路径 | 请求 | 成功响应与副作用 |
+|---|---|---|
+| `POST /api/migration/export` | JSON body 可选；桌面端发送 `{"frontend": {...}}`，后端只接受主题模式、色相、强调风格、自动续页和侧抽屉开关 | `200 application/vnd.openbiliclaw.backup+zip`，下载 `openbiliclaw-backup-YYYYMMDD-HHMMSS.obcbackup`。响应使用 `Cache-Control: no-store, private`；临时导出目录在文件传输结束后删除。配置保存锁忙时返回 `409 config_busy`。后端读取并合并磁盘上的 `config.toml` / `config.local.toml`（不烘焙环境变量），移除整段 `[api.auth]` 后只写包内 `config/config.toml`，不携带密码、password hash、session secret 或扩展设备 key；数据文件始终从当前进程已持锁的 active data dir 导出，尚待重启的新 `data_dir` 不会被提前读取。 |
+| `POST /api/migration/import` | 原始 `.obcbackup` bytes，不是 multipart；必须带 `X-OBC-Migration-Confirm: replace-all`。可选 `X-OBC-Migration-Request-ID: <UUID>`；未提供时服务端生成 UUID，非法值返回 `400 invalid_request_id`。压缩包上限 2 GB，服务端流式写临时文件 | `202 state="staged"`，返回迁移 ID、规范化的 `request_id`、源版本、文件数、解压大小、安全 UI 偏好、被目标机设置覆盖的字段、`source_omitted_environment_variables`、导入当时的 `target_active_environment_variables` 和 `restart_required=true`。此时当前配置、SQLite 与 runtime 均未替换。 |
+| `GET /api/migration/status` | 无 body | 返回 `idle`、`processing`、`staged`、`applied`、`failed` 或 `cancelled`。上传 / 校验仍在进行时，`processing` 携带规范化 `request_id`、`phase="uploading|validating"` 与 `restart_required=false`；`staged` 携带 `migration_id`、`request_id`、两类环境变量名、调整字段与 `restart_required=true`；`applied` 携带 `migration_id` 和白名单 `frontend`。响应不会暴露包内凭据。 |
+| `DELETE /api/migration/pending` | 无 body | 删除尚未应用的 pending stage，返回 `cancelled=true, state="cancelled"`；没有 pending 时是 `cancelled=false, state="idle"` 的幂等空操作。它不修改当前配置或用户数据；若迁移已进入启动期 apply journal 则返回 `409`。 |
+
+导出响应是**未加密且包含敏感信息**的 ZIP 容器；API 不宣称也不实现服务端加密。模型 / 来源凭据和平台 Cookie 会迁移，但源机器的整段 `[api.auth]` 不进入包。启动应用时会重新读取目标机最新磁盘配置，以当时整段 `api.auth` 为基线，再轮换文件 session secret、关闭扩展远程访问并清空设备 key；prepared DB 同时把 `auth_epoch` 设为来源与目标当前 epoch 最大值再加一，严格高于两者并撤销两台机器的旧 Web 会话，即使目标 session secret 由环境变量固定也不会延续。因此源包不会覆盖目标机密码门禁策略，旧会话或扩展配对也不会继续有效。
+
+导入完整校验 manifest、成员类型 / 路径 / 大小、SHA-256、配置和 SQLite 后，才把内容发布到项目根下的私有暂存区。`request_id` 是上传结果的关联 / 对账 ID，不是服务端自动去重键；收到不确定结果时应先 `GET /api/migration/status`，不要盲目重复上传。匹配同一 `request_id` 的 `processing` 表示后端仍在上传或校验，不是失败；断连后的单次瞬时 `idle` 也不能单独作为本次请求的终局。桌面端最多强制查询 3 次，遇到 `idle/cancelled` 会间隔 500ms 再确认，匹配 request ID 的 `processing/staged` 则立即收口；每次打开「通用」还会绕过本地已加载标记重新查询。
+
+配置、SQLite、画像、白名单 UI 偏好和其它数据都要等下一次 `openbiliclaw start`、`openbiliclaw serve-api` 或桌面包启动取得 migration runtime lock 并成功 apply 后才生效；status 的 staged / applied 响应都只可能携带白名单 `frontend`，桌面端会忽略 staged 值。`state="applied"` 后，每个浏览器会把 `migration_id` 记为本地一次性交接回执，只应用该迁移的偏好一次；之后用户修改主题或滚动设置，即使旧 applied status 仍持久存在也不会再次覆盖。详见[存储层的可移植数据迁移](storage.md#可移植数据迁移)。再次提交合法迁移包会替换尚未应用的暂存包，也可在重启前调用 `DELETE /api/migration/pending` 取消。
 
 ## 公开项目统计
 
@@ -63,6 +82,18 @@ guided init 不与待应用配置并行：队列为 `queued/applying` 时 `POST 
 
 这些边界不阻止 discovery 搜索，也不等待异步语义清池或完整 Soul rebuild。
 
+### 30 天内容历史（issue #112）
+
+| 方法与路径 | 状态 | 契约 |
+|---|---|---|
+| `GET /api/content-history?category=clicked\|shown\|removed&limit=12&cursor={opaque}` | ✅ | 分页返回最近 30 天的「主动点开过 / 出现过但没点开 / 最近移除」。每类按 canonical `item_key` 去重，并以 `occurred_at DESC, source_kind DESC, source_id DESC, item_key ASC` 形成全序。首屏省略 `cursor` 和 `offset`；响应通过 `next_cursor` / `has_more` 驱动续页。`limit` 为 1–50；旧客户端仍可在不传 cursor 时单独使用非负 `offset`，越过 SQLite signed integer 范围会在参数校验阶段返回 422。端点只读本地数据、在 LLM 降级态仍可用；仍受现有 API auth middleware 保护。 |
+
+cursor 是版本化、base64url 编码的 opaque token，调用方不得解析或拼装。服务端严格校验其完整 shape、长度和类型，并绑定请求 `category`、固定 30 天 retention、上一页完整排序位置以及首屏看到的 events / recommendations / removal 三个最大行 ID；坏格式、跨 category 重放以及 cursor 与任何显式 offset 并用都返回 422。续页因此不会因首屏后以新行追加的头部事实（event、removal 或新 recommendation）发生 OFFSET 式重复/跳项；`total` 仍统计锚定集合中当前符合该 category 的全部卡片，不是 cursor 后剩余数，`has_more` 由 `limit + 1` 判断。该 token 不是跨请求 MVCC 快照：既有行的更新/删除、保存恢复状态和滚动 30 天边界仍按续页请求时的当前投影可见。
+
+响应每项继续保留顶层 `context` / `restored` 兼容字段；`removed` 另返回 `contexts: [{context, occurred_at, restored}]`，同一内容可同时包含 `favorite`、`watch_later`、`dismiss`、`dislike` 的各自最新事实。收藏与稍后再看分别按对应 membership 计算 restored，互不遮挡；反馈 context 的 restored 固定为 false。`clicked` / `shown` 在 SQL 投影前复用平台 registry 规范 source alias 和 item-key 前缀（包括 `x/yt/xhs`），使 alias 与 canonical 事件折叠到同一身份，且 `shown` 能正确排除已点击卡片。
+
+三套图形界面每组默认只请求 12 条，续页只回传上一页的 `next_cursor`。历史输出会把 `content_url` 与 `cover_url` 中的协议相对 URL `//...` 统一补成 `https://...`，并只返回无凭据、无空白/控制字符且结构有效的绝对 HTTP(S) URL；非法内容链接仅在平台和内容 ID 能安全构造 canonical 链接时回退，否则返回空串，非法封面直接返回空串。封面继续交给 `/api/image-proxy`，前端使用 lazy / low-priority 图片，不在打开历史页时预热整月封面。
+
 ### 公开事件写入口的幂等 ID
 
 以下三个公开写入口都要求调用方显式提供稳定 ID；字段会先去除首尾空白，再校验非空且最长 400 字符：
@@ -88,6 +119,15 @@ ID 字段是严格 JSON string，不接受数字、布尔或其它类型的自�
 `POST /api/sources/{xhs,dy,yt,zhihu,reddit}/task-result` 的最终回调不再先把任务写成 `completed`。后端先在 `BEGIN IMMEDIATE` 中合并并冻结第一份 canonical result（含 XHS `self_info` 私有快照），任务仍保持非终态；随后只从这份持久结果重放来源事件、seen-key 和来源专属投影，全部成功后才执行不替换 `result_json` 的 terminal flip。若进程分别退出在 canonical merge→event ingress、event ingress→seen-key 或 seen-key→terminal 三个窗口，后续 callback 会忽略变化后的 body，用第一份结果补齐缺口。队列把 staged marker 视为业务 mutation 的逻辑终态：并发/迟到的 partial、final、fail、rate-limit 都不能改写它；但它继续遵守普通 claim lease，丢失非 2xx 响应后会在 15 分钟 lease 过期时由 dispatcher 重新领取，从而自动触发修复。seen-key 通过 `update_source_bootstrap_state()` 原子、严格落盘并按源保留最新 5,000 个身份键，失败会阻止 terminal flip；事件稳定键不含 task ID，因此 ingress 已提交但 marker 未写时的重放只返回 duplicate receipt。Reddit post/comment/subreddit/user 使用各自稳定身份，comment URL fallback 只接受含 comment id 的完整 permalink，不能把 post id 或标题误作 comment key。
 
 周期任务 payload 带 `incremental=true`；五源 handler 在 guided init 外给 durable event 标记 `profile_update_owner="generic"`，在 init-owned 回调中只落事实、由阶段 2/3 统一建模。事件 ingress 成功或 duplicate receipt 后才按响应顺序 checkpoint seen key，再翻 terminal；没有 handler 直接调用画像 pipeline。扩展离线时 runtime 不创建任务，也不推进调度时间。
+
+## B 站与抖音浏览器任务边界
+
+| 方法与路径 | 状态 | 契约 |
+|---|---|---|
+| `POST /api/sources/bili/task-result` | ✅ | B 站扩展搜索任务 payload 带 `discovery_lane="recent"` 时，结果仍以 `source_strategy="bili-extension-search"` 进入统一 evaluator，同时保存 `source_context="bili-extension-search:recent"` 和 raw lane provenance；该标记不改变相关性、阈值或 admission。 |
+| `GET /api/sources/dy/next-task` | ✅ | 对 legacy discovery 的 `dy_tasks` 执行 durable source-wide single-flight：`BEGIN IMMEDIATE` 内若已有未超过 15 分钟的 `in_progress` lease，则返回 bodyless 204，不让另一个扩展 ID/Profile 领取第二条任务；过期或缺失 `claimed_at` 的 lease 可按 FIFO 重领。此门禁不涵盖先于 legacy queue 检查的 native-save job。 |
+
+抖音的 15 分钟 stale lease 与 producer 的 15 分钟基础设施失败退避来自 2026-08-09 真实扩展 E2E：正常任务约 15–35 秒，而执行上下文丢失会耗尽 180 秒 watchdog。它们是防止重复 claim/分钟级重试风暴的工程安全值，不是抖音官方限额；任务 watchdog、lease 或调度 cadence 改动时必须重新校准。
 
 ## 封面代理与抓取状态
 
@@ -170,3 +210,5 @@ popup、移动 Web 与桌面 Web 只有 durable 对话中的假设卡片保留 c
 ## Runtime stream 保活与重连
 
 `GET ws://.../api/runtime-stream` 在 20 秒没有业务事件时发送 `{"type":"runtime.heartbeat","sent_at":"..."}`。心跳与普通事件共用唯一 writer，避免并发 `send_json`；鉴权撤销仍在每次发送前和 15 秒 watchdog 中 fail closed。桌面 Web 收到心跳即确认“实时连接正常”，异常 close 则显示“实时流重连中”、记录 close code/reason，并按 3 秒节奏重连；页面进入后台时仍按 visibility 生命周期主动关闭，不把该主动关闭显示成后端离线。
+
+`dy_task_available` 等 task-available 帧用于唤醒浏览器扩展 dispatcher，不是用户活动。桌面 Web 会在运行时状态投影之前丢弃 `dy_task_available`，避免把原始 wire type 显示成首页“现在在忙”；扩展仍照常消费该事件并立即轮询任务。

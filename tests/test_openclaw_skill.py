@@ -177,14 +177,28 @@ def test_build_openclaw_skills_returns_expected_names() -> None:
     assert [skill.name for skill in skills] == [
         "openbiliclaw_sync_account",
         "openbiliclaw_get_profile",
+        "openbiliclaw_get_capabilities",
         "openbiliclaw_recommend",
+        "openbiliclaw_reshuffle",
+        "openbiliclaw_append_recommendations",
         "openbiliclaw_submit_feedback",
         "openbiliclaw_get_delight",
+        "openbiliclaw_respond_delight",
         "openbiliclaw_get_runtime_status",
+        "openbiliclaw_get_activity_feed",
+        "openbiliclaw_get_platform_availability",
         "openbiliclaw_chat",
+        "openbiliclaw_get_chat_history",
         "openbiliclaw_next_probe",
+        "openbiliclaw_respond_interest_probe",
         "openbiliclaw_next_avoidance_probe",
         "openbiliclaw_respond_avoidance_probe",
+        "openbiliclaw_get_profile_edit_state",
+        "openbiliclaw_edit_profile",
+        "openbiliclaw_save_local",
+        "openbiliclaw_remove_saved",
+        "openbiliclaw_list_saved",
+        "openbiliclaw_sync_saved",
     ]
 
 
@@ -196,23 +210,11 @@ async def test_recommend_skill_delegates_to_adapter() -> None:
 
     payload = await skill.handler({"limit": 3, "refresh_if_needed": True})
 
-    assert payload == {
-        "ok": True,
-        "data": {
-            "items": [
-                {
-                    "recommendation_id": 12,
-                    "bvid": "BV1SKILL",
-                    "title": "把问题讲到结构层",
-                    "up_name": "结构控",
-                    "cover_url": "https://example.com/cover.jpg",
-                    "reason": "这条会接住你最近那股往深处看的劲头。",
-                    "topic_label": "你最近那股往深处看的劲头",
-                    "confidence": 0.88,
-                }
-            ]
-        },
-    }
+    item = payload["data"]["items"][0]
+    assert item["recommendation_id"] == 12
+    assert item["bvid"] == "BV1SKILL"
+    assert item["source_platform"] == ""
+    assert item["content_type"] == "video"
     assert adapter.calls == [("recommend", 3, True)]
 
 

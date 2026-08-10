@@ -3,9 +3,8 @@
  *
  * Task 3 of the Douyin bootstrap import plan
  * (docs/plans/2026-05-06-douyin-bootstrap-import.md). The module
- * itself does NOT auto-install on import — installFetchTap is called
- * explicitly by the content-script, so importing here under node:test
- * (no window) does not trigger side effects.
+ * auto-install guard is inert under node:test because no browser Window
+ * exists; the installers are called explicitly in these tests.
  *
  * Empirical signing / endpoint behaviour was verified against a real
  * douyin.com tab on 2026-05-07 via the chrome-devtools MCP. The
@@ -18,6 +17,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  autoInstallDouyinMainBridge,
   classifyDouyinResponseUrl,
   extractDouyinSelfSecUid,
   fetchDouyinSelfSecUid,
@@ -519,7 +519,7 @@ test("installFetchTap posts chunked search stream responses through optional sea
 });
 
 test("installFetchTap passively posts feed responses through optional search callback", async () => {
-  const calls: { items: unknown[] }[] = [];
+  const calls: { items: unknown[]; scope: string }[] = [];
   const fakeFetch = async (): Promise<Response> =>
     new Response(
       JSON.stringify({
@@ -531,15 +531,57 @@ test("installFetchTap passively posts feed responses through optional search cal
   installFetchTap(
     fakeWindow,
     () => {},
-    (items) => calls.push({ items }),
+    (items, scope) => calls.push({ items, scope }),
   );
   await fakeWindow.fetch("https://www.douyin.com/aweme/v1/web/tab/feed/?count=10");
   await fakeWindow.fetch("https://www.douyin.com/aweme/v2/web/module/feed/?count=20");
   assert.equal(calls.length, 2);
+  assert.equal(calls[0]!.scope, "dy_feed");
   assert.equal((calls[0]!.items[0] as { scope: string }).scope, "dy_feed");
   assert.equal((calls[0]!.items[0] as { aweme_id: string }).aweme_id, "feed-passive-1");
   assert.equal((calls[1]!.items[0] as { scope: string }).scope, "dy_feed");
   assert.equal((calls[1]!.items[0] as { aweme_id: string }).aweme_id, "feed-passive-1");
+});
+
+test("installFetchTap reports a parsed empty feed response as observed", async () => {
+  const calls: { items: unknown[]; scope: string }[] = [];
+  const fakeWindow = {
+    fetch: async (): Promise<Response> =>
+      new Response(JSON.stringify({ status_code: 0, aweme_list: [] }), { status: 200 }),
+  } as unknown as Window;
+  installFetchTap(
+    fakeWindow,
+    () => {},
+    (items, scope) => calls.push({ items, scope }),
+  );
+
+  await fakeWindow.fetch("https://www.douyin.com/aweme/v2/web/module/feed/?count=20");
+
+  assert.deepEqual(calls, [{ items: [], scope: "dy_feed" }]);
+});
+
+test("installFetchTap does not call error or malformed feed JSON a valid observation", async () => {
+  const responses = [
+    new Response(JSON.stringify({ status_code: 0, aweme_list: [] }), { status: 429 }),
+    new Response(JSON.stringify({ status_code: 4, aweme_list: [] }), { status: 200 }),
+    new Response(JSON.stringify({ status_code: 0 }), { status: 200 }),
+  ];
+
+  for (const response of responses) {
+    let observations = 0;
+    const fakeWindow = {
+      fetch: async (): Promise<Response> => response,
+    } as unknown as Window;
+    installFetchTap(
+      fakeWindow,
+      () => {},
+      () => {
+        observations += 1;
+      },
+    );
+    await fakeWindow.fetch("https://www.douyin.com/aweme/v2/web/module/feed/");
+    assert.equal(observations, 0);
+  }
 });
 
 test("installXhrTap passively posts feed responses through optional search callback", () => {
@@ -572,6 +614,35 @@ test("installXhrTap passively posts feed responses through optional search callb
   assert.equal(calls.length, 1);
   assert.equal((calls[0]!.items[0] as { scope: string }).scope, "dy_feed");
   assert.equal((calls[0]!.items[0] as { aweme_id: string }).aweme_id, "feed-xhr-passive-1");
+});
+
+test("installXhrTap rejects non-2xx feed responses as observations", () => {
+  let observations = 0;
+
+  class FakeXMLHttpRequest extends EventTarget {
+    readyState = 0;
+    responseText = "";
+    status = 0;
+
+    open(): void {}
+  }
+
+  const fakeWindow = { XMLHttpRequest: FakeXMLHttpRequest } as unknown as Window;
+  installXhrTap(
+    fakeWindow,
+    () => {},
+    () => {
+      observations += 1;
+    },
+  );
+  const xhr = new FakeXMLHttpRequest();
+  xhr.open("GET", "https://www.douyin.com/aweme/v2/web/module/feed/");
+  xhr.status = 429;
+  xhr.responseText = JSON.stringify({ status_code: 0, aweme_list: [] });
+  xhr.readyState = 4;
+  xhr.dispatchEvent(new Event("readystatechange"));
+
+  assert.equal(observations, 0);
 });
 
 test("installFetchTap passively posts related responses through optional search callback", async () => {
@@ -622,6 +693,121 @@ test("installFetchTap disposer restores the original fetch", async () => {
   assert.notEqual(fakeWindow.fetch, original);
   dispose();
   assert.equal(fakeWindow.fetch, original);
+});
+
+test("fetch and XHR taps install only one wrapper per page Window", async () => {
+  const originalFetch = async (): Promise<Response> =>
+    new Response(
+      JSON.stringify({ aweme_list: [{ aweme_id: "once-1", desc: "only once" }] }),
+    );
+  let firstFetchCallback = 0;
+  let duplicateFetchCallback = 0;
+
+  class FakeXMLHttpRequest extends EventTarget {
+    readyState = 0;
+    responseText = "";
+
+    open(): void {}
+  }
+
+  const fakeWindow = {
+    fetch: originalFetch,
+    XMLHttpRequest: FakeXMLHttpRequest,
+  } as unknown as Window;
+  const disposeFetch = installFetchTap(fakeWindow, () => {
+    firstFetchCallback += 1;
+  });
+  const wrappedFetch = fakeWindow.fetch;
+  const disposeDuplicateFetch = installFetchTap(fakeWindow, () => {
+    duplicateFetchCallback += 1;
+  });
+
+  const disposeXhr = installXhrTap(fakeWindow, () => {
+    firstFetchCallback += 1;
+  });
+  const wrappedOpen = FakeXMLHttpRequest.prototype.open;
+  const disposeDuplicateXhr = installXhrTap(fakeWindow, () => {
+    duplicateFetchCallback += 1;
+  });
+
+  assert.equal(fakeWindow.fetch, wrappedFetch);
+  assert.equal(FakeXMLHttpRequest.prototype.open, wrappedOpen);
+  await fakeWindow.fetch("https://www.douyin.com/aweme/v1/web/aweme/post/?count=18");
+
+  const xhr = new FakeXMLHttpRequest();
+  xhr.open("GET", "https://www.douyin.com/aweme/v1/web/aweme/post/?count=18");
+  xhr.responseText = JSON.stringify({
+    aweme_list: [{ aweme_id: "once-2", desc: "XHR only once" }],
+  });
+  xhr.readyState = 4;
+  xhr.dispatchEvent(new Event("readystatechange"));
+
+  assert.equal(firstFetchCallback, 2);
+  assert.equal(duplicateFetchCallback, 0);
+
+  // A duplicate installer's disposer is intentionally a no-op; the original
+  // installation remains live until its owner disposes it.
+  disposeDuplicateFetch();
+  disposeDuplicateXhr();
+  assert.equal(fakeWindow.fetch, wrappedFetch);
+  assert.equal(FakeXMLHttpRequest.prototype.open, wrappedOpen);
+  disposeFetch();
+  disposeXhr();
+  assert.equal(fakeWindow.fetch, originalFetch);
+});
+
+test("pending MAIN auto-install re-wraps page fetch and XHR without a second SDK waiter", () => {
+  const originalFetch = async (): Promise<Response> => new Response("{}");
+  const pageFetch = async (): Promise<Response> => new Response("{}");
+  let messageListenerInstalls = 0;
+
+  class FakeXMLHttpRequest extends EventTarget {
+    readyState = 0;
+    responseText = "";
+
+    open(): void {}
+  }
+
+  class FakeWindow extends EventTarget {
+    location = { origin: "https://www.douyin.com" };
+    fetch = originalFetch;
+    XMLHttpRequest = FakeXMLHttpRequest;
+
+    override addEventListener(
+      type: string,
+      callback: EventListenerOrEventListenerObject | null,
+      options?: AddEventListenerOptions | boolean,
+    ): void {
+      if (type === "message") messageListenerInstalls += 1;
+      super.addEventListener(type, callback, options);
+    }
+
+    postMessage(): void {}
+  }
+
+  const fakeWindow = new FakeWindow() as unknown as Window;
+  let sdkWaiters = 0;
+  const neverReady = (): Promise<boolean> => {
+    sdkWaiters += 1;
+    return new Promise<boolean>(() => {});
+  };
+  autoInstallDouyinMainBridge(fakeWindow, neverReady);
+  const firstWrappedFetch = fakeWindow.fetch;
+  const firstWrappedOpen = FakeXMLHttpRequest.prototype.open;
+  assert.notEqual(firstWrappedFetch, originalFetch);
+  assert.equal(messageListenerInstalls, 1);
+
+  (fakeWindow as unknown as { fetch: typeof pageFetch }).fetch = pageFetch;
+  const pageOpen = function pageOpen(): void {};
+  FakeXMLHttpRequest.prototype.open = pageOpen;
+  autoInstallDouyinMainBridge(fakeWindow, neverReady);
+
+  assert.notEqual(fakeWindow.fetch, pageFetch);
+  assert.notEqual(FakeXMLHttpRequest.prototype.open, pageOpen);
+  assert.notEqual(fakeWindow.fetch, firstWrappedFetch);
+  assert.notEqual(FakeXMLHttpRequest.prototype.open, firstWrappedOpen);
+  assert.equal(messageListenerInstalls, 1);
+  assert.equal(sdkWaiters, 1);
 });
 
 test("installApiHarvester resolves self identity through the postMessage bridge", async () => {
@@ -716,6 +902,140 @@ test("installApiHarvester deduplicates concurrent self identity requests per tab
       ["identity-b", "MS4wSharedUser"],
     ],
   );
+});
+
+test("installApiHarvester is idempotent and runs a duplicate requestId only once", async () => {
+  let listenerInstalls = 0;
+  let fetchCalls = 0;
+  const fetchResolvers: Array<(response: Response) => void> = [];
+
+  class FakeWindow extends EventTarget {
+    location = { origin: "https://www.douyin.com" };
+    fetch = async (): Promise<Response> => {
+      fetchCalls += 1;
+      return await new Promise<Response>((resolve) => fetchResolvers.push(resolve));
+    };
+
+    override addEventListener(
+      type: string,
+      callback: EventListenerOrEventListenerObject | null,
+      options?: AddEventListenerOptions | boolean,
+    ): void {
+      if (type === "message") listenerInstalls += 1;
+      super.addEventListener(type, callback, options);
+    }
+
+    postMessage(data: unknown): void {
+      queueMicrotask(() => {
+        this.dispatchEvent(bridgeMessage(this, data));
+      });
+    }
+  }
+
+  const fakeWindow = new FakeWindow();
+  installApiHarvester(fakeWindow as unknown as Window);
+  installApiHarvester(fakeWindow as unknown as Window);
+  assert.equal(listenerInstalls, 1);
+
+  const request = {
+    type: "OPENBILICLAW_DOUYIN_FEED_API_REQUEST",
+    requestId: "same-request-id",
+    maxItems: 5,
+  };
+  const firstResponse = new Promise<Record<string, unknown>>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("feed response timeout")), 500);
+    fakeWindow.addEventListener("message", function onMessage(event) {
+      const data = (event as MessageEvent).data as Record<string, unknown>;
+      if (data?.type !== "OPENBILICLAW_DOUYIN_FEED_API_RESPONSE") return;
+      clearTimeout(timer);
+      fakeWindow.removeEventListener("message", onMessage);
+      resolve(data);
+    });
+  });
+
+  fakeWindow.dispatchEvent(bridgeMessage(fakeWindow, request));
+  fakeWindow.dispatchEvent(bridgeMessage(fakeWindow, request));
+  assert.equal(fetchCalls, 1);
+  fetchResolvers.shift()!(
+    new Response(
+      JSON.stringify({
+        status_code: 0,
+        aweme_list: [{ aweme_id: "deduped-feed", desc: "deduped" }],
+      }),
+    ),
+  );
+
+  const response = await firstResponse;
+  assert.equal(fetchCalls, 1);
+  assert.equal((response.items as { aweme_id: string }[])[0]!.aweme_id, "deduped-feed");
+
+  // Settled IDs are released, so a genuinely new request can reuse the same
+  // correlation id without the registry growing forever.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  fakeWindow.dispatchEvent(bridgeMessage(fakeWindow, request));
+  assert.equal(fetchCalls, 2);
+  fetchResolvers.shift()!(new Response(JSON.stringify({ status_code: 0, aweme_list: [] })));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+});
+
+test("installApiHarvester evicts expired requestIds and suppresses their late response", async () => {
+  let fetchCalls = 0;
+  const fetchResolvers: Array<(response: Response) => void> = [];
+
+  class FakeWindow extends EventTarget {
+    location = { origin: "https://www.douyin.com" };
+    fetch = async (): Promise<Response> => {
+      fetchCalls += 1;
+      return await new Promise<Response>((resolve) => fetchResolvers.push(resolve));
+    };
+
+    postMessage(data: unknown): void {
+      queueMicrotask(() => {
+        this.dispatchEvent(bridgeMessage(this, data));
+      });
+    }
+  }
+
+  const fakeWindow = new FakeWindow();
+  installApiHarvester(fakeWindow as unknown as Window, 5);
+  const request = {
+    type: "OPENBILICLAW_DOUYIN_FEED_API_REQUEST",
+    requestId: "expired-request-id",
+    maxItems: 5,
+  };
+
+  fakeWindow.dispatchEvent(bridgeMessage(fakeWindow, request));
+  assert.equal(fetchCalls, 1);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const response = new Promise<Record<string, unknown>>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("replacement feed response timeout")), 500);
+    fakeWindow.addEventListener("message", function onMessage(event) {
+      const data = (event as MessageEvent).data as Record<string, unknown>;
+      if (data?.type !== "OPENBILICLAW_DOUYIN_FEED_API_RESPONSE") return;
+      clearTimeout(timer);
+      fakeWindow.removeEventListener("message", onMessage);
+      resolve(data);
+    });
+  });
+  fakeWindow.dispatchEvent(bridgeMessage(fakeWindow, request));
+  assert.equal(fetchCalls, 2);
+
+  const expiredResolver = fetchResolvers.shift()!;
+  const replacementResolver = fetchResolvers.shift()!;
+  expiredResolver(
+    new Response(
+      JSON.stringify({ aweme_list: [{ aweme_id: "stale-feed", desc: "stale" }] }),
+    ),
+  );
+  replacementResolver(
+    new Response(
+      JSON.stringify({ aweme_list: [{ aweme_id: "fresh-feed", desc: "fresh" }] }),
+    ),
+  );
+
+  const result = await response;
+  assert.equal((result.items as { aweme_id: string }[])[0]!.aweme_id, "fresh-feed");
 });
 
 test("installApiHarvester paginates favorite and like scopes through the postMessage bridge", async () => {

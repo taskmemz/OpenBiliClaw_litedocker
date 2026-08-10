@@ -1,14 +1,17 @@
 """Pool Curator — recommendation-side scoring independent of Discovery.
 
 Sits between the RecommendationEngine and the database to compute a
-composite ``rec_score`` that accounts for freshness, topic fatigue,
-source monotony, serendipity, and feedback signals — factors that
-Discovery's relevance_score does not capture.
+composite ``rec_score`` that accounts for publication-time value, topic
+fatigue, source monotony, serendipity, and feedback signals — factors
+that Discovery's relevance_score does not capture.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -17,6 +20,8 @@ if TYPE_CHECKING:
     from openbiliclaw.discovery.engine import DiscoveredContent
     from openbiliclaw.llm.embedding import SupportsEmbeddingService
     from openbiliclaw.storage.database import Database
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -38,10 +43,14 @@ class ScoringWeights:
     with the steeper fatigue curve (now ``count^1.5/len*5``) and the new
     topic_group axis, the same candidate now takes a 3-4x harder hit
     when it has appeared ≥2 times in recent history.
+
+    ``freshness`` is retained as a compatibility-friendly name, but now
+    weights a positive publication-time bonus.  It never represents cache
+    insertion or evaluation recency.
     """
 
     relevance: float = 0.30
-    freshness: float = 0.20
+    freshness: float = 0.10
     topic_fatigue: float = 0.25
     source_monotony: float = 0.15
     serendipity: float = 0.20
@@ -76,11 +85,111 @@ class ScoringContext:
     now: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
+@dataclass(frozen=True)
+class TemporalTopKShadowMetrics:
+    """Privacy-safe before/after aggregates for one ranking cut."""
+
+    requested_top_k: int
+    effective_top_k: int
+    overlap_count: int
+    jaccard: float
+    positional_match_count: int
+    baseline_parseable_published: int
+    effective_parseable_published: int
+    baseline_bonus_eligible: int
+    effective_bonus_eligible: int
+    baseline_classes: dict[str, int]
+    effective_classes: dict[str, int]
+    entered_classes: dict[str, int]
+    exited_classes: dict[str, int]
+    baseline_sources: dict[str, int]
+    effective_sources: dict[str, int]
+    entered_sources: dict[str, int]
+    exited_sources: dict[str, int]
+    baseline_age_buckets: dict[str, int]
+    effective_age_buckets: dict[str, int]
+    entered_age_buckets: dict[str, int]
+    exited_age_buckets: dict[str, int]
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a deterministic JSON-safe aggregate."""
+
+        return {
+            "requested_top_k": self.requested_top_k,
+            "effective_top_k": self.effective_top_k,
+            "overlap_count": self.overlap_count,
+            "jaccard": self.jaccard,
+            "positional_match_count": self.positional_match_count,
+            "baseline_parseable_published": self.baseline_parseable_published,
+            "effective_parseable_published": self.effective_parseable_published,
+            "baseline_bonus_eligible": self.baseline_bonus_eligible,
+            "effective_bonus_eligible": self.effective_bonus_eligible,
+            "baseline_classes": self.baseline_classes,
+            "effective_classes": self.effective_classes,
+            "entered_classes": self.entered_classes,
+            "exited_classes": self.exited_classes,
+            "baseline_sources": self.baseline_sources,
+            "effective_sources": self.effective_sources,
+            "entered_sources": self.entered_sources,
+            "exited_sources": self.exited_sources,
+            "baseline_age_buckets": self.baseline_age_buckets,
+            "effective_age_buckets": self.effective_age_buckets,
+            "entered_age_buckets": self.entered_age_buckets,
+            "exited_age_buckets": self.exited_age_buckets,
+        }
+
+
+@dataclass(frozen=True)
+class TemporalRankingShadowAudit:
+    """One aggregate-only shadow comparison for a curator candidate window."""
+
+    policy_version: str
+    candidate_count: int
+    parseable_published_count: int
+    bonus_eligible_count: int
+    class_counts: dict[str, int]
+    source_counts: dict[str, int]
+    age_bucket_counts: dict[str, int]
+    top_k_metrics: tuple[TemporalTopKShadowMetrics, ...]
+
+    def to_storage_record(self) -> dict[str, object]:
+        """Return the bounded storage shape; it contains no candidate identity."""
+
+        return {
+            "policy_version": self.policy_version,
+            "candidate_count": self.candidate_count,
+            "parseable_published_count": self.parseable_published_count,
+            "bonus_eligible_count": self.bonus_eligible_count,
+            "class_counts": self.class_counts,
+            "source_counts": self.source_counts,
+            "age_bucket_counts": self.age_bucket_counts,
+            "top_k_metrics": [metric.to_dict() for metric in self.top_k_metrics],
+        }
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-_FRESHNESS_HALF_LIFE_DAYS: float = 3.0
+# Conservative thresholds calibrated from the 2026-08 historical candidate-
+# and discovery-pool replay: only confident temporal judgements earn a bonus,
+# and medium-confidence judgements receive half strength.
+_TEMPORAL_CONFIDENCE_FULL: float = 0.80
+_TEMPORAL_CONFIDENCE_HALF: float = 0.60
+_TEMPORAL_CLASS_POLICIES: dict[str, tuple[float, float]] = {
+    # class: (half-life days, maximum unweighted class bonus)
+    "breaking": (1.0, 0.85),
+    "current": (14.0, 0.60),
+    "versioned": (120.0, 0.30),
+}
+# Source clocks occasionally differ by a few minutes.  Small negative ages are
+# clamped to zero, while a clearly future publication is treated as unknown.
+_PUBLICATION_CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
+_TEMPORAL_RANKING_SHADOW_POLICY_VERSION = "temporal-ranking-shadow-v1"
+_TEMPORAL_RANKING_SHADOW_TOP_K = (10, 50, 100)
+_TEMPORAL_AUDIT_CLASSES = frozenset(
+    {"breaking", "current", "versioned", "evergreen", "historical", "unknown"}
+)
 _FEEDBACK_DISLIKE_UP_PENALTY: float = 0.20
 _FEEDBACK_DISLIKE_TOPIC_PENALTY: float = 0.10
 # Softer than topic penalty — franchise propagation is a heuristic
@@ -275,13 +384,7 @@ class PoolCurator:
         scores: dict[str, float] = {}
         for item in candidates:
             base = item.relevance_score * w.relevance
-            fresh = (
-                self._freshness_score(
-                    item.discovered_at or item.last_scored_at,
-                    context.now,
-                )
-                * w.freshness
-            )
+            temporal_bonus = self._temporal_bonus_component(item, context.now) * w.freshness
             fatigue = self._combined_topic_fatigue(item, context) * w.topic_fatigue
             monotony = (
                 self._source_monotony(
@@ -292,7 +395,7 @@ class PoolCurator:
             )
             bonus = self._serendipity_bonus(item.source_strategy) * w.serendipity
 
-            score = base + fresh - fatigue - monotony + bonus
+            score = base + temporal_bonus - fatigue - monotony + bonus
 
             # Feedback adjustments (additive, outside weight system)
             score += self._feedback_adjustment(item, context.feedback)
@@ -301,6 +404,132 @@ class PoolCurator:
 
             scores[item.bvid] = max(0.0, score)
         return scores
+
+    def build_temporal_ranking_shadow_audit(
+        self,
+        candidates: list[DiscoveredContent],
+        scores: dict[str, float],
+        context: ScoringContext,
+    ) -> TemporalRankingShadowAudit | None:
+        """Compare temporal-bonus ranking with the exact no-bonus counterfactual.
+
+        The comparison is aggregate-only: no title, URL, author, keyword, bvid,
+        or content id leaves this method. It observes curator pre-diversification
+        ranking and never changes scores or admission.
+        """
+
+        items_by_id: dict[str, DiscoveredContent] = {}
+        for item in candidates:
+            identity = str(item.bvid or "").strip()
+            if identity:
+                items_by_id[identity] = item
+        if not items_by_id:
+            return None
+
+        effective_scores: dict[str, float] = {}
+        baseline_scores: dict[str, float] = {}
+        parseable: dict[str, bool] = {}
+        eligible: dict[str, bool] = {}
+        classes: dict[str, str] = {}
+        sources: dict[str, str] = {}
+        ages: dict[str, str] = {}
+        for identity, item in items_by_id.items():
+            raw_score = scores.get(identity, 0.0)
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                score = 0.0
+            if not math.isfinite(score):
+                score = 0.0
+            temporal_bonus = (
+                self._temporal_bonus_component(item, context.now) * self._weights.freshness
+            )
+            published = self._publication_datetime(item, context.now)
+            effective_scores[identity] = max(0.0, score)
+            baseline_scores[identity] = max(0.0, score - temporal_bonus)
+            parseable[identity] = published is not None
+            eligible[identity] = temporal_bonus > 0.0
+            classes[identity] = self._temporal_class_for_audit(item)
+            sources[identity] = self._source_for_audit(item)
+            ages[identity] = self._publication_age_bucket(published, context.now)
+
+        baseline_rank = sorted(
+            items_by_id,
+            key=lambda identity: (-baseline_scores[identity], identity),
+        )
+        effective_rank = sorted(
+            items_by_id,
+            key=lambda identity: (-effective_scores[identity], identity),
+        )
+        metrics: list[TemporalTopKShadowMetrics] = []
+        for requested_top_k in _TEMPORAL_RANKING_SHADOW_TOP_K:
+            effective_top_k = min(requested_top_k, len(items_by_id))
+            baseline_top = baseline_rank[:effective_top_k]
+            effective_top = effective_rank[:effective_top_k]
+            baseline_set = set(baseline_top)
+            effective_set = set(effective_top)
+            overlap = baseline_set & effective_set
+            union = baseline_set | effective_set
+            entered = effective_set - baseline_set
+            exited = baseline_set - effective_set
+            metrics.append(
+                TemporalTopKShadowMetrics(
+                    requested_top_k=requested_top_k,
+                    effective_top_k=effective_top_k,
+                    overlap_count=len(overlap),
+                    jaccard=round(len(overlap) / len(union), 6) if union else 1.0,
+                    positional_match_count=sum(
+                        left == right
+                        for left, right in zip(baseline_top, effective_top, strict=True)
+                    ),
+                    baseline_parseable_published=sum(parseable[key] for key in baseline_top),
+                    effective_parseable_published=sum(parseable[key] for key in effective_top),
+                    baseline_bonus_eligible=sum(eligible[key] for key in baseline_top),
+                    effective_bonus_eligible=sum(eligible[key] for key in effective_top),
+                    baseline_classes=self._audit_counts(baseline_top, classes),
+                    effective_classes=self._audit_counts(effective_top, classes),
+                    entered_classes=self._audit_counts(entered, classes),
+                    exited_classes=self._audit_counts(exited, classes),
+                    baseline_sources=self._audit_counts(baseline_top, sources),
+                    effective_sources=self._audit_counts(effective_top, sources),
+                    entered_sources=self._audit_counts(entered, sources),
+                    exited_sources=self._audit_counts(exited, sources),
+                    baseline_age_buckets=self._audit_counts(baseline_top, ages),
+                    effective_age_buckets=self._audit_counts(effective_top, ages),
+                    entered_age_buckets=self._audit_counts(entered, ages),
+                    exited_age_buckets=self._audit_counts(exited, ages),
+                )
+            )
+
+        identities = list(items_by_id)
+        return TemporalRankingShadowAudit(
+            policy_version=_TEMPORAL_RANKING_SHADOW_POLICY_VERSION,
+            candidate_count=len(identities),
+            parseable_published_count=sum(parseable.values()),
+            bonus_eligible_count=sum(eligible.values()),
+            class_counts=self._audit_counts(identities, classes),
+            source_counts=self._audit_counts(identities, sources),
+            age_bucket_counts=self._audit_counts(identities, ages),
+            top_k_metrics=tuple(metrics),
+        )
+
+    def record_temporal_ranking_shadow_audit(
+        self,
+        candidates: list[DiscoveredContent],
+        scores: dict[str, float],
+        context: ScoringContext,
+    ) -> bool:
+        """Best-effort persistence for the aggregate-only ranking shadow."""
+
+        audit = self.build_temporal_ranking_shadow_audit(candidates, scores, context)
+        recorder = getattr(self._database, "record_temporal_ranking_shadow_audit", None)
+        if audit is None or not callable(recorder):
+            return False
+        try:
+            return int(recorder(audit.to_storage_record()) or 0) > 0
+        except Exception:
+            logger.warning("temporal ranking shadow audit write failed", exc_info=True)
+            return False
 
     def needs_replenishment(self, *, threshold: int = _POOL_LOW_THRESHOLD) -> bool:
         """True when the pool is getting thin."""
@@ -327,20 +556,98 @@ class PoolCurator:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _freshness_score(timestamp_str: str, now: datetime) -> float:
-        """Sigmoid decay: ~1.0 at age 0, ~0.5 at half-life, ~0.1 at 2× half-life."""
-        if not timestamp_str:
-            return 0.5
+    def _temporal_bonus_component(item: DiscoveredContent, now: datetime) -> float:
+        """Return the unweighted, publication-based temporal bonus for *item*.
+
+        Evergreen, historical, unknown, low-confidence, and undated content is
+        deliberately neutral.  In particular, ``discovered_at`` and
+        ``last_scored_at`` are cache lifecycle clocks and must never stand in
+        for the content's publication time.
+        """
+        temporal_class = str(getattr(item, "temporal_class", "") or "").strip().lower()
+        policy = _TEMPORAL_CLASS_POLICIES.get(temporal_class)
+        if policy is None:
+            return 0.0
+
+        raw_confidence = getattr(item, "temporal_confidence", 0.0)
+        if isinstance(raw_confidence, bool):
+            return 0.0
         try:
-            discovered = datetime.fromisoformat(
-                timestamp_str.replace(" ", "T"),
-            )
-            if discovered.tzinfo is None:
-                discovered = discovered.replace(tzinfo=UTC)
+            confidence = float(raw_confidence)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            return 0.0
+        if confidence >= _TEMPORAL_CONFIDENCE_FULL:
+            confidence_weight = 1.0
+        elif confidence >= _TEMPORAL_CONFIDENCE_HALF:
+            confidence_weight = 0.5
+        else:
+            return 0.0
+
+        published = PoolCurator._publication_datetime(item, now)
+        if published is None:
+            return 0.0
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        age_days = max(0.0, (now - published).total_seconds() / 86400.0)
+        half_life_days, class_weight = policy
+        freshness = 2.0 ** (-age_days / half_life_days)
+        return float(class_weight * confidence_weight * freshness)
+
+    @staticmethod
+    def _publication_datetime(item: DiscoveredContent, now: datetime) -> datetime | None:
+        """Return a trustworthy publication clock, or ``None`` when unknown."""
+
+        published_at = getattr(item, "published_at", "")
+        if not isinstance(published_at, str) or not published_at.strip():
+            return None
+        try:
+            published = datetime.fromisoformat(published_at.strip().replace("Z", "+00:00"))
         except ValueError:
-            return 0.5
-        age_days = max(0.0, (now - discovered).total_seconds() / 86400.0)
-        return 1.0 / (1.0 + math.exp((age_days - _FRESHNESS_HALF_LIFE_DAYS) / 1.0))
+            return None
+        if published.tzinfo is None:
+            return None
+        effective_now = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+        if published - effective_now > _PUBLICATION_CLOCK_SKEW_TOLERANCE:
+            return None
+        return published
+
+    @staticmethod
+    def _temporal_class_for_audit(item: DiscoveredContent) -> str:
+        value = str(getattr(item, "temporal_class", "") or "").strip().lower()
+        return value if value in _TEMPORAL_AUDIT_CLASSES else "unknown"
+
+    @staticmethod
+    def _source_for_audit(item: DiscoveredContent) -> str:
+        raw = str(getattr(item, "source_platform", "") or "").strip().lower()
+        if not raw and item.bvid:
+            raw = "bilibili"
+        token = re.sub(r"[^a-z0-9_-]+", "_", raw).strip("_")[:32]
+        return token or "unknown"
+
+    @staticmethod
+    def _publication_age_bucket(published: datetime | None, now: datetime) -> str:
+        if published is None:
+            return "unknown"
+        effective_now = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+        age_days = max(0.0, (effective_now - published).total_seconds() / 86400.0)
+        if age_days <= 1.0:
+            return "<=1d"
+        if age_days <= 7.0:
+            return "1-7d"
+        if age_days <= 30.0:
+            return "7-30d"
+        if age_days <= 180.0:
+            return "30-180d"
+        return ">180d"
+
+    @staticmethod
+    def _audit_counts(
+        identities: list[str] | set[str],
+        values: dict[str, str],
+    ) -> dict[str, int]:
+        return dict(sorted(Counter(values[identity] for identity in identities).items()))
 
     @staticmethod
     def _topic_fatigue(topic: str, recent_topics: tuple[str, ...]) -> float:
@@ -479,13 +786,7 @@ class PoolCurator:
 
         for item in candidates:
             base = item.relevance_score * w.relevance
-            fresh = (
-                self._freshness_score(
-                    item.discovered_at or item.last_scored_at,
-                    context.now,
-                )
-                * w.freshness
-            )
+            temporal_bonus = self._temporal_bonus_component(item, context.now) * w.freshness
             monotony = (
                 self._source_monotony(
                     item.source_strategy,
@@ -518,7 +819,7 @@ class PoolCurator:
                 fatigue = self._combined_topic_fatigue(item, context)
             fatigue *= w.topic_fatigue
 
-            score = base + fresh - fatigue - monotony + bonus
+            score = base + temporal_bonus - fatigue - monotony + bonus
 
             # Embedding-based feedback adjustment
             candidate_topics = candidate_feedback_topics(item)

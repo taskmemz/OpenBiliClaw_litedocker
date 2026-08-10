@@ -242,6 +242,8 @@ function createSavedView(cfg) {
   let total = 0;
   let loading = false;
   let loaded = false;
+  let loadPromise = null;
+  let reloadAfterCurrent = false;
   const syncingKeys = createSavedSubmissionFence();
   let message = "";
   let messageIsError = false;
@@ -275,7 +277,7 @@ function createSavedView(cfg) {
     onTerminal: (terminalTask) => {
       message = summarize(terminalTask.items) || "同步已完成";
       messageIsError = false;
-      void load();
+      void load({ refreshAfterFlight: true });
     },
   });
 
@@ -307,7 +309,7 @@ function createSavedView(cfg) {
     $root.querySelector(".saved-load-retry")?.addEventListener("click", (event) => {
       pendingFocus = captureSavedFocus($root, event.currentTarget)
         || { kind: "list", action: "retry" };
-      void load();
+      void load({ refreshAfterFlight: true });
     });
   }
 
@@ -364,12 +366,12 @@ function createSavedView(cfg) {
         onTerminal: (terminalTask) => {
           message = summarize(terminalTask.items) || "同步已完成";
           messageIsError = false;
-          void load();
+          void load({ refreshAfterFlight: true });
         },
       });
       submitted = true;
       message = `同步任务已提交 · ${selected.length} 项`;
-      await load();
+      await load({ refreshAfterFlight: true });
     } catch (error) {
       message = error?.message || "同步失败，请稍后重试。";
       messageIsError = true;
@@ -500,7 +502,7 @@ function createSavedView(cfg) {
       const cover = getCoverImageAttrs(it.cover_url);
       const url = buildContentUrl(it);
       const coverHtml = cover
-        ? `<img class="saved-card-cover" src="${esc(cover.src)}" alt="" loading="lazy">`
+        ? `<img class="saved-card-cover" data-cover-src="${esc(cover.src)}" alt="" loading="lazy">`
         : `<div class="saved-card-cover saved-card-cover-empty" aria-hidden="true">${cfg.icon}</div>`;
       return `<article class="saved-card" data-item-key="${esc(it.item_key)}">
         <button class="saved-card-open" data-saved-action="open" type="button" ${url ? `data-url="${esc(url)}"` : "disabled"} aria-label="打开 ${esc(it.title || it.content_id)}">${coverHtml}</button>
@@ -516,6 +518,25 @@ function createSavedView(cfg) {
       </article>`;
     }).join("");
     renderShell(`<div class="saved-list">${cards}</div>`);
+
+    for (const image of $root.querySelectorAll("img.saved-card-cover")) {
+      const coverSrc = image.dataset.coverSrc || "";
+      let fallbackShown = false;
+      const showFallback = () => {
+        if (fallbackShown || !image.isConnected) return;
+        fallbackShown = true;
+        const fallback = document.createElement("div");
+        fallback.className = "saved-card-cover saved-card-cover-empty";
+        fallback.setAttribute("aria-hidden", "true");
+        fallback.innerHTML = cfg.icon;
+        image.replaceWith(fallback);
+      };
+      image.addEventListener("error", showFallback, { once: true });
+      delete image.dataset.coverSrc;
+      image.src = coverSrc;
+      // A cached failure may settle synchronously when src is assigned.
+      if (image.complete && image.naturalWidth === 0) queueMicrotask(showFallback);
+    }
 
     for (const card of $root.querySelectorAll(".saved-card")) {
       const item = items.find((row) => row.item_key === card.dataset.itemKey);
@@ -535,7 +556,7 @@ function createSavedView(cfg) {
         remove.disabled = true;
         try {
           await removeSavedItem(cfg.listKind, item.item_key);
-          await load();
+          await load({ refreshAfterFlight: true });
         } catch (error) {
           remove.disabled = false;
           message = error?.message || "本地移除失败，请重试。";
@@ -548,7 +569,7 @@ function createSavedView(cfg) {
     if (restoreSavedFocus($root, focusToken)) pendingFocus = null;
   }
 
-  async function load() {
+  async function loadOnce() {
     loading = true;
     renderList();
     const hadLoadError = Boolean(retained.snapshot().error);
@@ -571,6 +592,22 @@ function createSavedView(cfg) {
       loading = false;
       renderList();
     }
+  }
+
+  function load({ refreshAfterFlight = false } = {}) {
+    if (loadPromise) {
+      if (refreshAfterFlight) reloadAfterCurrent = true;
+      return loadPromise;
+    }
+    loadPromise = (async () => {
+      do {
+        reloadAfterCurrent = false;
+        await loadOnce();
+      } while (reloadAfterCurrent);
+    })().finally(() => {
+      loadPromise = null;
+    });
+    return loadPromise;
   }
 
   return function init(rootEl) {

@@ -1,7 +1,7 @@
 """Credential form descriptors, derived from the write gate.
 
 ``GET /api/sources/credentials`` ships a ``form`` per platform so the three
-settings surfaces can render seven platforms without knowing anything about any
+settings surfaces can render every registered platform without knowing anything about any
 of them (invariant I4). Before this, each surface carried its own idea of which
 platforms take a paste box, and the desktop page additionally hardcoded one
 sentence about 小红书 — the last per-platform display branch in the settings

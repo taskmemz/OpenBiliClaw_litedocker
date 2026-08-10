@@ -274,13 +274,21 @@ test("saved cards reserve a thumbnail slot and load covers through the backend p
   const popupJs = readFileSync(resolve("popup", "popup.js"), "utf8");
   const coverBlock = popupHtml.match(/\.saved-card-cover\s*\{[\s\S]*?\}/)?.[0] ?? "";
   const coverImageBlock = popupHtml.match(/\.saved-card-cover img\s*\{[\s\S]*?\}/)?.[0] ?? "";
+  const fallbackBlock = popupHtml.match(/\.saved-card-cover\.is-fallback\s*\{[\s\S]*?\}/)?.[0] ?? "";
+  const fallbackIconBlock = popupHtml.match(/\.saved-card-cover\.is-fallback svg\s*\{[\s\S]*?\}/)?.[0] ?? "";
 
   assert.match(coverBlock, /width:\s*84px;/);
   assert.match(coverBlock, /aspect-ratio:\s*16\s*\/\s*9;/);
   assert.match(coverBlock, /flex:\s*0\s+0\s+84px;/);
   assert.match(coverImageBlock, /object-fit:\s*cover;/);
+  assert.match(fallbackBlock, /display:\s*flex;/);
+  assert.match(fallbackBlock, /justify-content:\s*center;/);
+  assert.match(fallbackIconBlock, /width:\s*22px;/);
   assert.match(popupJs, /function buildSavedCardMedia/);
   assert.match(popupJs, /setProxyImageSrc\(image,\s*item\.cover_url\)/);
+  assert.match(popupJs, /image\.addEventListener\("error",\s*showFallback/);
+  assert.match(popupJs, /image\.complete\s*&&\s*image\.naturalWidth\s*===\s*0/);
+  assert.match(popupJs, /media\.innerHTML\s*=\s*HISTORY_IMAGE_ICON_SVG/);
   assert.match(popupJs, /body\.prepend\(media\)/);
 });
 

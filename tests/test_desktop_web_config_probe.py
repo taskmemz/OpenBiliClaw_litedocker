@@ -21,6 +21,7 @@ def test_desktop_web_settings_exposes_and_wires_model_probe_controls() -> None:
     assert 'probeConfigService("llm_chain", buildConfigUpdate())' in js
     assert 'probeConfigService("llm_instance", buildConfigUpdate(), instanceId)' in js
     assert 'probeConfigService("embedding", buildConfigUpdate())' in js
+    assert "timeoutMs: 125000" in js
     assert "function renderProbeResult" in js
 
     assert ".settings-probe-row" in css

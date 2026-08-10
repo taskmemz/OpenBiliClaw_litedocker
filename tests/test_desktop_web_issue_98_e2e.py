@@ -446,11 +446,16 @@ def test_saved_badges_hydrate_before_tabs_are_opened(
 
     watch_later_badge = chromium_page.locator("#watchLaterCountBadge")
     favorites_badge = chromium_page.locator("#favoritesCountBadge")
-    expect(watch_later_badge).to_be_visible(timeout=3000)
-    expect(watch_later_badge).to_have_text("3")
-    expect(favorites_badge).to_be_visible(timeout=3000)
-    expect(favorites_badge).to_have_text("2")
+    # The two independent totals hydrate while the content library is hidden;
+    # opening it reveals the per-child badges without summing them.
+    expect(watch_later_badge).to_have_text("3", timeout=3000)
+    expect(favorites_badge).to_have_text("2", timeout=3000)
     assert set(stub.saved_list_reads) == {"watch_later", "favorite"}
+    chromium_page.locator("#contentLibraryBtn").click()
+    expect(chromium_page.locator("#contentLibraryPage")).to_be_visible()
+    expect(chromium_page.locator("#contentLibraryWatchLaterTab")).to_be_visible()
+    expect(watch_later_badge).to_be_visible()
+    expect(favorites_badge).to_be_visible()
 
 
 def test_saved_badge_hydration_failure_does_not_block_home(
@@ -512,7 +517,7 @@ def test_opening_saved_page_prevents_older_badge_hydration_from_winning(
     )
     expect(chromium_page.locator("#videoGrid .video-card")).to_have_count(3, timeout=3000)
 
-    chromium_page.locator("#watchLaterBtn").click()
+    chromium_page.locator("#contentLibraryBtn").click()
     expect(chromium_page.locator("#watchLaterCountBadge")).to_have_text("4", timeout=3000)
 
     chromium_page.evaluate("window.__obcResolveInitialWatchLater()")
@@ -554,9 +559,8 @@ def test_older_full_saved_refresh_cannot_overwrite_newer_badge(
     chromium_page.evaluate(
         """
         () => {
-          const button = document.getElementById("watchLaterBtn");
-          button.click();
-          button.click();
+          document.getElementById("contentLibraryBtn").click();
+          document.getElementById("contentLibraryWatchLaterTab").click();
         }
         """
     )

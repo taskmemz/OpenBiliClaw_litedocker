@@ -236,6 +236,38 @@ def test_bili_task_result_marks_keyword_used_on_terminal_ok(
     assert status == "used"
 
 
+def test_bili_recent_task_result_preserves_lane_provenance(
+    bili_task_client: tuple[TestClient, Database, RecordingRuntimeController, RecordingEventHub],
+) -> None:
+    client, db, _runtime, _hub = bili_task_client
+    task_id = _enqueue_bili_search_task(
+        db,
+        {
+            "query": "大模型",
+            "order": "pubdate",
+            "discovery_lane": "recent",
+        },
+    )
+
+    response = client.post(
+        "/api/sources/bili/task-result",
+        json={
+            "task_id": task_id,
+            "status": "ok",
+            "videos": [{"bvid": "BVRECENT", "title": "刚刚发布"}],
+        },
+    )
+
+    assert response.status_code == 200
+    row = db.conn.execute(
+        "SELECT source_strategy, source_context, raw_payload "
+        "FROM discovery_candidates WHERE candidate_key = 'bilibili:BVRECENT'"
+    ).fetchone()
+    assert row["source_strategy"] == "bili-extension-search"
+    assert row["source_context"] == "bili-extension-search:recent"
+    assert json.loads(str(row["raw_payload"]))["discovery_lane"] == "recent"
+
+
 def test_bili_task_result_marks_failed_and_keyword_failed(
     bili_task_client: tuple[TestClient, Database, RecordingRuntimeController, RecordingEventHub],
 ) -> None:

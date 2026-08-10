@@ -713,9 +713,55 @@ def test_content_evaluation_prompts_define_publication_time_semantics() -> None:
         assert "published_at 是来源提供的权威发布时间" in system
         assert "evaluation_context.evaluated_at 是本次评估的权威时间基准" in system
         assert "模型知识截止时间" in system
-        assert "字段缺失或无效时保持中性" in system
+        assert "score 只衡量内容与用户画像的相关性及内容本身价值" in system
+        assert "与发布时间和时效性完全解耦" in system
+        assert "不得因为内容较旧或 published_at 缺失而减分" in system
+        assert "时间字段缺失或无效时仍可按内容语义分类" in system
+        for temporal_class in (
+            "breaking",
+            "current",
+            "versioned",
+            "evergreen",
+            "historical",
+            "unknown",
+        ):
+            assert temporal_class in system
+        assert "标题里的“今天”“最新”、年份" in system
+        assert "trending/search/feed 也不能决定分类" in system
+        assert "temporal_confidence" in system
+        assert "不是内容质量、相关性或新鲜度" in system
         assert '"evaluated_at": "2026-08-04T09:00:00Z"' in user
         assert '"published_at": "2026-08-01T00:00:00Z"' in user
+
+
+def test_temporal_evaluation_output_contract_is_static_for_pretty_and_sparse_batches() -> None:
+    pretty = build_batch_content_evaluation_prompt(
+        profile_summary={"interests": ["systems"]},
+        content_items=[{"content_id": "global-1", "title": "candidate"}],
+    )
+    sparse = build_batch_content_evaluation_prompt(
+        profile_summary={"interests": ["different"]},
+        content_items=[],
+        candidate_block=(
+            '{"defaults":{"content_type":"video","mode":"normal",'
+            '"source_platform":"bilibili"},"items":'
+            '[{"author":"u","id":"0","title":"candidate"}]}'
+        ),
+        local_result_ids=True,
+    )
+
+    for system in (pretty[0]["content"], sparse[0]["content"]):
+        assert "temporal_class" in system
+        assert "temporal_confidence" in system
+        assert "temporal_reason" in system
+        assert '"temporal_class": "evergreen"' in system
+        assert "分类看核心价值" in system
+        assert "score 只衡量内容与用户画像的相关性及内容本身价值" in system
+
+    assert pretty[0]["content"] == _BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT
+    assert "原样带回输入里的 id" in sparse[0]["content"]
+    assert "bvid" not in sparse[0]["content"]
+    assert "content_id" not in sparse[0]["content"]
 
 
 def test_content_evaluation_clock_keeps_exact_time_and_utc_hour_bucket() -> None:

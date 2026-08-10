@@ -237,6 +237,33 @@ async def test_bilibili_producer_enqueues_generated_keywords_and_kicks(
 
 
 @pytest.mark.asyncio
+async def test_bilibili_producer_reserves_one_bounded_recent_lane_task(
+    db: Database,
+    queue: BiliTaskQueue,
+) -> None:
+    producer = BilibiliExtensionSearchProducer(
+        task_queue=queue,
+        soul_engine=_Soul(),
+        llm_service=_LLM(),
+        bilibili_client=_BiliClient(cooldown=180),
+        presence=_Presence(),
+        recent_lane_tasks_per_cycle=1,
+        recent_lane_page_size=5,
+        min_interval_minutes=0,
+    )
+
+    result = await producer.produce_if_due(keywords=["近期关键词", "普通关键词"])
+
+    assert result == {"enqueued": 2, "attempted": 2, "reason": "ok"}
+    payloads = {payload["query"]: payload for payload in _task_payloads(db)}
+    assert payloads["近期关键词"]["order"] == "pubdate"
+    assert payloads["近期关键词"]["discovery_lane"] == "recent"
+    assert payloads["近期关键词"]["page_size"] == 5
+    assert "order" not in payloads["普通关键词"]
+    assert payloads["普通关键词"]["page_size"] == 20
+
+
+@pytest.mark.asyncio
 async def test_bilibili_producer_flag_on_claims_keywords_and_marks_executing(
     db: Database,
     queue: BiliTaskQueue,

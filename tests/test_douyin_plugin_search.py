@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -198,6 +199,57 @@ async def test_plugin_search_client_distinguishes_timeout_from_empty(
 
     assert result == []
     assert client.last_search_outcome == "timeout"
+    task = database.conn.execute(
+        "SELECT status, result_json, completed_at FROM dy_tasks ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    assert task is not None
+    assert task["status"] == "failed"
+    assert task["completed_at"]
+    assert json.loads(str(task["result_json"])) == {
+        "error": "wait_timeout",
+        "debug": {"wait_seconds": 0.0},
+    }
+
+
+@pytest.mark.asyncio
+async def test_plugin_search_client_cancellation_terminalizes_owned_task(
+    database: Database,
+) -> None:
+    DyTaskQueue(database)
+    client = DouyinPluginSearchClient(
+        database=database,
+        direct_client=_FallbackClient(),
+        wait_seconds=30,
+        poll_interval_seconds=0.01,
+        kick=lambda: None,
+    )
+
+    request = asyncio.create_task(client.search_aweme("猫", limit=5))
+    task = None
+    for _ in range(100):
+        task = database.conn.execute(
+            "SELECT id FROM dy_tasks ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        if task is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert task is not None
+
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    terminal = database.conn.execute(
+        "SELECT status, result_json, completed_at FROM dy_tasks WHERE id = ?",
+        (task["id"],),
+    ).fetchone()
+    assert terminal is not None
+    assert terminal["status"] == "failed"
+    assert terminal["completed_at"]
+    assert json.loads(str(terminal["result_json"])) == {
+        "error": "wait_cancelled",
+        "debug": {"wait_seconds": 30.0},
+    }
 
 
 @pytest.mark.asyncio

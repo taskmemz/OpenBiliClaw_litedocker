@@ -38,6 +38,19 @@ test("buildBiliTaskUrl returns null for invalid or unsupported tasks", () => {
   assert.equal(buildBiliTaskUrl({ id: "x", type: "unknown" as never, query: "猫" }), null);
 });
 
+test("buildBiliTaskUrl carries the bounded recent-lane sort", () => {
+  assert.equal(
+    buildBiliTaskUrl({
+      id: "bili-recent",
+      type: "search",
+      query: "大模型",
+      order: "pubdate",
+      discovery_lane: "recent",
+    }),
+    "https://search.bilibili.com/all?keyword=%E5%A4%A7%E6%A8%A1%E5%9E%8B&order=pubdate",
+  );
+});
+
 test("isValidBiliTask accepts search tasks with a non-empty query", () => {
   assert.equal(
     isValidBiliTask({
@@ -57,6 +70,7 @@ test("isValidBiliTask rejects malformed payloads", () => {
   assert.equal(isValidBiliTask({ id: "", type: "search", query: "猫" }), false);
   assert.equal(isValidBiliTask({ id: "x", type: "search", query: "" }), false);
   assert.equal(isValidBiliTask({ id: "x", type: "search", query: "猫", limit: 0 }), false);
+  assert.equal(isValidBiliTask({ id: "x", type: "search", query: "猫", order: "click" }), false);
   assert.equal(isValidBiliTask({ id: "x", type: "creator", query: "猫" }), false);
 });
 

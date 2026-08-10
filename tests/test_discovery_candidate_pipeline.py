@@ -336,6 +336,9 @@ async def test_staged_claim_evaluate_complete_matches_legacy_drain(tmp_path: Pat
                 "reason": "fit",
                 "topic_group": "tech",
                 "style_key": "deep_dive",
+                "temporal_class": "evergreen",
+                "temporal_confidence": 0.92,
+                "temporal_reason": "核心价值不依赖当前时间",
             }
             for i in range(3)
         ]
@@ -355,6 +358,19 @@ async def test_staged_claim_evaluate_complete_matches_legacy_drain(tmp_path: Pat
 
     assert result == {"evaluated": 3, "cached": 3, "rejected": 0, "stale": 0}
     assert db.count_discovery_candidates_by_status()["cached"] == 3
+    persisted_candidates = db.conn.execute(
+        "SELECT temporal_class, temporal_confidence, temporal_reason, "
+        "temporal_policy_version FROM discovery_candidates ORDER BY id"
+    ).fetchall()
+    persisted_cache = db.conn.execute(
+        "SELECT temporal_class, temporal_confidence, temporal_reason, "
+        "temporal_policy_version FROM content_cache ORDER BY bvid"
+    ).fetchall()
+    for persisted in (persisted_candidates, persisted_cache):
+        assert [row["temporal_class"] for row in persisted] == ["evergreen"] * 3
+        assert all(row["temporal_confidence"] == pytest.approx(0.92) for row in persisted)
+        assert [row["temporal_reason"] for row in persisted] == ["核心价值不依赖当前时间"] * 3
+        assert [row["temporal_policy_version"] for row in persisted] == ["v1"] * 3
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,7 @@ from openbiliclaw.discovery.strategies._utils import (
     compact_content_prompt_profile_summary,
 )
 from openbiliclaw.discovery.style_keys import VALID_STYLE_KEYS, normalize_style_key
+from openbiliclaw.discovery.temporal import TEMPORAL_POLICY_VERSION
 from openbiliclaw.llm.base import classify_llm_failure_kind
 from openbiliclaw.llm.json_utils import (
     extract_llm_json_list,
@@ -36,7 +37,7 @@ from openbiliclaw.soul.tone import ToneProfile, build_tone_profile
 from openbiliclaw.sources.platforms import normalize_source_platform, source_family
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine
+    from collections.abc import Callable, Coroutine, Mapping
 
     from openbiliclaw.discovery.engine import DiscoveredContent
     from openbiliclaw.llm.base import LLMResponse
@@ -467,6 +468,7 @@ class RecommendationEngine:
         pool_inventory_commit_callback: Callable[..., object] | None = None,
         expression_batch_concurrency: int = _DEFAULT_EXPRESSION_BATCH_CONCURRENCY,
         copy_ready_target_count: int | None = 0,
+        pool_available_target_count: int | None = 0,
         visual_profile_enabled: bool = False,
         keyframe_enabled: bool = False,
         keyframe_max_frames: int = _KEYFRAME_DEFAULT_MAX_FRAMES,
@@ -505,9 +507,16 @@ class RecommendationEngine:
         # ``0`` is the compatibility/rollback contract: drain the durable
         # expression backlog exactly as before. A positive target is injected
         # by runtime wiring after its config value has been clamped to the
-        # candidate-pool target; the engine only enforces that ready-copy high
-        # watermark and never deletes already-generated copy.
+        # candidate-pool target; the engine enforces that ready-copy high
+        # watermark together with the eligible public-availability gap and
+        # never deletes already-generated copy.
         self.copy_ready_target_count = max(0, int(copy_ready_target_count or 0))
+        # The public pool target is independent from the unrestricted
+        # ``copy_ready`` watermark: per-topic display caps can leave public
+        # availability below target even while deep same-topic copy is warm.
+        # A positive copy watermark uses this target to keep copy work focused
+        # on pending rows that can actually add a public inventory slot.
+        self.pool_available_target_count = max(0, int(pool_available_target_count or 0))
         # v0.3.63+: optional registry for detached fire-and-forget tasks
         # (classify_pool_backlog_detached, precompute_delight_scores_detached).
         # When provided, those tasks register here so RuntimeContext's
@@ -595,6 +604,10 @@ class RecommendationEngine:
                         0,
                         int(counts.get("admitted_pending_copy", 0)),
                     ),
+                    "admitted_pending_available": max(
+                        0,
+                        int(counts.get("admitted_pending_available", 0)),
+                    ),
                 }
             except Exception:
                 logger.exception("Failed to load pool readiness counts")
@@ -605,25 +618,38 @@ class RecommendationEngine:
             "raw": max(0, available),
             "pending": 0,
             "admitted_pending_copy": 0,
+            "admitted_pending_available": 0,
         }
 
+    def _pending_expression_copy_demand(self, readiness: Mapping[str, int]) -> int:
+        """Return copy work needed by either durable inventory watermark."""
+
+        pending = max(0, int(readiness.get("admitted_pending_copy", 0)))
+        copy_target = self.copy_ready_target_count
+        if copy_target <= 0:
+            return pending
+
+        copy_deficit = max(0, copy_target - max(0, int(readiness.get("copy_ready", 0))))
+        available_deficit = max(
+            0,
+            self.pool_available_target_count - max(0, int(readiness.get("available", 0))),
+        )
+        eligible_pending = max(0, int(readiness.get("admitted_pending_available", 0)))
+        eligible_available_deficit = min(available_deficit, eligible_pending)
+        return min(pending, max(copy_deficit, eligible_available_deficit))
+
     def count_pending_expression_copy_demand(self) -> int:
-        """Return durable copy work currently allowed by the ready watermark.
+        """Return durable copy work allowed by copy and public-pool watermarks.
 
         ``copy_ready`` is the canonical count of fully gated, non-viewed fresh
         rows before the per-topic display window. Pending-copy rows never count
-        as ready; they only cap how much of the current deficit can be filled.
-        ``None``/``0`` at construction preserves the legacy drain-to-backlog
-        behavior.
+        as ready; their topic-window-eligible subset can nevertheless fill a
+        public availability deficit. ``None``/``0`` at construction preserves
+        the legacy drain-to-backlog behavior.
         """
 
         readiness = self._pool_readiness_counts()
-        pending = max(0, int(readiness.get("admitted_pending_copy", 0)))
-        target = self.copy_ready_target_count
-        if target <= 0:
-            return pending
-        deficit = max(0, target - max(0, int(readiness.get("copy_ready", 0))))
-        return min(pending, deficit)
+        return self._pending_expression_copy_demand(readiness)
 
     def _expression_copy_drain_limit(self, requested_limit: int) -> int:
         """Bound one lock-owned drain without weakening legacy behavior."""
@@ -633,8 +659,7 @@ class RecommendationEngine:
         if requested <= 0 or target <= 0:
             return requested
         readiness = self._pool_readiness_counts()
-        deficit = max(0, target - max(0, int(readiness.get("copy_ready", 0))))
-        return min(requested, deficit)
+        return min(requested, self._pending_expression_copy_demand(readiness))
 
     async def serve(
         self,
@@ -1588,7 +1613,10 @@ class RecommendationEngine:
             # This is what prevents two queued drains from both observing the
             # same deficit and overfilling the high watermark.
             effective_limit = self._expression_copy_drain_limit(limit)
-            candidates = self._load_pool_candidates_needing_copy(limit=effective_limit)
+            candidates = self._load_pool_candidates_needing_copy(
+                limit=effective_limit,
+                eligible_available_first=self.copy_ready_target_count > 0,
+            )
             if not candidates:
                 return 0
 
@@ -5085,6 +5113,12 @@ class RecommendationEngine:
                 topic_key=str(row.get("topic_key", "")),
                 topic_group=str(row.get("topic_group", "")),
                 style_key=str(row.get("style_key", "")),
+                temporal_class=str(row.get("temporal_class", "") or "unknown"),
+                temporal_confidence=float(row.get("temporal_confidence", 0.0) or 0.0),
+                temporal_reason=str(row.get("temporal_reason", "") or ""),
+                temporal_policy_version=str(
+                    row.get("temporal_policy_version", "") or TEMPORAL_POLICY_VERSION
+                ),
                 source_strategy=str(row.get("source", "")),
                 relevance_score=float(row.get("relevance_score", 0.0) or 0.0),
                 relevance_reason=str(row.get("relevance_reason", "")),
@@ -5186,10 +5220,19 @@ class RecommendationEngine:
             context = build_from_rows(*curator_snapshot)
         else:
             context = self._curator.build_context()
-        return (
-            self._curator.score_candidates(candidates, context),
-            context.over_budget_amplification_keys,
+        scores = self._curator.score_candidates(candidates, context)
+        record_temporal_shadow = getattr(
+            self._curator,
+            "record_temporal_ranking_shadow_audit",
+            None,
         )
+        if callable(record_temporal_shadow):
+            try:
+                record_temporal_shadow(candidates, scores, context)
+            except Exception:
+                # Shadow observability must never make the serving path fail.
+                logger.warning("temporal ranking shadow observer failed", exc_info=True)
+        return scores, context.over_budget_amplification_keys
 
     def _apply_platform_floor(self, candidates: list[DiscoveredContent]) -> list[DiscoveredContent]:
         """Guarantee every stocked platform is represented in the serve window.
@@ -5250,9 +5293,16 @@ class RecommendationEngine:
             )
         return candidates
 
-    def _load_pool_candidates_needing_copy(self, *, limit: int) -> list[DiscoveredContent]:
+    def _load_pool_candidates_needing_copy(
+        self,
+        *,
+        limit: int,
+        eligible_available_first: bool = False,
+    ) -> list[DiscoveredContent]:
         rows = self._database.get_pool_candidates_needing_copy(
-            limit=limit, xhs_self_nickname=self._xhs_self_nickname()
+            limit=limit,
+            xhs_self_nickname=self._xhs_self_nickname(),
+            eligible_available_first=eligible_available_first,
         )
         return self._rows_to_discovered(rows)
 

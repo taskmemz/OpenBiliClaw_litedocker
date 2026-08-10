@@ -98,7 +98,21 @@ git remote set-url origin https://github.com/whiteguo233/OpenBiliClaw.git
 
 ### 我的数据存在哪里？会上传吗？
 
-所有数据存在本机的一个 SQLite 文件里，数据目录为 `~/OpenBiliClaw`（macOS / Linux）或 `%USERPROFILE%\OpenBiliClaw`（Windows），升级和卸载不会动它。插件不会把数据发送到 OpenBiliClaw 开发者运营的服务器；只有你配置了云端 LLM / embedding 时，相关内容才会按你的配置发给对应服务商。详见 [隐私政策](privacy.md)。
+核心行为、推荐与对话数据存在本机 SQLite，画像、凭据与缓存等辅助文件也在本机数据目录；默认运行根目录为 `~/OpenBiliClaw`（macOS / Linux）或 `%USERPROFILE%\OpenBiliClaw`（Windows），升级和卸载不会动它。插件不会把数据发送到 OpenBiliClaw 开发者运营的服务器；只有你配置了云端 LLM / embedding 时，相关内容才会按你的配置发给对应服务商。详见 [隐私政策](privacy.md)。
+
+### 为什么保存新的数据目录后仍在使用旧目录？
+
+这是安全边界，不是保存失败。运行中的后端已经为当前 active data dir 持有 canonical runtime lock，设置页保存新 `data_dir` 时只把路径写入 `config.toml`，响应会显示 `restart_required=true`；其它配置仍可在后台应用，但数据库、MemoryManager、同次保存的抖音 / X 凭据以及此时导出的迁移数据快照继续使用旧目录。请**完整退出并重新启动** OpenBiliClaw；新进程取得新目录锁后才会切换。期间即使配置 apply status 显示 `applied`，也只表示可热重载部分已生效。
+
+### 怎么把配置、画像和历史迁移到另一台机器？
+
+在旧机器**本机**打开桌面 Web `/web`，进入「设置 → 通用 → 数据迁移」，先导出 `.obcbackup`；把文件安全复制到新机器，再在新机器的同一位置选择导入。导入成功只表示已经完整校验并暂存，配置、数据和桌面偏好都要等重启应用成功后才切换。重启前可在页面查询或取消待导入项，取消不会改动当前数据；如果上传超时 / 断线，页面会用本次 `request_id` 查询状态，`processing` 表示仍在上传或校验。页面最多强制查询 3 次，遇到 `idle/cancelled` 会间隔 500ms 再确认，不会把紧接断线的一次 `idle` 当最终结果；再打开「通用」也会强制重新对账，避免盲目重复导入。
+
+重启应用成功后，每个浏览器会按 `migration_id` 只应用一次包内白名单桌面偏好。迁移状态之后仍可能显示 `applied`，但你后来手动修改的主题、色相或自动续页不会再被同一迁移覆盖；在另一浏览器或新的浏览器配置文件中，会各自完成一次交接。
+
+迁移会替换新机器现有的可移植配置和用户数据，因此导入前会二次确认。成功应用后，旧 `config.toml`、`config.local.toml` 和数据目录按存在情况保留为 `pre-import-*.bak` 回滚副本；目标机自己的数据路径、API 端口、网络 / TLS / 自启动、证书、浏览器 CDP 设置、Bilibili 专用代理和本机浏览器可执行文件路径不被覆盖。来源包会删除整段 `[api.auth]`，导入以目标机现有整段 `api.auth` 为基线，所以目标机的登录开关、密码和 proxy / Origin 策略保留；随后文件 session secret 会轮换，数据库的会话撤销 epoch 会设为来源与目标当前值最大值再加一，扩展设备访问也会关闭并清空 key。因此即使目标机用环境变量固定 session secret，来源 / 目标已有 Web 会话仍会失效，扩展远程设备需重新配对。
+
+请特别注意：`.obcbackup` **没有加密**，可能包含模型 / 来源 API Key、平台 Cookie、画像和浏览历史；它不包含源机 API auth 的密码 / hash、session secret 或设备 key，但仍必须只在可信设备之间传递，用完后从聊天、网盘和下载目录中删除不再需要的副本。日志、旧备份、embedding 缓存、证书、外部 CLI 登录和环境变量值不会导出；`source_omitted_environment_variables` 提示旧机器依赖但未入包的变量名，`target_active_environment_variables` 提示新机器当前仍会覆盖文件配置的变量名。迁移接口只接受后端确认的本机 loopback 调用，浏览器还必须同源；不能从手机 / LAN 页面或浏览器扩展远程触发。
 
 ### 配置文件写坏了导致启动失败？
 

@@ -6,7 +6,7 @@ for B站, but it hid behind ``GET /api/init-status`` — a read-only GET that
 quietly went out to bilibili.com on every poll — and nothing at all existed for
 the other six platforms.
 
-This module gives all seven the same button and, crucially, keeps their answers
+This module gives every registered source the same button and, crucially, keeps their answers
 honest about *how* they were reached.
 
 **Three outcomes, not two.** A verification either confirms the credential
@@ -81,6 +81,15 @@ VERIFY_ACTIONS: dict[str, VerifyAction] = {
     # makes. With no token the probe returns ``has_credential=False`` and the
     # click resolves to ``indeterminate`` without going out.
     "bangumi": "live_probe",
+}
+
+# ``browser_heartbeat`` is not a generic "everything else is Zhihu" action.
+# Each source owns a database getter and runtime-stream event prefix; making
+# that relationship explicit prevents a newly registered source from silently
+# reading and waking another platform's login state.
+_BROWSER_HEARTBEAT_PREFIXES: dict[str, str] = {
+    "xiaohongshu": "xhs",
+    "zhihu": "zhihu",
 }
 
 # The user-facing tri-state. Deliberately computed here rather than in each
@@ -766,7 +775,12 @@ async def _verify_browser_heartbeat(slug: str, database: Any, event_hub: Any) ->
     through the browser — which is why their green light can never mean the
     same thing as B站's, and why ``verify_method`` has to exist at all.
     """
-    prefix = "xhs" if slug == "xiaohongshu" else "zhihu"
+    prefix = _BROWSER_HEARTBEAT_PREFIXES.get(slug)
+    if prefix is None:
+        return _ActionResult(
+            f"来源 {slug} 尚未注册浏览器登录态刷新通道。",
+            conclusive=False,
+        )
     getter = f"get_{prefix}_login_state"
     if not hasattr(database, getter):
         return _ActionResult("登录态存储不可用（数据库未就绪）。", conclusive=False)

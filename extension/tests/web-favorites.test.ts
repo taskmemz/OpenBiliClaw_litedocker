@@ -29,9 +29,13 @@ test("mobile web exposes favorites API and tab entry", async () => {
   assert.equal(calls[0].url, "http://127.0.0.1:8420/api/favorites?limit=20&offset=40");
 
   const appJs = readFileSync(resolve("../src/openbiliclaw/web/js/app.js"), "utf8");
-  assert.match(appJs, /initFavoritesView/);
-  assert.match(appJs, /id:\s*"favorites"/);
-  assert.match(appJs, /label:\s*"收藏"/);
+  const libraryJs = readFileSync(resolve("../src/openbiliclaw/web/js/views/library.js"), "utf8");
+  assert.match(appJs, /id:\s*"library"/);
+  assert.match(appJs, /label:\s*"内容库"/);
+  assert.match(appJs, /\["watchLater", "favorites", "history"\]\.includes\(id\)/);
+  assert.match(libraryJs, /initFavoritesView/);
+  assert.match(libraryJs, /id:\s*"favorites"/);
+  assert.match(libraryJs, /label:\s*"收藏"/);
 });
 
 test("mobile recommend delight tray has a favorite star action", () => {
@@ -64,7 +68,8 @@ test("desktop web exposes favorites page, badge, and delight star", () => {
     "utf8",
   );
 
-  assert.match(desktopHtml, /id="favoritesBtn"/);
+  assert.match(desktopHtml, /id="contentLibraryBtn"/);
+  assert.match(desktopHtml, /id="contentLibraryFavoritesTab"/);
   assert.match(desktopHtml, /id="favoritesCountBadge"/);
   assert.match(desktopHtml, /id="favoritesPage"/);
   assert.match(desktopHtml, /data-delight="favorite"/);
@@ -75,11 +80,12 @@ test("desktop web exposes favorites page, badge, and delight star", () => {
   assert.match(desktopJs, /syncFavoriteButtons/);
 });
 
-test("extension popup has a favorites tab, list, and delight star", () => {
+test("extension popup has favorites inside the content library", () => {
   const popupHtml = readFileSync(resolve("popup", "popup.html"), "utf8");
   const popupJs = readFileSync(resolve("popup", "popup.js"), "utf8");
 
-  assert.match(popupHtml, /id="tabFavorites"/);
+  assert.match(popupHtml, /id="tabLibrary"[^>]*aria-controls="viewLibrary"/);
+  assert.match(popupHtml, /id="tabFavorites"[^>]*role="tab"/);
   assert.match(popupHtml, /id="viewFavorites"/);
   assert.match(popupHtml, /id="favoritesList"/);
   assert.match(popupJs, /delightFavoriteButton/);

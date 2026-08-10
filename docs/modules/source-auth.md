@@ -55,7 +55,7 @@ class SourceAuthContract(BaseModel):
 
 ### 三端如何渲染这份契约
 
-契约字段若不落到像素上，整个重构对用户不可见。`describeAccess()` 因此**只读 `auth`**，legacy `state` 仅作老后端兜底。判定顺序：`auth_required=false` → `credential`（`none` / `invalid`）→ `verification`。凭据维度先于结论维度，是因为两者正交、可能互相矛盾，此时宁可少报也不点亮一盏兜不住的绿灯。
+契约字段若不落到像素上，整个重构对用户不可见。`describeAccess()` 因此**只读 `auth`**，legacy `state` 仅作老后端兜底。判定先看 `hasVerifiableCredential()`：只有 `auth_required=false && 无可验证凭据` 才直接落到「无需登录」；其它情况再按 `credential`（`none` / `invalid`）→ `verification` 判定。凭据维度先于结论维度，是因为两者正交、可能互相矛盾，此时宁可少报也不点亮一盏兜不住的绿灯。
 
 | verification | 标签 | tone |
 | --- | --- | --- |
@@ -66,7 +66,7 @@ class SourceAuthContract(BaseModel):
 | `rate_limited` | 频率受限 | pending |
 | `blocked` | 接入受阻 | danger |
 
-`auth_required=false` 单独一档：**无需登录**（public 灰），既非已验证也非待验证，且不显示证据徽章——不需要凭据的源没有证据可评级。**Bangumi 的可选令牌是这条规则今天的例外**：它 `auth_required=false`（匿名可用），但配了令牌时 `verification` 会诚实地带上 `verified`/`failed`，只是前端仍按本行渲染成「无需登录」、不出徽章——令牌结论目前经由「测试连接」的消息与 `token_state` 徽章暴露，要把它做成常驻的 ◆ 联网验证 徽章需要给契约加一档「可选凭据」并改前端，见下方「Bangumi 的接入」。
+`auth_required=false` 且没有可验证凭据时单独一档：**无需登录**（public 灰），既非已验证也非待验证，也不显示证据徽章。匿名可用但带 optional credential 的来源不能走这个短路：`hasVerifiableCredential()` 会先识别已保存/失效凭据，`describeAuthVerdict()` 展示其 `verified/failed/unverified` 结论，`describeEvidence()` 常驻展示对应证据强度。Bangumi 的个人令牌已经采用这条路径；无令牌时仍是普通「无需登录」，有令牌时则显示 ◆ 联网验证及结论。
 
 证据强度是**独立于结论**的第二维度，同时用三种方式编码，其中没有一种是颜色（色觉障碍用户读不到颜色）：
 
@@ -101,6 +101,11 @@ class SourceAuthContract(BaseModel):
 | `POST /api/sources/{slug}/verify` | 显式验证，返回契约 + `outcome` / `replayed` / `retry_after_seconds` |
 | `POST /api/sources/{slug}/credential` | 统一写入：结构校验 → 活体校验 → 落盘 → 广播 → 返回重算契约 |
 
+`state / logged_in` 是给旧客户端和 Agent 宿主的兼容视图，但仍由各平台 provider 负责，不能与
+同一响应里的 `auth` 自相矛盾。抖音读取最近一次匹配当前凭据的活体探针：`verified` 同步映射为
+`ready / true`，`stale` 映射为 `stale / false`，其余结论映射为 `unverified / false`。状态端点
+仍只读 probe cache、绝不因轮询出网。
+
 7 条老写入端点（`/api/bilibili/cookie`、`/api/sources/{dy,x,reddit}/cookie`、`/api/sources/xhs/tokens`、`/api/sources/{xhs,zhihu}/login-state`）保留为 `deprecated=True` 的内部转发，响应结构**逐字段冻结（值，不只是键集）**——它们有浏览器扩展在调用，而一个键还在、值被掏空的响应对只比对键集的测试是隐形的。`PUT /api/config` 的四处凭据写入同样委托统一校验门。
 
 **凭据读取是状态查询，不是秘密导出。** `GET /api/sources/credentials` 的 `available`、掩码预览、`summary` 与非敏感 Cookie 名称用于回答“是否已保存/由哪里管理”；秘密原值永不返回。历史 `reveal_keys` query 保留为 no-op，`form.actions` 不再包含 `copy`，桌面页面也不渲染复制按钮。新值只能走统一 credential 写入或配置 PUT；空值与掩码回显不会覆盖现有值。
@@ -113,7 +118,7 @@ class SourceAuthContract(BaseModel):
 
 ## 设计决策
 
-**旧 `state` 是承袭的，不是推导的。** 原计划写一个 `derive_legacy_state(contract)`，实施时证明不可能：bilibili 与 douyin 的正交字段完全相同（`present` + `unverified` + `live_probe`），旧值却分别是 `ready`/`True` 与 `unverified`/`False`——B 站因「cookie 字段齐全」获得信任推定，抖音因其分支被写成永不声称成功而没有。**这个不可能性本身就是旧字段语义坍塌的最强证据。** 改由 `legacy.py` 的 `check_legacy_consistency()` 断言两套视图互不矛盾（不是相等：`ready` 合法地对应 `verified` 或 `unverified`）。
+**旧 `state` 是 provider-owned compatibility，不是全局推导。** 原计划写一个 `derive_legacy_state(contract)`，实施时证明不可能：同样的正交字段在不同平台具有不同历史兼容语义。各 provider 因而继续拥有自己的映射，`legacy.py` 的 `check_legacy_consistency()` 只断言两套视图不矛盾。provider 获得更强证据时可以在旧词汇内同步升级；抖音活体探针成功后若仍固定输出 `unverified / false`，会让同一响应的外层与 `auth.verification=verified` 直接冲突，因此现已映射为 `ready / true`。
 
 **状态端点绝不出网，由作用域强制。** `SourceAuthContext` 只持有 config 与 database，**拿不到 HTTP client**。PC Web 收到 `bilibili_cookie_synced`、`douyin_cookie_synced`、`x_cookie_synced` 或 `reddit_cookie_synced` runtime 事件后会立即重读该端点；文档可见时仍每 30 秒轮询一次，作为事件遗漏或 WebSocket 重连空窗的兜底，并同时刷新首页警示与来源卡片。若状态端点自己探测，一个空闲标签页就会每分钟打抖音两次、永不停止——那是自造风控。活体探测只发生在显式的 verify 动作里，状态端点通过 `probe_cache.LiveProbeCache.peek()` 读取上次结论（零 I/O）。
 
@@ -166,12 +171,12 @@ Bangumi 两者都不是：公开收藏 / 排行**匿名即可发现**（所以�
   `tests/test_source_auth_contract.py::test_bangumi_verify_with_a_valid_token_is_verified`
   等四个用例。
 
-**契约表达不了的那半（如实记录，没硬塞）：** 因为 `auth_required=false`，前端按上面
-「auth_required=false 单独一档」那条规则渲染成「无需登录」并**抑制证据徽章**——所以
-令牌验证结论虽然如实写进了 `verification`/`verified_at`，却不会以常驻的 ◆ 联网验证
-徽章出现。它今天经由两条既有通道对用户可见：「测试连接」按钮的消息，以及 discovery
-在真跑时把死令牌标成 `token_state="rejected"`（前端覆盖成「令牌已失效」）。要把令牌
-结论做成常驻徽章，需要给契约加一档「可选凭据」语义并改前端——本次零前端改动，故未做。
+**可选凭据现在有常驻证据。** 共享 renderer 不能只看到 `auth_required=false` 就提前返回：
+无令牌时 Bangumi 仍显示「无需登录」；有令牌时，`hasVerifiableCredential()` 让
+`describeAuthVerdict()` / `describeEvidence()` 展示 `verified/failed/unverified` 和 ◆ 联网验证，
+同时 discovery 的 `token_state="rejected"` 保留运行期权威否定。对应状态转换由
+`extension/tests/source-status.test.ts` 锁定，新增 optional-credential 来源必须复用这套语义，
+不得恢复「匿名可用就隐藏已保存凭据」的旧短路。
 
 **legacy 与两条额外维度。** `legacy_state` 恒为 `no_auth`（保持一致性检查严格；
 discovery 健康串落到 `detail`，`token_state` 单独成轴）。Bangumi 的 `SourceStatusItem`
@@ -194,7 +199,9 @@ discovery 健康串落到 `detail`，`token_state` 单独成轴）。Bangumi 的
 
 ## 新增平台的强制契约
 
-新平台必须在 `providers.py` 填全契约字段、在 `verify.py` 的 `VERIFY_ACTIONS` 登记动作，否则过不了 `tests/test_source_auth_contract.py` 的参数化测试。
+新平台必须在 `providers.py` 填全契约字段、在 `verify.py` 的 `VERIFY_ACTIONS` 登记动作，否则过不了 `tests/test_source_auth_contract.py` 的参数化测试。若动作是 `browser_heartbeat`，还必须同步登记 `_BROWSER_HEARTBEAT_PREFIXES`，提供对应数据库 getter、extension runtime-stream event handler 与来源专属 round-trip test；未知 slug 必须 fail closed，不能落到某个既有平台的 else 分支。
+
+`SourceAuthContract.auth_required` 当前仍是全源布尔，只适合「所有 required capability 同为匿名/登录」或「同一公开路径由 optional credential 增强」的来源。contract 的 `capability_required` 要把必交付流程和可选 account-resolution fallback 分开。若一个来源同时拥有匿名 public discover 与必须登录的 required private bootstrap/incremental，不要任选一个布尔，也不要在 CLI/setup/extension 复制准入判断：先在来源 contract 使用 `capability-specific` + 逐能力枚举，并把共享后端契约、status/setup/init readiness 与集合测试扩展到能表达这组事实；完成前该来源的 auth gate 是 `BLOCKED`。权威执行规则见 [`docs/platform-source-integration.md`](../platform-source-integration.md) §0–§0.1。
 
 **声称某平台「无法验证」之前，必须先做剥离对照实验**（实验组=完整凭据，对照组=剥掉登录 cookie 的游客态，同签名器/UA/时刻），拿不出对照数据不许写进 docstring。这条规则是有代价换来的：抖音的旧 docstring 断言它「没有稳定 nav 端点」，导致整个平台的登录态误报，还成了后续无人去修的理由。详见 [`docs/platform-source-integration.md`](../platform-source-integration.md) §0.1–§0.6。
 

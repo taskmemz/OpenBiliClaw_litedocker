@@ -23,7 +23,7 @@ so every legacy import path stays valid):
 | `build_cognition_profile_view_v1` / `CognitionProfileViewV1` | `soul/profile_views.py` | stable soul + stable preference + volatile cognition | **Yes, when soul is supplied** | Named, uncapped cognition-only projection. Removes storage/init bookkeeping and the duplicate `soul.interest` subtree, filters archived positive interests, preserves negative evidence and unknown semantic fields, and splits recent awareness/active insights from the stable prefix. Awareness/Insight historically received the full soul snapshot, including `personality_portrait`, so compact-v1 deliberately preserves it. Preference does not supply a soul snapshot. |
 | `speculation` (→ `to_llm_context(include_portrait=False)`) | `soul/profile_views.py` (`speculation`); renderer `soul/profile.py:720` (onion) / `:115` (flat) | str | **No** (opted out) | String view for the two speculator prompts. Task 7 collected the former in-line `to_llm_context(include_portrait=False)` fork into a façade view that delegates to the profile's own renderer (zero behaviour change). `include_portrait=True` default still keeps the portrait for eval/persona rendering (not this path). |
 | `chat_core_memory` / `render_core_memory_blocks` | `soul/profile_views.py` (`chat_core_memory`), `memory/manager.py` (`render_core_memory_blocks` / `render_core_memory_prompt`) | `(stable, volatile)` str pair | **Yes** (stable block) | Chat core-memory view. Reads the **effective** profile (AI ⊕ overrides via `_effective_soul_data`, `manager.py`), so manual edits show. `complete_with_core_memory` injects `stable_block` (portrait/identity/preference) into system and `volatile_block` (awareness/insights) ahead of the user turn — awareness churn no longer breaks the cached system prefix (Task 6). `render_core_memory_prompt` kept as the concatenated compat wrapper for non-chat readers. |
-| `ProfileResponse` (openclaw) | `integrations/openclaw/operations.py:105` | dataclass | **Yes** (intentional) | External API surface; portrait re-exposed at `operations.py:113`, each list capped `[:5]` (`operations.py:114-120`). |
+| `ProfileResponse` (Agent Bridge) | `integrations/openclaw/schemas.py` + `operations.py:get_profile` | dataclass | **Yes** (intentional) | External Agent Bridge surface; portrait is deliberately re-exposed and each list is capped at five items. |
 
 `CognitionEventViewV1` lives in `soul/event_prompt_views.py`. It is the matching
 event projection, not a profile serializer: it preserves event order/count and
@@ -62,7 +62,7 @@ explicit narrow set of transport/projection bookkeeping fields.
 | Probe sentiment judge | Per probe reply | `inject_core_memory=True` (intentional) — `api/app.py:6244` | core memory (kept: chat-adjacent tone reading) | Yes | Yes |
 | Related-chain seed | Per discovery cycle | direct read `favorite_up_users[:1]` — `discovery/strategies/related_chain.py:392` | favorite UPs only | No | No |
 | `/api/profile-summary` (UI) | On request | direct read — `api/app.py:3990` | full profile incl. portrait | Yes | No |
-| OpenClaw `get_profile` | On request | `ProfileResponse` — `integrations/openclaw/operations.py:105` | portrait + 5 traits / 5 needs / 5 interests | Yes (external) | No |
+| Agent Bridge `get_profile` | On request | `ProfileResponse` — `integrations/openclaw/operations.py:get_profile` | portrait + 5 traits / 5 needs / 5 interests | Yes (external) | No |
 | Delight scoring | Per candidate | embeddings only — `recommendation/delight.py` (no LLM profile prompt; spec D8) | (embedding vectors) | No | No |
 
 ## Portrait boundary (invariant)
@@ -75,7 +75,7 @@ It remains intentional on these established surfaces:
   complete soul snapshot; `CognitionProfileViewV1.stable_soul` preserves the
   portrait so compact-v1 does not silently change interpretation. Preference
   compact does not receive a soul snapshot.
-- **OpenClaw external `ProfileResponse`** (`operations.py:113`) — plus UI
+- **Agent Bridge external `ProfileResponse`** (`operations.py:get_profile`) — plus UI
   (`/api/profile-summary`) and eval personas, which are out of the profile-views
   scope but keep the portrait by design.
 

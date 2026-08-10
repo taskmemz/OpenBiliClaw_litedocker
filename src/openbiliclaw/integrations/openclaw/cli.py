@@ -12,8 +12,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .bootstrap import build_openclaw_adapter
+from .capabilities import build_capabilities
 from .errors import AdapterOperationError, AdapterValidationError
-from .schemas import AvoidanceProbeFeedbackRequest, ChatRequest, FeedbackRequest
+from .schemas import (
+    AvoidanceProbeFeedbackRequest,
+    ChatRequest,
+    DelightFeedbackRequest,
+    FeedbackRequest,
+    InterestProbeFeedbackRequest,
+    ProfileEditRequest,
+    SavedItemRequest,
+    SavedRemoveRequest,
+    SavedSyncRequest,
+)
 from .skill import build_openclaw_skills
 
 if TYPE_CHECKING:
@@ -31,7 +42,25 @@ _RUNTIME_STREAM_URL = "ws://127.0.0.1:8420/api/runtime-stream"
 # ``interest.probe``    — the agent has a new speculative interest hypothesis
 #                         it wants the user to confirm; payload mirrors the
 #                         response of ``next-probe``.
-_LISTEN_EVENT_TYPES = frozenset({"delight.candidate", "interest.probe", "avoidance.probe"})
+_LISTEN_EVENT_TYPES = frozenset(
+    {
+        "delight.candidate",
+        "delight.liked",
+        "delight.disliked",
+        "delight.chat",
+        "delight.refreshed",
+        "interest.probe",
+        "interest.confirmed",
+        "interest.rejected",
+        "interest.deferred",
+        "interest.chat",
+        "avoidance.probe",
+        "avoidance.confirmed",
+        "avoidance.rejected",
+        "avoidance.deferred",
+        "avoidance.chat",
+    }
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -40,7 +69,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("sync-account")
     subparsers.add_parser("get-profile")
+    subparsers.add_parser("capabilities")
     subparsers.add_parser("get-delight")
+    subparsers.add_parser("platform-availability")
+    subparsers.add_parser("profile-edit-state")
     subparsers.add_parser("next-probe")
     subparsers.add_parser("next-avoidance-probe")
     subparsers.add_parser("runtime-status")
@@ -61,6 +93,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default="openclaw",
         help="Dialogue session label (default: 'openclaw').",
     )
+    chat_parser.add_argument("--scope", default="chat")
+    chat_parser.add_argument("--turn-id", default="")
+    chat_parser.add_argument("--subject-id", default="")
+    chat_parser.add_argument("--subject-title", default="")
+    chat_parser.add_argument("--reply-to-turn-id", default="")
+
+    chat_history_parser = subparsers.add_parser("chat-history")
+    chat_history_parser.add_argument("--session", default="openclaw")
+    chat_history_parser.add_argument("--scope", default="")
+    chat_history_parser.add_argument("--limit", type=int, default=50)
 
     listen_parser = subparsers.add_parser(
         "listen",
@@ -79,6 +121,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     recommend_parser = subparsers.add_parser("recommend")
     recommend_parser.add_argument("--limit", type=int, default=5)
+    recommend_parser.add_argument("--source-platform", default="")
+    recommend_parser.add_argument("--exclude-item-id", action="append", default=[])
     refresh_group = recommend_parser.add_mutually_exclusive_group()
     refresh_group.add_argument(
         "--refresh-if-needed",
@@ -101,14 +145,89 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Stable idempotency ID; reuse it for retries of the same action.",
     )
 
+    for command, default_limit in (("reshuffle", 5), ("append", 10)):
+        page_parser = subparsers.add_parser(command)
+        page_parser.add_argument("--limit", type=int, default=default_limit)
+        page_parser.add_argument("--source-platform", default="")
+        page_parser.add_argument("--exclude-item-id", action="append", default=[])
+
+    activity_parser = subparsers.add_parser("activity-feed")
+    activity_parser.add_argument("--limit", type=int, default=10)
+    activity_parser.add_argument("--before", default="")
+
     avoidance_feedback_parser = subparsers.add_parser("respond-avoidance-probe")
     avoidance_feedback_parser.add_argument("--domain", required=True)
     avoidance_feedback_parser.add_argument(
         "--response",
-        choices=["confirm", "reject", "chat"],
+        choices=["confirm", "reject", "defer", "chat"],
         required=True,
     )
     avoidance_feedback_parser.add_argument("--message", default="")
+
+    interest_feedback_parser = subparsers.add_parser("respond-interest-probe")
+    interest_feedback_parser.add_argument("--domain", required=True)
+    interest_feedback_parser.add_argument(
+        "--response",
+        choices=["confirm", "reject", "defer", "chat"],
+        required=True,
+    )
+    interest_feedback_parser.add_argument("--message", default="")
+    interest_feedback_parser.add_argument("--confirmation-source", default="")
+    interest_feedback_parser.add_argument("--surface", default="agent")
+
+    delight_feedback_parser = subparsers.add_parser("respond-delight")
+    delight_feedback_parser.add_argument("--bvid", default="")
+    delight_feedback_parser.add_argument("--content-id", default="")
+    delight_feedback_parser.add_argument("--source-platform", default="")
+    delight_feedback_parser.add_argument(
+        "--response",
+        choices=["view", "like", "dislike", "chat", "dismiss"],
+        required=True,
+    )
+    delight_feedback_parser.add_argument("--title", default="")
+    delight_feedback_parser.add_argument("--message", default="")
+    delight_feedback_parser.add_argument("--request-id", default="")
+
+    edit_parser = subparsers.add_parser("edit-profile")
+    edit_parser.add_argument("--target", required=True)
+    edit_parser.add_argument("--op", required=True)
+    edit_parser.add_argument("--value", default=None)
+    edit_parser.add_argument("--parent", default="")
+    edit_parser.add_argument("--weight", type=float, default=None)
+
+    save_parser = subparsers.add_parser("save-local")
+    save_parser.add_argument("--list-kind", choices=["favorite", "watch_later"], required=True)
+    save_parser.add_argument("--source-platform", required=True)
+    save_parser.add_argument("--content-id", default="")
+    save_parser.add_argument("--content-url", default="")
+    save_parser.add_argument("--content-type", default="video")
+    save_parser.add_argument("--title", default="")
+    save_parser.add_argument("--author-name", default="")
+    save_parser.add_argument("--cover-url", default="")
+    save_parser.add_argument("--note", default="")
+
+    remove_saved_parser = subparsers.add_parser("remove-saved")
+    remove_saved_parser.add_argument(
+        "--list-kind", choices=["favorite", "watch_later"], required=True
+    )
+    remove_saved_parser.add_argument("--item-key", required=True)
+
+    list_saved_parser = subparsers.add_parser("list-saved")
+    list_saved_parser.add_argument(
+        "--list-kind", choices=["favorite", "watch_later"], required=True
+    )
+    list_saved_parser.add_argument("--limit", type=int, default=50)
+
+    sync_saved_parser = subparsers.add_parser("sync-saved")
+    sync_saved_parser.add_argument(
+        "--list-kind", choices=["favorite", "watch_later"], required=True
+    )
+    sync_saved_parser.add_argument("--item-key", action="append", default=[])
+    sync_saved_parser.add_argument(
+        "--allow-state-changing",
+        action="store_true",
+        help="Explicitly authorize native account writes for this command.",
+    )
     return parser
 
 
@@ -122,12 +241,19 @@ async def _run_command(args: argparse.Namespace, adapter: Any) -> dict[str, obje
         return {
             "ok": True,
             "data": {
+                "protocol_version": "agent-bridge/v2",
+                "host_names": ["openclaw", "hermes", "workbuddy"],
                 "skill_pack_path": str(_SKILL_PACK_PATH),
                 "skill_pack_exists": _SKILL_PACK_PATH.exists(),
                 "skill_count": len(skills),
                 "skill_names": [item.name for item in skills],
                 "cli_module": "openbiliclaw.integrations.openclaw.cli",
             },
+        }
+    if args.command == "capabilities":
+        return {
+            "ok": True,
+            "data": asdict(build_capabilities(adapter)),
         }
     if args.command == "emit-skill-descriptors":
         skills = build_openclaw_skills(adapter)
@@ -154,9 +280,22 @@ async def _run_command(args: argparse.Namespace, adapter: Any) -> dict[str, obje
         elif args.command == "runtime-status":
             result = await adapter.get_runtime_status()
         elif args.command == "recommend":
-            result = await adapter.recommend(
+            recommend_kwargs: dict[str, object] = {
+                "limit": args.limit,
+                "refresh_if_needed": bool(args.refresh_if_needed),
+            }
+            if args.source_platform:
+                recommend_kwargs["source_platform"] = args.source_platform
+            if args.exclude_item_id:
+                recommend_kwargs["excluded_item_ids"] = args.exclude_item_id
+            result = await adapter.recommend(**recommend_kwargs)
+        elif args.command in {"reshuffle", "append"}:
+            method_name = "reshuffle" if args.command == "reshuffle" else "append_recommendations"
+            method = getattr(adapter, method_name)
+            result = await method(
                 limit=args.limit,
-                refresh_if_needed=bool(args.refresh_if_needed),
+                source_platform=args.source_platform,
+                excluded_item_ids=args.exclude_item_id,
             )
         elif args.command == "submit-feedback":
             request = FeedbackRequest(
@@ -170,8 +309,23 @@ async def _run_command(args: argparse.Namespace, adapter: Any) -> dict[str, obje
             chat_request = ChatRequest(
                 message=args.message,
                 session=getattr(args, "session", "openclaw"),
+                scope=getattr(args, "scope", "chat"),
+                turn_id=getattr(args, "turn_id", ""),
+                subject_id=getattr(args, "subject_id", ""),
+                subject_title=getattr(args, "subject_title", ""),
+                reply_to_turn_id=getattr(args, "reply_to_turn_id", ""),
             )
             result = await adapter.chat(chat_request)
+        elif args.command == "chat-history":
+            result = await adapter.get_chat_history(
+                session=args.session,
+                scope=args.scope,
+                limit=args.limit,
+            )
+        elif args.command == "activity-feed":
+            result = await adapter.get_activity_feed(limit=args.limit, before=args.before)
+        elif args.command == "platform-availability":
+            result = await adapter.get_platform_availability()
         elif args.command == "next-probe":
             result = await adapter.get_next_probe()
         elif args.command == "next-avoidance-probe":
@@ -183,6 +337,68 @@ async def _run_command(args: argparse.Namespace, adapter: Any) -> dict[str, obje
                 message=args.message,
             )
             result = await adapter.respond_avoidance_probe(avoidance_request)
+        elif args.command == "respond-interest-probe":
+            result = await adapter.respond_interest_probe(
+                InterestProbeFeedbackRequest(
+                    domain=args.domain,
+                    response=args.response,
+                    message=args.message,
+                    confirmation_source=args.confirmation_source,
+                    surface=args.surface,
+                )
+            )
+        elif args.command == "respond-delight":
+            result = await adapter.respond_delight(
+                DelightFeedbackRequest(
+                    bvid=args.bvid,
+                    content_id=args.content_id,
+                    source_platform=args.source_platform,
+                    response=args.response,
+                    title=args.title,
+                    message=args.message,
+                    request_id=args.request_id,
+                )
+            )
+        elif args.command == "profile-edit-state":
+            result = await adapter.get_profile_edit_state()
+        elif args.command == "edit-profile":
+            result = await adapter.edit_profile(
+                ProfileEditRequest(
+                    target=args.target,
+                    op=args.op,
+                    value=args.value,
+                    parent=args.parent,
+                    weight=args.weight,
+                )
+            )
+        elif args.command == "save-local":
+            result = await adapter.save_local(
+                SavedItemRequest(
+                    list_kind=args.list_kind,
+                    source_platform=args.source_platform,
+                    content_id=args.content_id,
+                    content_url=args.content_url,
+                    content_type=args.content_type,
+                    title=args.title,
+                    author_name=args.author_name,
+                    cover_url=args.cover_url,
+                    note=args.note,
+                )
+            )
+        elif args.command == "remove-saved":
+            result = await adapter.remove_saved(
+                SavedRemoveRequest(list_kind=args.list_kind, item_key=args.item_key)
+            )
+        elif args.command == "list-saved":
+            result = await adapter.list_saved(list_kind=args.list_kind, limit=args.limit)
+        elif args.command == "sync-saved":
+            result = await adapter.sync_saved(
+                SavedSyncRequest(
+                    list_kind=args.list_kind,
+                    item_keys=args.item_key,
+                    allow_state_changing=bool(args.allow_state_changing),
+                )
+            )
         else:  # pragma: no cover - argparse guarantees command validity
             raise AdapterValidationError(f"Unsupported command: {args.command}")
     except AdapterValidationError as exc:
@@ -217,7 +433,7 @@ async def _acknowledge_delight(bvid: str) -> None:
         import aiohttp
 
         async with (
-            aiohttp.ClientSession() as session,
+            aiohttp.ClientSession(trust_env=False) as session,
             session.post(
                 _DELIGHT_ACK_URL,
                 json={"bvid": bvid},
@@ -295,7 +511,7 @@ async def _listen_ws(ws_url: str, event_types: frozenset[str]) -> None:
                         bvid = str(event.get("bvid", ""))
                         if bvid:
                             await _acknowledge_delight(bvid)
-        except (OSError, Exception):
+        except Exception:
             _print_payload(
                 {
                     "ok": False,
@@ -323,7 +539,7 @@ def main(argv: Sequence[str] | None = None, *, adapter: Any | None = None) -> in
 
     if adapter is not None:
         resolved_adapter = adapter
-    elif args.command in {"doctor", "emit-skill-descriptors"}:
+    elif args.command in {"doctor", "capabilities", "emit-skill-descriptors"}:
         resolved_adapter = object()
     else:
         resolved_adapter = build_openclaw_adapter()

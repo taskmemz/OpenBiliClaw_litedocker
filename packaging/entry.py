@@ -25,6 +25,7 @@ In both packaged layouts the read-only bundle provides the template config +
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import os
 import re
@@ -979,6 +980,43 @@ def main() -> None:
     # splash (closed once the tray appears); macOS — where a menu-bar agent gives
     # no Dock bounce — gets a one-shot notification here instead.
     _notify_starting()
+    project_root.mkdir(parents=True, exist_ok=True)
+    os.environ["OPENBILICLAW_PROJECT_ROOT"] = str(project_root)
+
+    # Crash recovery must run before any startup helper seeds config.toml or
+    # creates data/. Either target may intentionally be absent halfway through
+    # a journaled rename; recreating it here would occupy the restore target and
+    # turn a recoverable crash into a fail-closed startup.
+    migration_guard = None
+    if not os.environ.get("OPENBILICLAW_SELFTEST"):
+        from openbiliclaw.storage.migration import (
+            acquire_migration_runtime_guard,
+            apply_pending_migration,
+            migration_recovery_data_dir,
+        )
+
+        recovery_data_dir = migration_recovery_data_dir(project_root=project_root)
+        if recovery_data_dir is not None:
+            migration_guard = acquire_migration_runtime_guard(
+                project_root,
+                recovery_data_dir,
+            )
+            if migration_guard is None:
+                _close_splash()
+                print("[OpenBiliClaw] 迁移目标数据目录已有后端在运行；本次不启动新实例。")
+                return
+            atexit.register(migration_guard.release)
+            try:
+                migration_result = apply_pending_migration(
+                    project_root=project_root,
+                    locked_data_dir=recovery_data_dir,
+                )
+            except Exception:
+                migration_guard.release()
+                raise
+            if migration_result is not None:
+                print(f"[OpenBiliClaw] {migration_result.message}")
+
     # New packaged builds share the same data root as one-line / AI installs.
     # If a previous packaged build used the old OS-specific app-data root, copy
     # its data into the unified root before seeding any defaults.
@@ -990,8 +1028,6 @@ def main() -> None:
     # config/data as legacy packaged data when a selftest overrides the profile.
     if getattr(sys, "frozen", False):
         _migrate_legacy_install_dir_data(bundled_resources, project_root)
-    project_root.mkdir(parents=True, exist_ok=True)
-    os.environ["OPENBILICLAW_PROJECT_ROOT"] = str(project_root)
 
     # Ensure data & log directories exist
     (project_root / "data").mkdir(exist_ok=True)
@@ -1026,6 +1062,25 @@ def main() -> None:
         runtime_config = load_config()
         configure_logging(runtime_config, sweep_unmanaged=False)
         _reconcile_packaged_autostart(runtime_config)
+
+    # Recovery initially locks the journal's historical target. Environment or
+    # disk config may now select a different runtime data_dir; keep the first
+    # lock and atomically add the effective one before any backend component can
+    # open it.
+    if migration_guard is not None and runtime_config is None:
+        migration_guard.release()
+        raise RuntimeError("迁移恢复后无法加载运行配置；后端拒绝在未锁定的数据目录上启动。")
+    if migration_guard is not None and runtime_config is not None:
+        try:
+            runtime_data_locked = migration_guard.acquire_data_dir(runtime_config.data_path)
+        except Exception:
+            migration_guard.release()
+            raise
+        if not runtime_data_locked:
+            migration_guard.release()
+            _close_splash()
+            print("[OpenBiliClaw] 迁移恢复后的数据目录已被另一后端使用；本次拒绝启动。")
+            return
 
     default_host = "127.0.0.1"
     default_port = 8420
@@ -1069,6 +1124,53 @@ def main() -> None:
                 webbrowser.open(existing_base + landing)
             return
     _ = lock_handle  # keep a reference so the lock is held for the process lifetime
+
+    # The package lock above only covers frozen desktop builds.  This shared
+    # guard also fences CLI/Docker servers that use the same project root and is
+    # the proof required before a staged migration may replace SQLite + memory.
+    from openbiliclaw.storage.migration import (
+        acquire_migration_runtime_guard,
+        apply_pending_migration,
+    )
+
+    if migration_guard is None:
+        migration_data_dir = (
+            runtime_config.data_path if runtime_config is not None else project_root / "data"
+        )
+        migration_guard = acquire_migration_runtime_guard(project_root, migration_data_dir)
+        if migration_guard is None:
+            existing_host = "127.0.0.1" if host == "0.0.0.0" else host  # noqa: S104
+            _close_splash()
+            print("[OpenBiliClaw] 当前数据目录已有后端在运行；本次不启动新实例。")
+            with suppress(Exception):
+                webbrowser.open(f"http://{existing_host}:{port}/web/")
+            return
+        atexit.register(migration_guard.release)
+        try:
+            migration_result = apply_pending_migration(
+                project_root=project_root,
+                locked_data_dir=migration_data_dir,
+            )
+        except Exception:
+            migration_guard.release()
+            raise
+        if migration_result is not None:
+            print(f"[OpenBiliClaw] {migration_result.message}")
+
+    # A successful apply writes a portable config while preserving this
+    # machine's listener/TLS/autostart fields. Re-read it before any runtime
+    # services or browser URL are constructed.
+    with suppress(Exception):
+        from openbiliclaw.config import load_config
+        from openbiliclaw.logging_setup import configure_logging
+
+        runtime_config = load_config()
+        configure_logging(runtime_config, sweep_unmanaged=False)
+        _reconcile_packaged_autostart(runtime_config)
+        default_host = str(getattr(runtime_config.api, "host", "127.0.0.1") or "127.0.0.1")
+        default_port = int(getattr(runtime_config.api, "port", 8420) or 8420)
+        host = os.environ.get("OPENBILICLAW_HOST", "").strip() or default_host
+        port = int(os.environ.get("OPENBILICLAW_PORT", "").strip() or str(default_port))
 
     # with-embedding variant: seed the baked bge-m3 and bring up a private
     # Ollama for it BEFORE any other Ollama start. On success the default
@@ -1133,6 +1235,7 @@ def main() -> None:
                 server.run()
     finally:
         close_listener_sockets(listener_sockets)
+        migration_guard.release()
 
 
 if __name__ == "__main__":

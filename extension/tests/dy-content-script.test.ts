@@ -14,15 +14,247 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  classifyDouyinDiscoveryCompletion,
   classifyDouyinScopeCompletion,
   createScrollRoundController,
+  DouyinPassiveDiscoveryReplayBuffer,
   douyinDiscoveryExecutionPolicy,
   filterDiscoveryItemsForScope,
   isDouyinSearchResultUrl,
   isSameWindowSameOriginDouyinMessage,
   isValidFeedExecuteMessage,
+  isValidSearchExecuteMessage,
   isValidScopeExecuteMessage,
+  shouldReplayEarlyDiscoveryItems,
 } from "../src/content/douyin.ts";
+
+test("passive discovery buffer replays early items with dedupe, TTL, and a hard cap", () => {
+  let now = 1_000;
+  const buffer = new DouyinPassiveDiscoveryReplayBuffer(2, 100, () => now);
+  const first = { scope: "dy_feed", aweme_id: "feed-1", title: "first" };
+  const second = { scope: "dy_feed", aweme_id: "feed-2", title: "second" };
+  const third = { scope: "dy_feed", aweme_id: "feed-3", title: "third" };
+
+  assert.equal(buffer.ingest("dy_feed", [first, second, null, { scope: "dy_feed" }]), 2);
+  assert.equal(buffer.ingest("dy_search", []), 0);
+  assert.equal(buffer.ingest("unknown", [third]), 0);
+  assert.equal(buffer.ingest("dy_feed", [{ ...first, title: "updated" }, third]), 1);
+  const drained = buffer.drain("dy_feed");
+  assert.equal(drained.responsesObserved, 2);
+  assert.deepEqual(
+    drained.items.map((item) => [item.aweme_id, item.title]),
+    [
+      ["feed-1", "updated"],
+      ["feed-3", "third"],
+    ],
+  );
+  assert.deepEqual(buffer.drain("dy_feed"), { items: [], responsesObserved: 0 });
+  assert.deepEqual(buffer.drain("dy_search"), { items: [], responsesObserved: 1 });
+
+  buffer.ingest("dy_feed", [first]);
+  now += 101;
+  assert.deepEqual(buffer.drain("dy_feed"), { items: [], responsesObserved: 0 });
+});
+
+test("discovery completion keeps harvested items successful", () => {
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "search",
+      itemCount: 1,
+      injectStatus: "error: injection failed after DOM rendered",
+      fetchTapInstallStatus: "unknown",
+      apiError: "HTTP 429",
+      uiTriggered: false,
+      searchNavigationOk: false,
+    }),
+    { status: "ok" },
+  );
+});
+
+test("discovery completion reports explicit fetch-tap injection failures", () => {
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "search",
+      itemCount: 0,
+      injectStatus: "error: Could not load main/dy-fetch-tap.js",
+      fetchTapInstallStatus: "installed",
+      uiTriggered: true,
+      searchNavigationOk: true,
+    }),
+    { status: "failed", error: "fetch_tap_injection_failed" },
+  );
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "feed",
+      itemCount: 0,
+      injectStatus: "scripting_api_missing",
+      fetchTapInstallStatus: "installed",
+      alternateCollectionCompleted: true,
+    }),
+    { status: "failed", error: "fetch_tap_injection_failed" },
+  );
+});
+
+test("discovery completion rejects unconfirmed fetch-tap state", () => {
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "search",
+      itemCount: 0,
+      fetchTapInstallStatus: "unknown",
+      uiTriggered: true,
+      searchNavigationOk: true,
+    }),
+    { status: "failed", error: "fetch_tap_status_unknown" },
+  );
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "hot",
+      itemCount: 0,
+      fetchTapInstallStatus: "skipped_no_sdk",
+      uiTriggered: true,
+    }),
+    { status: "failed", error: "fetch_tap_sdk_unavailable" },
+  );
+});
+
+test("discovery completion maps API failures to stable non-sensitive codes", () => {
+  const classifyApiError = (apiError: string) =>
+    classifyDouyinDiscoveryCompletion({
+      source: "feed",
+      itemCount: 0,
+      fetchTapInstallStatus: "installed",
+      apiError,
+    });
+
+  assert.deepEqual(classifyApiError("Error: timeout"), {
+    status: "failed",
+    error: "api_timeout",
+  });
+  assert.deepEqual(classifyApiError("HTTP 503: upstream details"), {
+    status: "failed",
+    error: "api_http_error",
+  });
+  assert.deepEqual(classifyApiError("HTTP 429: too many requests"), {
+    status: "failed",
+    error: "api_rate_limited",
+  });
+  assert.deepEqual(classifyApiError("credential-shaped internal failure: secret=redacted"), {
+    status: "failed",
+    error: "api_collection_failed",
+  });
+});
+
+test("discovery completion reports failed search and hot UI paths", () => {
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "search",
+      itemCount: 0,
+      fetchTapInstallStatus: "installed",
+      uiTriggered: false,
+      searchNavigationOk: false,
+    }),
+    { status: "failed", error: "search_ui_not_triggered" },
+  );
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "search",
+      itemCount: 0,
+      fetchTapInstallStatus: "installed",
+      uiTriggered: true,
+      searchNavigationOk: false,
+    }),
+    { status: "failed", error: "search_navigation_failed" },
+  );
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "hot",
+      itemCount: 0,
+      fetchTapInstallStatus: "installed",
+      uiTriggered: false,
+    }),
+    { status: "failed", error: "hot_ui_not_triggered" },
+  );
+});
+
+test("discovery completion only accepts clean empty collection paths", () => {
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "search",
+      itemCount: 0,
+      injectStatus: "ok_file=main/dy-fetch-tap.js",
+      fetchTapInstallStatus: "installed",
+      uiTriggered: true,
+      searchNavigationOk: true,
+    }),
+    { status: "empty" },
+  );
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "hot",
+      itemCount: 0,
+      fetchTapInstallStatus: "installed",
+      uiTriggered: true,
+    }),
+    { status: "empty" },
+  );
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "feed",
+      itemCount: 0,
+      fetchTapInstallStatus: "installed",
+      passiveResponsesObserved: 0,
+      domItemsHarvested: 0,
+    }),
+    { status: "failed", error: "feed_no_observed_response" },
+  );
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "feed",
+      itemCount: 0,
+      fetchTapInstallStatus: "installed",
+      passiveResponsesObserved: 1,
+      domItemsHarvested: 0,
+    }),
+    { status: "empty" },
+  );
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "feed",
+      itemCount: 0,
+      fetchTapInstallStatus: "unknown",
+    }),
+    { status: "failed", error: "fetch_tap_status_unknown" },
+  );
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "feed",
+      itemCount: 0,
+      fetchTapInstallStatus: "unknown",
+      alternateCollectionCompleted: true,
+    }),
+    { status: "empty" },
+  );
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "feed",
+      itemCount: 0,
+      fetchTapInstallStatus: "skipped_no_sdk",
+      alternateCollectionCompleted: true,
+    }),
+    { status: "failed", error: "fetch_tap_sdk_unavailable" },
+  );
+  assert.deepEqual(
+    classifyDouyinDiscoveryCompletion({
+      source: "search",
+      itemCount: 0,
+      fetchTapInstallStatus: "unknown",
+      uiTriggered: true,
+      searchNavigationOk: true,
+      alternateCollectionCompleted: true,
+    }),
+    { status: "empty" },
+  );
+});
 
 test("Douyin bridge messages require the same Window and page origin", () => {
   const target = {
@@ -197,6 +429,32 @@ test("isDouyinSearchResultUrl requires a real search results route", () => {
     isDouyinSearchResultUrl("https://www.douyin.com/jingxuan/search/%E7%BE%8E%E9%A3%9F", "科技"),
     false,
   );
+  assert.equal(
+    isDouyinSearchResultUrl(
+      "https://www.douyin.com/jingxuan/search/%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD",
+      "人工",
+    ),
+    false,
+  );
+});
+
+test("search execute validation accepts only a boolean navigation resume flag", () => {
+  const base = { task_id: "search-task", keyword: "科技", max_items: 3 };
+  assert.equal(isValidSearchExecuteMessage(base), true);
+  assert.equal(
+    isValidSearchExecuteMessage({ ...base, resume_after_navigation: true }),
+    true,
+  );
+  assert.equal(
+    isValidSearchExecuteMessage({ ...base, resume_after_navigation: "yes" }),
+    false,
+  );
+});
+
+test("a new keyword discards stale search replay while navigation resume consumes it", () => {
+  assert.equal(shouldReplayEarlyDiscoveryItems("dy_search", false), false);
+  assert.equal(shouldReplayEarlyDiscoveryItems("dy_search", true), true);
+  assert.equal(shouldReplayEarlyDiscoveryItems("dy_feed", false), true);
 });
 
 test("filterDiscoveryItemsForScope keeps only the requested discovery scope", () => {

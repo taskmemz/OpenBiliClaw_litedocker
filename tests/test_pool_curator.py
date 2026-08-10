@@ -11,6 +11,7 @@ from openbiliclaw.recommendation.curator import (
     FeedbackSignals,
     PoolCurator,
     ScoringContext,
+    ScoringWeights,
 )
 from openbiliclaw.storage.database import Database
 
@@ -27,33 +28,114 @@ def _now() -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# Freshness scoring
+# Publication-time temporal bonus
 # ---------------------------------------------------------------------------
 
 
-def test_freshness_score_new_content_is_high() -> None:
+def _temporal_item(
+    *,
+    bvid: str = "BV_TEMPORAL",
+    temporal_class: str = "current",
+    temporal_confidence: object = 0.8,
+    published_at: str = "",
+    discovered_at: str = "",
+) -> DiscoveredContent:
+    item = DiscoveredContent(
+        bvid=bvid,
+        published_at=published_at,
+        discovered_at=discovered_at,
+    )
+    item.temporal_class = temporal_class
+    item.temporal_confidence = temporal_confidence  # type: ignore[assignment]
+    return item
+
+
+def test_temporal_bonus_uses_class_weight_for_new_content() -> None:
     now = _now()
-    score = PoolCurator._freshness_score(now.isoformat(), now)
-    assert score > 0.9
+    breaking = _temporal_item(
+        temporal_class="breaking",
+        published_at=now.isoformat(),
+    )
+    current = _temporal_item(
+        temporal_class="current",
+        published_at=now.isoformat(),
+    )
+    versioned = _temporal_item(
+        temporal_class="versioned",
+        published_at=now.isoformat(),
+    )
+
+    assert PoolCurator._temporal_bonus_component(breaking, now) == 0.85
+    assert PoolCurator._temporal_bonus_component(current, now) == 0.60
+    assert PoolCurator._temporal_bonus_component(versioned, now) == 0.30
 
 
-def test_freshness_score_old_content_decays() -> None:
+def test_temporal_bonus_reaches_half_at_each_class_half_life() -> None:
     now = _now()
-    old = (now - timedelta(days=7)).isoformat()
-    score = PoolCurator._freshness_score(old, now)
-    assert score < 0.3
+    cases = (("breaking", 1, 0.85), ("current", 14, 0.60), ("versioned", 120, 0.30))
+
+    for temporal_class, half_life_days, class_weight in cases:
+        item = _temporal_item(
+            temporal_class=temporal_class,
+            published_at=(now - timedelta(days=half_life_days)).isoformat(),
+        )
+        assert PoolCurator._temporal_bonus_component(item, now) == class_weight / 2
 
 
-def test_freshness_score_half_life_around_three_days() -> None:
+def test_temporal_bonus_confidence_thresholds_are_conservative() -> None:
     now = _now()
-    at_half_life = (now - timedelta(days=3)).isoformat()
-    score = PoolCurator._freshness_score(at_half_life, now)
-    assert 0.3 < score < 0.7
+    full = _temporal_item(temporal_confidence=0.8, published_at=now.isoformat())
+    half = _temporal_item(temporal_confidence=0.6, published_at=now.isoformat())
+    below = _temporal_item(temporal_confidence=0.599, published_at=now.isoformat())
+
+    assert PoolCurator._temporal_bonus_component(full, now) == 0.60
+    assert PoolCurator._temporal_bonus_component(half, now) == 0.30
+    assert PoolCurator._temporal_bonus_component(below, now) == 0.0
 
 
-def test_freshness_score_empty_timestamp_returns_default() -> None:
-    score = PoolCurator._freshness_score("", _now())
-    assert score == 0.5
+def test_temporal_bonus_rejects_malformed_confidence() -> None:
+    now = _now()
+
+    for confidence in (True, -0.1, 1.1, float("nan"), float("inf"), "high"):
+        item = _temporal_item(
+            temporal_confidence=confidence,
+            published_at=now.isoformat(),
+        )
+        assert PoolCurator._temporal_bonus_component(item, now) == 0.0
+
+
+def test_temporal_bonus_neutral_for_non_temporal_classes() -> None:
+    now = _now()
+    for temporal_class in ("evergreen", "historical", "unknown", ""):
+        item = _temporal_item(temporal_class=temporal_class, published_at=now.isoformat())
+        assert PoolCurator._temporal_bonus_component(item, now) == 0.0
+
+
+def test_temporal_bonus_neutral_for_missing_invalid_or_future_publication() -> None:
+    now = _now()
+    for published_at in (
+        "",
+        "not-a-date",
+        now.replace(tzinfo=None).isoformat(),
+        (now + timedelta(days=1)).isoformat(),
+    ):
+        item = _temporal_item(published_at=published_at)
+        assert PoolCurator._temporal_bonus_component(item, now) == 0.0
+
+
+def test_temporal_bonus_ignores_discovery_and_scoring_clocks() -> None:
+    now = _now()
+    item = _temporal_item(
+        published_at="",
+        discovered_at=now.isoformat(),
+    )
+    item.last_scored_at = now.isoformat()
+
+    assert PoolCurator._temporal_bonus_component(item, now) == 0.0
+
+
+def test_temporal_freshness_weight_defaults_to_soft_positive_bonus() -> None:
+    assert ScoringWeights().freshness == 0.10
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +414,125 @@ def test_score_candidates_penalises_fatigued_topic() -> None:
     )
     scores = curator.score_candidates([fresh_topic, stale_topic], context)
     assert scores["BV1"] > scores["BV2"]
+
+
+def test_score_candidates_ranks_recent_confident_temporal_content_higher() -> None:
+    db, _ = _make_db()
+    curator = PoolCurator(db)
+    now = _now()
+    recent = _temporal_item(
+        bvid="BV_RECENT",
+        temporal_class="current",
+        temporal_confidence=0.8,
+        published_at=now.isoformat(),
+    )
+    older = _temporal_item(
+        bvid="BV_OLDER",
+        temporal_class="current",
+        temporal_confidence=0.8,
+        published_at=(now - timedelta(days=14)).isoformat(),
+    )
+    evergreen = _temporal_item(
+        bvid="BV_EVERGREEN",
+        temporal_class="evergreen",
+        temporal_confidence=1.0,
+        published_at=now.isoformat(),
+    )
+    for item in (recent, older, evergreen):
+        item.relevance_score = 0.8
+        item.source_strategy = "search"
+
+    scores = curator.score_candidates([recent, older, evergreen], ScoringContext(now=now))
+
+    assert scores["BV_RECENT"] > scores["BV_OLDER"] > scores["BV_EVERGREEN"]
+
+
+def test_temporal_ranking_shadow_records_aggregate_topk_counterfactual() -> None:
+    db, _ = _make_db()
+    curator = PoolCurator(
+        db,
+        weights=ScoringWeights(
+            relevance=1.0,
+            freshness=0.10,
+            topic_fatigue=0.0,
+            source_monotony=0.0,
+            serendipity=0.0,
+        ),
+    )
+    now = _now()
+    candidates = [
+        _temporal_item(
+            bvid=f"BV_EVERGREEN_{index}",
+            temporal_class="evergreen",
+            temporal_confidence=1.0,
+            published_at=now.isoformat(),
+        )
+        for index in range(11)
+    ]
+    for index, item in enumerate(candidates):
+        item.relevance_score = 0.99 - index * 0.01
+        item.source_strategy = "search"
+    breaking = _temporal_item(
+        bvid="BV_BREAKING_PRIVATE_ID",
+        temporal_class="breaking",
+        temporal_confidence=0.8,
+        published_at=now.isoformat(),
+    )
+    breaking.relevance_score = 0.85
+    breaking.source_strategy = "search"
+    candidates.append(breaking)
+    context = ScoringContext(now=now)
+    scores = curator.score_candidates(candidates, context)
+
+    audit = curator.build_temporal_ranking_shadow_audit(candidates, scores, context)
+
+    assert audit is not None
+    assert audit.candidate_count == 12
+    assert audit.parseable_published_count == 12
+    assert audit.bonus_eligible_count == 1
+    assert audit.class_counts == {"breaking": 1, "evergreen": 11}
+    top10 = audit.top_k_metrics[0]
+    assert top10.requested_top_k == 10
+    assert top10.overlap_count == 9
+    assert top10.jaccard == 0.818182
+    assert top10.entered_classes == {"breaking": 1}
+    assert top10.exited_classes == {"evergreen": 1}
+    assert curator.record_temporal_ranking_shadow_audit(candidates, scores, context) is True
+
+    stored = db.query_temporal_ranking_shadow_audit()
+    assert len(stored) == 1
+    assert stored[0]["candidate_count"] == 12
+    assert stored[0]["top_k_metrics"][0]["overlap_count"] == 9
+    assert "BV_BREAKING_PRIVATE_ID" not in str(stored[0])
+
+
+async def test_async_scoring_uses_same_publication_temporal_bonus_as_sync() -> None:
+    db, _ = _make_db()
+    curator = PoolCurator(db)
+    now = _now()
+    candidates = [
+        _temporal_item(
+            bvid="BV_BREAKING",
+            temporal_class="breaking",
+            temporal_confidence=0.8,
+            published_at=(now - timedelta(hours=12)).isoformat(),
+        ),
+        _temporal_item(
+            bvid="BV_UNKNOWN",
+            temporal_class="unknown",
+            temporal_confidence=1.0,
+            published_at=now.isoformat(),
+        ),
+    ]
+    for item in candidates:
+        item.relevance_score = 0.8
+        item.source_strategy = "search"
+    context = ScoringContext(now=now)
+
+    sync_scores = curator.score_candidates(candidates, context)
+    async_scores = await curator.score_candidates_async(candidates, context)
+
+    assert async_scores == sync_scores
 
 
 async def test_async_feedback_embedding_checks_key_and_group_once() -> None:

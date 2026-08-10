@@ -103,7 +103,7 @@
 
 ### 🔒 100% 本地，100% 你的
 
-所有数据留在你硬盘上的一个 SQLite 文件里。LLM 默认用你自己的 API Key，也可实验性复用本机 Codex CLI 的 ChatGPT OAuth 凭据。没有云端，没有账号，没有任何人能看到你的画像。这个 Agent 怎么长，完全你说了算——反馈推荐、对话调教、换 LLM、改数据库，随你。
+核心行为、推荐和对话数据留在你硬盘上的 SQLite，配置、画像、凭据与缓存也只保存在本机文件中。LLM 默认用你自己的 API Key，也可实验性复用本机 Codex CLI 的 ChatGPT OAuth 凭据。没有 OpenBiliClaw 运营的云端账号，没有任何人能看到你的画像。这个 Agent 怎么长，完全你说了算——反馈推荐、对话调教、换 LLM、迁移或改数据库，随你。
 
 > 💡 **和其他推荐工具的对比**
 >
@@ -341,14 +341,14 @@ Chrome Web Store / AMO 发布包默认只声明本机后端权限。让插件连
 openbiliclaw start
 ```
 
-- **桌面端**：浏览器直接访问 `http://127.0.0.1:8420/web`（或 `http://127.0.0.1:8420/`，自动跳转）。大屏两栏布局，推荐流、画像、聊天、消息和设置全在一页。
-- **移动端**：点击插件顶部的手机图标扫二维码，或手动输入 `http://<电脑局域网 IP>:8420/m/`。适合手机上刷推荐、看画像、和阿B聊天。
+- **桌面端**：浏览器直接访问 `http://127.0.0.1:8420/web`（或 `http://127.0.0.1:8420/`，自动跳转）。大屏两栏布局，推荐流、30 天历史、画像、聊天、消息和设置全在一页。
+- **移动端**：点击插件顶部的手机图标扫二维码，或手动输入 `http://<电脑局域网 IP>:8420/m/`。适合手机上刷推荐、回看 30 天历史、看画像和与阿B聊天。
 
 > 首次运行 `openbiliclaw init` 时会询问是否允许局域网访问（默认 Y）。如果选了 N 或想改回来，编辑 `config.toml` 的 `[api].host`（`0.0.0.0` = 通过可用的 IPv4 / IPv6 局域网访问，`127.0.0.1` = 仅本机）。二维码优先使用 IPv4；仅有 IPv6 时会自动生成带方括号的 IPv6 地址。
 
 打开 `/m/` 后可以把手机页面保存成桌面快捷入口：iPhone / iPad 用 Safari 的「分享 → 添加到主屏幕」；Android Chrome / Chromium 浏览器用菜单里的「安装应用」或「添加到主屏幕」。局域网 HTTP 在部分 Android 浏览器上可能只生成快捷方式；如果想要更稳定的完整 PWA 安装提示，建议在可信环境里用 HTTPS 反代访问本机后端。
 
-页面包含「推荐 / 稍后 / 收藏 / 画像 / 对话」五个底部 Tab：推荐页支持「换一批 / 加载更多 / 喜欢 / 不感兴趣 / 稍后再看 / 收藏 / 写一句 / 聊一聊」，稍后和收藏页管理「稍后再看 / 收藏」列表，画像页展示人格素描、核心特质、兴趣和认知更新，对话页与插件共享主聊天历史。
+页面底部收敛为「推荐 / 内容库 / 画像 / 对话」四个一级 Tab。内容库内再按「稍后再看 / 收藏 / 历史记录」切换：前两项管理保存列表；历史记录按「主动点开过 / 出现过但没点开 / 最近移除」分页展示近 30 天内容，同一内容的多个移除原因会一起显示，收藏和稍后再看可以分别恢复。旧的稍后、收藏和历史直达链接会自动迁移到对应内容库子项。
 
 <details>
 <summary>不用 AI 助手：直接跑一句话安装脚本</summary>
@@ -501,19 +501,20 @@ npm run package
 
 </details>
 
-## 🤖 接入 OpenClaw / AI 编码助手
+## 🤖 接入 OpenClaw / Hermes / WorkBuddy Agent
 
-OpenBiliClaw 仓库内置了一个 [workspace skill](skills/openbiliclaw-adapter/SKILL.md)。把仓库挂到任何支持 skill 的 AI 编码助手（OpenClaw / Claude Code / Codex CLI / Cursor 等），助手就能直接调用你本机上的 OpenBiliClaw。
+OpenBiliClaw 仓库内置了一个 [workspace skill](skills/openbiliclaw-adapter/SKILL.md) 和版本化的 Agent Bridge。把仓库挂到任何支持 skill 或本地 JSON CLI 的 Agent 宿主（OpenClaw / Hermes / WorkBuddy / Claude Code / Codex CLI / Cursor 等），宿主就能直接调用你本机上的 OpenBiliClaw。
 
 ### 接入之后能干什么
 
 - ✨ **主动推荐** — 系统在后台持续发现内容，遇到高分惊喜时通过 WebSocket 主动推送给 OpenClaw，OpenClaw 再转述给你——**你不需要开口问**
-- 🔮 **主动追问兴趣** — 系统猜测你可能对某个方向感兴趣，生成一个假设和问题，通过 OpenClaw 主动来问你"这个方向你认不认？"——你回答后画像自动更新
-- 🧭 **主动确认避雷** — 系统也会确认你可能想避开的内容形态，OpenClaw 可用 `next-avoidance-probe` / `respond-avoidance-probe` 完成确认；只有确认后才写入过滤偏好
-- 💬 **苏格拉底式对话** — 不止是确认兴趣，OpenClaw 可以跟你深聊：追问动机、提出假设、确认理解，越聊越懂你
+- 🔮 **主动追问兴趣** — 系统猜测你可能对某个方向感兴趣，支持 confirm / reject / defer / chat 四态反馈，画像自动更新
+- 🧭 **主动确认避雷** — 系统也会确认你可能想避开的内容形态，支持四态反馈；只有确认后才写入过滤偏好
+- 💬 **苏格拉底式对话** — 带 durable `turn_id` 的多轮对话，重试或切换宿主后仍可读取历史
 - 📖 **读当前灵魂画像** — MBTI、核心特质、深层需求、兴趣领域
-- 🎯 **按需拉个性化推荐** — 带解释、带置信度、带主题标签
-- 💬 **把反馈写回学习闭环** — `like` / `dislike` / `comment` 即时更新画像与池子评分
+- 🎯 **按需拉多源推荐** — 支持平台范围、换一批、追加、库存可用量和完整内容元数据
+- 💬 **把反馈写回学习闭环** — 推荐和惊喜卡片反馈都支持 durable 幂等
+- 💾 **本地优先保存** — 收藏 / 稍后再看先落本地；外部同步必须显式授权
 - 🔄 **同步 B 站账号行为** — 拉历史、收藏、关注等长期信号，注入记忆系统
 
 ### 一句话让 OpenClaw 完成接入
@@ -521,7 +522,7 @@ OpenBiliClaw 仓库内置了一个 [workspace skill](skills/openbiliclaw-adapter
 把下面这段粘给 OpenClaw（或 Claude Code / Codex CLI / Cursor），它会自动读指南并完成接入：
 
 ```text
-请按照 https://raw.githubusercontent.com/whiteguo233/OpenBiliClaw/main/docs/openclaw-quickstart.md 的说明帮我把当前仓库接入 OpenClaw(务必用 Bash 的 curl 下载这个文档,不要用 WebFetch — 会丢关键指令)
+请按照 https://raw.githubusercontent.com/whiteguo233/OpenBiliClaw/main/docs/openclaw-quickstart.md 的说明帮我把当前仓库接入 Agent Bridge（目标宿主是 OpenClaw；务必用 Bash 的 curl 下载这个文档，不要用 WebFetch — 会丢关键指令）
 ```
 
 ### 用户使用示例
@@ -569,9 +570,9 @@ OpenClaw 收到 `interest.probe` 事件（或主动拉取 `next-probe`），发�
 >
 > **OpenClaw**（内部执行 `recommend --limit 3`，整理后回复）
 
-整个闭环都是本地的——OpenClaw 只是调 CLI 桥接，画像和数据仍留在你自己的 SQLite 文件里，一条都不会上云。
+整个闭环都是本地的——Agent 宿主只是调 CLI 桥接，画像和数据仍留在你自己的 SQLite 文件里，一条都不会上云。
 
-> 📖 完整命令参考与常见问题，见 [OpenClaw 接入指南](docs/openclaw-quickstart.md)。
+> 📖 完整命令参考与常见问题，见 [Agent Bridge 接入指南](docs/openclaw-quickstart.md) 和 [能力说明](docs/agent-integration.md)。宿主启动后先执行 `capabilities`，不要缓存旧的功能子集。
 
 ## ✨ 核心特性
 
@@ -584,10 +585,12 @@ OpenClaw 收到 `interest.probe` 事件（或主动拉取 `next-probe`），发�
 - 💬 **有温度的推荐理由** — 像朋友一样解释为什么你会喜欢，而不是「因为你看过类似视频」
 - 🔄 **持续学习** — 苏格拉底式对话 + 行为分析 + 反馈即时生效，越用越懂你
 - ⭐ **本地优先收藏 / 稍后看** — 推荐卡先写本地 SQLite，自动同步默认关闭；桌面 Web 刷新后首屏就显示保存数量徽标；B站和六个扩展平台均支持收藏与原生稍后看/收藏回退，2026-07-14 七平台两类动作真实账号回归均为 `synced/already_synced`
+- 🕘 **30 天内容历史** — 插件、桌面与移动端统一显示点开过、出现未点和最近移除；按页懒加载封面，移除的本地收藏 / 稍后看可一键恢复
 - 🧩 **浏览器插件** — Chrome / Edge / Brave / Arc / Firefox，侧边栏推荐 + 跨站行为采集，装上就能用
 - 🚀 **图形化引导初始化** — 安装包 `/setup/`、桌面 Web 和插件都能点一下完成初始化，不碰命令行
+- 📦 **跨机器迁移** — 桌面配置页一键导出 / 导入可移植配置、SQLite、画像、Cookie 与图片缓存；导入先校验暂存，可查询 / 取消，重启后带回滚副本应用。`.obcbackup` 含明文敏感信息，但不含源机 API 登录密码 / 会话签名密钥或扩展设备 key
 - 🔬 **自动化评测优化** — 5 个模块各带 LLM-as-judge 自优化循环，prompt 质量随轮次自动提升
-- 🔒 **完全私有** — 所有数据本地 SQLite，LLM 用你自己的 Key，每个实例只为你一个人构建
+- 🔒 **完全私有** — SQLite、配置、画像与缓存都留在本机，LLM 用你自己的 Key，每个实例只为你一个人构建
 - 🔌 **本地 embedding** — 可选 Ollama + bge-m3，CPU 即可，无需额外 API Key
 - 🔧 **完全可控** — 同类型 LLM 可配置多个独立渠道，拖拽全局 / 模块故障切换链；也可直接编辑画像、写自定义 Skill
 
@@ -607,10 +610,21 @@ background ─ background admission (default 3) ──────┘
 引导初始化：信号 → 偏好 → 完整画像提交 → 发现 → 评估 → 推荐文案 → canonical 内容可用
                                                      └→ 终态后再调度可选探针
 
+Agent 宿主（OpenClaw / Hermes / WorkBuddy）
+         → capabilities(agent-bridge/v2) + JSON CLI / skill descriptors
+         → integrations.agent 别名 / integrations.openclaw 兼容适配器
+         → runtime / soul / recommendation / saved_sync 业务所有者
+
 配置恢复草稿（正常或降级；业务 API 仍阻断）
          ├→ /api/config/probe-service → 临时 registry → 总并发 gate
          └→ /api/config/discover-models → 精确实例 GET /models（不写配置）
                                       → 可编辑模型下拉 + 本地 Effort 建议
+抖音来源补货：daemon presence 门（显式手动调用绕过）→ 单轮共享插件等待预算
+             → dy_task 终态 → pending_eval；离线零入队，失败有界退避
+本机数据迁移：导出 → 去除 api.auth 的配置 + SQLite 在线快照 + 可移植文件 → 明文 .obcbackup
+            导入(request_id) → processing(上传/校验) → 私有暂存 ↔ status / cancel
+                               ↘ 每次打开通用设置强制对账；applied 偏好按 migration_id 每浏览器一次
+                               → 重启取得项目 + canonical data-dir lock → 替换成功 | 回滚原数据
 持久对话回复：reply_to_turn_id + 固定时间/payload → POST-time frozen binding → pending SQLite → rowid 串行 reply worker → 可见 completion CAS（app-stable 对话 lease）
 回复后学习/对象结算：独立 11-kind typed 结算单队列 → actual worker + guard
 确认入口（待聊列表/卡片）→ 单锚(kind+ref+generation) → 全入口 frozen admission / 归属矩阵
@@ -622,7 +636,7 @@ background ─ background admission (default 3) ──────┘
                        ├→ one context digest → prompt/history/event/learn/settlement provenance
                        ├→ action 本地≤1s：完成 200 / 阻塞 202 → popup/移动/桌面 1/2/5s 轮询≤30s
                        └→ 疑惑 FIFO≤5 / 队头 fencing / 12h 补扫
-配置保存：事务落盘后统一 HTTP 202 queued/apply_revision → latest-wins 后台应用队列 → apply-status / 成功失败回执
+配置保存：事务落盘后统一 HTTP 202 queued/apply_revision → latest-wins 后台应用队列 → apply-status / 成功失败回执；data_dir 仅持久化，完整重启后切换
 配置热重载：保持接单并排空旧 worker → 原子暂停/revoke → 新 worker；安全窗25分钟
 实时连接：runtime-stream 20s idle 心跳 → 短暂 close 显示重连中并自动续连
 封面：proxy 前台 + refresh 预取 → app-stable lane（总4/后台3、前台优先）
@@ -648,6 +662,7 @@ background ─ background admission (default 3) ──────┘
 ├─────────┴──────────┴───────────┴───────────────┤
 │ 普通事件/推荐点击 → generic durable cursor ─┐    │
 │ 内容反馈 → content_feedback durable cursor ─┴→ buffer+cursor 同一原子 checkpoint │
+│ 30天历史：click events + recommendations + saved_item_removals → 三端分页/lazy │
 │ dislike：单卡同步隐藏；主题写入后 effective snapshot → 推荐历史/换批/通知最终复核 │
 │ discovery 可继续宽搜；异步语义清池只优化库存，不作为展示正确性边界 │
 │ 首启 fence+task admission → listener；后台 owner recovery → tick_if_buffered │
@@ -655,6 +670,9 @@ background ─ background admission (default 3) ──────┘
 │ 对话 → typed settlement worker → learning          │
 │ 旧反馈批：unified_interest_line=false 时启用   │
 │ 初始化屏障：完整画像落盘 → 发现/评估/表达 → 可浏览推荐 │
+│ B站供给：普通相关性搜索 + 预算内 1×5 pubdate recent lane → 统一评估 │
+│ 候选评估：时间中性相关性 + Agent 时效分型 → 发布时间高置信正向 bonus │
+│ 推荐时效 shadow：含 bonus vs 无 bonus Top10/50/100 聚合 → class/source/age 审计（不改 serving）│
 │ 封面：proxy前台 + refresh预取 → app-stable 4/3 lane → singleflight/原子缓存 │
 │ Soul 认知纪律：待聊双轨冷却 · 单对话锚 · worker-only 结算 · 轻量 winner receipt · 疑惑 FIFO · 台账 · 深层门控 │
 │   LLM 适配层 · 多平台源适配（SourceAdapter）        │
@@ -662,6 +680,7 @@ background ─ background admission (default 3) ──────┘
 │   可选视觉预热：封面 / 画像质心 / 关键帧 + 弹幕 document embedding     │
 │   provenance（provider/model/dim/采样）→ 成功空 / 瞬时失败 → 下轮重试   │
 │   配置恢复草稿（正常/降级）→ 临时探测 / 精确实例 /models（不写盘）│
+│   本机迁移：checksummed .obcbackup → request-id pending ↔ status/cancel → 重启 replace/rollback │
 │  来源族注册表：alias · strategy · URL host             │
 │             → pool 统计 · seen_items 持久化已看账本     │
 │ Bangumi 官方匿名 API → search/ranked/latest producer → shared eval │
@@ -670,8 +689,8 @@ background ─ background admission (default 3) ──────┘
 │ cognition named views → task-scoped gate：仅 awareness_confusions compact；其余 legacy │
 │ token diet：偏好逐段真实装箱；洞察 近期/裁决保底 + 相关/重要/多样性加权≤40 → 完整历史 merge │
 │ keyword planner → 24h 安全跨 digest pending 整理 → 缺口/生成/领取（0=硬过期）│
-│ admitted backlog → copy-ready 高水位缺口补文案 → serve 后异步回水（0=legacy drain-all）│
-│ API projected 库存 → 3×30 worker → 串行入池；OpenClaw 首批≤4 → copy≤4/不拆分重试 → 四端 │
+│ admitted backlog → copy 水位 ∪ 可换 topic 空位缺口 → eligible-first 补文案（0=legacy drain-all）│
+│ API projected=available+eligible copy-pending+evaluated → 3×30 worker → 串行入池 → 四端 │
 │ API raw 断供 → 欠份额来源即时并行补给 → 真实新增清退避 / 重复空转阶梯退避 │
 │ 惊喜就绪门：正式推荐词/主题就绪 + seen_items 硬过滤 → 打分并原子快照 → 四端 × 写回已看账本 │
 │ 库存 API/OpenClaw 启动钩子 → 历史恢复/原子维护 → 再暴露 LLM │
@@ -690,7 +709,7 @@ background ─ background admission (default 3) ──────┘
 │ exact OpenBiliClaw / YouTube Watch Later 目标 → 安全 task-result          │
 │ trusted-local E2E 精确授权 → 单 item saved sync → 六字段安全 callback      │
 │ unsupported_adapter_missing 可重试 · unsupported_content_type local-only │
-│ Canonical ID · Local-first SavedSync · Task Poll · SQLite（事件 · 已看账本 · 候选池 · 推荐 · 保存/任务）│
+│ Canonical ID · Local-first SavedSync · Task Poll · SQLite（事件 · 已看账本 · 候选池 · 推荐 · 保存/任务 · 移除快照）│
 │ 六平台 adapter → broker → shared MV3 recovery barrier → Reddit/X/YT/XHS/DY/Zhihu executor（6/6 fixture + real-account）│
 └────────────────────────────────────────────────┘
 
@@ -872,7 +891,7 @@ OpenBiliClaw 的目标是做你的**全网个性化内容入口**——从 B 站
 
 ## 隐私速览
 
-默认数据流向：浏览器插件 → 你配置的本地 OpenBiliClaw 后端 → 本机 SQLite。插件不会把数据发送到 OpenBiliClaw 开发者运营的服务器。若你配置云端 LLM / embedding，相关内容会按你的配置发送给对应服务商。详见 [隐私政策](docs/privacy.md)。
+默认数据流向：浏览器插件 → 你配置的本地 OpenBiliClaw 后端 → 本机 SQLite / 数据文件。插件不会把数据发送到 OpenBiliClaw 开发者运营的服务器。若你配置云端 LLM / embedding，相关内容会按你的配置发送给对应服务商。你主动从配置页导出的 `.obcbackup` 可能包含模型 / 来源 API Key、Cookie、画像和历史，且**没有加密**；它会排除源机整段 API auth（密码、session、设备 key 等），但仍只能在可信设备间传递。详见 [隐私政策](docs/privacy.md)。
 
 ## 📄 License
 

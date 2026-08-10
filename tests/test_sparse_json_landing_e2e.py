@@ -24,12 +24,8 @@ from openbiliclaw.llm.base import LLMResponse
 from openbiliclaw.soul.profile import InterestTag, SoulProfile
 from openbiliclaw.storage.database import Database
 
-_HISTORICAL_PRODUCTION_SYSTEM_SHA256 = (
-    "589bee46f1167c3c1dfde9b92bc28fa241fdcbeb378d75912ec81d88b81611c3"
-)
-_HISTORICAL_PRODUCTION_USER_SHA256 = (
-    "62fbf2e03401ac36efe4ff935b1a424eb8a147497fd46ff296e2a5202b7bd68f"
-)
+_V4_PRODUCTION_SYSTEM_SHA256 = "53f1ed5efef79a3f28b897d762ea8b655579a872cbeb5c39e24ff95c4220ff49"
+_V4_PRODUCTION_USER_SHA256 = "62fbf2e03401ac36efe4ff935b1a424eb8a147497fd46ff296e2a5202b7bd68f"
 
 
 def _profile(*, private: bool = False) -> SoulProfile:
@@ -190,10 +186,9 @@ async def test_default_engine_uses_sparse_local_ids_on_cold_and_warm_prompt_path
         "2026-08-04T08:00:00Z",
     ]
     user_input = str(llm.calls[0]["user_input"])
-    evaluation_context = (
-        user_input.split("<evaluation_context>\n\n", 1)[1]
-        .split("\n\n</evaluation_context>", 1)[0]
-    )
+    evaluation_context = user_input.split("<evaluation_context>\n\n", 1)[1].split(
+        "\n\n</evaluation_context>", 1
+    )[0]
     assert json.loads(evaluation_context) == {"evaluated_at": "2026-08-05T12:34:56Z"}
     assert candidate_block.startswith('{"defaults":')
     assert not candidate_block.startswith("ROW-WIRE-V1")
@@ -209,7 +204,7 @@ async def test_default_engine_uses_sparse_local_ids_on_cold_and_warm_prompt_path
 
     cache_keys = list(engine._eval_cache_store())  # noqa: SLF001
     assert cache_keys
-    assert all(key.startswith("content-eval-v3:batch:") for key in cache_keys)
+    assert all(key.startswith("content-eval-v4:batch:") for key in cache_keys)
     assert all(key.endswith(":transport:sparse-json") for key in cache_keys)
 
 
@@ -391,7 +386,7 @@ class _ProductionRollbackService:
 
 
 @pytest.mark.asyncio
-async def test_explicit_production_rollback_matches_frozen_historical_prompt_hashes(
+async def test_explicit_production_rollback_matches_v4_prompt_golden(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -418,11 +413,9 @@ async def test_explicit_production_rollback_matches_frozen_historical_prompt_has
     system_instruction = str(llm.calls[0]["system_instruction"])
     user_input = str(llm.calls[0]["user_input"])
     assert hashlib.sha256(system_instruction.encode("utf-8")).hexdigest() == (
-        _HISTORICAL_PRODUCTION_SYSTEM_SHA256
+        _V4_PRODUCTION_SYSTEM_SHA256
     )
-    assert hashlib.sha256(user_input.encode("utf-8")).hexdigest() == (
-        _HISTORICAL_PRODUCTION_USER_SHA256
-    )
+    assert hashlib.sha256(user_input.encode("utf-8")).hexdigest() == (_V4_PRODUCTION_USER_SHA256)
 
     candidate_block = _candidate_block(user_input)
     production_items = json.loads(candidate_block)

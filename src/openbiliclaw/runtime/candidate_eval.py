@@ -38,6 +38,7 @@ class CandidateEvalSnapshot:
     evaluating: int
     evaluated_pending_admission: int
     admitted_pending_copy: int
+    admitted_pending_available: int | None = None
 
 
 def effective_candidate_eval_workers(configured: int, llm_concurrency: int) -> int:
@@ -268,6 +269,11 @@ class CandidateEvalCoordinator:
             evaluating=int(value.get("evaluating", 0)),
             evaluated_pending_admission=int(value.get("evaluated_pending_admission", 0)),
             admitted_pending_copy=int(value.get("admitted_pending_copy", 0)),
+            admitted_pending_available=(
+                int(value["admitted_pending_available"])
+                if value.get("admitted_pending_available") is not None
+                else None
+            ),
         )
 
     def _fill_open_slots(self) -> float | None:
@@ -321,7 +327,7 @@ class CandidateEvalCoordinator:
             return
         admission_headroom = max(
             0,
-            snapshot.target - snapshot.available - snapshot.admitted_pending_copy,
+            snapshot.target - snapshot.available - self._eligible_pending_inventory(snapshot),
         )
         if admission_headroom <= 0:
             return
@@ -339,7 +345,9 @@ class CandidateEvalCoordinator:
                 snapshot = self._snapshot()
                 admission_headroom = max(
                     0,
-                    snapshot.target - snapshot.available - snapshot.admitted_pending_copy,
+                    snapshot.target
+                    - snapshot.available
+                    - self._eligible_pending_inventory(snapshot),
                 )
                 result = await self.pipeline.complete_claim(
                     outcome,
@@ -565,9 +573,23 @@ class CandidateEvalCoordinator:
     def _projected_inventory(snapshot: CandidateEvalSnapshot) -> int:
         return (
             max(0, snapshot.available)
-            + max(0, snapshot.admitted_pending_copy)
+            + CandidateEvalCoordinator._eligible_pending_inventory(snapshot)
             + max(0, snapshot.evaluated_pending_admission)
         )
+
+    @staticmethod
+    def _eligible_pending_inventory(snapshot: CandidateEvalSnapshot) -> int:
+        """Return pending-copy rows that can fill a public inventory slot.
+
+        ``None`` preserves compatibility with older snapshot providers while
+        production composition roots always inject the canonical eligible
+        count from storage.
+        """
+
+        value = snapshot.admitted_pending_available
+        if value is None:
+            value = snapshot.admitted_pending_copy
+        return max(0, int(value))
 
     @staticmethod
     def _resume_notification(reason: str) -> bool:

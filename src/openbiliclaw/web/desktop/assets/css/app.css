@@ -869,7 +869,7 @@
     .message-item .inline-chat-bubble.thinking { color: var(--muted); animation: pulse 1.5s ease-in-out infinite; }
     .message-item .inline-chat-reply { justify-self: start; background: var(--surface); color: var(--fg); }
     .message-item .inline-chat-bubble.error { border-color: color-mix(in oklab, var(--danger), var(--border-soft) 55%); background: color-mix(in oklab, var(--danger), var(--surface) 90%); color: var(--danger); }
-    #homePage, #watchLaterPage, #favoritesPage, #profilePage, #chatPage, #settingsPage { animation: page-enter 160ms var(--ease-standard); }
+    #homePage, #contentLibraryPage, #profilePage, #chatPage, #settingsPage { animation: page-enter 160ms var(--ease-standard); }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
     @keyframes page-enter {
       from { opacity: 0; }
@@ -920,6 +920,39 @@
     .profile-chip-row { display: flex; flex-wrap: wrap; gap: var(--space-2); }
     .profile-section-title { margin: var(--space-3) 0 var(--space-2); color: var(--fg); font-size: var(--text-base); font-weight: 700; }
     .content-page { width: 100%; max-width: min(1120px, var(--recommendation-grid-max)); margin-inline: auto; }
+    .content-library-page-head { margin-bottom: var(--space-4); }
+    .content-library-page-head h2 { margin: var(--space-1) 0; }
+    .content-library-tabs {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: var(--space-6);
+      padding: 5px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-lg);
+      background: color-mix(in oklab, var(--surface), var(--bg) 35%);
+    }
+    .content-library-tab {
+      display: inline-flex;
+      min-width: 0;
+      min-height: 44px;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      padding: 8px 12px;
+      border: 0;
+      border-radius: var(--radius-md);
+      background: transparent;
+      color: var(--fg-2);
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard), box-shadow var(--motion-fast) var(--ease-standard);
+    }
+    .content-library-tab:hover { background: var(--surface); color: var(--fg); }
+    .content-library-tab.is-active { background: var(--surface); color: var(--accent); box-shadow: var(--elev-ring), var(--elev-1); }
+    .content-library-tab:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+    .content-library-panel[hidden] { display: none; }
     .content-page-head, .profile-page-head { display: flex; align-items: end; justify-content: space-between; gap: var(--space-5); margin-bottom: var(--space-6); }
     .content-page-head h2, .profile-page-head h2 { margin-top: var(--space-1); }
     .profile-page-list { gap: var(--space-4); }
@@ -1210,6 +1243,22 @@
     .settings-probe-status { flex: 1 1 240px; min-width: 0; color: var(--muted); font-size: var(--text-sm); line-height: 1.45; overflow-wrap: anywhere; }
     .settings-probe-status[data-tone="success"] { color: var(--success); }
     .settings-probe-status[data-tone="error"] { color: var(--danger); }
+    .settings-migration-card { grid-column: 1 / -1; display: grid; gap: var(--space-4); min-width: 0; padding: clamp(18px, 2.4vw, 28px); border: 1px solid color-mix(in oklab, var(--accent), var(--border) 72%); border-radius: var(--radius-lg); background: linear-gradient(145deg, color-mix(in oklab, var(--surface), var(--accent) 7%), color-mix(in oklab, var(--surface), var(--bg) 34%)); box-shadow: var(--elev-ring); }
+    .settings-migration-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4); min-width: 0; }
+    .settings-migration-head h3 { margin: 0; color: var(--fg); font-size: clamp(20px, 2vw, 25px); line-height: 1.25; }
+    .settings-migration-badge { flex: 0 0 auto; display: inline-flex; align-items: center; min-height: 28px; padding: 3px 10px; border: 1px solid color-mix(in oklab, var(--accent), var(--border-soft) 55%); border-radius: var(--radius-pill); background: color-mix(in oklab, var(--surface), var(--accent) 10%); color: var(--accent-strong); font-size: 12px; font-weight: 750; white-space: nowrap; }
+    .settings-migration-copy { margin: 0; color: var(--fg-2); line-height: 1.65; overflow-wrap: anywhere; }
+    .settings-migration-inventory { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-3); min-width: 0; }
+    .settings-migration-inventory > span { display: grid; align-content: start; gap: 5px; min-width: 0; padding: var(--space-3); border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: color-mix(in oklab, var(--surface), transparent 4%); }
+    .settings-migration-inventory strong { color: var(--fg); font-size: var(--text-sm); }
+    .settings-migration-inventory small { color: var(--muted); line-height: 1.5; overflow-wrap: anywhere; }
+    .settings-migration-warning { margin: 0; padding: var(--space-3) var(--space-4); border: 1px solid color-mix(in oklab, var(--warn), var(--border-soft) 52%); border-radius: var(--radius-md); background: color-mix(in oklab, var(--surface), var(--warn) 10%); color: color-mix(in oklab, var(--warn-fg), var(--fg) 25%); line-height: 1.55; overflow-wrap: anywhere; }
+    .settings-migration-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); }
+    .settings-migration-actions button:disabled { opacity: 0.55; cursor: wait; }
+    .settings-migration-status { min-height: 1.5em; margin: 0; color: var(--muted); font-size: var(--text-sm); line-height: 1.5; overflow-wrap: anywhere; }
+    .settings-migration-status[data-tone="pending"] { color: var(--accent-strong); }
+    .settings-migration-status[data-tone="success"] { color: var(--success); }
+    .settings-migration-status[data-tone="error"] { color: var(--danger); }
     /* Verification answers in three, not two. "Could not tell" — a dead proxy, a
        closed browser, a throttled platform, YouTube needing no login at all — is
        not a failure, and painting it red sends users off to delete a cookie that
@@ -1574,6 +1623,7 @@
       .delight-main-actions { flex-basis: 212px; grid-template-columns: 116px 88px; }
       .delight-feedback-actions { width: 128px; }
       .settings-grid, .settings-panel, .settings-subpanel, .inline-row, .settings-advanced-fields { grid-template-columns: 1fr; }
+      .settings-migration-inventory { grid-template-columns: 1fr; }
       .llm-instance-grid, .llm-module-grid { grid-template-columns: 1fr; }
       .llm-instance-dialog { padding: 0; }
       .llm-instance-dialog-panel { width: 100%; height: 100%; max-height: none; border: 0; border-radius: 0; }
@@ -1618,6 +1668,10 @@
       .spec-actions { flex-wrap: wrap; }
     }
     @media (max-width: 620px) {
+      .settings-migration-head { display: grid; }
+      .settings-migration-badge { width: fit-content; }
+      .settings-migration-actions { align-items: stretch; }
+      .settings-migration-actions .pill-btn { flex: 1 1 160px; }
       .delight-actions { flex-wrap: wrap; justify-content: stretch; }
       .delight-main-actions { flex: 1 1 212px; grid-template-columns: minmax(116px, 1fr) 88px; }
       .delight-feedback-actions { flex: 0 0 128px; margin-left: auto; }
@@ -1700,6 +1754,8 @@
 .nav-count-badge[hidden] { display: none; }
 .saved-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: var(--space-4, 16px); }
 .saved-page .saved-card { cursor: default; }
+.saved-page .saved-card .saved-cover-fallback { width: 100%; height: 100%; display: grid; place-items: center; color: var(--muted); }
+.saved-page .saved-card .saved-cover-fallback svg { width: 28px; height: 28px; }
 .saved-sync-status { min-height: 20px; margin: 0 0 var(--space-3); color: var(--fg-2); font-size: 12px; }
 #watchLaterSyncAll, #favoritesSyncAll { min-inline-size: 190px; }
 .saved-card-actions { display: flex; justify-content: flex-end; gap: var(--space-2); flex-wrap: wrap; }
@@ -1737,6 +1793,49 @@
   background: color-mix(in oklab, var(--surface), var(--accent) 8%);
 }
 .saved-page .saved-empty { padding: 64px 24px; text-align: center; color: var(--fg-2); }
+
+/* ── Bounded content history ───────────────────────────────── */
+.history-page-head {
+  padding: var(--space-5);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(135deg, var(--surface), var(--accent-subtle));
+}
+.history-sections { display: grid; gap: var(--space-5); margin-top: var(--space-5); }
+.history-section { padding: var(--space-5); border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--surface); }
+.history-section-head { display: flex; align-items: end; justify-content: space-between; gap: var(--space-4); }
+.history-section-head h3 { margin: 3px 0 0; font-size: 20px; line-height: 1.2; }
+.history-section-count { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.history-section-description { margin: 6px 0 var(--space-4); color: var(--fg-2); font-size: 13px; }
+.history-section-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: var(--space-3); }
+.history-card { overflow: hidden; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: color-mix(in oklab, var(--surface), var(--bg) 28%); }
+.history-card-open { display: grid; grid-template-columns: 118px minmax(0, 1fr); width: 100%; min-height: 82px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.history-card-open:disabled { cursor: default; }
+.history-card-media { display: flex; width: 118px; height: 82px; align-items: center; justify-content: center; overflow: hidden; background: var(--accent-subtle); color: var(--muted); }
+.history-card-media img { width: 100%; height: 100%; object-fit: cover; }
+.history-card-media svg { width: 25px; height: 25px; }
+.history-card-media.is-fallback { flex-direction: column; gap: 4px; }
+.history-card-copy { display: flex; min-width: 0; flex-direction: column; padding: 10px 11px; }
+.history-card-title { display: -webkit-box; overflow: hidden; color: var(--fg); font-size: 13px; font-weight: 750; line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.history-card-author { overflow: hidden; margin-top: 3px; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.history-card-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: auto; color: var(--muted); font-size: 10px; }
+.history-card-meta span:first-child { color: var(--accent); }
+.history-card-contexts { display: grid; border-top: 1px solid var(--border-soft); }
+.history-card-context { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 52px; padding: 4px 8px 4px 11px; }
+.history-card-context + .history-card-context { border-top: 1px solid var(--border-soft); }
+.history-card-context-copy { display: grid; min-width: 0; gap: 2px; color: var(--fg-2); font-size: 11px; }
+.history-card-context-copy time { color: var(--muted); font-size: 10px; }
+.history-card-restore { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; min-height: 38px; border: 0; border-top: 1px solid var(--border-soft); background: transparent; color: var(--accent); font-size: 12px; font-weight: 700; cursor: pointer; }
+.history-card-context .history-card-restore { width: auto; min-width: 44px; min-height: 44px; padding: 7px 10px; border-top: 0; border-radius: var(--radius-sm); background: var(--accent-subtle); }
+.history-card-restore svg { width: 15px; height: 15px; }
+.history-card-restore:disabled { color: var(--muted); cursor: default; }
+.history-empty { padding: 42px 20px; border: 1px dashed var(--border-soft); border-radius: var(--radius-md); color: var(--muted); text-align: center; }
+.history-page-message { margin: var(--space-3) 0 0; padding: 10px 12px; border-radius: var(--radius-sm); font-size: 12px; line-height: 1.5; }
+.history-page-message.is-error { border: 1px solid color-mix(in oklab, var(--danger), transparent 70%); background: color-mix(in oklab, var(--danger), transparent 92%); color: var(--danger); }
+.history-page-message.is-notice { border: 1px solid var(--border-soft); background: var(--accent-subtle); color: var(--fg-2); }
+.history-section-more { display: flex; justify-content: center; margin-top: var(--space-4); }
+.history-card-open:focus-visible, .history-card-restore:focus-visible { outline: 3px solid color-mix(in oklab, var(--accent), transparent 68%); outline-offset: 2px; }
+
 @media (max-width: 820px), (pointer: coarse) {
   .video-card .feedback-icon-btn.watch-later-btn,
   .video-card .feedback-icon-btn.favorite-btn,
@@ -1745,6 +1844,8 @@
     flex-basis: 44px; width: 44px; min-width: 44px; height: 44px; min-height: 44px;
   }
   .saved-page .small-btn, .saved-page .pill-btn, .saved-load-retry { min-width: 44px; min-height: 44px; }
+  .history-card-restore, .history-section-more .pill-btn { min-height: 44px; }
+  .history-section-list { grid-template-columns: 1fr; }
 }
 
 /* ── Save toggles in the feedback row (稍后再看 = 时钟 / 收藏 = 星星) ──

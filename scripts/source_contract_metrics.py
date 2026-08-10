@@ -24,14 +24,13 @@ Standard library only, so this runs in any CI job that has a Python 3.11+.
 
 Usage::
 
-    python scripts/source_contract_metrics.py           # human-readable table
-    python scripts/source_contract_metrics.py --json    # machine-readable
-    python scripts/source_contract_metrics.py --check    # exit 1 unless all on target
+    PYTHONPATH="$PWD/src" "$SOURCE_SKILL_PYTHON" scripts/source_contract_metrics.py --check
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import sys
@@ -45,29 +44,116 @@ if TYPE_CHECKING:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Canonical platform slugs the contract has to cover (spec "Goal" / D2 table).
-# Bangumi joined as the 8th platform when main merged in; it now carries a full
-# contract and a verify action like the rest, so metric 4's denominator has to
-# include it or the gate would pass at 7/8 and quietly excuse a missing action.
-PLATFORMS: tuple[str, ...] = (
-    "bilibili",
-    "xiaohongshu",
-    "douyin",
-    "youtube",
-    "twitter",
-    "zhihu",
-    "reddit",
-    "bangumi",
-)
 
-# HTTP routes address platforms by short alias; normalise before counting.
-API_SLUG_ALIASES: dict[str, str] = {
-    "bili": "bilibili",
-    "xhs": "xiaohongshu",
-    "dy": "douyin",
-    "yt": "youtube",
-    "x": "twitter",
-}
+def _source_family_inventory() -> tuple[tuple[str, ...], dict[str, str]]:
+    """Derive the metric denominator and route aliases from the canonical registry."""
+    path = REPO_ROOT / "src/openbiliclaw/sources/platforms.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    constants: dict[str, str] = {}
+    rules: ast.expr | None = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        constants[target.id] = node.value.value
+            if any(
+                isinstance(target, ast.Name) and target.id == "SOURCE_FAMILY_RULES"
+                for target in node.targets
+            ):
+                rules = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                constants[node.target.id] = node.value.value
+            if node.target.id == "SOURCE_FAMILY_RULES":
+                rules = node.value
+
+    if not isinstance(rules, (ast.Tuple, ast.List)):
+        raise RuntimeError("SOURCE_FAMILY_RULES must be a literal tuple/list for metrics")
+
+    def _string(node: ast.expr) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            return constants.get(node.id)
+        return None
+
+    families: list[str] = []
+    aliases: dict[str, str] = {}
+    for rule in rules.elts:
+        if (
+            not isinstance(rule, ast.Call)
+            or not isinstance(rule.func, ast.Name)
+            or rule.func.id != "SourceFamilyRule"
+        ):
+            raise RuntimeError("every SOURCE_FAMILY_RULES entry must be a literal SourceFamilyRule")
+        keywords = {item.arg: item.value for item in rule.keywords if item.arg}
+        family_node = keywords.get("family")
+        family = _string(family_node) if family_node is not None else None
+        if family is None:
+            raise RuntimeError("every SourceFamilyRule needs a statically readable family keyword")
+        if family in families:
+            raise RuntimeError(f"duplicate canonical source family in metrics registry: {family}")
+        families.append(family)
+        aliases[family] = family
+        alias_node = keywords.get("platform_aliases")
+        if (
+            not isinstance(alias_node, ast.Call)
+            or not isinstance(alias_node.func, ast.Name)
+            or alias_node.func.id != "frozenset"
+            or len(alias_node.args) != 1
+            or not isinstance(alias_node.args[0], (ast.Set, ast.Tuple, ast.List))
+        ):
+            raise RuntimeError(
+                f"SourceFamilyRule {family!r} needs a literal frozenset platform_aliases"
+            )
+        for alias_node_item in alias_node.args[0].elts:
+            alias = _string(alias_node_item)
+            if alias is None:
+                raise RuntimeError(f"SourceFamilyRule {family!r} has a non-literal platform alias")
+            owner = aliases.get(alias)
+            if owner is not None and owner != family:
+                raise RuntimeError(
+                    f"platform alias {alias!r} is shared by {owner!r} and {family!r}"
+                )
+            aliases[alias] = family
+    if not families:
+        raise RuntimeError("SOURCE_FAMILY_RULES contains no statically readable families")
+    return tuple(dict.fromkeys(families)), aliases
+
+
+# Unlike the original fixed eight-entry table, this changes automatically when
+# a new canonical family is registered, so a templated verify route cannot make
+# an 8/8 metric conceal a ninth platform missing from the surrounding contract.
+PLATFORMS, API_SLUG_ALIASES = _source_family_inventory()
+
+
+def _literal_registry_keys(relative: str, name: str) -> set[str]:
+    """Read string keys from one top-level literal registry assignment."""
+    path = REPO_ROOT / relative
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    value: ast.expr | None = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            value = node.value
+            break
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+        ):
+            value = node.value
+            break
+    if not isinstance(value, ast.Dict):
+        raise RuntimeError(f"{relative}:{name} must be a top-level literal dict for metrics")
+    return {
+        key.value
+        for key in value.keys
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    }
+
 
 API_DIR = Path("src/openbiliclaw/api")
 APP_PY = Path("src/openbiliclaw/api/app.py")
@@ -432,11 +518,11 @@ def measure_platforms_with_verify() -> Metric:
     Counting rule: scan every route in the API package for a path shaped
     ``/api/sources/<slug>/verify``.
 
-    * A templated slug (``{slug}``) is one route serving every platform, so it
-      counts as all 7. Phase 2 ships exactly that shape -- counting literal
-      slugs only would make the target of 7 unreachable by design. This gate
-      cannot prove the dispatcher really handles all 7; ``test_verify_method_
-      matches_actual_io`` is what enforces per-platform honesty.
+    * A templated slug (``{slug}``) makes the route reachable for every platform,
+      but a platform counts only when both ``SOURCE_AUTH_PROVIDERS`` and
+      ``VERIFY_ACTIONS`` contain it. The denominator comes independently from
+      the canonical source-family registry, so a newly registered ninth source
+      cannot turn a missing dispatcher entry into a self-fulfilling 9/9.
     * Literal slugs are de-duplicated through ``API_SLUG_ALIASES`` so that
       ``/api/sources/dy/verify`` counts as douyin exactly once.
 
@@ -444,6 +530,10 @@ def measure_platforms_with_verify() -> Metric:
     """
     covered: set[str] = set()
     evidence: list[str] = []
+    providers = _literal_registry_keys(
+        "src/openbiliclaw/api/source_auth/providers.py", "SOURCE_AUTH_PROVIDERS"
+    )
+    actions = _literal_registry_keys("src/openbiliclaw/api/source_auth/verify.py", "VERIFY_ACTIONS")
 
     for path, source in _api_sources():
         for _verb, route, _call, offset in _iter_routes(source):
@@ -457,13 +547,17 @@ def measure_platforms_with_verify() -> Metric:
             else:
                 covered.add(API_SLUG_ALIASES.get(slug, slug))
 
+    wired = covered & providers & actions & set(PLATFORMS)
     return Metric(
         key="platforms_with_verify_endpoint",
         label="有 verify 动作的平台",
-        value=len(covered & set(PLATFORMS)),
+        value=len(wired),
         target=len(PLATFORMS),
         direction="at_least",
-        rule="/api/sources/{平台}/verify 覆盖的平台数（模板路由记为全部 7 个）",
+        rule=(
+            "/api/sources/{平台}/verify 路由 ∩ SOURCE_AUTH_PROVIDERS ∩ VERIFY_ACTIONS；"
+            "目标来自 canonical source-family registry"
+        ),
         evidence=tuple(evidence),
     )
 

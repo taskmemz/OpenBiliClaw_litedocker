@@ -17,7 +17,7 @@
 | `sources_status()` 函数体量 | 424 行 | ≤ 140 行（聚合器 + 每平台独立 provider） | 见下方 `scripts/` 门 |
 | 桌面 `app.js` **平台源设置区域内**的 per-platform 分支 | 1 处 | 0 处 | 同上 |
 | 前端状态映射表副本数 | 2 份（desktop / popup，已漂移） | 1 份（后端下发） | `rg 'SOURCE_ACCESS_STATE\|SOURCE_STATUS_DOT'` |
-| 有统一命名的 verify 路由的平台 | 0 / 7（能力上是 1/7，见 D7 修正） | 7 / 7 | `POST /api/sources/{k}/verify` |
+| 有统一命名的 verify 路由的平台 | 0 / 7（能力上是 1/7，见 D7 修正） | canonical source-family registry 全覆盖（当时 7/7，当前 8/8） | `POST /api/sources/{k}/verify` ∩ `SOURCE_AUTH_PROVIDERS` ∩ `VERIFY_ACTIONS`；分母来自 canonical registry |
 | 后端可活体验证的平台 | 1 / 7（仅 B 站，且藏在 `init-status` 等端点下） | 2 / 7（+ 抖音，D11 实测） | 见 Phase 1 映射表 |
 | 凭据写入端点命名形态 | **5** 种（含 `PUT /api/config`，见 D5 修正） | 1 种 + 旧端点转发 | `openapi.json` 断言 |
 | 承载平台源设置的前端 | 2（desktop + popup） | 2（移动端有意排除，见下） | `scripts/source_contract_metrics.py` 第 6 项 |
@@ -374,7 +374,7 @@ B 站 cookie 迁出 config.toml 到 `data/bilibili_cookie.json`（与 douyin/x �
 | Lever | Measured effect |
 | --- | --- |
 | Phase 1 | 用户能分辨"验证过"与"只是填了"；D3 的双页面矛盾消失；**抖音从"永远待验证"翻转为可活体验证（D11）**，后端可活体验证的平台 1 → 2；聚合器 424 → ≤140 行 |
-| Phase 2 | 凭据从"填完不知道对不对"变为一键可验；7/7 平台有回执 |
+| Phase 2 | 凭据从"填完不知道对不对"变为一键可验；canonical registry 中每个平台都有回执（Phase 当时 7/7） |
 | Phase 3 | 无效凭据不再静默落盘；两条写入路径校验强度统一 |
 | Phase 4 | 前端 per-platform 分支 6 → 0；map 副本 2 → 1，D6 漂移根除 |
 | Phase 5 | config.toml 不再存明文凭据；四端契约补齐 |

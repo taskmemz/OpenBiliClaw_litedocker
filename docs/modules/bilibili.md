@@ -22,6 +22,7 @@
 | 搜索 WBI 化与 412 软降级 | ✅ | `search()` 现会先从 `nav` 获取 WBI key，走 `/x/web-interface/wbi/search/type`；遇到 `412 Precondition Failed` 时会记录 warning 并返回空结果，避免拖垮整轮 discover |
 | 搜索风控冷却（分级） | ✅ | 412（显式 IP 封禁）即时进入硬冷却（base 600s）；`v_voucher`（多为 WBI key churn / 轻限流）改为**阈值化软冷却**——单个关键词耗尽重试只记一次 streak、不触发冷却（整轮其余关键词 + 共用此冷却的 explore 继续出货），但会打开短期 `search_dom_fallback_remaining()` 信号让扩展可补一轮真实搜索页；连续 `_SEARCH_VOUCHER_BLOCK_THRESHOLD`（默认 3）个关键词级耗尽才启用进程级 cooldown（base 缩到 180s）；一旦怀疑风暴（streak>0）后续关键词只做单次快探测、不再每词 ~21s 硬抗，任一成功即清零 streak。所有 BilibiliAPIClient 实例共享冷却和 DOM fallback 状态 |
 | 扩展搜索兜底任务桥 | ✅ | `BilibiliExtensionSearchProducer` 在 `search_cooldown_remaining()>0` 或 `search_dom_fallback_remaining()>0`、扩展 presence 在线、B 站池子低于 quota 时入队 `bili_tasks(type="search")`；扩展后台打开 `search.bilibili.com/all?keyword=...`，content script 抓渲染后的搜索卡片并 POST `/api/sources/bili/task-result`，后端写入 `discovery_candidates`，后续仍由统一 evaluator 判断是否入池 |
+| 近期供给 lane | ✅ | API 与扩展搜索都在既有请求/关键词预算内把每轮第 1 个 query 标为 `order="pubdate"`，最多取 5 条；它仍使用 `source_strategy="search"` / `bili-extension-search` 与同一 admission 规则，只用 `discovery_lane="recent"`、`source_context` 和 raw payload 保留可回放的检索来源。 |
 | 弹幕 fetch outcome | ✅ | `get_danmaku_texts_result()` 区分 `success`（可为空）、`no_data` 与 `transient_failure`；HTTP、XML、限速和网络异常保留原因并交给上层重试。HTTP 200 但根元素不是 B 站 `<i>`（包括 HTML challenge）不会伪装成成功空结果。`get_danmaku_texts()` 继续提供只返回文本列表的兼容包装 |
 | 账户侧同步来源 | ✅ | 已支持 history / favorites / following 三类长期信号，供后台低频同步使用；favorites 会按收藏夹分页补齐到预算上限；同步事件会带 `metadata.signal_strength` 供偏好分析区分证据强弱 |
 | 原生收藏 / 稍后再看写入 | ✅ | `BilibiliAPIClient` 新增认证 form POST、exact-title 收藏夹复用/创建、视频收藏和稍后再看写入；`BilibiliNativeSaveAdapter` 将 B 站 application code 归一化为 saved-sync 状态，并已由 `RuntimeContext` 注册到平台中立 `/api/saved/*`。UI 仍属后续任务；默认关闭自动同步，旧 B 站保存端点仍只写本地。 |
@@ -144,7 +145,13 @@ from openbiliclaw.sources.bili_tasks import BiliTaskQueue
 queue = BiliTaskQueue(database)
 task_id = queue.enqueue_with_id(
     "search",
-    {"query": "机械键盘 声音", "limit": 20, "source": "bili-extension-search"},
+    {
+        "query": "机械键盘 声音",
+        "limit": 5,
+        "order": "pubdate",
+        "discovery_lane": "recent",
+        "source": "bili-extension-search",
+    },
 )
 task = queue.next_pending()
 queue.merge_result(task_id, videos=[{"bvid": "BV...", "title": "..."}], complete=True)
@@ -153,12 +160,12 @@ queue.merge_result(task_id, videos=[{"bvid": "BV...", "title": "..."}], complete
 任务端点：
 
 - `GET /api/sources/bili/next-task`：扩展领取最旧 pending B 站任务，领取后标记 `in_progress`。
-- `POST /api/sources/bili/task-result`：接收 `ok` / `partial` / `empty` / `failed` 结果；视频结果转换为 `DiscoveredContent` 后写入 `discovery_candidates`。
+- `POST /api/sources/bili/task-result`：接收 `ok` / `partial` / `empty` / `failed` 结果；视频结果转换为 `DiscoveredContent` 后写入 `discovery_candidates`。任务 payload 带 `discovery_lane="recent"` 时，候选保存 `source_context="bili-extension-search:recent"` 与同名 raw provenance，但不改变策略、评分或 admission 阈值。
 - `POST /api/sources/bili/kick`：通过 runtime stream 广播 `bili_task_available`，让扩展可立即 poll。
 
 扩展侧协议：
 
-- `background/bili-task-dispatcher.ts`：轮询 `/api/sources/bili/next-task`，收到 search task 后打开后台搜索页，等待 tab ready 后向 B 站 content script 发送 `BILI_TASK_EXECUTE`；如果 Chrome 报 content script listener 暂未就绪，会在 8 秒窗口内短重试，避免真实页面 complete 早于 isolated content script 注册时把任务误标失败。
+- `background/bili-task-dispatcher.ts`：轮询 `/api/sources/bili/next-task`，收到 search task 后打开后台搜索页；近期任务会把 `order=pubdate` 写入真实 B 站 URL。tab ready 后向 B 站 content script 发送 `BILI_TASK_EXECUTE`；如果 Chrome 报 content script listener 暂未就绪，会在 8 秒窗口内短重试，避免真实页面 complete 早于 isolated content script 注册时把任务误标失败。
 - `content/bili/task-executor.ts`：不直连 B 站 API，不生成 WBI 签名，只读取真实页面已渲染的 `.bili-video-card` / `.video-list-item` 等结果卡片，提取 `bvid/title/up_name/url/cover_url/view_count/duration/description`。
 - `service-worker.ts`：监听 runtime stream 的 `bili_task_available` 事件做即时 poll，接收 `BILI_TASK_RESULT` 并回传后端；普通 alarm 作为兜底。
 
@@ -213,3 +220,4 @@ headed = false     # 调试时设为 true
 11. **扩展兜底只做冷却时补位**：B 站 API 搜索仍是主路径；后端搜索任务只在服务端搜索冷却且浏览器 presence 在线时触发，避免常驻打开搜索页或把插件变成主 crawler。扩展侧只抓用户真实会话中可见的渲染结果，不在 isolated world 里伪造签名请求；background 对 `BILI_TASK_EXECUTE` 做短重试以吸收 content script 注入时序抖动；回传结果也不直接入正式池，而是进入统一候选待评估池，继续复用跨源评估、去重和 admission 规则。
 12. **账号写入 fail closed**：收藏/稍后再看在视频信息 lookup 前先验证 `SESSDATA + bili_jct`；BV → aid 通过 `_get_json()` 解析 application code，只有非 bool 的正整数 aid 才允许发写 POST。只有最终 favorite resource-deal POST 的 `11201` 会被 client 包装成 `BilibiliFavoriteDuplicateError`，adapter 还要求 resolved action 为 favorite 才映射 `already_synced`；folder/resolver 的 generic `11201` 及非 favorite route 的 duplicate 异常保持 failed。watch-later 的 `90003` 是视频不可用并固定返回 failed。
 13. **收藏夹并发单飞范围**：每个 `BilibiliAPIClient` 按 exact title 持有实例内 `asyncio.Lock`；进入锁后重新查询再决定创建，只避免同一个 client 实例内的并发调用重复创建 `OpenBiliClaw`。不同 client（即使使用同一账号）、不同进程或 event loop 之间没有协调；不宣称 account/process 级全局单飞。
+14. **近期 lane 不扩张请求预算**：生产 composition 只把既有第 1 个 search query 改为 `pubdate` 并收窄到 5 条，不复制关键词、不新建 source strategy，也不提高候选 admission 配额；其 provenance 只用于回放与诊断，避免把“较新”误当成“更相关”。

@@ -1,16 +1,16 @@
-# OpenClaw 接入指南
+# OpenClaw / Hermes / WorkBuddy Agent Bridge 接入指南
 
-> 给 OpenClaw 和维护者的完整落地说明：怎么部署 OpenBiliClaw、怎么初始化、怎么让 OpenClaw 调用、以及日常怎么用。
+> 给 Agent 宿主和维护者的完整落地说明：怎么部署 OpenBiliClaw、怎么初始化、怎么协商当前能力、以及日常怎么用。OpenClaw 是兼容入口名，协议本身是 host-neutral。
 
 ## 适用场景
 
-当你希望 OpenClaw 在当前仓库里直接调用 OpenBiliClaw 的学习与推荐能力时，使用这份指南。
+当你希望 OpenClaw、Hermes、WorkBuddy 或其他本地 Agent 宿主直接调用 OpenBiliClaw 的学习与推荐能力时，使用这份指南。
 
 当前接入方式不是 Python SDK 注册，而是：
 
 1. 仓库根目录提供 workspace skill：`skills/openbiliclaw-adapter/SKILL.md`
 2. skill 通过 JSON CLI bridge 调用：`src/openbiliclaw/integrations/openclaw/cli.py`
-3. CLI bridge 再调用内部 adapter operation
+3. CLI bridge 再调用协议中立的 Agent adapter operation；`src/openbiliclaw/integrations/agent.py` 提供 Python 别名
 
 ## 部署策略
 
@@ -19,7 +19,7 @@
 1. 目标机器有 Docker：优先 Docker 部署
 2. 目标机器没有 Docker：退回本地 Python 部署
 
-这个判断很直接，因为 OpenClaw 最终只需要两件事：
+这个判断很直接，因为 Agent 宿主最终只需要两件事：
 
 1. 能发现仓库里的 workspace skill
 2. 能执行 skill 要求的命令
@@ -172,35 +172,46 @@ openbiliclaw init
 
 如果你想跳过交互式向导（自动化场景），用 `scripts/agent_bootstrap.py` 的命令行 flag 一次性把所有字段传进去——见 [docs/agent-install.md](agent-install.md)。
 
-## OpenClaw 如何发现并调用
+## Agent 宿主如何发现并调用
 
-OpenClaw 当前应直接发现仓库里的 workspace skill：
+宿主当前应直接发现仓库里的 workspace skill：
 
 - `skills/openbiliclaw-adapter/SKILL.md`
 
-这个 skill 不直接实现推荐逻辑，而是要求 OpenClaw 调下面的 CLI bridge：
+这个 skill 不直接实现推荐逻辑，而是要求宿主调用下面的 CLI bridge：
 
 ```bash
 uv run python -m openbiliclaw.integrations.openclaw.cli <command> [flags]
 ```
 
-每次 CLI bridge 构造 direct adapter 时，会在任何画像、对话或推荐 LLM operation 可调用前，先同步执行一次零 LLM 的候选池历史恢复与原子维护；同一 controller 后续若进入后台 runtime，不会重复执行该启动维护。
+启动后先协商能力版本：
+
+```bash
+uv run python -m openbiliclaw.integrations.openclaw.cli capabilities
+```
+
+返回的 `protocol_version` 当前为 `agent-bridge/v2`，`skill_names` 是宿主应缓存的完整清单。每次 CLI bridge 构造 direct adapter 时，会在任何画像、对话或推荐 LLM operation 可调用前，先同步执行一次零 LLM 的候选池历史恢复与原子维护；同一 controller 后续若进入后台 runtime，不会重复执行该启动维护。
 direct adapter 构造推荐引擎时会把 `[scheduler].copy_ready_target_count` 钳到
-`0..pool_target_count`，与 API/普通 CLI 使用同一 copy-ready 水位；配置为 `0` 时明确保留
-legacy drain-all，便于紧急回滚。
+`0..pool_target_count`，并同时注入公开 `pool_target_count`，与 API/普通 CLI 使用同一
+eligible topic-first 双缺口文案调度；配置为 `0` 时明确保留 legacy drain-all，便于紧急回滚。
 
 已支持的命令：
 
+- `capabilities` — 返回协议版本、兼容宿主和完整能力清单
 - `sync-account`
 - `get-profile`
-- `get-delight` — 检查是否有惊喜推荐
-- `next-probe` — 获取下一个待确认的猜测兴趣方向
-- `chat --message "..." [--session openclaw]` — 苏格拉底式对话，一问一答，自动回写画像
+- `recommend --limit 5 [--source-platform <platform>]`
+- `reshuffle` / `append` — 换一批或追加
+- `get-delight` / `respond-delight` — 惊喜推荐及反馈
+- `activity-feed` / `platform-availability`
+- `next-probe` / `respond-interest-probe` — 兴趣假设四态反馈
+- `next-avoidance-probe` / `respond-avoidance-probe` — 避雷假设四态反馈
+- `chat --message "..." [--session openclaw]` / `chat-history` — durable 苏格拉底式对话
+- `profile-edit-state` / `edit-profile` — 画像 overlay
+- `save-local` / `list-saved` / `remove-saved` / `sync-saved`
 - `runtime-status`
-- `recommend --limit 5`
-- `recommend --limit 5 --refresh-if-needed`
 - `submit-feedback --recommendation-id 7 --feedback-type like --request-id feedback-7-like-1`
-- `listen` — 长连接推送 (`delight.candidate` + `interest.probe`)
+- `listen` — 长连接推送候选和 probe 结果事件
 - `doctor`
 - `emit-skill-descriptors`
 
@@ -233,9 +244,17 @@ uv run python -m openbiliclaw.integrations.openclaw.cli recommend --limit 3
 3. `get-profile` 返回 `{"ok": true, "data": ...}`
 4. `recommend --limit 3` 返回推荐列表
 
-## OpenClaw 日常使用流程
+## Agent 宿主日常使用流程
 
-推荐给 OpenClaw 的常规使用顺序如下。
+推荐给 Agent 宿主的常规使用顺序如下。
+
+### 0. 协商能力
+
+```bash
+uv run python -m openbiliclaw.integrations.openclaw.cli capabilities
+```
+
+不要在宿主配置里长期维护一份旧的静态命令列表；升级后以该清单刷新工具缓存。
 
 ### 1. 读当前画像
 
@@ -251,14 +270,21 @@ uv run python -m openbiliclaw.integrations.openclaw.cli get-profile
 uv run python -m openbiliclaw.integrations.openclaw.cli next-probe
 ```
 
-如果返回了一条假设，OpenClaw 应把 `question` 字段展示给用户，然后把用户的回答通过 `chat` 回传：
+如果返回了一条假设，宿主应把 `question` 字段展示给用户，然后可以使用显式四态反馈：
+
+```bash
+uv run python -m openbiliclaw.integrations.openclaw.cli respond-interest-probe \
+  --domain "建筑美学" --response confirm
+```
+
+需要继续讨论时再使用：
 
 ```bash
 uv run python -m openbiliclaw.integrations.openclaw.cli chat \
   --message "嗯对，最近在看很多参数化设计的东西"
 ```
 
-苏格拉底式对话支持多轮——每次 `chat` 都会返回一个新的追问/回应，并且对话内容会自动回写进灵魂画像。
+苏格拉底式对话支持多轮——每次 `chat` 都会返回一个新的追问/回应，并且对话内容会自动回写进灵魂画像；返回的 `turn_id` 可用于重试和 `chat-history`。
 
 ### 3. 取推荐
 
@@ -289,21 +315,44 @@ uv run python -m openbiliclaw.integrations.openclaw.cli submit-feedback \
 
 `--request-id` 必填，trim 后必须为 1–400 字符。同一个用户动作因超时、响应丢失或 agent 重试而再次提交时必须复用；不同动作即使 recommendation/type/note 相同，也应生成新的 ID。
 
-### 5. 查看运行时状态
+惊喜卡片支持同样的反馈闭环：
+
+```bash
+uv run python -m openbiliclaw.integrations.openclaw.cli respond-delight \
+  --bvid BV1xxx --response like --request-id delight-BV1xxx-like-1
+```
+
+### 5. 画像和本地保存
+
+```bash
+uv run python -m openbiliclaw.integrations.openclaw.cli profile-edit-state
+uv run python -m openbiliclaw.integrations.openclaw.cli save-local \
+  --list-kind favorite --source-platform bilibili --content-id BV1xxx
+uv run python -m openbiliclaw.integrations.openclaw.cli list-saved --list-kind favorite
+```
+
+`save-local` 不会写外部账号。只有用户明确授权时才运行：
+
+```bash
+uv run python -m openbiliclaw.integrations.openclaw.cli sync-saved \
+  --list-kind favorite --allow-state-changing
+```
+
+### 6. 查看运行时状态
 
 ```bash
 uv run python -m openbiliclaw.integrations.openclaw.cli runtime-status
 ```
 
-### 6. 低频做账户同步
+### 7. 低频做账户同步
 
 ```bash
 uv run python -m openbiliclaw.integrations.openclaw.cli sync-account
 ```
 
-## OpenClaw 调用约定
+## Agent 宿主调用约定
 
-给 OpenClaw 的规则建议保持为：
+给宿主的规则建议保持为：
 
 1. 优先用 `recommend --limit <n>`，这是快路径
 2. 只有明确需要新鲜度检查时，才加 `--refresh-if-needed`
@@ -311,6 +360,8 @@ uv run python -m openbiliclaw.integrations.openclaw.cli sync-account
 4. 如果返回 `{ "ok": false, ... }`，直接上抛错误，不要继续串后续动作
 5. 对 `comment` 反馈，必须带 `--note`
 6. 把 `doctor` 当成接线排障入口，而不是日常业务命令
+7. 写操作使用稳定 `request_id`；native save 必须携带显式授权
+8. 使用 `capabilities` / `emit-skill-descriptors` 发现能力，不要依赖过时文档中的旧列表
 
 ## 常见问题
 

@@ -181,7 +181,7 @@
   <text x="150" y="201" text-anchor="middle" fill="#f0883e" font-size="9.5">LLM: build_search_queries_prompt</text>
 
   <rect x="35" y="216" width="230" height="26" rx="4" fill="#161b22" stroke="#58a6ff" stroke-width="1"/>
-  <text x="150" y="233" text-anchor="middle" fill="#58a6ff" font-size="9.5">真实 search() × N (专用 cookie 客户端)</text>
+  <text x="150" y="233" text-anchor="middle" fill="#58a6ff" font-size="9.5">相关性 search + 预算内 1×5 pubdate lane</text>
 
   <rect x="35" y="248" width="230" height="26" rx="4" fill="#1a1208" stroke="#f0883e" stroke-width="1"/>
   <text x="150" y="265" text-anchor="middle" fill="#f0883e" font-size="9.5">evaluate_content_batch</text>
@@ -189,7 +189,7 @@
   <rect x="35" y="280" width="230" height="26" rx="4" fill="#161b22" stroke="#484f58" stroke-width="1"/>
   <text x="150" y="297" text-anchor="middle" fill="#c9d1d9" font-size="9.5">keep if score ≥ 0.60 (原始分)</text>
 
-  <text x="150" y="326" text-anchor="middle" fill="#8b949e" font-size="9" font-style="italic">intermediates: {queries:[...]}</text>
+  <text x="150" y="326" text-anchor="middle" fill="#8b949e" font-size="9" font-style="italic">query/lane 交错 · provenance: search:recent</text>
 
   <!-- ── Trending Lane ── -->
   <rect x="300" y="150" width="260" height="190" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="1.5"/>
@@ -248,7 +248,7 @@
   <!-- shared evaluator band -->
   <rect x="20" y="356" width="1100" height="40" rx="8" fill="#1a1208" stroke="#f0883e" stroke-width="1.5"/>
   <text x="570" y="375" text-anchor="middle" fill="#f0883e" font-size="12" font-weight="600">共享评估器 — evaluate_content_batch (build_batch_content_evaluation_prompt)</text>
-  <text x="570" y="389" text-anchor="middle" fill="#8b949e" font-size="9.5">发现侧给 B站/抖音直采/YouTube 打分；推荐侧 classify_pool_backlog 用同一 prompt 给扩展直采来源(小红书/抖音扩展)补分 · batch 30 · 写 relevance/topic_group/style_key</text>
+  <text x="570" y="389" text-anchor="middle" fill="#8b949e" font-size="9.5">发现侧与推荐侧共用 time-neutral relevance + temporal class/confidence/reason · batch 30 · 持久化到候选/缓存</text>
 
   <!-- Arrows from 4 lanes → merge -->
   <line x1="150" y1="396" x2="200" y2="446" stroke="#3fb950" stroke-width="1" marker-end="url(#arrow-green)"/>
@@ -329,7 +329,7 @@
 
   <rect x="805" y="596" width="300" height="40" rx="6" fill="#1a1208" stroke="#f0883e" stroke-width="1"/>
   <text x="955" y="613" text-anchor="middle" fill="#f0883e" font-size="9.5">RecommendationEngine.classify_pool_backlog()</text>
-  <text x="955" y="627" text-anchor="middle" fill="#8b949e" font-size="9">用同一套评估 prompt 补分 → style_key/topic_group/relevance</text>
+  <text x="955" y="627" text-anchor="middle" fill="#8b949e" font-size="9">同一评估 prompt → style/topic/time-neutral relevance + temporal class</text>
 
   <text x="955" y="656" text-anchor="middle" fill="#8b949e" font-size="9">engine 只注册 XiaohongshuAdapter 占位 (no-op)</text>
   <text x="955" y="672" text-anchor="middle" fill="#8b949e" font-size="9">仅此扩展通道绕过 engine；抖音/YT 后端直采仍走 discover() (§6)</text>
@@ -1075,7 +1075,7 @@
   <!-- ── Unified output ── -->
   <rect x="40" y="358" width="1060" height="52" rx="10" fill="#1a1a24" stroke="#8b949e" stroke-width="2"/>
   <text x="570" y="380" text-anchor="middle" fill="#c9d1d9" font-size="12.5" font-weight="700">评估结果统一写回</text>
-  <text x="570" y="399" text-anchor="middle" fill="#8b949e" font-size="10">relevance_score / topic_group / style_key → content_cache（已评估，与 B 站内容一视同仁进推荐）</text>
+  <text x="570" y="399" text-anchor="middle" fill="#8b949e" font-size="10">time-neutral relevance / topic / style / temporal_* → content_cache（统一进入推荐）</text>
 
   <text x="570" y="438" text-anchor="middle" fill="#6e7681" font-size="10">同一把尺子、不同工位：评估标准完全一致；区别只是<tspan fill="#8b949e">调用时机</tspan>（发现时 vs 入池后）与<tspan fill="#8b949e">调用方</tspan>。小红书并非「不评估」，而是晚一步、在推荐侧用同一 prompt 补评估。</text>
 </svg>
@@ -1124,7 +1124,7 @@
       <li><b>第一步 · 后端出题</b>：<code>XhsTaskProducer</code>（小红书任务生产者）默认每 20 分钟检查一次，读你的画像，让大模型把兴趣改写成小红书风格的搜索词（<code>generate_xhs_keywords</code>）。它<b>只把搜索词当作「任务」入队</b>，存进 <code>XhsTaskQueue</code>（任务队列，一张 SQLite 表，任务状态：待处理 → 进行中 → 完成 / 失败）；搜索默认每天最多 20 条，pending + in-progress 达 5 条时不再产词，只按空位补齐。</li>
       <li><b>第二步 · 浏览器答题</b>：Chrome 扩展轮询 <code>GET /api/sources/xhs/next-task</code>（领一个任务）；search / creator 以 20 分钟为目标按 ±25% 抖动后持久化下一次时间。扩展在<b>后台标签页</b>打开小红书搜索结果 → 直接从网页元素 <code>DOM</code> 里读卡片的标题 / 作者 / 封面（<code>extractNoteMetadataFromAnchor</code>，零额外网络请求）→ 通过 <code>POST .../task-result</code> 和 <code>.../observed-urls</code> 回传。可见安全验证 / 操作频繁 / 429 会触发 1/2/4…小时、24 小时封顶的持久冷却。<b>⚠ 严禁自动滚动</b> —— 自动滚动是小红书识别机器人的典型信号，扩展只读你自己已经滚到的卡片。</li>
       <li><b>第三步 · 写入池</b>：后端 <code>_cache_xhs_notes()</code> 把回传的笔记直接写进 <code>content_cache</code>，<b>不经过发现引擎</b>（所以没有引擎里那套打分 / 多样性处理）。</li>
-      <li><b>第四步 · 补分类</b>：因为没经引擎，推荐侧用 <code>classify_pool_backlog()</code>（源无关补分类）给这些笔记补上话题 / 风格 / 相关度分。<b>注意：它用的是和发现侧 <code>evaluate_content_batch</code> 完全相同的评估 prompt</b>（<code>build_batch_content_evaluation_prompt</code>），只是调用方变成 RecommendationEngine（caller 标签 <code>recommendation.evaluate_batch</code>）—— 同一把尺子、不同工位，<b>并不是另一套更弱的评估</b>。补完之后就和 B 站内容一视同仁地进推荐。</li>
+      <li><b>第四步 · 补分类</b>：因为没经引擎，推荐侧用 <code>classify_pool_backlog()</code>（源无关补分类）给这些笔记补上话题 / 风格 / 时间中性的相关度，以及 <code>temporal_class / confidence / reason</code>。<b>注意：它用的是和发现侧 <code>evaluate_content_batch</code> 完全相同的评估 prompt</b>（<code>build_batch_content_evaluation_prompt</code>），只是调用方变成 RecommendationEngine（caller 标签 <code>recommendation.evaluate_batch</code>）—— 同一把尺子、不同工位，<b>并不是另一套更弱的评估</b>。补完之后就和 B 站内容一视同仁地进推荐。</li>
       <li><b>另外两条补充通道</b>：① <b>被动收集</b> —— 你自己刷小红书时，扩展顺手采集视口里出现的卡片；② <b>创作者订阅</b> —— 每 24 小时去你关注的创作者主页抓最新笔记。</li>
     </ol>
   </div>
@@ -1221,7 +1221,7 @@
 
   <tr class="grp"><td colspan="2">④ 跨图通用（recommendation / soul）</td></tr>
   <tr><td class="term">RecommendationEngine.serve()</td><td>推荐主入口；换一批(reshuffle) / 续页(append) / 生成(generate) 都委托给它。</td></tr>
-  <tr><td class="term">PoolCurator</td><td>候选池二次评分器：综合新鲜度 / 话题疲劳 / 来源单调 / 惊喜度 / 反馈再排序。</td></tr>
+  <tr><td class="term">PoolCurator</td><td>候选池二次评分器：综合发布时间 bonus / 话题疲劳 / 来源单调 / 惊喜度 / 反馈再排序，并记录 aggregate-only no-bonus shadow。</td></tr>
   <tr><td class="term">SoulProfile / OnionProfile</td><td>用户画像；OnionProfile 是当前的五层「洋葱模型」（核心/价值/兴趣/角色/表层）。</td></tr>
   <tr><td class="term">speculator / speculation</td><td>猜测兴趣探针：主动猜你可能感兴趣的新方向，命中后才写进画像。</td></tr>
 </table>

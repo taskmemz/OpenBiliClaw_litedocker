@@ -26,9 +26,14 @@ test("mobile web exposes watch-later API and tab entry", async () => {
   assert.equal(calls[0].url, "http://127.0.0.1:8420/api/watch-later?limit=20&offset=40");
 
   const appJs = readFileSync(resolve("../src/openbiliclaw/web/js/app.js"), "utf8");
-  assert.match(appJs, /initWatchLaterView/);
-  assert.match(appJs, /id:\s*"watchLater"/);
-  assert.match(appJs, /label:\s*"稍后"/);
+  const libraryJs = readFileSync(resolve("../src/openbiliclaw/web/js/views/library.js"), "utf8");
+  assert.match(appJs, /id:\s*"library"/);
+  assert.match(appJs, /label:\s*"内容库"/);
+  assert.match(appJs, /\["watchLater", "favorites", "history"\]\.includes\(id\)/);
+  assert.match(libraryJs, /initWatchLaterView/);
+  assert.match(libraryJs, /id:\s*"watchLater"/);
+  assert.match(libraryJs, /label:\s*"稍后再看"/);
+  assert.match(libraryJs, /role="tablist"/);
 });
 
 test("mobile recommend delight tray has a watch-later star action", () => {
@@ -46,7 +51,8 @@ test("desktop web exposes watch-later page, badge, and delight star", () => {
     "utf8",
   );
 
-  assert.match(desktopHtml, /id="watchLaterBtn"/);
+  assert.match(desktopHtml, /id="contentLibraryBtn"/);
+  assert.match(desktopHtml, /id="contentLibraryWatchLaterTab"/);
   assert.match(desktopHtml, /id="watchLaterCountBadge"/);
   assert.match(desktopHtml, /id="watchLaterPage"/);
   assert.match(desktopHtml, /data-delight="watch-later"/);
@@ -64,11 +70,13 @@ test("extension delight banner has a watch-later star action", () => {
   assert.match(popupJs, /bindWatchLaterToggle\(btn, delight\)/);
 });
 
-test("extension popup exposes a watch-later tab and list like web surfaces", () => {
+test("extension popup exposes watch-later inside the content library", () => {
   const popupHtml = readFileSync(resolve("popup", "popup.html"), "utf8");
   const popupJs = readFileSync(resolve("popup", "popup.js"), "utf8");
 
-  assert.match(popupHtml, /id="tabWatchLater"/);
+  assert.match(popupHtml, /id="tabLibrary"[^>]*aria-controls="viewLibrary"/);
+  assert.match(popupHtml, /id="viewLibrary"[^>]*role="tabpanel"/);
+  assert.match(popupHtml, /id="tabWatchLater"[^>]*role="tab"/);
   assert.match(popupHtml, /aria-controls="viewWatchLater"/);
   assert.match(popupHtml, /id="viewWatchLater"/);
   assert.match(popupHtml, /id="watchLaterList"/);

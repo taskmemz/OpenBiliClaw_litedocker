@@ -321,7 +321,7 @@
         </div>
         <div class="box state">
           <strong>桌面端单页控制器</strong>
-          <span>`desktop/assets/js/app.js` 管理推荐、画像、聊天、设置、消息、delight 队列与本地 endpoint 设置。</span>
+          <span>`desktop/assets/js/app.js` 管理推荐、画像、聊天、设置、消息、delight 队列、本地 endpoint，以及 `.obcbackup` 导出 / 导入确认与进度。</span>
         </div>
         <div class="box stream">
           <strong>runtime-stream 合并刷新</strong>
@@ -342,6 +342,10 @@
         <div class="box api">
           <strong>配置与资源代理</strong>
           <span>`/config`、`/runtime-status`、`/image-proxy`。图片代理做白名单、redirect、类型和 10MB 校验。</span>
+        </div>
+        <div class="box api">
+          <strong>本机迁移 API</strong>
+          <span>`POST /api/migration/export`、`POST /api/migration/import`、`GET /api/migration/status`、`DELETE /api/migration/pending`。只接受 real-loopback + same-origin；status 用 request ID 返回 processing / staged 供对账，pending 可取消，重启才应用。</span>
         </div>
       </div>
     </div>
@@ -369,6 +373,10 @@
       <div class="module">
         <strong>Desktop controller</strong>
         <p>桌面端把 endpoint、本地存储、设置表单、delight 内聊、watch-later 和推荐卡片动作放在单控制器中。</p>
+      </div>
+      <div class="module">
+        <strong>Migration controller</strong>
+        <p>只从桌面配置页收集白名单 UI 偏好；导出优先把 response stream 写入用户选定文件，不支持 File System Access API 时才回退 blob 下载；导入上传原始文件并要求显式替换确认，staged 后提示重启。</p>
       </div>
       <div class="module">
         <strong>Boundaries</strong>
@@ -459,8 +467,44 @@
     </div>
   </section>
 
+  <section aria-labelledby="migration-title">
+    <h2 id="migration-title">5. 流程图：跨机器迁移</h2>
+    <div class="flow">
+      <div class="step">
+        <span class="step-num">1</span>
+        <strong>旧机器本机导出</strong>
+        <p>设置页明确提示包内含模型 / 来源 Key、Cookie、画像与历史且未加密；用户确认后调用 local-only export。</p>
+      </div>
+      <div class="step">
+        <span class="step-num">2</span>
+        <strong>一致快照</strong>
+        <p>后端合并两层磁盘配置并移除整段 `[api.auth]`，再从已锁定的 active data dir 加入 SQLite online backup、记忆、来源凭据、图片缓存与白名单 UI 偏好，生成带 SHA-256 清单的明文 `.obcbackup`。</p>
+      </div>
+      <div class="step">
+        <span class="step-num">3</span>
+        <strong>新机器本机导入</strong>
+        <p>再次确认替换当前用户状态后携 request ID 上传；后端校验路径、大小、版本、checksum、配置与 SQLite。</p>
+      </div>
+      <div class="step">
+        <span class="step-num">4</span>
+        <strong>私有暂存 / 对账 / 取消</strong>
+        <p>上传 / 校验时 status 返回 processing、request ID 与 uploading / validating phase；合法包才进入 `pending-*`，当前 runtime、数据库和 UI 偏好不变化。断线后最多强制查 3 次，idle / cancelled 间隔 500ms 再确认；每次打开通用设置也会强制查询，重启前可 DELETE pending。</p>
+      </div>
+      <div class="step">
+        <span class="step-num">5</span>
+        <strong>重启应用或回滚</strong>
+        <p>启动器同时取得项目与 canonical data-dir runtime lock 后 journaled replace 配置 / 数据；保留目标机路径和整段 API auth 基线，再轮换文件 session secret、把 auth epoch 提升到来源 / 目标当前值之上、清空设备 key；失败恢复 `pre-import` 副本。页面只在 status=applied 后按 migration ID 为每个浏览器应用一次偏好。</p>
+      </div>
+      <div class="step">
+        <span class="step-num">6</span>
+        <strong>确认目标机状态</strong>
+        <p>重启后的 status 显示 applied / failed；按来源遗漏列表补环境变量，检查目标活跃变量的覆盖，重新登录 Web，并在需要时重新配对远程扩展设备。</p>
+      </div>
+    </div>
+  </section>
+
   <section aria-labelledby="failure-title">
-    <h2 id="failure-title">5. 降级与边界</h2>
+    <h2 id="failure-title">6. 降级与边界</h2>
     <div class="architecture">
       <div class="box risk">
         <strong>后端离线</strong>
@@ -477,6 +521,14 @@
       <div class="box risk">
         <strong>权限边界</strong>
         <span>Cookie 同步、平台页面任务和行为采集都必须由插件执行，Web 端只作为本地 API 客户端。</span>
+      </div>
+      <div class="box risk">
+        <strong>迁移包边界</strong>
+        <span>`.obcbackup` 未加密且可能含模型 / 来源 Key、平台登录 Cookie、画像；只在可信设备间传递。源机整段 API auth、环境变量值、Web 会话签名材料、扩展设备 key、证书、日志和派生缓存不导出。</span>
+      </div>
+      <div class="box risk">
+        <strong>数据目录切换</strong>
+        <span>在线保存新的 data_dir 只持久化并提示需要重启；当前 runtime 与外部凭据写继续使用已持有 canonical lock 的 active 目录，完整重启取得新目录锁后才切换。</span>
       </div>
     </div>
   </section>

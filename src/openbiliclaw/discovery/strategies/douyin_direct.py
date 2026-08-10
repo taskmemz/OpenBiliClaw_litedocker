@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from openbiliclaw.sources.douyin_direct import normalize_aweme_item
 from openbiliclaw.sources.douyin_plugin_search import DouyinBudgetExhausted
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Awaitable, Callable, Iterable
 
     from openbiliclaw.soul.profile import SoulProfile
     from openbiliclaw.storage.database import Database
@@ -133,6 +134,10 @@ class DouyinDirectStrategy(DiscoveryStrategy):
     def name(self) -> str:
         return "douyin_direct"
 
+    @property
+    def source_platform(self) -> str:
+        return "douyin"
+
     async def discover(self, profile: SoulProfile, limit: int = 20) -> list[DiscoveredContent]:
         # Each raw item carries (source_strategy, raw_dict, source_keyword_id).
         # Only search items get a non-None keyword id (P1.8 yield provenance);
@@ -150,6 +155,30 @@ class DouyinDirectStrategy(DiscoveryStrategy):
             "creator_sec_uids": list(self.creator_sec_uids),
         }
 
+        cycle_deadline: float | None = None
+        raw_cycle_timeout = getattr(self.client, "discovery_cycle_timeout_seconds", None)
+        if raw_cycle_timeout is not None:
+            try:
+                cycle_timeout = max(0.0, float(raw_cycle_timeout))
+            except (TypeError, ValueError):
+                cycle_timeout = 0.0
+            cycle_deadline = asyncio.get_running_loop().time() + cycle_timeout
+            self.last_intermediates["cycle_timeout_seconds"] = cycle_timeout
+
+        async def run_with_cycle_budget(
+            operation: Callable[[], Awaitable[list[dict[str, object]]]],
+        ) -> tuple[list[dict[str, object]], bool]:
+            if cycle_deadline is None:
+                return await operation(), False
+            remaining = cycle_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return [], True
+            try:
+                async with asyncio.timeout(remaining):
+                    return await operation(), False
+            except TimeoutError:
+                return [], True
+
         if "search" in self.sources:
             search_source_strategy = str(
                 getattr(self.client, "search_source_strategy", "dy-direct-search")
@@ -157,11 +186,15 @@ class DouyinDirectStrategy(DiscoveryStrategy):
             )
             for index, keyword in enumerate(keywords):
                 keyword_id = self.seed_keyword_ids.get(keyword) if self.seed_keyword_ids else None
-                try:
-                    search_items = await self.client.search_aweme(
-                        keyword,
+
+                async def fetch_search(current_keyword: str = keyword) -> list[dict[str, object]]:
+                    return await self.client.search_aweme(
+                        current_keyword,
                         limit=min(self.per_source_limit, max(1, limit)),
                     )
+
+                try:
+                    search_items, cycle_timed_out = await run_with_cycle_budget(fetch_search)
                 except DouyinBudgetExhausted:
                     for unexecuted in keywords[index:]:
                         keyword_outcomes[unexecuted] = "budget_exhausted"
@@ -170,6 +203,10 @@ class DouyinDirectStrategy(DiscoveryStrategy):
                     logger.warning("douyin search branch failed for %r: %s", keyword, exc)
                     keyword_outcomes[keyword] = "failed"
                     continue
+                if cycle_timed_out:
+                    for unexecuted in keywords[index:]:
+                        keyword_outcomes[unexecuted] = "timeout"
+                    break
                 keyword_outcomes[keyword] = _client_outcome(
                     self.client,
                     "last_search_outcome",
@@ -177,6 +214,11 @@ class DouyinDirectStrategy(DiscoveryStrategy):
                 )
                 for item in search_items:
                     raw_items.append((search_source_strategy, item, keyword_id))
+                if keyword_outcomes[keyword] == "timeout" and cycle_deadline is not None:
+                    cycle_deadline = asyncio.get_running_loop().time()
+                    for unexecuted in keywords[index + 1 :]:
+                        keyword_outcomes[unexecuted] = "timeout"
+                    break
             source_outcomes["search"] = _aggregate_outcomes(keyword_outcomes.values())
 
         if "hot" in self.sources:
@@ -185,17 +227,24 @@ class DouyinDirectStrategy(DiscoveryStrategy):
                 getattr(self.client, "hot_source_strategy", "dy-direct-hot") or "dy-direct-hot"
             )
             try:
-                hot_items = await self.client.get_hot_board(limit=hot_limit)
+                hot_items, cycle_timed_out = await run_with_cycle_budget(
+                    lambda: self.client.get_hot_board(limit=hot_limit)
+                )
             except Exception as exc:
                 logger.warning("douyin hot branch failed: %s", exc)
                 hot_items = []
                 source_outcomes["hot"] = "failed"
             else:
-                source_outcomes["hot"] = _client_outcome(
-                    self.client,
-                    "last_hot_outcome",
-                    hot_items,
-                )
+                if cycle_timed_out:
+                    source_outcomes["hot"] = "timeout"
+                else:
+                    source_outcomes["hot"] = _client_outcome(
+                        self.client,
+                        "last_hot_outcome",
+                        hot_items,
+                    )
+                    if source_outcomes["hot"] == "timeout" and cycle_deadline is not None:
+                        cycle_deadline = asyncio.get_running_loop().time()
             for item in hot_items:
                 raw_items.append((hot_source_strategy, item, None))
 
@@ -205,27 +254,48 @@ class DouyinDirectStrategy(DiscoveryStrategy):
                 getattr(self.client, "feed_source_strategy", "dy-direct-feed") or "dy-direct-feed"
             )
             try:
-                feed_items = await self.client.get_recommend_feed(limit=feed_limit)
+                feed_items, cycle_timed_out = await run_with_cycle_budget(
+                    lambda: self.client.get_recommend_feed(limit=feed_limit)
+                )
             except Exception as exc:
                 logger.warning("douyin feed branch failed: %s", exc)
                 feed_items = []
                 source_outcomes["feed"] = "failed"
             else:
-                source_outcomes["feed"] = _client_outcome(
-                    self.client,
-                    "last_feed_outcome",
-                    feed_items,
-                )
+                if cycle_timed_out:
+                    source_outcomes["feed"] = "timeout"
+                else:
+                    source_outcomes["feed"] = _client_outcome(
+                        self.client,
+                        "last_feed_outcome",
+                        feed_items,
+                    )
+                    if source_outcomes["feed"] == "timeout" and cycle_deadline is not None:
+                        cycle_deadline = asyncio.get_running_loop().time()
             for item in feed_items:
                 raw_items.append((feed_source_strategy, item, None))
 
         if "creator" in self.sources:
             for sec_uid in self.creator_sec_uids:
-                for item in await self.client.get_creator_posts(
-                    sec_uid,
-                    limit=min(self.per_source_limit, max(1, limit)),
-                ):
+
+                async def fetch_creator(current_sec_uid: str = sec_uid) -> list[dict[str, object]]:
+                    return await self.client.get_creator_posts(
+                        current_sec_uid,
+                        limit=min(self.per_source_limit, max(1, limit)),
+                    )
+
+                try:
+                    creator_items, cycle_timed_out = await run_with_cycle_budget(fetch_creator)
+                except Exception as exc:
+                    logger.warning("douyin creator branch failed for %r: %s", sec_uid, exc)
+                    source_outcomes["creator"] = "failed"
+                    continue
+                if cycle_timed_out:
+                    source_outcomes["creator"] = "timeout"
+                    break
+                for item in creator_items:
                     raw_items.append(("dy-direct-creator", item, None))
+                source_outcomes["creator"] = "used" if creator_items else "empty"
 
         self.last_intermediates["keyword_outcomes"] = keyword_outcomes
         self.last_intermediates["source_outcomes"] = source_outcomes

@@ -10,6 +10,7 @@ DESKTOP_JS = (ROOT / "src/openbiliclaw/web/desktop/assets/js/app.js").read_text(
 SETUP_HTML = (ROOT / "src/openbiliclaw/web/setup/index.html").read_text(encoding="utf-8")
 POPUP_HTML = (ROOT / "extension/popup/popup.html").read_text(encoding="utf-8")
 POPUP_JS = (ROOT / "extension/popup/popup.js").read_text(encoding="utf-8")
+POPUP_API_JS = (ROOT / "extension/popup/popup-api.js").read_text(encoding="utf-8")
 
 
 def test_desktop_exposes_instance_library_global_chain_and_module_chains() -> None:
@@ -112,6 +113,7 @@ def test_extension_manages_native_instances_and_preserves_module_routes() -> Non
     assert "routes: Object.fromEntries(" in POPUP_JS
     assert 'probeConfigService("llm_instance", collectForm(), instanceId)' in POPUP_JS
     assert 'probeConfigService("llm_chain", collectForm())' in POPUP_JS
+    assert "timeoutMs: 125_000" in POPUP_API_JS
     assert 'setVal("cfgLlmInstanceApiKey", "")' in POPUP_JS
     assert 'id="cfgLlmInstanceClearApiKey"' in POPUP_HTML
     assert 'getInt("cfgLlmConcurrencyV2", 4)' in POPUP_JS

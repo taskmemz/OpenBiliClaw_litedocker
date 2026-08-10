@@ -99,7 +99,7 @@ runtime 使用公开 `drain_pending_expression_copy(profile, limit<=60, max_extr
 | v0.3.123 推荐画像输入与 discovery 统一 | ✅ | `_recommendation_profile_summary()` 改为直接委托 discovery 的 `build_profile_summary()`，推荐与发现喂给 LLM 的是**同一份**结构化画像；推荐侧因此补齐了之前缺的字段（`values` / `cognitive_style` / `motivational_drivers` / `current_phase` / `life_stage` / `source_platform_mix` / `recent_awareness` / `mbti` / `interest_domains` 等），并随统一一起不再带 `personality_portrait` 总结。`include_active_insights` 形参移除（统一输入恒含 active_insights）；embedding 选出的相关兴趣经 `interests=` 透传 |
 | v0.3.144+ 推荐画像上下文缓存前缀保护 | ✅ | 批量池文案、单条实时文案和 legacy/recovery 分类 prompt 已经携带结构化画像；调用 `LLMService.complete_structured_task()` 时会在支持路径上设置 `inject_core_memory=False`。v0.3.147+ 起这些画像 prompt 还会复用共享 `profile_prompt_layers()`：稳定 core / interests 层放前，recent 层放后，并用 `PromptLayerRenderCache` 只替换发生变化的层。Delight score 预计算不再单独调用 LLM |
 | v0.3.144 推荐理由双 worker + 默认 30 | ✅ | `_drain_expression_copy()` 不再对所有待生成 batch 一次性 `gather`，而是默认 batch_size=30、用 2 个 worker 顺序领取 batch；真实 provider 并发测试显示 45 条推荐文案偶发 JSON 解析失败，因此推荐理由保持保守批量；批量解析失败会在当前 worker 内先拆半重试，半批仍失败才退到单条兜底；`_expression_lock` 仍串行化多入口，热重载 / shutdown 的 `CancelledError` 不会被当作普通 batch 失败吞掉 |
-| v0.3.x demand-driven copy-ready 水位 | ✅ | `count_pool_readiness()` 区分可服务 `available`、已完成正式文案的 `copy_ready` 与仍待文案的 `admitted_pending_copy`；正数 `scheduler.copy_ready_target_count` 只补当前 copy-ready 缺口，不再排空所有 durable backlog。API RuntimeContext、CLI `_build_recommendation_engine()` 与 OpenClaw bootstrap 都注入 `min(max(copy_ready_target_count, 0), max(pool_target_count, 0))`，保证同一配置跨组合根一致；设为 `0` 明确回滚到 legacy drain-all。 |
+| v0.3.x demand-driven copy-ready 水位 | ✅ | `count_pool_readiness()` 区分可服务 `available`、已完成正式文案的 `copy_ready`、全部待文案 `admitted_pending_copy`，以及补齐后能进入 topic 展示窗口的 `admitted_pending_available`。正数 `scheduler.copy_ready_target_count` 同时补 `copy_ready` 水位缺口和 `pool_target_count - available` 中已有 eligible 素材可兑现的缺口，领取时 eligible topic 优先；这样 90 条 copy 水位不会在公开可换仍低于 300 时让表达与评估协调器同时休眠，也不会为已饱和 topic 排空深层 backlog。API RuntimeContext、CLI `_build_recommendation_engine()` 与 OpenClaw bootstrap 同时注入钳制后的 copy 水位和公开库存目标；设为 `0` 明确回滚到 legacy drain-all。 |
 | v0.3.154 推荐 prompt diet | 🧪 | `_recommendation_profile_summary()` 现在是推荐表达与 legacy 分类的单一画像入口：先 `build_profile_summary()`，再应用 discovery 共享的 `compact_content_prompt_profile_summary()`（20 条核心上下文、48 个兴趣、32 个兴趣域 × 每域 16 个 specifics、12 条近期语境，避雷项不裁剪）。单条表达传入的 `interests=` 内容相关兴趣替换仍保留，替换后再统一 compact。96 / 16 在当前画像只节省 `0.67%` 标准请求输入 token 且严格 replay 仍失败，因此按收益验证要求实验性改为 48 / 16；长尾召回从第 49 项开始，最终是否保留取决于新的 100×3 fail-closed replay。`classify_pool_backlog()` 默认 `batch_size=30`。原定 200+100 `body_text` 截断被 Reddit 100×3 质量门否决，legacy/recovery 分类与 single/batch expression 均恢复完整正文 |
 | v0.3.x XHS 自发布内容过滤 | ✅ | `get_pool_candidates` / `count_pool_candidates` / `count_pool_readiness` 及后台整理查询（evaluation / copy / delight）在 SQL 层排除已知的自发布小红书行；`_purge_self_authored_pool_items` 同时匹配 `up_name` 和 `author_name`；self_info 首次到达或变更时立即 purge 已入池内容。`RecommendationEngine` 通过 `xhs_self_info_provider` 回调从 runtime state 获取 nickname，`Database` 保持纯存储层不直接读 runtime state |
 | v0.3.x serve 平台保底 | ✅ | `serve()` 装载 top-40 relevance 窗口后、排除过滤前调用 `_apply_platform_floor()`：按 `list_servable_pool_platforms()` 找出窗口内缺席但仍可服务的平台，对每个用 `get_pool_candidates_for_platform(platform, limit=5)` 补拉并按 bvid 去重扩窗（补货时记一行 INFO），避免会话早期 top-40 全是 B站 而知乎 / 小红书 / 抖音标签页长时间空置；下游 MMR / 多样化不变。单平台池（纯 B站 安装）直接跳过，行为零变化 |
@@ -268,7 +268,7 @@ count = await engine.precompute_pool_copy(
 - 批量响应解析失败、缺少可验证 ID 或产生跨视频重复文案时，后台 drain 会在当前 worker 内递归拆半重试；只有拆到单条仍失败时才走单条表达兜底，因此默认 30 条 batch 不会因为一次弱模型输出异常直接放大成 30 个并发请求
 - 批量文案和推荐池分类调用复用 prompt 内 compact profile，并在兼容的 LLMService 路径上跳过额外 core memory 注入；这些调用还会复用共享画像分层缓存，画像核心 / 兴趣不变时保持前置 prompt block 完全相同。这只改变 token / prompt-cache 形态，不改变排序、入池 gate、评分 rubric 或文案策略。Delight score 预计算已改为零 LLM 的 Evo 结果复用路径
 - 批量文案并发由 `_expression_lock + expression_batch_concurrency(default=2)` 控制：多入口不会抢同一批候选，同一次 drain 内也只会有两个文案 batch 同时打 LLM；拆半重试在 worker 内串行执行，不额外创建嵌套并发任务
-- `copy_ready_target_count > 0` 时，每次 drain 都按 canonical `copy_ready` 缺口重新钳制领取量；API、CLI 和 OpenClaw 在构造引擎时还会把该值钳到 `pool_target_count`，避免任一入口为永远不可服务的池外库存生成文案。`copy_ready_target_count = 0` 保留旧版排空 pending backlog 的显式回滚语义
+- `copy_ready_target_count > 0` 时，每次 drain 都在 expression lock 内按 `max(copy_ready 水位缺口, min(公开 available 缺口, admitted_pending_available))` 重新钳制领取量，并先领取补齐后能进入 topic 展示窗口的行；只有 copy-ready 水位本身不足时才继续领取深层 backlog。API、CLI 和 OpenClaw 在构造引擎时同时注入钳制后的 copy 水位与 `pool_target_count`。`copy_ready_target_count = 0` 保留旧版排空全部 pending backlog 的显式回滚语义
 - 成功后把结果回写到 `content_cache.pool_expression / content_cache.pool_topic_label`
 - 生成失败时不会写 profile 级统一 fallback，而是保留空值，交给 popup 隐藏
 - runtime refresh 会在补货后自动触发这一步，避免 popup 的“换一批 / 继续追加”现场等待 LLM
@@ -422,19 +422,23 @@ Content-Type: application/json
 from openbiliclaw.recommendation.curator import PoolCurator
 ```
 
-`PoolCurator` 提供推荐侧的独立评分，不依赖 Discovery 的结果。它从候选池中读取内容，按照一套专属权重对每条候选打分，供上层调用方叠加使用。
+`PoolCurator` 提供推荐侧的独立评分。它从候选池读取 Evaluation Agent 已持久化的语义特征，并按照一套专属权重对每条候选打分；时效只以发布时间明确、高置信类别的正向 bonus 进入推荐排序，不改写 discovery relevance 或 admission。
 
 #### ScoringWeights
 
 | 维度 | 权重 |
 |------|------|
 | `relevance` | 0.30 |
-| `freshness` | 0.20 |
-| `topic_fatigue` | 0.15 |
+| `freshness` | 0.10 |
+| `topic_fatigue` | 0.25 |
 | `source_monotony` | 0.15 |
 | `serendipity` | 0.20 |
 
 `serendipity` 加分只对 `explore` 来源发放（满额 1.0）。其余任何 strategy —— 包括 `trending` —— 一律为 0.0：来源只是上下文，不能凭发现路径白拿 rec_score（issue #90）。
+
+`freshness` 现在表示 publication-time temporal bonus，不再读取 `discovered_at`。只有 `breaking/current/versioned`、有效 `published_at` 且分类置信度至少 `0.60` 的候选参与：半衰期分别为 1 / 14 / 120 天，类别权重为 0.85 / 0.60 / 0.30；置信度 `>=0.80` 使用完整权重，`>=0.60 且 <0.80` 使用半量，低于 0.60 为 0。`evergreen/historical/unknown`、缺失/无效/明显未来时间全部保持中性，不会把发现时间冒充发布时间。
+
+每次 Curator 评分还会 best-effort 生成 `temporal-ranking-shadow-v1` 聚合审计：把当前含 bonus 排序与“精确减掉本次 bonus”的 no-bonus 反事实比较，记录 Top 10 / 50 / 100 的 overlap、Jaccard、同位置数，以及按时效类别、来源和年龄桶的进入/退出分布。审计发生在 MMR/多样性选择之前，不改变分数、准入或 serving；写入失败只记 WARNING。持久化内容不含 BVID、内容 ID、标题、作者、URL、query 或画像文本，保留上限为 30 天 / 5,000 轮。
 
 #### 关键数据结构
 
@@ -474,7 +478,10 @@ from openbiliclaw.recommendation.curator import PoolCurator
 
 | 常量 | 值 |
 |------|----|
-| 新鲜度半衰期 | 3 天 |
+| `breaking` temporal bonus | 半衰期 1 天，类别权重 0.85 |
+| `current` temporal bonus | 半衰期 14 天，类别权重 0.60 |
+| `versioned` temporal bonus | 半衰期 120 天，类别权重 0.30 |
+| temporal confidence 分档 | `>=0.80` 全量；`>=0.60 且 <0.80` 半量；其余中性 |
 | dislike UP 主惩罚 | 0.20 |
 | dislike 话题惩罚 | 0.10 |
 | like 话题加成 | 0.05 |
@@ -489,11 +496,15 @@ context: ScoringContext = curator.build_context()
 # 对候选列表评分，返回 bvid → rec_score 的映射（不修改输入）
 scores: dict[str, float] = curator.score_candidates(candidates, context)
 
+# 聚合比较含 bonus 排序与 no-bonus 反事实；不改变 scores/serving
+audit = curator.build_temporal_ranking_shadow_audit(candidates, scores, context)
+curator.record_temporal_ranking_shadow_audit(candidates, scores, context)
+
 # 检查候选池健康状态
 report: PoolHealthReport = curator.check_pool_health()
 ```
 
-`score_candidates()` 以叠加覆盖层的形式返回新的分数映射，不会修改传入的候选对象。`PoolCurator` 的所有方法均不修改输入数据。
+`score_candidates()` 以叠加覆盖层的形式返回新的分数映射，不会修改传入的候选对象。`PoolCurator` 的所有方法均不修改输入数据。shadow 的年龄桶固定为 `<=1d / 1-7d / 7-30d / 30-180d / >180d / unknown`，用于与 2026-08 历史回放口径连续比较；它只回答“bonus 改了谁的相对位置”，不自动开启硬 stale gate。
 
 ## 示例：记忆如何影响推荐结果
 

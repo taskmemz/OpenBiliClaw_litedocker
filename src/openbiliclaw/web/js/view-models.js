@@ -765,6 +765,8 @@ export function getPoolStatusSummary(status) {
         ? `刚补进 ${runtime.last_replenished_count} 条`
         : runtime.last_discovered_count > 0
           ? "这轮找到了内容"
+        : runtime.pool_pending_count > 0
+          ? `另有 ${runtime.pool_pending_count} 条素材`
         : poolIsSufficient
           ? "这会儿先不补货"
           : "这轮还没补进",
@@ -773,6 +775,8 @@ export function getPoolStatusSummary(status) {
         ? formatRuntimeTopicList(runtime.recent_pool_topics)
         : runtime.last_discovered_count > 0
           ? "但可立即换的库存还没变"
+          : runtime.pool_pending_count > 0
+            ? "素材已抓到，会按可换库存缺口整理"
           : poolIsSufficient
             ? "先把这一池给你慢慢换开"
             : "还在继续摸你的口味",
@@ -833,7 +837,7 @@ export function getMobileRecommendationHeaderState({
                   : runtime.last_discovered_count > 0
                     ? "已发现"
                     : poolSummary.replenished,
-            label: pendingOnly ? "素材整理" : "最近补进",
+            label: pendingOnly ? "素材整理" : "补货进展",
             tone: "brand",
           },
           {

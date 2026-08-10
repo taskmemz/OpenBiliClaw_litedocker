@@ -1736,7 +1736,11 @@ def _build_network_config(raw: dict[str, Any]) -> NetworkConfig:
     return NetworkConfig(mode=mode, proxy=proxy)
 
 
-def _build_config(raw: dict[str, Any]) -> Config:
+def _build_config(
+    raw: dict[str, Any],
+    *,
+    consult_environment: bool = True,
+) -> Config:
     """Build a Config dataclass from raw dict."""
     general = raw.get("general", {})
     api_raw = raw.get("api", {}) if isinstance(raw.get("api"), dict) else {}
@@ -2116,7 +2120,7 @@ def _build_config(raw: dict[str, Any]) -> Config:
         ),
     )
 
-    api_auth = _build_api_auth(api_raw)
+    api_auth = _build_api_auth(api_raw, consult_environment=consult_environment)
 
     return Config(
         language=general.get("language", "zh"),
@@ -2341,7 +2345,7 @@ def _build_config(raw: dict[str, Any]) -> Config:
             )
         ),
         soul=soul,
-        tls_proxy=_build_tls_proxy(raw),
+        tls_proxy=_build_tls_proxy(raw, consult_environment=consult_environment),
     )
 
 
@@ -2694,7 +2698,11 @@ _TLS_PROXY_ENV_TO_FIELD: dict[str, str] = {
 }
 
 
-def _build_api_auth(api_raw: dict[str, Any]) -> ApiAuthConfig:
+def _build_api_auth(
+    api_raw: dict[str, Any],
+    *,
+    consult_environment: bool = True,
+) -> ApiAuthConfig:
     """Assemble ``ApiAuthConfig`` from raw config + dedicated env vars.
 
     Multi-word fields cannot use the generic ``OPENBILICLAW_A_B_C`` override
@@ -2708,6 +2716,8 @@ def _build_api_auth(api_raw: dict[str, Any]) -> ApiAuthConfig:
     auth_raw: dict[str, Any] = raw if isinstance(raw, dict) else {}
 
     def _env(name: str) -> str | None:
+        if not consult_environment:
+            return None
         value = os.environ.get(name)
         return value if value and value.strip() else None
 
@@ -2872,13 +2882,17 @@ def tls_proxy_enabled_override_source() -> str | None:
     return None
 
 
-def _build_tls_proxy(raw: dict[str, Any]) -> TlsProxyConfig:
+def _build_tls_proxy(
+    raw: dict[str, Any],
+    *,
+    consult_environment: bool = True,
+) -> TlsProxyConfig:
     """Build ``TlsProxyConfig`` from TOML plus the explicit TLS env contract."""
     tls_raw_val = raw.get("tls_proxy")
     tls_raw: dict[str, Any] = tls_raw_val if isinstance(tls_raw_val, dict) else {}
 
     def env_or_disk(name: str, key: str, default: object) -> object:
-        env_value = os.environ.get(name)
+        env_value = os.environ.get(name) if consult_environment else None
         if env_value is not None and env_value.strip():
             return env_value
         return tls_raw.get(key, default)
@@ -3885,6 +3899,7 @@ def load_config_with_diagnostics(
     config_path: str | Path | None = None,
     *,
     ensure_default_file: bool = True,
+    consult_environment: bool = True,
 ) -> tuple[Config, ConfigDiagnostics]:
     """Load configuration from TOML file(s).
 
@@ -3923,18 +3938,27 @@ def load_config_with_diagnostics(
                     file_data = tomllib.load(f)
                 raw = _deep_merge(raw, file_data)
 
-    raw = _apply_env_overrides(raw)
+    if consult_environment:
+        raw = _apply_env_overrides(raw)
     # Removed-key notices are collected from the RAW [discovery] table before
     # _build_discovery ever runs — the values are ignored, never fail-fast.
     diagnostics.issues.extend(_removed_discovery_key_issues(raw))
-    config = _build_config(raw)
+    config = _build_config(raw, consult_environment=consult_environment)
     diagnostics.issues.extend(_collect_config_issues(config))
     return config, diagnostics
 
 
-def load_config(config_path: str | Path | None = None) -> Config:
+def load_config(
+    config_path: str | Path | None = None,
+    *,
+    consult_environment: bool = True,
+) -> Config:
     """Load configuration only, without diagnostics."""
-    config, _ = load_config_with_diagnostics(config_path, ensure_default_file=False)
+    config, _ = load_config_with_diagnostics(
+        config_path,
+        ensure_default_file=False,
+        consult_environment=consult_environment,
+    )
     return config
 
 
@@ -3977,7 +4001,11 @@ _LOCAL_AUTH_KEY_TO_FIELD = {
 }
 
 
-def _auth_overridden_fields(*, consult_local: bool) -> set[str]:
+def _auth_overridden_fields(
+    *,
+    consult_local: bool,
+    consult_environment: bool = True,
+) -> set[str]:
     """Render fields of ``[api.auth]`` governed by an override LAYER above
     ``config.toml`` — environment variables OR ``config.local.toml`` (both win over
     ``config.toml`` in ``load_config``).
@@ -3995,7 +4023,11 @@ def _auth_overridden_fields(*, consult_local: bool) -> set[str]:
     default. So ``consult_local`` must be False for every explicit-path save, or we
     would preserve/omit fields based on a layer that was never merged (review r11).
     """
-    fields = {field for field, on in _auth_env_field_overrides().items() if on}
+    fields = (
+        {field for field, on in _auth_env_field_overrides().items() if on}
+        if consult_environment
+        else set()
+    )
     if consult_local:
         for key in config_local_auth_keys():
             mapped = _LOCAL_AUTH_KEY_TO_FIELD.get(key)
@@ -4037,9 +4069,13 @@ def _config_local_tls_proxy_keys() -> set[str]:
     return set(tls_proxy) if isinstance(tls_proxy, dict) else set()
 
 
-def _tls_proxy_overridden_fields(*, consult_local: bool) -> set[str]:
+def _tls_proxy_overridden_fields(
+    *,
+    consult_local: bool,
+    consult_environment: bool = True,
+) -> set[str]:
     """Return TLS fields whose effective values come from an override layer."""
-    overridden = _tls_proxy_env_overridden_fields()
+    overridden = _tls_proxy_env_overridden_fields() if consult_environment else set()
     if consult_local:
         overridden.update(_config_local_tls_proxy_keys())
     return overridden
@@ -4132,7 +4168,11 @@ def _create_llm_migration_backup(path: Path) -> Path | None:
 
 
 def _api_auth_lines(
-    config: Config, on_disk_auth: dict[str, Any] | None, *, consult_local: bool
+    config: Config,
+    on_disk_auth: dict[str, Any] | None,
+    *,
+    consult_local: bool,
+    consult_environment: bool = True,
 ) -> list[str]:
     """Render the ``[api.auth]`` block, preserving on-disk credential provenance.
 
@@ -4162,7 +4202,10 @@ def _api_auth_lines(
     effective-reload verify and refuse — see review r9.)
     """
     auth = config.api.auth
-    overridden = _auth_overridden_fields(consult_local=consult_local)
+    overridden = _auth_overridden_fields(
+        consult_local=consult_local,
+        consult_environment=consult_environment,
+    )
     disk = on_disk_auth or {}
     lines = ["[api.auth]"]
 
@@ -4250,6 +4293,7 @@ def _tls_proxy_lines(
     on_disk_tls_proxy: dict[str, Any] | None,
     *,
     consult_local: bool,
+    consult_environment: bool = True,
 ) -> list[str]:
     """Render TLS config without baking env/config.local overrides into the base.
 
@@ -4259,7 +4303,10 @@ def _tls_proxy_lines(
     env var or ``config.local.toml`` restores the original base/default value.
     """
     tls_proxy = config.tls_proxy
-    overridden = _tls_proxy_overridden_fields(consult_local=consult_local)
+    overridden = _tls_proxy_overridden_fields(
+        consult_local=consult_local,
+        consult_environment=consult_environment,
+    )
     disk = on_disk_tls_proxy or {}
     lines = ["[tls_proxy]"]
 
@@ -4322,6 +4369,8 @@ def save_config(
     config_path: str | Path | None = None,
     *,
     autostart_authoritative: bool = False,
+    preserve_override_provenance: bool = True,
+    include_api_auth: bool = True,
 ) -> Path:
     """Persist a Config dataclass to TOML.
 
@@ -4381,6 +4430,8 @@ def save_config(
         on_disk_autostart=on_disk_autostart,
         autostart_authoritative=autostart_authoritative,
         consult_local=consult_local,
+        consult_environment=preserve_override_provenance,
+        include_api_auth=include_api_auth,
     )
     if config.llm.instance_routing and path.exists():
         _create_llm_migration_backup(path)
@@ -4396,8 +4447,20 @@ def _render_config_toml(
     on_disk_autostart: dict[str, Any] | None = None,
     autostart_authoritative: bool = False,
     consult_local: bool = False,
+    consult_environment: bool = True,
+    include_api_auth: bool = True,
 ) -> str:
     """Render a Config dataclass into TOML."""
+    api_auth_lines = (
+        _api_auth_lines(
+            config,
+            on_disk_auth,
+            consult_local=consult_local,
+            consult_environment=consult_environment,
+        )
+        if include_api_auth
+        else []
+    )
     lines = [
         "[general]",
         f"language = {_toml_string(config.language)}",
@@ -4407,9 +4470,14 @@ def _render_config_toml(
         f"host = {_toml_string(config.api.host)}",
         f"port = {config.api.port}",
         "",
-        *_api_auth_lines(config, on_disk_auth, consult_local=consult_local),
+        *api_auth_lines,
         "",
-        *_tls_proxy_lines(config, on_disk_tls_proxy, consult_local=consult_local),
+        *_tls_proxy_lines(
+            config,
+            on_disk_tls_proxy,
+            consult_local=consult_local,
+            consult_environment=consult_environment,
+        ),
         "",
     ]
     if config.llm.instance_routing:

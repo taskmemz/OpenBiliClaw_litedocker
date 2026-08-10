@@ -36,6 +36,14 @@ _DOUYIN_SCORE_THRESHOLDS = {
     "feed": 0.60,
 }
 _DOUYIN_DEFAULT_SCORE_THRESHOLD = _DOUYIN_SCORE_THRESHOLDS["search"]
+# Calibrated from the 2026-08-09 real-extension E2E: successful tasks took
+# roughly 15-35s while an execution-context loss consumed the full 180s task
+# watchdog. These are engineering retry floors, not Douyin limits: 15m avoids
+# colliding with the durable stale-lease window and 60m prevents an exhausted
+# daily budget from being polled every refresh tick. Recalibrate if the task
+# watchdog, lease duration, or producer cadence changes.
+_DOUYIN_FAILURE_RETRY_MINUTES = 15
+_DOUYIN_BUDGET_RETRY_MINUTES = 60
 
 
 def douyin_runtime_hot_budget(*, base_budget: int, requested_limit: int) -> int:
@@ -79,7 +87,12 @@ class DouyinDiscoveryProducer:
     # Only used for the restart-surviving cadence floor; None falls back to
     # the in-process stamp.
     database: Any | None = None
+    # API daemon-only browser availability gate. Explicit CLI/debug producers
+    # leave this None so they can still run a deliberate smoke request.
+    presence: Any | None = None
+    presence_grace_seconds: int = 90
     _last_run_at: datetime | None = field(default=None, init=False)
+    _retry_not_before: datetime | None = field(default=None, init=False)
     _last_skip_reason: str = field(default="", init=False)
     _non_search_rotation: int = field(default=0, init=False)
 
@@ -87,6 +100,8 @@ class DouyinDiscoveryProducer:
         """Run one Douyin discovery cycle if enabled and due."""
         if not self.enabled:
             return self._skip("disabled")
+        if not self._extension_present():
+            return self._skip("extension_absent")
         if not self._is_due():
             return self._skip("throttled")
         if self._candidate_pool_full():
@@ -152,11 +167,13 @@ class DouyinDiscoveryProducer:
             if coordinator is not None:
                 for item in claimed:
                     coordinator.rollback(item)
+            self._stamp_run(0, reason="budget_exhausted")
             return self._skip("budget_exhausted")
         except Exception as exc:
             logger.warning("douyin producer failed: %s", exc)
             if claimed and coordinator is not None:
                 self._requeue_claimed_transient(coordinator, claimed)
+            self._stamp_run(0, reason="error")
             return self._skip("error")
 
         if claimed and coordinator is not None:
@@ -166,11 +183,12 @@ class DouyinDiscoveryProducer:
                 result.keyword_outcomes,
             )
 
-        self._stamp_run(len(result.items))
+        result_reason = self._result_reason(result)
+        self._stamp_run(len(result.items), reason=result_reason)
         payload: dict[str, object] = {
             "discovered": len(result.items),
             "source_counts": dict(result.source_counts),
-            "reason": self._result_reason(result),
+            "reason": result_reason,
         }
         if result.source_outcomes:
             payload["source_outcomes"] = dict(result.source_outcomes)
@@ -196,26 +214,64 @@ class DouyinDiscoveryProducer:
             payload.update(drain_result)
         return payload
 
-    def _stamp_run(self, discovered: int) -> None:
-        """Record this round on the cadence floor.
+    def _stamp_run(self, discovered: int, *, reason: str = "ok") -> None:
+        """Record this attempt and apply the plugin-specific retry floor.
 
         Productive rounds go to the shared ledger so the floor survives a
-        restart; the in-process stamp stays as the fallback for producers
-        constructed without a database.
+        restart. Every attempt also gets an in-process stamp: the shared ledger
+        deliberately ignores empty rounds, but immediately retrying a browser
+        task can create an unbounded pending-task loop when the extension is
+        offline. Infrastructure failures receive a longer cool-down than a
+        genuine empty response.
         """
+        now = datetime.now(UTC)
         record_producer_run(getattr(self, "database", None), "douyin", int(discovered))
-        self._last_run_at = datetime.now(UTC)
+        self._last_run_at = now
+        if int(discovered) > 0 or reason in {"ok", "empty"}:
+            self._retry_not_before = None
+        elif reason == "budget_exhausted":
+            self._retry_not_before = now + timedelta(minutes=_DOUYIN_BUDGET_RETRY_MINUTES)
+        elif reason in {"error", "timeout"}:
+            self._retry_not_before = now + timedelta(minutes=_DOUYIN_FAILURE_RETRY_MINUTES)
 
     def _is_due(self) -> bool:
+        now = datetime.now(UTC)
+        if self._retry_not_before is not None and now < self._retry_not_before:
+            return False
         if self.min_interval_minutes <= 0:
             return True
+        # The persisted ledger is intentionally productive-only. Keep this
+        # local attempt floor as well so empty plugin tasks cannot be enqueued
+        # once per refresh tick for the lifetime of the backend process.
+        if self._last_run_at is not None and now - self._last_run_at < timedelta(
+            minutes=self.min_interval_minutes
+        ):
+            return False
         database = getattr(self, "database", None)
         if ledger_available(database):
             # Restart-surviving floor keyed on the last *productive* round.
             return not producer_ran_within(database, "douyin", self.min_interval_minutes)
         if self._last_run_at is None:
             return True
-        return datetime.now(UTC) - self._last_run_at >= timedelta(minutes=self.min_interval_minutes)
+        return now - self._last_run_at >= timedelta(minutes=self.min_interval_minutes)
+
+    def _extension_present(self) -> bool:
+        """Fail fast in daemon mode when no extension can claim browser tasks.
+
+        ``presence=None`` preserves explicit CLI/debug construction. The
+        runtime factory injects the shared presence tracker because all three
+        steady-state sources currently use the browser task bridge.
+        """
+        if self.presence is None:
+            return True
+        is_present = getattr(self.presence, "is_present", None)
+        if not callable(is_present):
+            return False
+        try:
+            return bool(is_present(max(1, int(self.presence_grace_seconds))))
+        except Exception:
+            logger.debug("douyin producer: extension presence unavailable", exc_info=True)
+            return False
 
     def _sources_for_limit(self, requested_limit: int) -> tuple[str, ...]:
         configured = tuple(source for source in self.sources if str(source).strip())
@@ -323,6 +379,8 @@ def build_douyin_discovery_producer(
     discovery_engine: Any,
     candidate_pipeline: Any | None = None,
     keyword_fetch: Any | None = None,
+    presence: Any | None = None,
+    presence_grace_seconds: int = 90,
     enabled_override: bool | None = None,
 ) -> DouyinDiscoveryProducer | None:
     """Build the runtime Douyin producer if Douyin discovery is enabled."""
@@ -390,6 +448,8 @@ def build_douyin_discovery_producer(
         soul_engine=soul_engine,
         discover=_discover,
         enabled=producer_enabled,
+        presence=presence,
+        presence_grace_seconds=presence_grace_seconds,
         min_interval_minutes=int(getattr(dy_cfg, "min_interval_minutes", 3)),
         database=database,
         sources=("search", "hot", "feed"),

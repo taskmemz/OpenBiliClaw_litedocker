@@ -90,6 +90,10 @@ class YoutubeSearchStrategy(DiscoveryStrategy):
     def name(self) -> str:
         return "yt_search"
 
+    @property
+    def source_platform(self) -> str:
+        return "youtube"
+
     async def discover(
         self,
         profile: SoulProfile,
@@ -225,6 +229,10 @@ class YoutubeTrendingStrategy(DiscoveryStrategy):
     def name(self) -> str:
         return "yt_trending"
 
+    @property
+    def source_platform(self) -> str:
+        return "youtube"
+
     async def discover(self, profile: SoulProfile, limit: int = 20) -> list[DiscoveredContent]:
         raw = await self.client.get_trending(limit=self.fetch_limit)
         self.last_intermediates = {"fetched": len(raw)}
@@ -299,6 +307,10 @@ class YoutubeChannelStrategy(DiscoveryStrategy):
     @property
     def name(self) -> str:
         return "yt_channel"
+
+    @property
+    def source_platform(self) -> str:
+        return "youtube"
 
     async def discover(self, profile: SoulProfile, limit: int = 20) -> list[DiscoveredContent]:
         channel_ids = self._subscribed_channel_ids()

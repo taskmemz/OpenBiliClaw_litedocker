@@ -937,6 +937,17 @@ class TestMobileWebViewModels:
             assert.equal(pending.available, "找到 142 条素材，正在整理成可换内容");
             assert.equal(pending.replenished, "正在整理");
             assert.equal(pending.topics, "整理好就能换，不会把素材数当可换数");
+
+            const stockedWithBacklog = getPoolStatusSummary({
+              initialized: true,
+              pool_available_count: 222,
+              pool_pending_count: 177,
+              pool_target_count: 300,
+              manual_refresh_state: "idle",
+            });
+            assert.equal(stockedWithBacklog.available, "还有 222 条可换");
+            assert.equal(stockedWithBacklog.replenished, "另有 177 条素材");
+            assert.equal(stockedWithBacklog.topics, "素材已抓到，会按可换库存缺口整理");
         """)
         )
 
@@ -977,7 +988,7 @@ class TestMobileWebViewModels:
               header.poolChips.map((chip) => [chip.label, chip.value, chip.tone]),
               [
                 ["当前可换", "23 条", "neutral"],
-                ["最近补进", "补进 7 条", "brand"],
+                ["补货进展", "补进 7 条", "brand"],
                 ["现在在忙", "城市影像 / 设备测评", "info"],
               ],
             );
@@ -995,7 +1006,7 @@ class TestMobileWebViewModels:
               internal.poolChips.map((chip) => [chip.label, chip.value]),
               [
                 ["当前可换", "600 条"],
-                ["最近补进", "补进 1 条"],
+                ["补货进展", "补进 1 条"],
                 ["现在在忙", "小红书任务 / 探索"],
               ],
             );

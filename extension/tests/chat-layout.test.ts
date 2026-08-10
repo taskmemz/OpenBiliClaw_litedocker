@@ -122,7 +122,7 @@ test("chat form reserves a dedicated status line for staged progress", () => {
 test("chat tab scrolls restored history to the newest message", () => {
   const popupJs = readFileSync(resolve("popup", "popup.js"), "utf8");
   const setActiveTabBlock =
-    popupJs.match(/function setActiveTab\(tabName\) \{[\s\S]*?\n\}/)?.[0] ?? "";
+    popupJs.match(/function setActiveTab\([^)]*\) \{[\s\S]*?\n\}/)?.[0] ?? "";
   const hydrateBlock =
     popupJs.match(/async function hydrateChatHistory\(\) \{[\s\S]*?\n\}/)?.[0] ?? "";
 

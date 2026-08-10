@@ -415,7 +415,10 @@ class DyTaskQueue:
         # active init only init-owned bootstrap tasks are handed out). None = all.
         # Staged results remain stale-reclaimable so a lost result response
         # gets a fresh dispatcher callback that repairs canonical projections.
-        where = "(status = 'pending' OR (status = 'in_progress' AND claimed_at <= ?))"
+        where = (
+            "(status = 'pending' OR "
+            "(status = 'in_progress' AND (claimed_at IS NULL OR claimed_at <= ?)))"
+        )
         params: list[Any] = [stale_before]
         if only_ids is not None:
             ids = [str(i) for i in only_ids]
@@ -426,8 +429,25 @@ class DyTaskQueue:
         conn = self._db.open_connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            # The extension mutex is scoped to one service-worker global. Two
+            # unpacked extension IDs or browser profiles do not share it and
+            # could otherwise claim different Douyin tasks concurrently. Keep
+            # the source queue single-flight at the durable claim boundary;
+            # stale leases remain eligible for recovery below.
+            active = conn.execute(
+                """
+                SELECT 1
+                FROM dy_tasks
+                WHERE status = 'in_progress' AND claimed_at > ?
+                LIMIT 1
+                """,
+                (stale_before,),
+            ).fetchone()
+            if active is not None:
+                conn.commit()
+                return None
             row = conn.execute(
-                f"SELECT * FROM dy_tasks WHERE {where} ORDER BY created_at ASC LIMIT 1",
+                f"SELECT * FROM dy_tasks WHERE {where} ORDER BY created_at ASC, rowid ASC LIMIT 1",
                 params,
             ).fetchone()
             if row is None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import threading
 from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -417,3 +418,254 @@ def test_failed_apply_refreshes_canonical_snapshot_behind_new_draft(
     expect(share).to_have_value("4")
     page.get_by_role("button", name="放弃修改").click()
     expect(share).to_have_value("5")
+
+
+def test_settings_data_migration_download_reconcile_and_cancel_do_not_dirty_config(
+    settings_save_server: tuple[str, SettingsSaveStub],
+    chromium_page: Page,
+) -> None:
+    base_url, stub = settings_save_server
+    page = chromium_page
+    page.add_init_script(
+        """
+        (() => {
+          const nativeCrypto = globalThis.crypto;
+          const compatibilityCrypto = { randomUUID: undefined };
+          if (typeof nativeCrypto?.getRandomValues === "function") {
+            compatibilityCrypto.getRandomValues = nativeCrypto.getRandomValues.bind(nativeCrypto);
+          }
+          Object.defineProperty(globalThis, "crypto", {
+            configurable: true,
+            value: compatibilityCrypto,
+          });
+          Object.defineProperty(globalThis, "showSaveFilePicker", {
+            configurable: true,
+            value: undefined,
+          });
+        })();
+        """
+    )
+    requests: list[tuple[str, dict[str, str], bytes, str]] = []
+    migration_state: dict[str, str] = {
+        "state": "idle",
+        "request_id": "",
+        "migration_id": "migration-e2e-001",
+    }
+
+    def migration_route(route: Any, request: Any) -> None:
+        path = request.url.split("?", 1)[0]
+        if path.endswith("/api/migration/status"):
+            payload: dict[str, object] = {
+                "state": migration_state["state"],
+                "restart_required": migration_state["state"] == "staged",
+            }
+            if migration_state["state"] == "staged":
+                payload.update(
+                    {
+                        "migration_id": migration_state["migration_id"],
+                        "request_id": migration_state["request_id"],
+                        "source_omitted_environment_variables": ["OPENBILICLAW_SOURCE_ONLY"],
+                        "target_active_environment_variables": ["OPENBILICLAW_TARGET_ONLY"],
+                        "frontend": {
+                            "theme_mode": "dark",
+                            "theme_hue": 210,
+                            "accent_style": "modern",
+                            "auto_load_on_scroll": False,
+                            "side_drawer_open": True,
+                        },
+                    }
+                )
+            elif migration_state["state"] == "applied":
+                payload["migration_id"] = migration_state["migration_id"]
+                payload["frontend"] = {
+                    "theme_mode": "dark",
+                    "theme_hue": 210,
+                    "accent_style": "modern",
+                    "auto_load_on_scroll": False,
+                    "side_drawer_open": True,
+                }
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(payload),
+            )
+            return
+        body = request.post_data_buffer or b""
+        headers = dict(request.headers)
+        requests.append((path, headers, body, request.method))
+        if path.endswith("/api/migration/export"):
+            route.fulfill(
+                status=200,
+                headers={
+                    "Content-Type": "application/vnd.openbiliclaw.backup+zip",
+                    "Content-Disposition": 'attachment; filename="portable.obcbackup"',
+                },
+                body=b"portable-backup",
+            )
+            return
+        if path.endswith("/api/migration/import"):
+            migration_state["state"] = "staged"
+            migration_state["request_id"] = headers["x-obc-migration-request-id"].replace("-", "")
+            route.abort("connectionfailed")
+            return
+        if path.endswith("/api/migration/pending") and request.method == "DELETE":
+            migration_state["state"] = "cancelled"
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "state": "cancelled",
+                        "cancelled": True,
+                        "restart_required": False,
+                        "message": "待导入迁移包已取消，当前数据未改动。",
+                    }
+                ),
+            )
+            return
+        route.fulfill(status=404, content_type="application/json", body="{}")
+
+    page.route("**/api/migration/**", migration_route)
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.goto(f"{base_url}/web/")
+    page.get_by_role("button", name="设置", exact=True).click()
+    page.get_by_role("tab", name="通用").click()
+
+    expect(page.locator("#migrationStatus")).to_contain_text("只能在运行后端的本机操作")
+    expect(page.locator("#settingsSaveBar")).to_have_attribute("data-dirty", "false")
+
+    with page.expect_download() as download_info:
+        page.get_by_role("button", name="导出全部信息").click()
+    assert download_info.value.suggested_filename == "portable.obcbackup"
+    expect(page.locator("#migrationStatus")).to_contain_text("迁移包已保存")
+
+    page.locator("#migrationImportFile").set_input_files(
+        {
+            "name": "portable.obcbackup",
+            "mimeType": "application/vnd.openbiliclaw.backup+zip",
+            "buffer": b"portable-backup",
+        }
+    )
+    expect(page.locator("#migrationStatus")).to_contain_text("请完全退出并重新启动", timeout=15_000)
+    expect(page.locator("#migrationStatus")).to_contain_text("OPENBILICLAW_SOURCE_ONLY")
+    expect(page.locator("#migrationStatus")).to_contain_text("OPENBILICLAW_TARGET_ONLY")
+    assert page.evaluate("localStorage.getItem('obc.theme')") != "dark"
+    expect(page.locator("#settingsSaveBar")).to_have_attribute("data-dirty", "false")
+    assert stub.saved_payloads == []
+
+    export_request = next(item for item in requests if item[0].endswith("/migration/export"))
+    import_request = next(item for item in requests if item[0].endswith("/migration/import"))
+    exported_frontend = json.loads(export_request[2])["frontend"]
+    assert set(exported_frontend) == {
+        "theme_mode",
+        "theme_hue",
+        "accent_style",
+        "auto_load_on_scroll",
+        "side_drawer_open",
+    }
+    assert export_request[1]["x-obc-auth"] == "1"
+    assert import_request[1]["x-obc-auth"] == "1"
+    assert import_request[1]["x-obc-migration-confirm"] == "replace-all"
+    request_id = import_request[1]["x-obc-migration-request-id"]
+    assert re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        request_id,
+        re.IGNORECASE,
+    )
+    assert migration_state["request_id"] == request_id.replace("-", "")
+
+    cancel = page.get_by_role("button", name="取消待导入")
+    expect(cancel).to_be_visible()
+    cancel.click()
+    expect(page.locator("#migrationStatus")).to_contain_text("已取消")
+    expect(cancel).to_be_hidden()
+    cancel_request = next(item for item in requests if item[0].endswith("/migration/pending"))
+    assert cancel_request[3] == "DELETE"
+    assert cancel_request[1]["x-obc-auth"] == "1"
+    expect(page.locator("#settingsSaveBar")).to_have_attribute("data-dirty", "false")
+
+    migration_state["state"] = "applied"
+    page.reload()
+    page.get_by_role("button", name="设置", exact=True).click()
+    page.get_by_role("tab", name="通用").click()
+    expect(page.locator("#migrationStatus")).to_contain_text("成功载入")
+    page.wait_for_function("localStorage.getItem('obc.theme') === 'dark'")
+    assert page.evaluate("localStorage.getItem('obc.themeHue')") == "210"
+    assert page.evaluate("localStorage.getItem('obc.accentStyle')") == "modern"
+    assert page.evaluate("localStorage.getItem('openbiliclaw.webui.autoLoadOnScroll')") == "0"
+    assert (
+        page.evaluate("localStorage.getItem('openbiliclaw.webui.appliedMigrationFrontend')")
+        == migration_state["migration_id"]
+    )
+
+    # A durable applied status is only a one-shot preference handoff. A later
+    # browser reload must not overwrite the user's post-migration choice.
+    page.evaluate("localStorage.setItem('obc.theme', 'light')")
+    page.reload()
+    page.get_by_role("button", name="设置", exact=True).click()
+    page.get_by_role("tab", name="通用").click()
+    expect(page.locator("#migrationStatus")).to_contain_text("成功载入")
+    assert page.evaluate("localStorage.getItem('obc.theme')") == "light"
+
+
+def test_migration_request_id_final_fallback_is_rfc4122_uuid(
+    settings_save_server: tuple[str, SettingsSaveStub],
+    chromium_page: Page,
+) -> None:
+    base_url, _stub = settings_save_server
+    page = chromium_page
+    page.add_init_script(
+        """
+        Object.defineProperty(globalThis, "crypto", {
+          configurable: true,
+          value: { randomUUID: undefined, getRandomValues: undefined },
+        });
+        """
+    )
+    request_ids: list[str] = []
+
+    def migration_route(route: Any, request: Any) -> None:
+        path = request.url.split("?", 1)[0]
+        if path.endswith("/api/migration/status"):
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({"state": "idle", "restart_required": False}),
+            )
+            return
+        if path.endswith("/api/migration/import"):
+            request_id = dict(request.headers)["x-obc-migration-request-id"]
+            request_ids.append(request_id)
+            route.fulfill(
+                status=202,
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "state": "staged",
+                        "request_id": request_id.replace("-", ""),
+                        "restart_required": True,
+                    }
+                ),
+            )
+            return
+        route.fulfill(status=404, content_type="application/json", body="{}")
+
+    page.route("**/api/migration/**", migration_route)
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.goto(f"{base_url}/web/")
+    page.get_by_role("button", name="设置", exact=True).click()
+    page.get_by_role("tab", name="通用").click()
+    page.locator("#migrationImportFile").set_input_files(
+        {
+            "name": "portable.obcbackup",
+            "mimeType": "application/vnd.openbiliclaw.backup+zip",
+            "buffer": b"portable-backup",
+        }
+    )
+    expect(page.locator("#migrationStatus")).to_contain_text("请完全退出并重新启动", timeout=15_000)
+    assert len(request_ids) == 1
+    assert re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        request_ids[0],
+        re.IGNORECASE,
+    )

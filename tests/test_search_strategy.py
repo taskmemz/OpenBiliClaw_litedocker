@@ -624,6 +624,69 @@ async def test_search_strategy_uses_llm_queries_and_searches_each_query() -> Non
 
 
 @pytest.mark.asyncio
+async def test_search_strategy_recent_lane_is_bounded_budgeted_and_provenanced() -> None:
+    from openbiliclaw.discovery.candidate_pool import discovered_content_to_candidate_write
+    from openbiliclaw.discovery.strategies.strategies import SearchStrategy
+
+    class LaneClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int, str]] = []
+
+        async def search(
+            self,
+            keyword: str,
+            page: int = 1,
+            page_size: int = 20,
+            order: str = "totalrank",
+        ) -> list[dict[str, object]]:
+            self.calls.append((keyword, page_size, order))
+            suffix = "recent" if order == "pubdate" else "base"
+            return [
+                {
+                    "bvid": f"BV-{keyword}-{suffix}",
+                    "title": f"{keyword}-{suffix}",
+                    "pubdate": 1783492200,
+                }
+            ]
+
+    client = LaneClient()
+    strategy = SearchStrategy(
+        llm_service=FakeLLMService("{}"),
+        bilibili_client=client,
+        concurrency=DiscoveryConcurrencyController(search_budget_total=9),
+        recent_lane_queries_per_run=1,
+        recent_lane_page_size=5,
+        llm_evaluation=False,
+    )
+
+    results = await strategy.discover(
+        _build_profile(),
+        limit=2,
+        queries=["q0", "q1", "q2"],
+    )
+
+    # Per-strategy budget is 9/3=3 calls: two normal queries + one recent
+    # request. The third normal query is trimmed rather than exceeding budget.
+    assert client.calls == [
+        ("q0", 10, "totalrank"),
+        ("q1", 10, "totalrank"),
+        ("q0", 5, "pubdate"),
+    ]
+    recent = next(item for item in results if item.discovery_lane == "recent")
+    write = discovered_content_to_candidate_write(recent, source_context="mixed")
+    assert write.source_strategy == "search"
+    assert write.source_context == "search:recent"
+    assert write.raw_payload["discovery_lane"] == "recent"
+    assert strategy.last_intermediates["recent_lane"] == {
+        "order": "pubdate",
+        "request_count": 1,
+        "page_size": 5,
+        "api_results": 1,
+        "unique_candidates": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_search_strategy_skips_llm_query_generation_during_search_cooldown() -> None:
     from openbiliclaw.discovery.strategies.strategies import SearchStrategy
 

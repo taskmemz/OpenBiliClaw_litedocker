@@ -968,6 +968,10 @@ def _build_recommendation_engine() -> Any:
         embedding_service=embedding_service,
         xhs_self_info_provider=_xhs_self_info_provider,
         copy_ready_target_count=effective_copy_target,
+        pool_available_target_count=max(
+            0,
+            int(getattr(cfg.scheduler, "pool_target_count", 0) or 0),
+        ),
         visual_profile_enabled=bool(
             getattr(getattr(cfg, "discovery", None), "visual_profile_enabled", False)
         ),
@@ -1075,6 +1079,8 @@ def _build_discovery_engine() -> Any:
         DiscoveryConcurrencyController,
     )
     from openbiliclaw.discovery.strategies.strategies import (
+        RECENT_SUPPLY_LANE_PAGE_SIZE,
+        RECENT_SUPPLY_LANE_QUERIES,
         ExploreStrategy,
         RelatedChainStrategy,
         SearchStrategy,
@@ -1140,6 +1146,8 @@ def _build_discovery_engine() -> Any:
         concurrency=concurrency,
         database=database,
         embedding_service=embedding_service,
+        recent_lane_queries_per_run=RECENT_SUPPLY_LANE_QUERIES,
+        recent_lane_page_size=RECENT_SUPPLY_LANE_PAGE_SIZE,
     )
     trending_strategy = TrendingStrategy(
         bilibili_client=bilibili_client,
@@ -5003,6 +5011,52 @@ def logs_prune(
     console.print(f"\n[bold green]✓ Applied — actually freed {freed_mb:.1f} MB[/bold green]")
 
 
+def _acquire_server_migration_guard() -> Any:
+    """Exclusively apply a staged import before any server-side DB access."""
+    from openbiliclaw.config import _project_root, load_config
+    from openbiliclaw.storage.migration import (
+        acquire_migration_runtime_guard,
+        apply_pending_migration,
+        migration_recovery_data_dir,
+    )
+
+    project_root = _project_root()
+    recovery_data_dir = migration_recovery_data_dir(project_root=project_root)
+    current_data_dir = (
+        recovery_data_dir if recovery_data_dir is not None else load_config().data_path
+    )
+    guard = acquire_migration_runtime_guard(project_root, current_data_dir)
+    if guard is None:
+        _print_status_panel(
+            "error",
+            "后端已在运行",
+            "另一个 OpenBiliClaw 后端正在使用当前数据目录；请先退出它再启动。",
+        )
+        raise typer.Exit(code=1)
+    try:
+        result = apply_pending_migration(
+            project_root=project_root,
+            locked_data_dir=current_data_dir,
+        )
+        runtime_data_dir = load_config().data_path
+        if not guard.acquire_data_dir(runtime_data_dir):
+            _print_status_panel(
+                "error",
+                "数据目录已在使用",
+                "迁移恢复后的运行数据目录已被另一后端锁定；本次拒绝启动。",
+            )
+            guard.release()
+            raise typer.Exit(code=1)
+    except Exception:
+        guard.release()
+        raise
+    if result is not None and result.state == "applied":
+        _print_status_panel("success", "迁移已应用", result.message)
+    elif result is not None and result.state == "failed":
+        _print_status_panel("warning", "迁移未应用", result.message)
+    return guard
+
+
 @app.command()
 def start(
     host: str = typer.Option("", "--host", help="API 监听地址（默认读 config.toml [api].host）"),
@@ -5011,6 +5065,14 @@ def start(
     ),
 ) -> None:
     """启动 OpenBiliClaw Agent."""
+    guard = _acquire_server_migration_guard()
+    try:
+        _start_agent(host=host, port=port)
+    finally:
+        guard.release()
+
+
+def _start_agent(*, host: str, port: int) -> None:
     from openbiliclaw.config import load_config
 
     cfg = load_config()
@@ -5018,6 +5080,10 @@ def start(
     effective_port = port if port else cfg.api.port
     _print_page_title("启动 OpenBiliClaw", "本地 API 服务")
     _ensure_runtime_database_healthy()
+    # Keep the cold-copy backup ahead of guided-init/runtime construction.
+    # Opening and closing a plain file descriptor for a live SQLite inode after
+    # a persistent connection exists can release this process's POSIX locks.
+    _maybe_create_runtime_database_backup()
     _print_status_panel(
         "info",
         "API 服务",
@@ -5046,7 +5112,6 @@ def start(
                 "（并确保代理覆盖而非透传客户端转发头），或让代理自行鉴权，"
                 "否则远程请求可能被误判为本机而绕过密码。",
             )
-    _maybe_create_runtime_database_backup()
     _preflight_loopback_ollama(cfg)
     _self_heal_autostart_registration(cfg)
     _run_api_server(host=effective_host, port=effective_port)
@@ -5786,6 +5851,14 @@ def serve_api(
     tls_port: int | None = _SERVE_API_TLS_PORT_OPTION,
 ) -> None:
     """启动容器友好的 API 服务入口."""
+    guard = _acquire_server_migration_guard()
+    try:
+        _serve_api(host=host, port=port, tls_port=tls_port)
+    finally:
+        guard.release()
+
+
+def _serve_api(*, host: str, port: int, tls_port: int | None) -> None:
     _print_page_title("启动 OpenBiliClaw", "容器 API 服务")
     _print_status_panel(
         "info",
@@ -11421,8 +11494,9 @@ def _run_douyin_discovery(
             _print_status_panel(
                 "warning",
                 "抖音插件任务等待超时",
-                "任务可能仍在浏览器后台执行；可提高 "
-                "OPENBILICLAW_DY_DISCOVERY_SEARCH_WAIT_SECONDS 后重试并检查任务状态。",
+                "等待超时的任务已写入 failed 终态，不会残留 pending。请确认浏览器扩展在线；"
+                "若扩展确实在执行但耗时较长，可提高 "
+                "OPENBILICLAW_DY_DISCOVERY_SEARCH_WAIT_SECONDS 后重试。",
             )
             raise typer.Exit(code=1)
         if "failed" in outcomes:

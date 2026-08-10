@@ -4,13 +4,59 @@
 
 `src/openbiliclaw/storage/` 负责本地 SQLite 数据库、schema 初始化、候选池计数和高频读写路径。它不理解 runtime state 或用户画像，只提供确定性的持久化 API。
 
-本模块当前承担五类边界：
+本模块当前承担六类边界：
 
 - 行为、推荐、候选池、聊天和鉴权状态的 SQLite 表结构管理。
 - 推荐池 `content_cache` 的可换 / raw / pending 计数口径。
 - discovery 待评估池 `discovery_candidates` 的生命周期管理。
+- evaluator prefilter 与推荐时效排序的 privacy-safe shadow 审计。
 - 跨平台收藏 / 稍后再看的 canonical 本地 membership、元数据快照、native sync 状态和独立任务快照持久化。
 - 事件入口幂等回执，以及小红书 / 抖音 / YouTube / 知乎 / Reddit 来源任务首个终态结果的 crash-safe staging。
+- 跨机器迁移包的一致快照、严格校验、私有暂存和重启期 journaled replace / rollback。
+
+## 可移植数据迁移
+
+`storage/migration.py` 把运行中的用户状态导出为格式版本 1 的 `openbiliclaw-user-data` 包，文件扩展名为 `.obcbackup`。容器本质是标准 ZIP，**没有密码和加密**；`manifest.json` 明确写入 `contains_secrets=true`、`encrypted=false`，并为每个允许成员记录路径、类型、字节数与 SHA-256。导出 SQLite 时不直接复制可能正在写入的主文件，而是以只读 URI 打开源库、用 SQLite online backup API 生成一致快照并执行 `PRAGMA integrity_check`；其它文件复制前后会核对 stat / digest，持续变化时拒绝生成伪一致快照。目录遍历会在进入前剪枝排除根、采用独立扫描上限，并在复制前、复制流中和 ZIP 写入时逐层执行容量限制；ZIP 完成后立即删除最多 8 GB 的未压缩 snapshot，只在一次受全程互斥保护的下载期间保留最多 2 GB 的 archive。
+
+### 导出范围
+
+| 包含 | 刻意排除 |
+|---|---|
+| 磁盘 `config.toml` + `config.local.toml` 合并、移除整段 `[api.auth]` 后生成的单份 `config/config.toml`；主数据库和数据目录中的其它可迁移 SQLite；Soul / memory / runtime 用户状态文件；`*_cookie.json` 等平台登录凭据；`data/image-cache/`；白名单桌面偏好 | 来源配置的分层 provenance 与整段 `[api.auth]`（含密码 / hash、session secret、proxy / Origin 策略与设备 key）；`logs/`；`data/backups/`、`data/cache/`、`data/eval/`、`data/embedding_cache.db`；`data/certs/`、`data/autostart/`；WAL / SHM / lock / temp；OpenBiliClaw Web / 扩展访问会话；外部 CLI 凭据；环境变量**值** |
+
+图片缓存是刻意包含的用户状态：部分平台的签名图片 URL 会过期，迁移后无法可靠重新下载。导出配置仍来自磁盘 `config.toml` + `config.local.toml`，但数据快照路径固定为当前进程已取得 canonical lock 的 active data dir；在线保存但尚未重启启用的新 `data_dir` 不会成为本次数据来源。manifest 的 `source_omitted_environment_variables` 只记录源机导出时有值、会影响运行结果的环境变量**名称**（`OPENBILICLAW_*`、Gemini 标准 Key、系统代理 / CA），不记录 value；暂存时另采集目标进程当时有值的名称为 `target_active_environment_variables`。前者提示目标机重新提供来源依赖，后者是目标环境可能覆盖导入文件的暂存时快照；实际应用仍以重启时环境为准，两者都不表示值已迁移。前端文件只允许 `theme_mode`、`theme_hue`、`accent_style`、`auto_load_on_scroll`、`side_drawer_open`；后端 endpoint、Bearer / session、通知与缓存状态不进入包。
+
+### 校验与暂存
+
+`stage_migration_archive()` 在任何 active 配置或数据库被替换前完成全部验证：
+
+- 压缩包不超过 2 GB，成员不超过 20,000 个，目录扫描项目不超过 100,000 个，单成员不超过 4 GB，总解压大小不超过 8 GB；manifest 不超过 16 MB，前端偏好文件不超过 64 KB，成员路径不超过 512 字符 / 16 层；
+- ZIP 成员必须是 manifest 精确列出的普通文件，拒绝绝对路径、`..`、过深 / 过长路径、符号链接、设备 / 特殊文件、重复成员和加密成员；
+- 格式版本必须等于当前版本，源 OpenBiliClaw 版本不能高于目标运行版本；
+- 每个文件的实际大小和 SHA-256 必须匹配，TOML 必须能构建无 blocking issue 的 `Config`，每个识别为 SQLite 的文件必须通过 `integrity_check`。
+
+校验通过后才把内容发布到项目根的 `.openbiliclaw-migration/pending-<uuid>/`，记录整个暂存树的 seal 并原子更新 `pending.json`；启动应用前会重新核对该 seal，暂存内容被改动就拒绝替换。运行中的 `Database`、`MemoryManager`、配置对象和浏览器偏好保持不变，HTTP 最终返回 `202 staged + migration_id + request_id + restart_required`。`request_id` 是 UUID 规范化后的上传关联 ID；持久化 `migration_status()` 会在 staged 状态回传它，而 HTTP status 路由还会在上传 / 校验进行中叠加 `state="processing"`、同一 `request_id` 与 `phase="uploading|validating"`。这让客户端在响应超时 / 断线后区分“仍在处理”和已暂存，但 request ID 不是服务端自动去重键。桌面端不会用一次瞬时 `idle` 终结不确定请求：它最多强制查询 3 次，对 `idle/cancelled` 间隔 500ms 再确认，匹配 ID 的 `processing/staged` 立即收口。如果再次导入另一个合法包，新的 pending marker 取代旧包，旧暂存目录被清理；`cancel_pending_migration()` 可在应用开始前删除 pending，且不接触 active 数据。
+
+### 重启应用与回滚
+
+`openbiliclaw start`、`openbiliclaw serve-api` 和桌面打包入口在读取业务数据库前，同时尝试持有项目根 `.openbiliclaw-migration/runtime.lock` 与 canonical 数据目录同级的 `.<data-dir-name>.openbiliclaw-runtime.lock`。这样同一项目、或不同项目但共享同一数据目录的受支持后端，都不能并行越过应用边界。锁覆盖整个进程生命周期，因此在线 `PUT /api/config` 改变 `data_dir` 只能持久化并返回 `restart_required=true`；当前 runtime 与外部凭据写继续使用已锁住的 active 目录，完整重启取得新目录锁后才切换。存在 pending 时，启动器先在目标配置 / 数据目录旁准备新副本，再通过 `apply-journal.json` 记录每一步并执行同目录 `os.replace`：
+
+1. 目标 `config.toml`、`config.local.toml` 与数据目录按存在情况移为 `*.pre-import-<migration-id 前 12 位>.bak`；
+2. 在 prepared 主库上运行当前 schema 初始化 smoke；读取来源 prepared DB 与目标 active DB 的当前 `auth_epoch`，写入 `max(来源, 目标) + 1` 并删除来源 `password_fingerprint`。新 epoch 严格高于两者，使会话撤销不依赖 session secret 是否被环境变量固定；随后启用导入数据与规范化配置并再次校验 SQLite；
+3. 成功后在 `status.json` 保存不对 API 暴露的活动代际回执（目标路径、配置 SHA-256、严格递增的 DB auth epoch），再删除 pending / journal / 暂存目录；若不支持目录 fsync 的文件系统在断电后复活同一 marker，启动端必须先锁回执中的数据目录并精确验证代际，只清理重复 marker、绝不重放。任何一步失败则按可重复执行的 `rolling_back` journal 恢复原配置和数据，并记录 `failed` 状态；提交确认前出现的 premature applied 回执会先被降为 failed，避免恢复后自锁。
+
+本次成功应用产生的 `pre-import` 回滚副本会保留；完成提交后会清理更早迁移遗留的同类回滚 / failed / prepared artifact，使每个目标只保留本次可恢复副本。启动应用会重新读取目标机的磁盘配置与有效数据路径；`data/certs/` 与 `data/autostart/` 会从应用时目标目录复制到新数据目录，路径、监听端口、日志、网络 / TLS / 自启动和 CDP 等机器专属配置也使用此时目标机现值。整段 `api.auth` 先以目标机应用时的最新磁盘值为基线，来源包既不含也不覆盖任何 auth 字段；随后轮换磁盘 session secret，并把扩展远程访问 key 清空且关闭。prepared DB 的严格递增 `auth_epoch` 同时高于来源与目标当前 epoch，会独立撤销两台机器的旧 Web 会话，即使 `OPENBILICLAW_API_AUTH_SESSION_SECRET` 仍由目标环境固定也不例外；正常启动 reconcile 再记录目标凭据 fingerprint。这样保留目标机的门禁 / 密码 / proxy / Origin 策略，但不保留旧会话和设备配对。白名单桌面偏好也只在这次 apply 成功后由设置页生效，不在上传暂存时提前切换；浏览器按 `migration_id` 只接收一次，同一 applied status 后续不会覆盖用户的新选择。
+
+### 公开 Python API
+
+| API | 作用 |
+|---|---|
+| `create_migration_archive(config, frontend_settings, project_root=...)` | 创建在线一致、带清单与校验和的临时导出包；调用方负责在响应完成后删除临时目录。 |
+| `stage_migration_archive(path, current_config, project_root=..., request_id=...)` | 验证并发布唯一 pending 导入，记录规范化请求关联 ID，不修改 active runtime。 |
+| `cancel_pending_migration(project_root=...)` | 删除尚未应用的 pending；没有 pending 时返回 `False`，不修改 active 配置或数据。 |
+| `acquire_migration_runtime_guard(project_root, data_dir=None)` | 非阻塞取得项目锁，并在给出 `data_dir` 时同时取得 canonical 数据目录锁；任一冲突即返回 `None`。 |
+| `apply_pending_migration(project_root=...)` | 只应在持有 runtime guard 时调用；应用或恢复一次 pending migration。 |
+| `migration_status(project_root=...)` | 返回 `idle/staged/applied/failed/cancelled` 的非敏感状态；staged 含 `request_id` 和两类环境变量名供对账。 |
 
 ## 已实现功能
 
@@ -32,8 +78,9 @@
 | 态势门控 shadow 采数 + 代理折价（v0.3.176+） | ✅ | 认知画像流水线 Phase 3 / Wave B 遗留。`posture_gate_shadow_stats()` 从 `profile_update_ledger` 汇总 enforce save-time 校验所需的 shadow 判定统计：最早**有效**判定时间（`gate_verdict IN (shadow_accept, shadow_downgrade, shadow_reject)`，不含 `shadow_error`）+ 近 14 天 / 近 7 天有效判定数。`discount_events_by_confusion(evidence_refs)` 对可解析为事件 id 的 `evidence_refs` 关联 events 行 patch `metadata.discounted_by_confusion=true` + `signal_strength` 折至 0.2（`sources/event_format.apply_confusion_discount`，幂等）；非 id ref 跳过，不删行、不改其它列。供疑惑 `proxy_behavior` 出口调用。 |
 | 疑惑对象表 + 归属重放队列（`confusions`，v0.3.182+） | ✅ | 原有状态、72h ask 冷却、partial unique `clarifying≤1` 与 `held_updates` 保持；新增幂等迁移列 `replay_queue TEXT NOT NULL DEFAULT '[]'`。`release_orphan_confusion_claim()` 同时要求 status/`expected_ask_turn_id` 匹配、claim 的 `updated_at` 已超过调用方给定最小年龄、且同一原子 UPDATE 内 `NOT EXISTS(chat_turns.turn_id)`，才把真 crash-gap 孤儿恢复为 open 并清除未实际提问的 `ask_turn_id/asked_at`；活跃 claim→create 窗口和已有 live turn 都不会被回收。`enqueue_confusion_replay()` 在独立 `BEGIN IMMEDIATE` 中去重入尾、上限 5、返回最旧逐出项；`pop_confusion_replay_head(expected_id=...)` 只允许精确队头出队（顺序 fencing）；`clear_confusion_replay_queue()` 原子返回并清空。`list_pending_confusion_dialogue_replays()` **优先扫描任意 status 的非空 replay_queue**（覆盖 resolve commit→pop 之间崩溃后已 terminal 的行），剩余额度再查 `clarifying` 且 completed、晚于 `asked_at`、尚无 turn payload receipt 的 classification gap。`mark_confusion_dialogue_replay_processed()` 可在 turn 仍 pending 时先写幂等 receipt，完成后扫描不会重复计数。 |
 | Retraction 事件折价（离线重读面） | ✅ | `mark_positive_events_retracted(identity_urls, retracted_action, *, retraction_at)` 在独立短连接的一次事务中，对 `event_type == retracted_action` 且 URL 归一化 identity key（`sources/identity_keys.dedup_key`：tweet_id / bvid / mid / xhs note_id）命中、**且事件时间早于 `retraction_at`** 的行 patch `metadata.retracted=true` + `signal_strength=min(现值,0.2)`；事件时间不可得的行保守不标。无时间窗口（identity key 全局唯一），覆盖 `openbiliclaw init` 全量重建与 12h 认知整理等重读 events 表路径；不删行、不改 `event_type`/`url`。`latest_retraction_time_for(url, action)` 返回该 identity + action 最新的已存 retraction 事件时间，供落库路径对账迟到正向事件（account_sync 回填）。`retracted_action` 越界返回 0/None。 |
-| 推荐池 readiness 计数 | ✅ | `count_pool_readiness()` 返回 `available/raw/pending/admitted_pending_copy/pending_eval/evaluated_pending`。其中 `admitted_pending_copy` 只统计已通过 admission、已完成 style/topic 分类、链接可用且尚缺 expression/topic label 的 canonical 行，并复用 recommendation、`seen_items`、self-XHS 与 delight guards。 |
+| 推荐池 readiness 计数 | ✅ | `count_pool_readiness()` 返回 `available/copy_ready/raw/pending/admitted_pending_copy/admitted_pending_available/pending_eval/evaluated_pending`。其中 `admitted_pending_copy` 只统计已通过 admission、已完成 style/topic 分类、链接可用且尚缺 expression/topic label 的 canonical 行；`admitted_pending_available` 是它的严格子集，只保留当前 `topic_group` 三条展示窗口仍有空位、补齐文案后能让 canonical `available` 净增的行。公开加载与计数都先应用 durable seen / linkability gate，再做 topic cap；已看或不可打开的高分行不会占住三条窗口。两者都复用 recommendation、`seen_items`、self-XHS 与 delight guards。 |
 | 规范化保存存储 | ✅ | `saved_items` 以 canonical key 保存跨平台元数据快照，`saved_memberships` 独立表达收藏 / 稍后看归属，`native_save_states` 持久化当前逐项同步状态；`native_save_tasks` / `native_save_task_items` 独立持久化每次请求的 UUID、不可变成员集合和 task-scoped 结果。旧 `watch_later` / `favorites` 由带 marker 的单次事务迁移导入。 |
+| 30 天内容历史投影（issue #112） | ✅ | `list_content_history_page()` 从 `events` 中 recommendation-owned click、`recommendations` 中展示与 dismiss/dislike 反馈以及 `saved_item_removals` 投影三类历史；`list_content_history()` 保留为 offset 兼容包装。连接注册的 deterministic UDF 直接委托 `sources.platforms.normalize_source_platform()`，在 SQL 投影前同时规范 source alias 与 item-key 前缀；缺平台的 legacy click 才显式默认 Bilibili。legacy recommendation 先用 indexed scalar lookup 计算 canonical key 和 hydration bvid，再以主键等值 hydrate，避免成熟库上的 `LEFT JOIN ... OR` 全扫；`shown` 把已点击 recommendation ID 与 item key 各自 materialize 为一次性 `NOT IN` lookup set，避免对每条候选相关扫描 click 集合。每页的 entries、全量 total、`limit + 1` 和 source max-id anchors 在同一 SQLite read snapshot 中读取；keyset 只在按 item 去重后应用，排序以时间、来源类型、来源行 ID 和 item key 完整打破并列。anchors 隔离首屏之后追加的事实，但既有行更新/删除、membership restored 与滚动 retention 仍是当前投影，不承诺跨请求 MVCC snapshot。`removed` 先按 `(item_key, context)` 选择各 context 最新事实，再按 item 聚成一张卡；favorite / watch_later 先 materialize canonical membership lookup，再独立关联 exact list identity，Python 按固定兼容顺序组装 `contexts`，不依赖 SQLite 3.44 才支持的 aggregate `ORDER BY`。API 投影固定忽略 30 天前快照；物理行由数据库初始化及后续 membership 删除时 opportunistic prune，并非独立周期维护或“到点即删”的承诺。曝光与点击继续使用各自权威表，不复制成第二份日志。 |
 | 扩展原生保存 job ledger 与旧状态迁移 | ✅ | `extension_native_save_jobs` 保存脱敏后的六平台扩展任务；task URL 只允许平台 HTTPS host 与默认端口，输出移除 fragment/非导航 query（YouTube 仅保留身份参数 `v`；小红书仅保留打开公开笔记所需的单值非空 `xsec_token/xsec_source`，其它 key 仍剥离）。partial unique index 保证 `(platform, item_key, requested_action)` 只有一个 pending/in-progress row。命名迁移只把六个 canonical 平台的旧 `unsupported`/空 error code 改为 `unsupported_adapter_missing`，绝不改 Bilibili、未知平台或 `unsupported_content_type`。 |
 | 推荐链路 canonical identity | ✅ | `content_cache.item_key` 对**非空值**使用 partial unique index（`WHERE item_key != ''`），另有普通 lookup index，`recommendations.item_key` 使用普通索引；空值只作为 v0.3.166 及更早写入器不知道 additive 列时的兼容窗口，避免旧桌面版与新版源码共用数据库后第二条补池候选开始持续触发 `UNIQUE constraint failed`。当前版本初始化会临时移除旧全量 guard，按平台 + raw `content_id` 回填空 identity，并在恢复 partial unique 前确定性合并 canonical 重复行（优先 canonical storage key、填补非空元数据、重定向 recommendation 引用）。若 loser 仍被旧 `watch_later` / `favorites` 引用，consolidation 会先为真实 legacy schema 补 additive `item_key` 并写入 canonical key；后续 normalized saved migration 在 exact `bvid` 不存在时用该稳定键 join keeper，既保留 membership，也不绕过 Task 2 的单次 marker / no-resurrection 语义。B 站 `bvid` 主键保持 raw BV 兼容，非 B 站 `bvid` 存储键使用 namespaced identity，API 继续从独立字段输出 raw ID 与 authoritative URL。 |
 | 推荐历史避雷证据字段 | ✅ | `get_recommendations()` 在既有 DTO 字段外返回 `description/tags/topic_key/topic_group/pool_topic_label`，供 API 与 OpenClaw 在历史行离开 storage 后按最新 effective dislikes 做与 serve 一致的最终过滤；`exclude_processed=true` 继续同步排除已反馈单卡。 |
@@ -41,8 +88,10 @@
 | 有界库存维护与历史恢复 | ✅ | `maintain_pool_inventory(max_mutations=50)` 在独立短连接 `BEGIN IMMEDIATE` 中先恢复仍合格且能净增 canonical available 的历史 `suppressed` 结果，再统一 stale / explore / topic / source / raw 维护；恢复数受当批 `raw_ceiling - raw_before` headroom 约束，raw 已满或超限时先裁剪、绝不继续恢复。单事务最多修改 50 行，只有确有 deferred victim，或裁剪释放 headroom 后仍可继续恢复时才返回 `has_more=True`；protected/token-owned excess 无可裁剪 victim 时以稳定 WARNING 结束，不再形成恢复/裁剪振荡。已满 topic 不参与恢复，排名窗口试探失败会在同一事务还原。维护连接只等写锁 75ms，交互写入优先；每批仍保护 canonical available 底线并在不变量失败时整体回滚。 |
 | 换批读写隔离 | ✅ | `PoolServeSnapshot` 在专属单线程 serve worker 的一次只读事务中统一读取 readiness、候选、平台补位、持久化已看账本和 curator 信号；同一快照只物化一次 `seen_items`，并按账本最新 event id 缓存结果，写入新浏览事件后自动失效。`persist_pool_serve_async()` 用另一条短事务原子写入 recommendation + shown。serve 与 maintenance 使用不同 executor、不同 SQLite 连接，不把共享 `Database.conn` 直接跨线程并发访问。 |
 | 八平台来源族归一化 | ✅ | `sources.platforms` 以可枚举规则统一 Bilibili、小红书、抖音、YouTube、X、知乎、Reddit、Bangumi 的别名、策略前缀和 URL host；pool accounting、已看身份与 URL 推断共用同一口径。 |
+| 来源定向历史缓存读取 | ✅ | `get_unrecommended_content(limit, source_platforms=...)` 在 SQL 平衡与 `LIMIT` 之前按平台过滤，供 source-scoped discovery backfill 使用；空 `source_platform` 的 legacy 行只按 B 站处理，不能跨源补进 B 站 / YouTube / 抖音定向运行。 |
 | discovery 待评估池 | ✅ | `discovery_candidates` 支持 mixed-source enqueue / claim / evaluation / admission，并持久化 `claim_token`、`score_threshold`、`eval_attempts` 与 batch 级 `batch_eval_attempts`；stale-sensitive 完成和释放都匹配 `id + status + claim_token`。 |
 | evaluator prefilter shadow 审计 | ✅ | `evaluator_prefilter_shadow_audit` 用随机 decision id 连接预过滤决策与最终原始 LLM score / admission 结果；只保存 identity hash、类别、数值和 digest，不保存标题、URL、正文、prompt、画像文本或 provider response。每次 insert 同时执行 30 天和 20,000 行双重 retention；任何写入/回填失败由 discovery fail-open，并以 incomplete telemetry 阻断 enforce gate。 |
+| 推荐时效排序 shadow 审计 | ✅ | `temporal_ranking_shadow_audit` 只保存一次候选窗口的总数、时间覆盖、bonus 资格数，以及 class/source/age bucket 和 Top10/50/100 before/after 聚合；不保存任何候选 identity 或内容文本。每次写入执行 30 天 / 5,000 行双重 retention，失败不影响推荐。 |
 | discovery 历史候选查询 | ✅ | `get_existing_discovery_candidate_keys()` 与 `get_existing_content_cache_ids()` 支持 pipeline 在 enqueue 前过滤历史候选和已缓存内容，避免重复 raw 占住 Evo 前供给窗口。 |
 | discovery 状态恢复 | ✅ | 启动初始化会释放过期 `evaluating` 行；terminal 状态有 status guard，避免 stale update 改写 cached / rejected 结果。 |
 | discovery keyword store | ✅ | `discovery_keywords` 用 `keyword_kind` 区分常规 search 词与 explore 词；默认 `regular`，`explore` 词只供 `ExploreStrategy` 专用 claim，不会被普通 B 站 search 消费。`history_keywords()` 把带 `used_at` 的零产出/全重复 `expired` 词保留在近期冷却内，`recycle_oldest_used(min_age_hours=...)` 只回收超过窗口的历史词；`retire_duplicate_only_keywords()` 接收候选预过滤的真实重复反馈并立即退役无新身份的词。`requeue_keyword_after_transient_failure()` 仍可把 claimed / executing 词无损退回 pending、清理执行时间且不增加 attempts，供平台风控等瞬时故障重试。 |
@@ -361,12 +410,17 @@ db.reset_claimed_discovery_candidates_to_pending(
 db.reset_stale_discovery_candidate_evaluations(max_age_minutes=30)
 known_candidate_keys = db.get_existing_discovery_candidate_keys(["bangumi:326"])
 known_content_ids = db.get_existing_content_cache_ids(["BV1xx411c7mD"])
+cached_bilibili = db.get_unrecommended_content(
+    limit=30,
+    source_platforms=["bilibili"],
+)
 ```
 
 行为说明：
 
 - `enqueue_discovery_candidates()` 用 `candidate_key` 去重；重复发现刷新 `last_seen_at` 与来源目录指标，不生成第二行。传入 `max_pending_per_source` 时，cap 只统计 active `pending_eval/evaluating/evaluated`；超额且未领取的 active 行进入 `trimmed_capacity`，保留 `source_raw_ceiling:<family>` 审计原因，terminal history 不占 cap，`evaluating` / 非空 token 永不成为 victim。
 - `rating_score / rating_count / source_rank` 是 additive 目录指标列，同时存在于 `discovery_candidates` 与 `content_cache`；旧数据库启动时自动补列。重复候选会刷新这些上游目录值，claim → evaluation → admission → cache round-trip 不丢失；评分不会写进 like/comment 字段。
+- `temporal_class / temporal_confidence / temporal_reason / temporal_policy_version` 同时存在于 `discovery_candidates` 与 `content_cache`，保存 Evaluation Agent 的时效语义而不是动态 freshness 分数。旧库 additive 补列为 `unknown / 0 / '' / v1`；非法类别、非有限或越界置信度 fail-closed 为 `unknown / 0`，动态 bonus 始终在推荐时按当前时间计算。`cache_content()` 只有在调用方显式携带完整 temporal 三元组时才覆盖已有分类，原始来源的重复摄入不会把已评估结果清回 `unknown`。
 - `claim_discovery_candidates_for_eval(limit=..., claim_token=...)` 原子领取 `pending_eval`，按来源 round-robin 混合取样，并把同一 token 写到整批；不传 token 时自动生成，兼容单次 CLI drain。
 - `persist_claimed_discovery_candidate_evaluations(..., claim_token=...)` 返回实际更新的 ID 集合，只接受仍为 `evaluating` 且 token 匹配的行；完成后清空 token / claimed_at。`reset_claimed_discovery_candidates_to_pending()` 使用相同所有权条件，因此旧 worker 不能覆盖或释放重新领取的行。
 - `get_evaluated_discovery_candidates_for_admission(limit=..., preferred_source_platforms=None)` 读取已完成评估但尚未写入 `content_cache` 的行，供池子从满池降回目标以下后重试 admission。v0.3.181+（份额公平 spec 2026-07-20）：传入 `preferred_source_platforms` 时用 `CASE WHEN source_platform IN (…) THEN 0 ELSE 1 END` 把欠份额来源排到 FIFO 前面，防止超份额积压霸占取行窗口；缺省不传时排序与旧 `evaluated_at ASC` 逐字节一致。
@@ -378,7 +432,7 @@ known_content_ids = db.get_existing_content_cache_ids(["BV1xx411c7mD"])
 - `reset_stale_discovery_candidate_evaluations(max_age_minutes=...)` 将崩溃遗留的旧 `evaluating` 行释放回 `pending_eval`。
 - `mark_discovery_candidate_cached()` / `reject_discovery_candidate(..., status=...)` 只改写 `evaluating` / `evaluated` 行；terminal rows 不会被 stale caller 复活或覆盖。常见 rejection status 包括 `rejected_low_score`、`rejected_duplicate`、`rejected_cache_admission`、`rejected_recently_viewed`、`rejected_franchise_quota`。
 - `count_discovery_candidates_by_status()` 与 `count_discovery_candidates_by_source_status()` 用于诊断待评估池生命周期分布。
-- `count_pool_readiness()["evaluated_pending"]` 是 `discovery_candidates(status='evaluated')` 的 durable 数量；`admitted_pending_copy` 与 `get_pool_candidates_needing_copy()` 共用 `_load_admitted_pending_copy_rows_on()`，不会用宽泛的 `pending` 差值推算。
+- `count_pool_readiness()["evaluated_pending"]` 是 `discovery_candidates(status='evaluated')` 的 durable 数量；`admitted_pending_copy` 与 `get_pool_candidates_needing_copy()` 共用 `_load_admitted_pending_copy_rows_on()`，不会用宽泛的 `pending` 差值推算。`admitted_pending_available` 再把 unrestricted `copy_ready` 按每 topic 三条窗口占位，表达调度可用 `eligible_available_first=True` 先领取能立即增加公开库存的行，再按 copy-ready 水位需要领取深层 backlog。
 
 ### Evaluator Prefilter Shadow Audit
 
@@ -394,6 +448,18 @@ counts = db.prefilter_shadow_audit_counts()
 - retention 常量来自 Phase 2 多日 shadow 校准窗口：30 天保证真实波次可跨日分层，20,000 行 ceiling 在 evaluator 90 条 hard cap 下仍覆盖 220 轮以上，同时为长期 daemon 提供与流量无关的硬上界。
 - `query_prefilter_shadow_audit()` 只返回 privacy-safe 列；只读 gate 命令在 SQLite read transaction 中冻结当前最大 audit id，输出聚合 count/recall/strata/fail-open 结果，不初始化数据库、不调用 provider、也不写配置。
 - `get_existing_discovery_candidate_keys(keys)` 返回任意 lifecycle status 下已经出现过的 `candidate_key`；`get_existing_content_cache_ids(ids)` 返回已经进入正式 `content_cache` 的 BVID / `content_id`。两者用于 `DiscoveryCandidatePipeline` 在 enqueue 前过滤历史重复，而不是等 SQLite `INSERT OR IGNORE` 静默吞掉后才发现供给不足。
+- `get_unrecommended_content(limit, source_platforms=None)` 缺省保留跨源兼容读取；传平台集合时先在 SQL 中筛选再取平衡窗口，避免大量高分其它来源占满 `limit * 5` 窗口后把目标来源饿死。空 legacy 平台值只在目标包含 B 站时可见。
+
+### Temporal Ranking Shadow Audit
+
+```python
+audit_id = db.record_temporal_ranking_shadow_audit(audit.to_storage_record())
+rows = db.query_temporal_ranking_shadow_audit(limit=100)
+```
+
+- `temporal_ranking_shadow_audit` 使用固定策略版本 `temporal-ranking-shadow-v1`。顶层 count map 必须精确合计到候选总数，TopK 只接受 10 / 50 / 100 及固定 before/after/entered/exited schema；非法、非有限或不一致输入直接拒绝。
+- 表中没有 BVID、`item_key`、内容 ID、标题、作者、URL、query、理由或画像字段。来源先净化为短枚举 token，年龄只保留 `<=1d / 1-7d / 7-30d / 30-180d / >180d / unknown` 桶，无法从记录反查单条候选。
+- 每次 insert 后清理 30 天前记录，并只保留最新 5,000 行。RecommendationEngine 把它作为 best-effort observer；写库或校验失败只记录 WARNING，排序、MMR、admission 和 serving 均继续使用已经算出的分数。
 
 ### Bangumi Producer Ledger
 

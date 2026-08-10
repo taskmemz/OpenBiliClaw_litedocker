@@ -41,6 +41,7 @@ OpenBiliClaw 是一个**本地优先、开源的跨平台个性化内容发现 A
 - **小红书赞 / 收藏强信号**由 MAIN-world `xhs-action-tap`（`obc-xhs-action`，与 token sniffer 隔离）在网络层认定：like/dislike/collect/uncollect 写端点业务成功才发，替代此前「按钮文案匹配、图标按钮漏采」的 DOM 路径；xhs adapter 声明 `tapAuthoritativeActions:{like,favorite,retraction}`，kernel 抑制对应 DOM 发射，事件 URL 与后端 note 键型互通以支持赞→撤销折价
 - 记录用户的**主动反馈**：`dislike` 类动作统一规范成 `feedback` 事件，避免各平台负反馈语义分叉
 - 插件 side panel 与桌面 / 移动 Web 使用同一 platform-neutral 保存契约：卡片先本地保存，保存页显式同步并轮询逐项任务；默认关闭自动同步，首次开启提示将修改对应平台账号；本地删除不删除平台记录
+- 插件 side panel 与桌面 / 移动 Web 使用同一 30 天内容历史契约：recommendation-owned click、推荐展示和本地保存移除快照分别投影为「主动点开过 / 出现过但没点开 / 最近移除」，按 canonical identity 去重分页；保存移除项可恢复，封面不做整页预热，只按视口懒加载走现有图片代理缓存
 - 本机调试可通过 `/api/extension/e2e/run` 驱动已安装插件在抖音 / 小红书 / X 真实页面执行白名单 DOM 操作，再由后端校验 `/api/events` 是否自然入库；runner 会把复用 tab 归位到平台入口并在回传结果前 flush 捕捉 buffer，该链路不伪造行为事件，用于验证捕捉层本身。`/api/events` 的每个 `event_id`、`/api/feedback` 与 `/api/recommendation-click` 的 `request_id` 都是 trim 后 1–400 字符的必填稳定键；缺失、空白或超长由请求模型在任何 event/projection 写入前返回 422。同一动作重试必须复用，服务端不补随机键。`/api/events` 在画像明确未初始化时会拒收普通行为事件，首轮画像信号只由 guided init 来源任务拉取；初始化后所有 accepted event 都先经统一 ingress commit，HTTP 只 wake、不等待 pipeline / LLM。app-owned `EventProcessingScheduler` 让 `profile_events` generic consumer 与 `content_feedback` consumer 按各自 durable cursor 扫描显式 owner，以 event row ID 生成稳定 signal，并用 `checkpointed_enqueue_batch()` 在同一个 `pipeline_state.json` snapshot 中原子发布 buffer+cursor，再由 owner 调 `tick_if_buffered()`；独立周期画像维护才调用完整 `tick()`。首次 app startup 只 await owner fence、本地 durable 准备与 scheduler admission，真正 scan/checkpoint/consume 在 scheduler-owned background task 中继续；provider 401、pending buffer LLM 或永不返回调用不能延迟 listener/health。shutdown 取消并 gather；热重载仍同步 pause/drain/recover/rebind，不缩短 owner pass 或破坏 cursor/buffer。5 秒 safety scan 继续覆盖丢 wake。retraction 投影在 generic cursor 前完成，hypothesis/import feedback 由其它 owner 处理或只越过 feedback cursor。两个 owner 首次接管都先按最大 event row id 发布 cutover fence，旧 direct-ingest 行不重学。`feedback_state.json` 只作迁移 provenance/兼容镜像，不是 owner 权威。`pending_signal_events` 仍只是 search / related_chain refresh 的触发水位，不是画像待处理数。`/api/feedback` 另明确采用 event-first 两次 commit：durable event 后才单独更新 recommendation projection，第二步失败由同 `request_id` duplicate retry 校验并补投影，不宣称跨表原子；相同 ID 的不同 payload 维持 409。
 
 - 上述三个公开事件 ID 字段采用严格 JSON string 校验，不把数字、布尔或其它 JSON 类型自动转成
@@ -152,7 +153,7 @@ Discovery 可以继续宽搜，普通 dislike 不撤销关键词或来源任务�
 
 | 策略 | 说明 |
 |------|------|
-| **兴趣关键词搜索** | 根据用户画像生成关键词组合搜索 |
+| **兴趣关键词搜索** | 根据用户画像生成关键词组合搜索；B 站生产路径在既有请求预算内预留 1 个 `pubdate` 请求（最多 5 条），与普通相关性结果交错进入评估窗口，只补近期供给而不改变 relevance/admission |
 | **搜索灵感脑暴** | 可选地从 like 二级兴趣抽样；`OnionProfile.interest.likes` 会优先展开 specifics，一级 domain 只在缺少 specifics 时兜底，并按 parent 计数降权防止小窗口被同一领域占满；结合 recent interest selection count、关键词覆盖频次、raw candidate 数量 / 占比 / dominant content type 和最终候选池占比降权高频兴趣，coverage join 统一走 `_normalize_match_text()` 折叠大小写 / 空白漂移，画像整理会同步迁移 keyword 与 selection ledger 标签，完整 coverage 只在本地控制环使用，LLM payload 只携带 must-cover + 少量 cooldown 摘要；随后由 `discovery.keyword_brainstorm` 脑暴带 `kind_fit=regular|explore|both` 的搜索 probe branch，每兴趣最多 2 条，regular + explore 同轮触发时共用一次 brainstorm 和一次 grounding stage；按 `[discovery].inspiration_search_backends` 通过 search provider 链（默认已启用平台源 → Exa → You.com free MCP）grounding 具体实体 / 社区词 / 讨论点，stage 级搜索预算由 `inspiration_max_probe_searches_per_stage` 控制，平台源扇出由 `inspiration_platforms_per_probe` 控制，每 probe 翻页 / 扩量由 `inspiration_search_pages_per_probe` 控制，B 站 / 抖音 / X 等 risk-controlled 来源受 `inspiration_riskcontrolled_probe_budget` 与 cooldown / 限流约束；`platform_sources` 只把 B站 / YouTube / X / Reddit / Bangumi、抖音 direct client，以及小红书 / 知乎 bridge 可用时的搜索标题 / URL / 摘要作为灵感 evidence，不入候选池；泛词不是硬错误，会交给 curator 结合画像、平台 guide 和覆盖约束判断；再经 `discovery.keyword_inspiration` 做 Profile Curator / Detail Expander，优先生成按平台 keyed 的 `platform_keywords`；`platform_guides.query_style` 明确 B 站 / 小红书 / 抖音 / YouTube / X / 知乎 / Reddit / Bangumi 的平台检索语法；写库前由系统侧执行 must-cover 排序、每平台二级兴趣 / lens family 上限、原样证据标题 / URL / 过长 query / 平台语言不匹配 / 平台检索语法不匹配过滤、grounding hint `source_interest` 校正、explore 横向 lens 校验，缺失 must-cover 兴趣时用 `discovery.keyword_inspiration.repair` 做一次 bounded repair，repair 仍缺词时用 deterministic platform-native backfill 补齐；新配置默认以混合模式开启，与旧 merged keyword planner 并行，admission yield 会回填 inspiration / expansion 反馈计数；实验开关可让 due 平台完全跳过旧 merged keyword planner，只用新流程产词，并在 B 站 explore 到期时写入 `keyword_kind="explore"` 的探索词池；`keyword-inspiration-dry-run` 可真实预览中间链路但不写关键词池，且使用独立 preview selection scope，`keyword-inspiration-report` 对比 inspiration / merged cohort、输出 production / preview 抽中分布并给出 replace 门禁 |
 | **相关推荐链探索** | 从已知好内容出发，沿相关推荐不断深入 |
 | **分区热门/排行榜** | 固定全站榜，并按本地洗牌轮转覆盖非 0 分区榜，结合用户画像筛选 |
@@ -166,9 +167,11 @@ Discovery 可以继续宽搜，普通 dislike 不撤销关键词或来源任务�
 > 评估的核心依据是**用户的 Soul（灵魂画像）和深层兴趣**，而非通用指标。
 
 - **核心评估**：这个内容是否匹配这个用户的深层兴趣和当前状态？
-- **时效性基准**：来源 `published_at` 与本轮精确 UTC `evaluated_at` 一起进入单条、批量及推荐池补分类 prompt；模型比较两者判断热点 / 时事 / 版本更新是否仍新鲜，不根据自身知识截止日期猜当前时间。发布时间缺失或无效时保持中性；评分缓存绑定发布时间摘要与独立评估小时桶。
+- **时效性基准**：来源 `published_at` 与本轮精确 UTC `evaluated_at` 一起进入单条、批量及推荐池补分类 prompt；模型用内容主体判断 `breaking/current/versioned/evergreen/historical/unknown` 及置信度，不根据标题日期词或自身知识截止日期猜当前时间。`relevance_score` 与新旧完全解耦；发布时间缺失或无效时仍可语义分类，但推荐侧不发时间 bonus。评估缓存绑定发布时间摘要与独立小时桶，并由 v4 namespace 隔离旧评分语义。
+- **近期供给与排序观测**：B 站 API 主搜索与扩展 fallback 都只提供一个小型 recent lane；lane provenance 贯穿 `DiscoveredContent → discovery_candidates`，但不改变来源策略、准入阈值或配额。推荐侧对每个候选窗口聚合比较“含 publication bonus”与“无 bonus”Top10/50/100，按 class/source/age 记录进入退出；shadow 不含候选身份/文本，写失败 fail-open，也不会自动开启 stale 淘汰。
 - **可选辅助指标**：播放量/点赞/弹幕质量等——由用户画像决定是否参考（有些用户在意质量指标，有些人不在意）
-- **统一待评估池与准入**：API daemon 的不同来源 raw candidates 进入 `discovery_candidates` 后，由唯一 `CandidateEvalCoordinator` tokenized claim；默认 3 个 30 条 LLM worker 并行，任一完成即补位，SQLite 完成提交与 admission 串行。pipeline 单次 enqueue callback 立即唤醒这个 owner，refresh / managed producer 不再同步 drain。raw 清空且 projected 仍低于目标时，coordinator 调用 quota-aware supply wave，即时 tick 所有欠份额 producer 并执行 B 站 refresh；同平台周期 / 即时 tick 由 per-source lock 去重。补池生产性以真实 `inserted/enqueued` 为准，全部 duplicate 即使跑过策略也进入 30/60/120/300/600 秒退避，真实入队立即清零。串行 lane 先持久化全部 token-owned 评分，再按 `target - available - admitted_pending_copy` admission；超过 headroom 的达标结果保留为 `evaluated`。评估输入包含正文 / 标签 / 互动指标；`[discovery].eval_prefilter_mode` 默认 shadow 只记录 embedding would-filter，enforce 才会让明显低相似且非 explore 的候选本地低分缓存并跳过 LLM；多模态评估开启且模型支持图像时会复用运行时图片缓存。OpenClaw direct one-shot 不启动 daemon owner，`recommend(refresh_if_needed=True)` 的首轮 source supply / inline claim 固定 ≤4，并在 durable admission 后同步 drain ≤4 条 expression copy。调度 projected 固定为 `available + admitted_pending_copy + evaluated_pending_admission`，普通 raw 不计入；来源只影响取数方式、配额和 prompt 上下文，平台节流、raw ceiling 与准入阈值不变。
+- **统一待评估池与准入**：API daemon 的不同来源 raw candidates 进入 `discovery_candidates` 后，由唯一 `CandidateEvalCoordinator` tokenized claim；默认 3 个 30 条 LLM worker 并行，任一完成即补位，SQLite 完成提交与 admission 串行。pipeline 单次 enqueue callback 立即唤醒这个 owner，refresh / managed producer 不再同步 drain。raw 清空且 projected 仍低于目标时，coordinator 调用 quota-aware supply wave，即时 tick 所有欠份额 producer 并执行 B 站 refresh；同平台周期 / 即时 tick 由 per-source lock 去重。补池生产性以真实 `inserted/enqueued` 为准，全部 duplicate 即使跑过策略也进入 30/60/120/300/600 秒退避，真实入队立即清零。串行 lane 先持久化全部 token-owned 评分，再按 `target - available - admitted_pending_available` admission；`admitted_pending_available` 只统计补齐表达后能进入当前 topic 三条展示窗口的 pending-copy，超过 headroom 的达标结果保留为 `evaluated`。评估输入包含正文 / 标签 / 互动指标；`[discovery].eval_prefilter_mode` 默认 shadow 只记录 embedding would-filter，enforce 才会让明显低相似且非 explore 的候选本地低分缓存并跳过 LLM；多模态评估开启且模型支持图像时会复用运行时图片缓存。OpenClaw direct one-shot 不启动 daemon owner，`recommend(refresh_if_needed=True)` 的首轮 source supply / inline claim 固定 ≤4，并在 durable admission 后同步 drain ≤4 条 expression copy。调度 projected 固定为 `available + admitted_pending_available + evaluated_pending_admission`，普通 raw 与同 topic 深层 pending-copy 不计入；表达协调器以 `max(copy-ready 缺口, min(available 缺口, admitted_pending_available))` 接手已入池 eligible 素材。来源只影响取数方式、配额和 prompt 上下文，平台节流、raw ceiling 与准入阈值不变。
+- **来源定向回填**：主策略不足时，历史 `content_cache` backfill 先按本轮 strategy 的 `source_platform` 在 SQL 中过滤，再做平衡与 `LIMIT`；空 legacy 平台只归 B 站。一次 B 站 / YouTube / 抖音定向运行不能被其它平台的高分历史行补满。
 
 ---
 
@@ -221,6 +224,32 @@ Discovery 可以继续宽搜，普通 dislike 不撤销关键词或来源任务�
   - 例如：新平台接入、特定领域的内容评估策略、新的推荐呈现方式
 - **Skill 注册**：Agent 自动发现可用 Skill，根据任务需要选择调用
 
+#### 2.5.1 Agent Bridge 能力协商与兼容边界
+
+OpenClaw、Hermes、WorkBuddy 等宿主通过同一份 `agent-bridge/v2` 能力清单发现
+OpenBiliClaw 的当前功能；`integrations/openclaw/skill.py` 是 descriptor 的唯一注册表，
+`integrations/agent.py` 提供协议中立的 Python 别名，历史 `integrations.openclaw` 路径和
+`openbiliclaw.integrations.openclaw.cli` 命令继续兼容。宿主启动或升级后先调用
+`capabilities`，不得根据旧版 skill 名称猜测能力。
+
+当前桥接边界覆盖多源推荐与分页消费、活动流和平台可用性、兴趣 / 避雷四态探针、惊喜反馈、
+带 `turn_id` 的 durable 对话历史、画像编辑，以及 local-first 保存列表。所有写入动作都返回
+稳定 request / turn 标识；外部账号 native-save 只能通过显式授权的 `sync_saved` 触发，不能把
+本地 membership 当成平台同步成功。新增核心功能时必须同步更新 operation DTO / handler、skill
+descriptor、CLI（适用时）、capability manifest、幂等测试和集成文档，保持宿主不会悄悄落后于内核。
+
+---
+
+### 2.6 📦 本机数据迁移
+
+**目标**：让单用户 Agent 的可移植状态能安全、可理解地从一台机器搬到另一台机器，而不复制目标机器的网络身份或在运行中替换数据库。
+
+- **用户入口**：桌面 Web「设置 → 通用 → 数据迁移」提供导出、导入、状态查询和取消 pending；四条 API 仅接受后端真实观察到的本机 loopback，请求来自浏览器时还必须同源，扩展、LAN 与远端调用不在授权范围。
+- **包格式**：`.obcbackup` 是带版本、成员大小和 SHA-256 清单的标准 ZIP，明确为**未加密敏感文件**。它包含模型 / 来源凭据、SQLite、画像 / 记忆、平台 Cookie、图片缓存和少量安全 UI 偏好，但两层磁盘配置合并后会移除整段 `[api.auth]`，密码 / hash、session secret 和扩展设备 key 不进入包。配置快照来自磁盘两层，数据快照则固定读取本进程已持锁的 active data dir，不提前使用尚待重启的新目录。
+- **可移植边界**：日志、旧备份、embedding / 评测 / 临时缓存、证书、自启动文件、OpenBiliClaw Web / 扩展访问会话、外部 CLI 凭据与环境变量值不导出；平台登录 Cookie 是明确包含的敏感状态。`source_omitted_environment_variables` 提示源机遗漏的变量名，`target_active_environment_variables` 单独提示目标进程仍会覆盖导入配置的变量名。
+- **导入边界**：上传只做有界 ZIP 校验、checksum、配置构建与 SQLite integrity check，并发布私有 pending stage；active runtime 与 UI 偏好都不变化。导入携带 / 生成 UUID `request_id`；上传 / 校验期间 status 返回匹配 ID 的 `processing` 与 `uploading|validating` phase。连接结果不确定时，桌面端最多强制查询 3 次，对 `idle/cancelled` 间隔 500ms 再确认，不能以一次瞬时 `idle` 终结对账；每次打开「通用」也强制查询。重启前可取消 pending。下一次后端启动同时持有项目与 canonical data-dir 互斥锁后，通过 journaled replace 原子应用配置 / 数据；桌面端只在 status 已为 `applied` 后按 `migration_id` 为每个浏览器应用一次白名单偏好，用户后续修改不再被旧 status 覆盖。
+- **故障与身份**：替换失败恢复原配置 / 数据；成功后原文件保留为 `pre-import` 回滚副本。目标机器的数据 / 数据库 / 日志路径、API host / port、网络 / TLS / 自启动和 CDP 设置继续生效；Bilibili 专用代理与本机浏览器可执行文件路径也保留目标值，目标证书 / 自启动文件保留。整段 `api.auth` 采用目标机现值，再轮换文件 session secret、把 auth epoch 严格提升为来源 / 目标当前值最大值加一以强制撤销旧会话，并清空 / 关闭扩展远程配对。
+
 ---
 
 ## 3. 系统架构
@@ -240,17 +269,29 @@ guided init: signals → preferences → full profile commit
                                   → discovery → evaluation → copy → canonical pool ready
                                   → terminal → runtime schedules optional probes
 
+Agent hosts (OpenClaw / Hermes / WorkBuddy)
+        → capabilities(agent-bridge/v2) + JSON CLI / skill descriptors
+        → integrations.agent alias / integrations.openclaw compatibility adapter
+        → runtime / soul / recommendation / saved_sync owners
+
 config recovery control plane (normal or degraded; business APIs stay gated)
                 ├─ draft → /api/config/probe-service → temporary registry → total gate
                 └─ draft → /api/config/discover-models → exact instance GET /models
                           → editable model list + local effort advisory (no config write)
 config save control plane: persist first → HTTP 202 queued/apply_revision → latest-wins queue → runtime receipt/status
+                           └─ data_dir changed → restart_required; active locked dir stays until full restart
+migration control plane: local export → checksummed plaintext .obcbackup
+                      → local import + request_id validates/stages ↔ status/cancel
+                      → restart + runtime lock → journaled config/data replace → applied | rollback
 XHS hidden search tab → MAIN search-response normalizer → isolated replay/DOM fallback → task final
 XHS/DY/YT/Zhihu/Reddit task final: canonical staged result (XHS bootstrap payload caps enforced) → durable event receipt
                                  → atomic bounded seen-key → terminal flip
                                  stale lease reclaim replays first write; staged row rejects late mutation
 extension-online periodic re-pull: presence + profile/init/config gates → persisted round-robin
                                  → one active bootstrap across five task tables → EventHub → extension
+Douyin source supply: daemon presence gate (explicit manual call bypasses it)
+                     → one shared plugin-cycle wait budget → terminal dy_task → pending_eval
+                     absent → zero enqueue; timeout/error/budget → bounded retry floor
 
 cover images: proxy foreground ─┐
               refresh prefetch ─┴→ app-stable coordinator(total 4 / bg 3, fg priority)
@@ -386,6 +427,10 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  │ 推荐点击：content_id/url/source_platform -> source-aware click signal │ │
 │  └──────────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────┐   │
+│  │30天历史：click events + recommendations + saved_item_removals│ │
+│  │ -> /api/content-history 三分类分页 -> 插件/移动/桌面 lazy 封面 │ │
+│  └──────────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────────┐   │
 │  │ durable chat：session=popup -> 插件/移动/桌面；主历史含 probe 聊天 │   │
 │  └──────────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────┐   │
@@ -418,7 +463,9 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  │     PoolCurator + 双轴 fatigue + per-group 窗口 + 新兴趣放大保护 │ │
 │  │     request_replenishment + 定时/手动补货 + B/XHS/DY/YT/X/Zhihu/Reddit/Bangumi=5/1/1/1/1/1/1/1 │ │
 │  │     raw断供 → 欠份额 producer 即时并行唤醒 → 真实新增计数 / 无产出阶梯退避 │ │
-│  │ API CandidateEvalCoordinator: durable projected -> 3×30 workers -> serial headroom admit │ │
+│  │ API CandidateEvalCoordinator: available + eligible copy-pending + evaluated -> 3×30 -> serial admit │ │
+│  │ evaluator: time-neutral relevance + temporal class/confidence/reason -> durable candidate/cache │ │
+│  │ curator: valid published_at + high-confidence temporal class -> bounded positive bonus │ │
 │  │ OpenClaw refresh: first source/eval <=4 -> copy <=4/no split retry -> canonical subset; both hosts recover first │ │
 │  │ delight: copy/topic ready + seen_items guard -> score/snapshot -> UI × writes seen ledger │ │
 │  │ reshuffle: current IDs + seen_items -> PoolServeSnapshot/MMR -> atomic persist -> one batch event │ │
@@ -625,6 +672,7 @@ localhost。两个入口互斥，默认 HTTP 不变。
 - [ ] 情境感知推荐（时间/情绪/场景自适应）
 - [ ] 定时自动发现和推送
 - [ ] 记忆可视化（查看 Agent 对你的理解）
+- [x] 配置页跨机器导出 / 导入可移植用户状态
 - [ ] UP 主追踪和新视频提醒
 
 ### v1.0 — 成熟的开源工具
@@ -645,9 +693,9 @@ localhost。两个入口互斥，默认 HTTP 不变。
 2. **有温度的表达** — Agent 的每一次输出都像朋友在说话
 3. **主动追问和假设** — 不等用户说，主动猜测并验证
 4. **用户掌控权** — 用户可以查看、修正、引导 Agent 的理解
-5. **隐私本地化** — 所有数据和计算在本地
+5. **隐私本地化** — 所有数据和计算在本地；用户可导出可移植状态，但迁移包含明文敏感信息，边界必须显式可见
 6. **开放可扩展** — 通用开源设计 + Skill 系统
 
 ---
 
-*文档版本: v0.3 | 日期: 2026-06-25 | 状态: 持续更新*
+*文档版本: v0.3 | 日期: 2026-08-09 | 状态: 持续更新*

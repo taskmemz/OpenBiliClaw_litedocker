@@ -26,8 +26,13 @@ import {
   loadNotifications,
   refreshPendingConfirmations as refreshChatPendingConfirmations,
 } from "./views/chat.js";
-import { initWatchLaterView, initFavoritesView } from "./views/saved.js";
-import { initSettingsView } from "./views/settings.js";
+import {
+  contentLibrarySlug,
+  initContentLibraryView,
+  leaveContentLibraryView,
+  normalizeContentLibraryTab,
+  storedContentLibraryTab,
+} from "./views/library.js";
 import { createDialogFocusController } from "./saved-sync-runtime.js";
 
 // ── DOM refs ─────────────────────────────────────────────────
@@ -252,12 +257,10 @@ async function openMobileSettings(opener) {
 
 // ── Tab Bar ──────────────────────────────────────────────────
 const TABS = [
-  { id: "recommend", icon: "\u2728", label: "\u63A8\u8350" },
-  { id: "watchLater", icon: "🕐", label: "稍后" },
-  { id: "favorites", icon: "⭐", label: "收藏" },
-  { id: "profile", icon: "\u{1F9E0}", label: "\u753B\u50CF" },
-  { id: "chat", icon: "\u{1F4AC}", label: "\u5BF9\u8BDD" },
-  { id: "settings", icon: "\u2699\uFE0F", label: "\u8BBE\u7F6E" },
+  { id: "recommend", icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m12 3 1.7 4.3L18 9l-4.3 1.7L12 15l-1.7-4.3L6 9l4.3-1.7L12 3Z"/><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15Z"/></svg>', label: "推荐" },
+  { id: "library", icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H10l2 2h5.5A2.5 2.5 0 0 1 20 7.5v9A2.5 2.5 0 0 1 17.5 19h-11A2.5 2.5 0 0 1 4 16.5z"/><path d="M8 10h8M8 14h6"/></svg>', label: "内容库" },
+  { id: "profile", icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>', label: "画像" },
+  { id: "chat", icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4v8Z"/></svg>', label: "对话" },
 ];
 
 function renderTabBar() {
@@ -272,6 +275,8 @@ function renderTabBar() {
     const el = document.createElement("button");
     el.className = `tab-item${isActive ? " active" : ""}`;
     el.setAttribute("role", "tab");
+    el.id = `mobile-shell-tab-${tab.id}`;
+    el.setAttribute("aria-controls", `view-${tab.id}`);
     el.setAttribute("aria-selected", String(isActive));
     el.setAttribute(
       "aria-label",
@@ -284,6 +289,8 @@ function renderTabBar() {
       let target = null;
       if (e.key === "ArrowRight") target = TABS[(TABS.indexOf(tab) + 1) % TABS.length];
       else if (e.key === "ArrowLeft") target = TABS[(TABS.indexOf(tab) - 1 + TABS.length) % TABS.length];
+      else if (e.key === "Home") target = TABS[0];
+      else if (e.key === "End") target = TABS[TABS.length - 1];
       if (target) { e.preventDefault(); navigateToTab(target.id); $tabBar.querySelector(`[aria-selected="true"]`)?.focus(); }
     });
     $tabBar.appendChild(el);
@@ -292,46 +299,86 @@ function renderTabBar() {
 
 // ── Views ────────────────────────────────────────────────────
 const views = {};
+let appliedRouteKey = "";
 
 function ensureView(id) {
   if (views[id]) return views[id];
   const el = document.createElement("div");
   el.className = "view";
   el.id = `view-${id}`;
+  el.setAttribute("role", "tabpanel");
+  el.setAttribute("aria-labelledby", `mobile-shell-tab-${id}`);
   $app.appendChild(el);
   views[id] = el;
   return el;
 }
 
-function initActiveView() {
+function initActiveView(route = readHash()) {
   const id = state.activeTab;
   if (id === "recommend") initRecommendView(views.recommend);
-  else if (id === "watchLater") initWatchLaterView(views.watchLater);
-  else if (id === "favorites") initFavoritesView(views.favorites);
+  else if (id === "library") initContentLibraryView(views.library, {
+    tab: route.libraryTab,
+    // The inner view already applied the child switch. Push its canonical
+    // route so Back keeps the old saved-tab navigation semantics; setting the
+    // applied key first makes the resulting hashchange a no-op.
+    onSelect: (libraryTab) => {
+      const hash = `#/library/${contentLibrarySlug(libraryTab)}`;
+      appliedRouteKey = hash;
+      if (window.location.hash !== hash) window.location.hash = hash;
+    },
+  });
   else if (id === "profile") initProfileView(views.profile);
   else if (id === "chat") initChatView(views.chat);
-  else if (id === "settings") initSettingsView(views.settings);
+}
+
+function syncChatViewBodyState(id) {
+  document.body.classList.toggle("chat-view-active", id === "chat");
 }
 
 /**
  * Navigate to a tab. Exported for cross-view use (e.g. delight "聊一聊" → chat).
  */
-export function navigateToTab(id) {
-  if (!TABS.find((t) => t.id === id)) return;
-  location.hash = `#/${id}`;
-  patchState({ activeTab: id });
-  document.body.classList.toggle("chat-view-active", id === "chat");
-  for (const [key, el] of Object.entries(views)) {
-    el.classList.toggle("active", key === id);
+export function navigateToTab(id, { libraryTab = "", replaceRoute = false } = {}) {
+  const legacyLibraryTab = ["watchLater", "favorites", "history"].includes(id)
+    ? normalizeContentLibraryTab(id)
+    : "";
+  const nextId = legacyLibraryTab ? "library" : id;
+  if (!TABS.find((t) => t.id === nextId)) return;
+  const nextLibraryTab = nextId === "library"
+    ? normalizeContentLibraryTab(libraryTab || legacyLibraryTab || storedContentLibraryTab())
+    : "";
+  const nextHash = nextId === "library"
+    ? `#/library/${contentLibrarySlug(nextLibraryTab)}`
+    : `#/${nextId}`;
+  if (appliedRouteKey === nextHash && state.activeTab === nextId && location.hash === nextHash) return;
+  if (location.hash !== nextHash) {
+    if (replaceRoute) {
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${nextHash}`);
+    } else {
+      location.hash = nextHash;
+    }
   }
-  renderTabBar();
-  initActiveView();
+  if (nextId !== "library") leaveContentLibraryView();
+  patchState({ activeTab: nextId });
+  syncChatViewBodyState(nextId);
+  for (const [key, el] of Object.entries(views)) {
+    el.classList.toggle("active", key === nextId);
+  }
+  initActiveView({ id: nextId, libraryTab: nextLibraryTab });
+  appliedRouteKey = nextHash;
 }
 
 // ── Hash Router ──────────────────────────────────────────────
 function readHash() {
-  const hash = location.hash.replace("#/", "").replace("#", "");
-  return TABS.find((t) => t.id === hash) ? hash : "recommend";
+  const hash = location.hash.replace(/^#\/?/, "");
+  const [topLevel, child] = hash.split("/");
+  if (topLevel === "library") {
+    return { id: "library", libraryTab: normalizeContentLibraryTab(child, storedContentLibraryTab()), legacy: false };
+  }
+  if (["watchLater", "watch-later", "watch_later", "favorites", "favorite", "history"].includes(topLevel)) {
+    return { id: "library", libraryTab: normalizeContentLibraryTab(topLevel), legacy: true };
+  }
+  return { id: TABS.some((tab) => tab.id === topLevel) ? topLevel : "recommend", libraryTab: "", legacy: false };
 }
 
 // ── WebSocket ────────────────────────────────────────────────
@@ -398,9 +445,13 @@ async function startApp() {
 
   if (!_appStarted) {
     _appStarted = true;
-    window.addEventListener("hashchange", () => navigateToTab(readHash()));
+    window.addEventListener("hashchange", () => {
+      const route = readHash();
+      navigateToTab(route.id, { libraryTab: route.libraryTab, replaceRoute: route.legacy });
+    });
   }
-  navigateToTab(readHash());
+  const route = readHash();
+  navigateToTab(route.id, { libraryTab: route.libraryTab, replaceRoute: route.legacy });
 }
 
 function showLogin() {

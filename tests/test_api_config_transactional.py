@@ -570,3 +570,41 @@ async def test_queued_config_failure_restores_last_applied_config(
     assert "queued rebuild failed" in status["error"]
     assert load_config(config_path).llm.openai.model == "gpt-4o-mini"
     assert load_config(tmp_path / "config.toml.bak").llm.openai.model == "gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_hot_reload_rollback_preserves_persisted_restart_only_data_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    initial = _valid_config()
+    initial.data_dir = str(tmp_path / "active-data")
+    monkeypatch.setenv("OPENBILICLAW_PROJECT_ROOT", str(tmp_path))
+    save_config(initial, config_path)
+    app = create_app(memory_manager=object(), database=object(), soul_engine=object())
+    next_data = tmp_path / "next-data"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        first = await client.put("/api/config", json={"data_dir": str(next_data)})
+        assert first.status_code == 202
+        assert first.json()["restart_required"] is True
+        await _wait_for_apply_state(client, "applied")
+
+        async def fail_rebuild(self: RuntimeContext, new_config: Config) -> None:  # noqa: ARG001
+            raise RuntimeError("later hot reload failed")
+
+        monkeypatch.setattr(RuntimeContext, "rebuild_from_config", fail_rebuild)
+        second = await client.put(
+            "/api/config",
+            json={"llm": {"openai": {"model": "gpt-4.1-mini"}}},
+        )
+        assert second.status_code == 202
+        await _wait_for_apply_state(client, "failed")
+
+    restored = load_config(config_path)
+    assert restored.data_dir == str(next_data)
+    assert restored.llm.openai.model == "gpt-4o-mini"

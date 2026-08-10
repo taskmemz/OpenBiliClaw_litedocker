@@ -20,6 +20,16 @@ class _FakeSoulEngine:
         return {"profile": "ok"}
 
 
+class _FakePresence:
+    def __init__(self, *, present: bool) -> None:
+        self.present = present
+        self.grace_calls: list[int] = []
+
+    def is_present(self, grace_seconds: int) -> bool:
+        self.grace_calls.append(grace_seconds)
+        return self.present
+
+
 class _FakeCandidatePipeline:
     def __init__(
         self,
@@ -82,6 +92,31 @@ async def test_douyin_producer_invokes_discovery_with_cache_options() -> None:
     assert options.cache is True
     assert options.evaluate is True
     assert options.keywords_per_run == 3
+
+
+async def test_douyin_producer_skips_browser_tasks_when_extension_is_absent() -> None:
+    calls = 0
+
+    async def discover(profile: Any, options: DouyinDiscoveryOptions) -> DouyinDiscoveryResult:
+        nonlocal calls
+        calls += 1
+        return DouyinDiscoveryResult(items=[], cached=False, source_counts={})
+
+    presence = _FakePresence(present=False)
+    producer = DouyinDiscoveryProducer(
+        soul_engine=_FakeSoulEngine(),
+        discover=discover,
+        enabled=True,
+        presence=presence,
+        presence_grace_seconds=12,
+        min_interval_minutes=0,
+    )
+
+    result = await producer.produce_if_due(limit=3)
+
+    assert result == {"discovered": 0, "reason": "extension_absent"}
+    assert presence.grace_calls == [12]
+    assert calls == 0
 
 
 async def test_douyin_producer_enqueues_raw_candidates_when_pipeline_is_available() -> None:
@@ -320,6 +355,77 @@ async def test_douyin_producer_throttles_recent_runs() -> None:
 
     assert result == {"discovered": 0, "reason": "throttled"}
     assert calls == 0
+
+
+async def test_douyin_producer_throttles_empty_plugin_attempt_with_productive_ledger() -> None:
+    """The productive-only DB ledger must not bypass the local attempt floor."""
+
+    class _ProductiveOnlyLedger:
+        def record_source_producer_run(self, platform: str, discovered: int) -> None:
+            assert platform == "douyin"
+            assert discovered > 0
+
+        def source_producer_ran_within(self, platform: str, minutes: int) -> bool:
+            assert platform == "douyin"
+            assert minutes == 3
+            return False
+
+    calls = 0
+
+    async def discover(profile: Any, options: DouyinDiscoveryOptions) -> DouyinDiscoveryResult:
+        nonlocal calls
+        calls += 1
+        return DouyinDiscoveryResult(
+            items=[],
+            cached=False,
+            source_counts={},
+            source_outcomes={"feed": "empty"},
+        )
+
+    producer = DouyinDiscoveryProducer(
+        soul_engine=_FakeSoulEngine(),
+        discover=discover,
+        enabled=True,
+        min_interval_minutes=3,
+        database=_ProductiveOnlyLedger(),
+    )
+
+    first = await producer.produce_if_due(limit=3)
+    second = await producer.produce_if_due(limit=3)
+
+    assert first["reason"] == "empty"
+    assert second == {"discovered": 0, "reason": "throttled"}
+    assert calls == 1
+
+
+async def test_douyin_producer_backs_off_after_plugin_infrastructure_failure() -> None:
+    calls = 0
+
+    async def discover(profile: Any, options: DouyinDiscoveryOptions) -> DouyinDiscoveryResult:
+        nonlocal calls
+        calls += 1
+        return DouyinDiscoveryResult(
+            items=[],
+            cached=False,
+            source_counts={},
+            source_outcomes={"feed": "failed"},
+        )
+
+    producer = DouyinDiscoveryProducer(
+        soul_engine=_FakeSoulEngine(),
+        discover=discover,
+        enabled=True,
+        # A zero normal cadence still must not turn a broken extension into a
+        # once-per-refresh browser-task storm.
+        min_interval_minutes=0,
+    )
+
+    first = await producer.produce_if_due(limit=3)
+    second = await producer.produce_if_due(limit=3)
+
+    assert first["reason"] == "error"
+    assert second == {"discovered": 0, "reason": "throttled"}
+    assert calls == 1
 
 
 async def test_douyin_producer_soft_skips_when_profile_unavailable() -> None:

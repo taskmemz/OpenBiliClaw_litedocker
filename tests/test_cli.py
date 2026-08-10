@@ -1126,6 +1126,91 @@ def test_browser_content_reports_command_failure(
     assert "snapshot failed" in result.stdout
 
 
+def test_server_migration_guard_locks_journal_target_data_before_loading_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Crash recovery is bound to the journal path even when config is absent."""
+    from openbiliclaw.storage import migration
+
+    project_root = tmp_path / "profile"
+    migration_root = project_root / ".openbiliclaw-migration"
+    migration_root.mkdir(parents=True)
+    target_data = tmp_path / "relocated" / "canonical-data"
+    migration_id = "d" * 32
+    token = migration_id[:12]
+    target_config = project_root / "config.toml"
+    target_local = project_root / "config.local.toml"
+    config_backup = project_root / f"config.toml.pre-import-{token}.bak"
+    local_backup = project_root / f"config.local.toml.pre-import-{token}.bak"
+    data_backup = target_data.with_name(f"{target_data.name}.pre-import-{token}.bak")
+    prepared_config = project_root / f".config.toml.import-{token}"
+    prepared_data = target_data.with_name(f".{target_data.name}.import-{token}")
+    config_backup.write_text("[general]\ndata_dir = 'data'\n", encoding="utf-8")
+    data_backup.mkdir(parents=True)
+    (data_backup / "restored.txt").write_text("old target data", encoding="utf-8")
+    (migration_root / "apply-journal.json").write_text(
+        json.dumps(
+            {
+                "state": "applying",
+                "migration_id": migration_id,
+                "target_config": str(target_config.resolve()),
+                "target_local": str(target_local.resolve()),
+                "target_data": str(target_data.resolve()),
+                "prepared_config": str(prepared_config.resolve()),
+                "prepared_data": str(prepared_data.resolve()),
+                "config_backup": str(config_backup.resolve()),
+                "local_backup": str(local_backup.resolve()),
+                "data_backup": str(data_backup.resolve()),
+                "target_config_existed": True,
+                "target_local_existed": False,
+                "target_data_existed": True,
+                "new_config_active": False,
+                "new_data_active": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert not target_config.exists()
+    assert not target_data.exists()
+
+    monkeypatch.setenv("OPENBILICLAW_PROJECT_ROOT", str(project_root))
+
+    events: list[tuple[str, Path]] = []
+    applied: list[tuple[Path, Path]] = []
+    real_acquire = migration.acquire_migration_runtime_guard
+
+    def _load_recovered_config() -> SimpleNamespace:
+        events.append(("load-config", target_data.resolve()))
+        return SimpleNamespace(data_path=target_data.resolve())
+
+    def _acquire_guard(project_root: Path, data_dir: Path):
+        events.append(("guard", data_dir))
+        return real_acquire(project_root, data_dir)
+
+    def _apply_pending(*, project_root: Path, locked_data_dir: Path) -> None:
+        events.append(("apply", locked_data_dir))
+        applied.append((project_root, locked_data_dir))
+
+    monkeypatch.setattr(config_module, "load_config", _load_recovered_config)
+    monkeypatch.setattr(migration, "acquire_migration_runtime_guard", _acquire_guard)
+    monkeypatch.setattr(migration, "apply_pending_migration", _apply_pending)
+
+    guard = cli_module._acquire_server_migration_guard()
+    try:
+        assert guard.paths == (
+            migration_root / "runtime.lock",
+            target_data.parent / f".{target_data.name}.openbiliclaw-runtime.lock",
+        )
+        assert applied == [(project_root.resolve(), target_data.resolve())]
+        assert events == [
+            ("guard", target_data.resolve()),
+            ("apply", target_data.resolve()),
+            ("load-config", target_data.resolve()),
+        ]
+    finally:
+        guard.release()
+
+
 def test_start_uses_lan_accessible_api_defaults(
     monkeypatch: pytest.MonkeyPatch, runner: CliRunner
 ) -> None:
@@ -1153,6 +1238,42 @@ def test_start_uses_lan_accessible_api_defaults(
     assert "API 服务" in result.stdout
     assert backup_calls == ["called"]
     assert called == {"host": "0.0.0.0", "port": 8420}
+
+
+def test_start_creates_backup_before_guided_init_opens_runtime_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = config_module.Config()
+    events: list[str] = []
+
+    monkeypatch.setattr(config_module, "load_config", lambda: cfg)
+    monkeypatch.setattr(
+        cli_module,
+        "_ensure_runtime_database_healthy",
+        lambda: events.append("health"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_maybe_create_runtime_database_backup",
+        lambda: events.append("backup"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_guided_init_completed_best_effort",
+        lambda: events.append("guided-init") or True,
+    )
+    monkeypatch.setattr(cli_module, "_warn_if_pause_on_disconnect_requires_presence", lambda: None)
+    monkeypatch.setattr(cli_module, "_preflight_loopback_ollama", lambda _cfg: None)
+    monkeypatch.setattr(cli_module, "_self_heal_autostart_registration", lambda _cfg: None)
+    monkeypatch.setattr(
+        cli_module,
+        "_run_api_server",
+        lambda *, host, port: events.append(f"server:{host}:{port}"),
+    )
+
+    cli_module._start_agent(host="", port=0)
+
+    assert events == ["health", "backup", "guided-init", "server:0.0.0.0:8420"]
 
 
 def test_start_uses_configured_api_host_and_port(
@@ -1895,6 +2016,7 @@ def test_runtime_builders_share_database_instance(
     assert created_memories[0].database is created_databases[0]
     assert recommendation_engine.database is created_databases[0]
     assert recommendation_engine.kwargs["copy_ready_target_count"] == expected_copy_target
+    assert recommendation_engine.kwargs["pool_available_target_count"] == 30
     assert discovery_engine.database is created_databases[0]
     recorder = recommendation_engine.llm.usage_recorder
     assert recorder is not None

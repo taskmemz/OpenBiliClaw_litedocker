@@ -86,6 +86,16 @@
         },
         {
             "matches": [
+                "*://*.douyin.com/*"
+            ],
+            "js": [
+                "dist/main/dy-fetch-tap.js"
+            ],
+            "run_at": "document_start",
+            "world": "MAIN"
+        },
+        {
+            "matches": [
                 "*://*.youtube.com/*"
             ],
             "js": [

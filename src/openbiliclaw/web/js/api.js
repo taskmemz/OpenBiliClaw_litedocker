@@ -191,6 +191,36 @@ export async function fetchRecommendations() {
   return Array.isArray(data.items) ? data.items : [];
 }
 
+export async function fetchContentHistory(category, limit = 12, cursorOrOffset = "") {
+  if (!["clicked", "shown", "removed"].includes(category)) {
+    throw new TypeError(`Unknown content history category: ${category}`);
+  }
+  const params = new URLSearchParams({
+    category,
+    limit: String(Math.max(1, Math.min(50, Math.floor(Number(limit) || 12)))),
+  });
+  // The current UI uses an opaque keyset cursor. Numeric offsets remain
+  // accepted only for older callers during migration. An empty cursor is
+  // intentionally omitted because the API treats it as malformed.
+  if (typeof cursorOrOffset === "number") {
+    const offset = Math.max(0, Math.floor(Number(cursorOrOffset) || 0));
+    if (offset > 0) params.set("offset", String(offset));
+  } else {
+    const cursor = String(cursorOrOffset || "").trim();
+    if (cursor) params.set("cursor", cursor);
+  }
+  const data = await requestJson(`/content-history?${params}`, {
+    timeoutMs: DEFAULT_READ_TIMEOUT_MS,
+  });
+  return {
+    ...data,
+    items: Array.isArray(data?.items) ? data.items : [],
+    total: Math.max(0, Number(data?.total) || 0),
+    has_more: data?.has_more === true,
+    next_cursor: data?.has_more === true ? String(data?.next_cursor || "") : "",
+  };
+}
+
 export async function reshuffleRecommendations(excludedBvids = []) {
   const data = await requestJson(
     "/recommendations/reshuffle",

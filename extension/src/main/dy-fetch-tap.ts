@@ -10,20 +10,11 @@
  * wrapper sees it, so we never compute X-Bogus / msToken / `_signature`
  * ourselves.
  *
- * **Critical timing detail** (verified empirically 2026-05-07 via
- * chrome-devtools MCP probe — see
- * docs/plans/2026-05-06-douyin-bootstrap-import-design.md §3 step 5):
- * Douyin's page bundle wraps `window.fetch` with its own axios-style
- * wrapper *after* document_start. Installing at `runAt:"document_start"`
- * is shadowed by the page bundle's later wrapper and captures **zero**
- * responses. The bootstrap content script must
- * `await waitForDouyinSdk(window, 8000)` (polling for
- * `window.byted_acrawler`) before calling `installFetchTap`.
- * Wrapping the SDK's wrapper preserves the signing (their wrapper
- * signs internally) and adds our observation as the outermost layer.
- *
- * This module does NOT auto-install. Side effects only happen when
- * the content script explicitly calls `installFetchTap(window, ...)`.
+ * The bundle auto-installs at document_start to observe the first page
+ * request, then re-validates its wrappers after `window.byted_acrawler`
+ * appears and on every explicit reinjection. This is intentional: Douyin's
+ * page bundle can replace fetch/XHR after document_start, while waiting for
+ * the SDK alone misses an already-completed first feed response.
  */
 
 export type DouyinScope = "dy_post" | "dy_collect" | "dy_like" | "dy_follow";
@@ -403,6 +394,60 @@ type FetchLike = (
   init?: RequestInit,
 ) => Promise<Response>;
 
+type XhrOpenLike = (
+  method: string,
+  url: string | URL,
+  async?: boolean,
+  user?: string | null,
+  password?: string | null,
+) => void;
+
+interface FetchTapInstallState {
+  originalFetch: FetchLike;
+  wrappedFetch: FetchLike;
+}
+
+interface XhrTapInstallState {
+  prototype: XMLHttpRequest;
+  originalOpen: XhrOpenLike;
+  wrappedOpen: XhrOpenLike;
+}
+
+interface ActiveApiRequest {
+  token: object;
+  timeoutId: ReturnType<typeof setTimeout>;
+}
+
+interface ApiHarvesterInstallState {
+  listener: EventListener;
+  activeRequests: Map<string, ActiveApiRequest>;
+  requestTimeoutMs: number;
+}
+
+interface DouyinMainBridgeState {
+  fetchTap?: FetchTapInstallState;
+  xhrTap?: XhrTapInstallState;
+  apiHarvester?: ApiHarvesterInstallState;
+  autoInstallStatus?: "pending" | "installed";
+}
+
+type DouyinMainBridgeWindow = Window & {
+  __openbiliclawDouyinMainBridgeState?: DouyinMainBridgeState;
+};
+
+/**
+ * Store install state on the page Window, rather than in module globals.
+ * Chrome executes each scripting.executeScript file injection in a fresh
+ * bundle closure, while the MAIN-world Window survives SPA route changes and
+ * repeated injections. The Window marker therefore makes installation
+ * idempotent across both calls and separately evaluated bundle instances.
+ */
+function getDouyinMainBridgeState(target: Window): DouyinMainBridgeState {
+  const shared = target as DouyinMainBridgeWindow;
+  shared.__openbiliclawDouyinMainBridgeState ??= {};
+  return shared.__openbiliclawDouyinMainBridgeState;
+}
+
 const SEARCH_TAP_MESSAGE_TYPE = "OPENBILICLAW_DOUYIN_SEARCH_PAGE";
 
 function isSearchResponseUrl(url: string): boolean {
@@ -416,14 +461,21 @@ function isSearchResponseUrl(url: string): boolean {
 }
 
 function isPassiveDiscoveryResponseUrl(url: string): boolean {
-  if (!url) return false;
+  return classifyPassiveDiscoveryScope(url) !== null;
+}
+
+function classifyPassiveDiscoveryScope(url: string): DouyinSearchScope | null {
+  if (!url) return null;
   const path = url.split("?", 1)[0] ?? "";
-  return (
-    isSearchResponseUrl(url) ||
-    path.includes("/aweme/v1/web/aweme/related/") ||
+  if (isSearchResponseUrl(url)) return "dy_search";
+  if (path.includes("/aweme/v1/web/aweme/related/")) return "dy_hot";
+  if (
     path.includes("/aweme/v1/web/tab/feed/") ||
     path.includes("/aweme/v2/web/module/feed/")
-  );
+  ) {
+    return "dy_feed";
+  }
+  return null;
 }
 
 function parsePassiveDiscoveryResponse(url: string, json: unknown): DouyinSearchItem[] {
@@ -438,6 +490,27 @@ function parsePassiveDiscoveryResponse(url: string, json: unknown): DouyinSearch
     return parseSearchAwemeResponse(json);
   }
   return [];
+}
+
+function isSuccessfulDouyinResponsePayload(json: unknown): boolean {
+  if (!json || typeof json !== "object" || Array.isArray(json)) return false;
+  const root = json as Record<string, unknown>;
+  if (!("status_code" in root)) return true;
+  const statusCode = Number(root.status_code);
+  return Number.isFinite(statusCode) && statusCode === 0;
+}
+
+function isValidPassiveDiscoveryEnvelope(
+  scope: DouyinSearchScope,
+  json: unknown,
+): boolean {
+  if (!isSuccessfulDouyinResponsePayload(json)) return false;
+  const root = json as Record<string, unknown>;
+  if (scope === "dy_search") {
+    return Array.isArray(root.data) || Array.isArray(root.aweme_list);
+  }
+  if (scope === "dy_hot") return Array.isArray(root.aweme_list);
+  return Array.isArray(root.aweme_list) || Array.isArray(root.data);
 }
 
 function parseJsonText(text: string): unknown {
@@ -478,14 +551,23 @@ async function readJsonResponse(resp: Response): Promise<unknown> {
  * mutates the original Response — we use `Response.clone()` so the
  * page's own consumer reads the body untouched.
  *
- * Returns a disposer that restores the original `target.fetch`.
+ * Returns a disposer that restores the original `target.fetch`. A duplicate
+ * installation returns a no-op disposer because the first installer owns the
+ * shared wrapper.
  */
 export function installFetchTap(
   target: Window,
   postBack: (items: DouyinBootstrapItem[], scope: DouyinScope) => void,
-  postSearchBack?: (items: DouyinSearchItem[]) => void,
+  postSearchBack?: (items: DouyinSearchItem[], scope: DouyinSearchScope) => void,
 ): () => void {
   const w = target as unknown as { fetch: FetchLike };
+  const shared = getDouyinMainBridgeState(target);
+  const installed = shared.fetchTap;
+  if (installed && w.fetch === installed.wrappedFetch) {
+    // The first installer owns the live wrapper. A duplicate caller gets a
+    // no-op disposer so it cannot accidentally tear down that installation.
+    return (): void => {};
+  }
   const originalFetch = w.fetch;
 
   const wrapped: FetchLike = async (input, init) => {
@@ -512,12 +594,12 @@ export function installFetchTap(
         // right move; we never want to throw inside fetch-tap because
         // the page's React app would observe the rejection.
       }
-    } else if (isPassiveDiscoveryResponseUrl(url) && postSearchBack) {
+    } else if (resp.ok && isPassiveDiscoveryResponseUrl(url) && postSearchBack) {
       try {
         const json: unknown = await readJsonResponse(resp);
-        const items = parsePassiveDiscoveryResponse(url, json);
-        if (items.length > 0) {
-          postSearchBack(items);
+        const discoveryScope = classifyPassiveDiscoveryScope(url);
+        if (discoveryScope && isValidPassiveDiscoveryEnvelope(discoveryScope, json)) {
+          postSearchBack(parsePassiveDiscoveryResponse(url, json), discoveryScope);
         }
       } catch {
         // Best-effort search observation; never disturb the page.
@@ -526,9 +608,16 @@ export function installFetchTap(
     return resp;
   };
 
+  const state: FetchTapInstallState = {
+    originalFetch,
+    wrappedFetch: wrapped,
+  };
+  shared.fetchTap = state;
   w.fetch = wrapped;
   return (): void => {
-    w.fetch = originalFetch;
+    if (shared.fetchTap !== state) return;
+    if (w.fetch === wrapped) w.fetch = originalFetch;
+    delete shared.fetchTap;
   };
 }
 
@@ -539,26 +628,24 @@ export function installFetchTap(
  * listen on the per-request readystatechange (state=4) and parse
  * .responseText.
  *
- * Diagnostic-only: returns the disposer that un-wraps both .open and
- * .send.
+ * Diagnostic-only: returns the disposer that un-wraps .open. A duplicate
+ * installation returns a no-op disposer owned independently of the live tap.
  */
 export function installXhrTap(
   target: Window,
   postBack: (items: DouyinBootstrapItem[], scope: DouyinScope) => void,
-  postSearchBack?: (items: DouyinSearchItem[]) => void,
+  postSearchBack?: (items: DouyinSearchItem[], scope: DouyinSearchScope) => void,
 ): () => void {
   const proto = (target as unknown as { XMLHttpRequest: { prototype: XMLHttpRequest } })
     .XMLHttpRequest.prototype;
-  type OpenLike = (
-    method: string,
-    url: string | URL,
-    async?: boolean,
-    user?: string | null,
-    password?: string | null,
-  ) => void;
-  const originalOpen = proto.open as unknown as OpenLike;
+  const shared = getDouyinMainBridgeState(target);
+  const installed = shared.xhrTap;
+  if (installed && installed.prototype === proto && proto.open === installed.wrappedOpen) {
+    return (): void => {};
+  }
+  const originalOpen = proto.open as unknown as XhrOpenLike;
 
-  const wrappedOpen: OpenLike = function wrappedOpen(
+  const wrappedOpen: XhrOpenLike = function wrappedOpen(
     this: XMLHttpRequest,
     method: string,
     url: string | URL,
@@ -574,6 +661,10 @@ export function installXhrTap(
       const scope = classifyDouyinResponseUrl(u);
       if (!scope && !isPassiveDiscoveryResponseUrl(u)) return;
       try {
+        const httpStatus = Number(this.status);
+        if (Number.isFinite(httpStatus) && httpStatus > 0 && (httpStatus < 200 || httpStatus >= 300)) {
+          return;
+        }
         const text = this.responseText;
         if (!text) return;
         const json: unknown = parseJsonText(text);
@@ -585,8 +676,14 @@ export function installXhrTap(
           if (items.length > 0) postBack(items, scope);
           return;
         }
-        const searchItems = parsePassiveDiscoveryResponse(u, json);
-        if (searchItems.length > 0 && postSearchBack) postSearchBack(searchItems);
+        const discoveryScope = classifyPassiveDiscoveryScope(u);
+        if (
+          postSearchBack &&
+          discoveryScope &&
+          isValidPassiveDiscoveryEnvelope(discoveryScope, json)
+        ) {
+          postSearchBack(parsePassiveDiscoveryResponse(u, json), discoveryScope);
+        }
       } catch {
         // Best-effort: never throw inside XHR listener.
       }
@@ -594,9 +691,19 @@ export function installXhrTap(
     return originalOpen.call(this, method, url, async ?? true, user, password);
   };
 
-  (proto as unknown as { open: OpenLike }).open = wrappedOpen;
+  const state: XhrTapInstallState = {
+    prototype: proto,
+    originalOpen,
+    wrappedOpen,
+  };
+  shared.xhrTap = state;
+  (proto as unknown as { open: XhrOpenLike }).open = wrappedOpen;
   return (): void => {
-    (proto as unknown as { open: OpenLike }).open = originalOpen;
+    if (shared.xhrTap !== state) return;
+    if (proto.open === wrappedOpen) {
+      (proto as unknown as { open: XhrOpenLike }).open = originalOpen;
+    }
+    delete shared.xhrTap;
   };
 }
 
@@ -629,9 +736,12 @@ const FETCH_TAP_INSTALL_TYPE = "OPENBILICLAW_DOUYIN_FETCH_TAP_INSTALL";
  *   - content script at document_idle (catches third ping at T+1000ms)
  *   - any unexpected delay short of 1.5s
  */
-function replayInstallStatusPing(status: "installed" | "skipped_no_sdk"): void {
+function replayInstallStatusPing(
+  target: Window,
+  status: "installed" | "skipped_no_sdk",
+): void {
   const fire = (): void => {
-    window.postMessage({ type: FETCH_TAP_INSTALL_TYPE, status }, window.location.origin);
+    target.postMessage({ type: FETCH_TAP_INSTALL_TYPE, status }, target.location.origin);
   };
   fire();
   setTimeout(fire, 500);
@@ -1243,8 +1353,73 @@ export function isSameWindowSameOriginApiRequest(
   return event.source === target && event.origin === target.location.origin;
 }
 
-export function installApiHarvester(target: Window): void {
-  target.addEventListener("message", (event: MessageEvent) => {
+const API_REQUEST_DEDUP_TIMEOUT_MS = 120_000;
+const API_REQUEST_MAX_IN_FLIGHT = 128;
+
+type PostApiResponse = (message: Record<string, unknown>) => void;
+
+function startApiRequestOnce(
+  target: Window,
+  state: ApiHarvesterInstallState,
+  requestType: string,
+  requestId: string,
+  run: (postResponse: PostApiResponse) => Promise<void>,
+): void {
+  const key = `${requestType}:${requestId}`;
+  if (state.activeRequests.has(key)) return;
+
+  // A page should have only a handful of live bridge requests. Keep the
+  // registry bounded even if page fetches hang forever and timers are heavily
+  // throttled in a background tab.
+  if (state.activeRequests.size >= API_REQUEST_MAX_IN_FLIGHT) {
+    const oldestKey = state.activeRequests.keys().next().value as string | undefined;
+    if (oldestKey !== undefined) {
+      const oldest = state.activeRequests.get(oldestKey);
+      if (oldest) clearTimeout(oldest.timeoutId);
+      state.activeRequests.delete(oldestKey);
+    }
+  }
+
+  const token = {};
+  const timeoutId = setTimeout(() => {
+    const current = state.activeRequests.get(key);
+    if (current?.token === token) state.activeRequests.delete(key);
+  }, state.requestTimeoutMs);
+  const entry: ActiveApiRequest = { token, timeoutId };
+  state.activeRequests.set(key, entry);
+
+  const postResponse: PostApiResponse = (message) => {
+    // Suppress results from requests that outlived the bridge timeout (or were
+    // evicted by the safety bound). Their isolated-world listener is gone.
+    if (state.activeRequests.get(key)?.token !== token) return;
+    target.postMessage(message, target.location.origin);
+  };
+  const cleanup = (): void => {
+    clearTimeout(timeoutId);
+    if (state.activeRequests.get(key)?.token === token) {
+      state.activeRequests.delete(key);
+    }
+  };
+
+  // Both fulfillment and rejection release the request id. Individual
+  // handlers below translate expected harvest errors into bridge responses.
+  void run(postResponse).then(cleanup, cleanup);
+}
+
+export function installApiHarvester(
+  target: Window,
+  requestTimeoutMs: number = API_REQUEST_DEDUP_TIMEOUT_MS,
+): void {
+  const shared = getDouyinMainBridgeState(target);
+  if (shared.apiHarvester) return;
+
+  const state: ApiHarvesterInstallState = {
+    listener: (): void => {},
+    activeRequests: new Map(),
+    requestTimeoutMs: Math.max(1, Math.floor(requestTimeoutMs)),
+  };
+  const listener: EventListener = (rawEvent) => {
+    const event = rawEvent as MessageEvent;
     if (!isSameWindowSameOriginApiRequest(event, target)) return;
     const data = (event?.data ?? null) as Record<string, unknown> | null;
     if (!data || typeof data !== "object") return;
@@ -1253,31 +1428,25 @@ export function installApiHarvester(target: Window): void {
       const keyword = String(data.keyword ?? "").trim();
       const maxItems = Number(data.maxItems ?? 0);
       if (!requestId || !keyword) return;
-      void (async () => {
+      startApiRequestOnce(target, state, SEARCH_API_REQUEST_TYPE, requestId, async (post) => {
         try {
           const result = await harvestSearchViaApi(target, keyword, maxItems);
-          target.postMessage(
-            {
-              type: SEARCH_API_RESPONSE_TYPE,
-              requestId,
-              items: result.items,
-              pages_fetched: result.pages_fetched,
-            },
-            target.location.origin,
-          );
+          post({
+            type: SEARCH_API_RESPONSE_TYPE,
+            requestId,
+            items: result.items,
+            pages_fetched: result.pages_fetched,
+          });
         } catch (err) {
-          target.postMessage(
-            {
-              type: SEARCH_API_RESPONSE_TYPE,
-              requestId,
-              items: [],
-              pages_fetched: 0,
-              error: String(err instanceof Error ? err.message : err),
-            },
-            target.location.origin,
-          );
+          post({
+            type: SEARCH_API_RESPONSE_TYPE,
+            requestId,
+            items: [],
+            pages_fetched: 0,
+            error: String(err instanceof Error ? err.message : err),
+          });
         }
-      })();
+      });
       return;
     }
     if (data.type === HOT_API_REQUEST_TYPE) {
@@ -1287,95 +1456,77 @@ export function installApiHarvester(target: Window): void {
       const word = String(data.word ?? "");
       const sentenceId = String(data.sentenceId ?? "");
       if (!requestId || !seedAwemeId) return;
-      void (async () => {
+      startApiRequestOnce(target, state, HOT_API_REQUEST_TYPE, requestId, async (post) => {
         try {
           const result = await harvestHotRelatedViaApi(target, seedAwemeId, maxItems, {
             word,
             sentenceId,
             seedAwemeId,
           });
-          target.postMessage(
-            {
-              type: HOT_API_RESPONSE_TYPE,
-              requestId,
-              items: result.items,
-              pages_fetched: result.pages_fetched,
-            },
-            target.location.origin,
-          );
+          post({
+            type: HOT_API_RESPONSE_TYPE,
+            requestId,
+            items: result.items,
+            pages_fetched: result.pages_fetched,
+          });
         } catch (err) {
-          target.postMessage(
-            {
-              type: HOT_API_RESPONSE_TYPE,
-              requestId,
-              items: [],
-              pages_fetched: 0,
-              error: String(err instanceof Error ? err.message : err),
-            },
-            target.location.origin,
-          );
+          post({
+            type: HOT_API_RESPONSE_TYPE,
+            requestId,
+            items: [],
+            pages_fetched: 0,
+            error: String(err instanceof Error ? err.message : err),
+          });
         }
-      })();
+      });
       return;
     }
     if (data.type === FEED_API_REQUEST_TYPE) {
       const requestId = String(data.requestId ?? "");
       const maxItems = Number(data.maxItems ?? 0);
       if (!requestId) return;
-      void (async () => {
+      startApiRequestOnce(target, state, FEED_API_REQUEST_TYPE, requestId, async (post) => {
         try {
           const result = await harvestFeedViaApi(target, maxItems);
-          target.postMessage(
-            {
-              type: FEED_API_RESPONSE_TYPE,
-              requestId,
-              items: result.items,
-              pages_fetched: result.pages_fetched,
-            },
-            target.location.origin,
-          );
+          post({
+            type: FEED_API_RESPONSE_TYPE,
+            requestId,
+            items: result.items,
+            pages_fetched: result.pages_fetched,
+          });
         } catch (err) {
-          target.postMessage(
-            {
-              type: FEED_API_RESPONSE_TYPE,
-              requestId,
-              items: [],
-              pages_fetched: 0,
-              error: String(err instanceof Error ? err.message : err),
-            },
-            target.location.origin,
-          );
+          post({
+            type: FEED_API_RESPONSE_TYPE,
+            requestId,
+            items: [],
+            pages_fetched: 0,
+            error: String(err instanceof Error ? err.message : err),
+          });
         }
-      })();
+      });
       return;
     }
     if (data.type === IDENTITY_REQUEST_TYPE) {
       const requestId = String(data.requestId ?? "");
       if (!requestId) return;
-      void (async () => {
+      startApiRequestOnce(target, state, IDENTITY_REQUEST_TYPE, requestId, async (post) => {
         try {
           const secUid = await resolveDouyinSelfSecUid(target);
-          target.postMessage(
-            {
-              type: IDENTITY_RESPONSE_TYPE,
-              requestId,
-              secUid,
-              ...(!secUid ? { error: "identity_unavailable" } : {}),
-            },
-            target.location.origin,
-          );
+          post({
+            type: IDENTITY_RESPONSE_TYPE,
+            requestId,
+            secUid,
+            ...(!secUid ? { error: "identity_unavailable" } : {}),
+          });
         } catch (err) {
-          target.postMessage(
-            {
-              type: IDENTITY_RESPONSE_TYPE,
-              requestId,
-              secUid: "",
-              error: String(err instanceof Error ? err.message : err),
-            },
-            target.location.origin,
-          );
+          post({
+            type: IDENTITY_RESPONSE_TYPE,
+            requestId,
+            secUid: "",
+            error: String(err instanceof Error ? err.message : err),
+          });
         }
-      })();
+      });
       return;
     }
     if (data.type !== API_REQUEST_TYPE) return;
@@ -1384,65 +1535,102 @@ export function installApiHarvester(target: Window): void {
     const secUid = String(data.secUid ?? "");
     const maxItems = Number(data.maxItems ?? 0);
     if (!requestId || !scope || !secUid) return;
-    void (async () => {
+    startApiRequestOnce(target, state, API_REQUEST_TYPE, requestId, async (post) => {
       try {
         const result = await harvestScopeViaApi(target, scope, secUid, maxItems);
-        target.postMessage(
-          {
-            type: API_RESPONSE_TYPE,
-            requestId,
-            items: result.items,
-            pages_fetched: result.pages_fetched,
-            ...(result.error ? { error: result.error } : {}),
-          },
-          target.location.origin,
-        );
+        post({
+          type: API_RESPONSE_TYPE,
+          requestId,
+          items: result.items,
+          pages_fetched: result.pages_fetched,
+          ...(result.error ? { error: result.error } : {}),
+        });
       } catch (err) {
-        target.postMessage(
-          {
-            type: API_RESPONSE_TYPE,
-            requestId,
-            items: [],
-            pages_fetched: 0,
-            error: String(err instanceof Error ? err.message : err),
-          },
-          target.location.origin,
-        );
+        post({
+          type: API_RESPONSE_TYPE,
+          requestId,
+          items: [],
+          pages_fetched: 0,
+          error: String(err instanceof Error ? err.message : err),
+        });
       }
-    })();
-  });
+    });
+  };
+
+  state.listener = listener;
+  shared.apiHarvester = state;
+  target.addEventListener("message", listener);
 }
 
-if (typeof window !== "undefined" && typeof document !== "undefined") {
-  // Generous timeout: real e2e probe (2026-05-08) showed
-  // skipped_no_sdk on slow page-bundle loads even when the user was
-  // logged in. Bumped 8s → 15s so first navs after a chrome.tabs.create
-  // have headroom; subsequent SPA-route reloads in the same tab usually
-  // resolve in <500ms.
-  void waitForDouyinSdk(window, 15_000).then((ready) => {
+/**
+ * Ensure every MAIN-world bridge hook still wraps the page's live primitives.
+ *
+ * Douyin may replace window.fetch or XMLHttpRequest.prototype.open after its
+ * SDK initializes or during an SPA transition. The individual installers are
+ * Window-idempotent but deliberately re-wrap when the page replaced a hook, so
+ * every explicit bundle reinjection must call them again instead of treating
+ * an old "installed" marker as proof that the live wrapper still exists.
+ */
+export function installDouyinMainBridge(target: Window): void {
+  const postItems = (items: DouyinBootstrapItem[], scope: DouyinScope): void => {
+    target.postMessage(
+      { type: FETCH_TAP_MESSAGE_TYPE, scope, items },
+      target.location.origin,
+    );
+  };
+  const postSearchItems = (
+    items: DouyinSearchItem[],
+    scope: DouyinSearchScope,
+  ): void => {
+    target.postMessage(
+      { type: SEARCH_TAP_MESSAGE_TYPE, scope, items, response_observed: true },
+      target.location.origin,
+    );
+  };
+  installFetchTap(target, postItems, postSearchItems);
+  installXhrTap(target, postItems, postSearchItems);
+  installApiHarvester(target);
+}
+
+export function autoInstallDouyinMainBridge(
+  target: Window,
+  waitForSdk: (target: Window, timeoutMs: number) => Promise<boolean> = waitForDouyinSdk,
+): void {
+  const shared = getDouyinMainBridgeState(target);
+  if (shared.autoInstallStatus === "installed") {
+    // Re-validate the live primitives before replaying the sentinel. The page
+    // may have replaced fetch/XHR since the earlier bundle evaluation.
+    installDouyinMainBridge(target);
+    replayInstallStatusPing(target, "installed");
+    return;
+  }
+
+  // A dynamic reinjection can arrive while the first SDK readiness wait is
+  // still pending. Revalidate live fetch/XHR on every evaluation; only the
+  // readiness waiter itself remains single-flight.
+  installDouyinMainBridge(target);
+  if (shared.autoInstallStatus === "pending") return;
+
+  shared.autoInstallStatus = "pending";
+  // Generous timeout: real e2e probe (2026-05-08) showed skipped_no_sdk
+  // on slow page-bundle loads even when the user was logged in.
+  void waitForSdk(target, 15_000).then((ready) => {
     if (!ready) {
-      replayInstallStatusPing("skipped_no_sdk");
+      // Allow a later explicit injection to retry after a slow SDK load.
+      delete shared.autoInstallStatus;
+      replayInstallStatusPing(target, "skipped_no_sdk");
       // eslint-disable-next-line no-console
       console.debug("[OpenBiliClaw] dy fetch-tap skipped: SDK not detected");
       return;
     }
-    const postItems = (items: DouyinBootstrapItem[], scope: DouyinScope): void => {
-      window.postMessage(
-        { type: FETCH_TAP_MESSAGE_TYPE, scope, items },
-        window.location.origin,
-      );
-    };
-    const postSearchItems = (items: DouyinSearchItem[]): void => {
-      window.postMessage(
-        { type: SEARCH_TAP_MESSAGE_TYPE, items },
-        window.location.origin,
-      );
-    };
-    installFetchTap(window, postItems, postSearchItems);
-    installXhrTap(window, postItems, postSearchItems);
-    installApiHarvester(window);
-    replayInstallStatusPing("installed");
+    installDouyinMainBridge(target);
+    shared.autoInstallStatus = "installed";
+    replayInstallStatusPing(target, "installed");
     // eslint-disable-next-line no-console
     console.debug("[OpenBiliClaw] dy fetch-tap + API harvester installed (MAIN world)");
   });
+}
+
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  autoInstallDouyinMainBridge(window);
 }

@@ -1238,6 +1238,26 @@ test("getPoolStatusSummary explains discovered-but-not-added refresh result", ()
   );
 });
 
+test("getPoolStatusSummary surfaces captured material beside existing inventory", () => {
+  assert.deepEqual(
+    getPoolStatusSummary({
+      initialized: true,
+      pool_available_count: 222,
+      pool_pending_count: 177,
+      pool_target_count: 300,
+      last_discovered_count: 0,
+      last_replenished_count: 0,
+      recent_pool_topics: [],
+      manual_refresh_state: "idle",
+    }),
+    {
+      available: "还有 222 条可换",
+      replenished: "另有 177 条素材",
+      topics: "素材已抓到，会按可换库存缺口整理",
+    },
+  );
+});
+
 test("getReadyRecommendationHint prefers pool inventory over unread history", () => {
   assert.deepEqual(
     getReadyRecommendationHint({
@@ -1332,6 +1352,19 @@ test("mergeRuntimeStatusEvent updates pool fields from runtime stream payload", 
   assert.equal(merged.pool_pending_count, 142);
   assert.equal(merged.last_replenished_count, 6);
   assert.deepEqual(merged.recent_pool_topics, ["国际时事", "宏观经济"]);
+});
+
+test("pool stream snapshot recovers inventory after first-load status timeout", () => {
+  const merged = mergeRuntimeStatusEvent(null, {
+    type: "pool_status",
+    pool_available_count: 222,
+    pool_raw_count: 455,
+    pool_pending_count: 177,
+  });
+
+  assert.equal(merged.initialized, true);
+  assert.equal(merged.pool_available_count, 222);
+  assert.equal(getPoolStatusSummary(merged)?.available, "还有 222 条可换");
 });
 
 test("getRealtimePoolStatusSummary prefers runtime stream message when available", () => {

@@ -8,6 +8,7 @@ import {
 export const CONFIG_CACHE_KEY = "openbiliclaw.config_cache";
 export const CONFIG_GET_TIMEOUT_MS = 12_000;
 export const CONFIG_PUT_TIMEOUT_MS = 60_000;
+export const CONTENT_HISTORY_READ_TIMEOUT_MS = 12_000;
 const HEALTH_SUCCESS_CACHE_TTL_MS = 3_000;
 const HEALTH_FAILURE_CACHE_TTL_MS = 1_000;
 
@@ -285,6 +286,80 @@ export async function fetchEmbeddingRepairStatus() {
 export async function fetchRecommendations() {
   const payload = await requestJson("/recommendations", { method: "GET" });
   return Array.isArray(payload.items) ? payload.items.map(normalizeRecommendation) : [];
+}
+
+/** Merge one opaque-cursor page without appending a canonical item twice. */
+export function reconcileContentHistoryPage({
+  items = [],
+  incomingItems = [],
+  incomingTotal = 0,
+  nextCursor = "",
+  hasMore = false,
+  append = false,
+} = {}) {
+  const current = Array.isArray(items) ? items : [];
+  const incoming = Array.isArray(incomingItems) ? incomingItems : [];
+  const normalizedTotal = Math.max(0, Number(incomingTotal) || 0);
+  const reasons = new Set();
+  const seen = new Set();
+  const merged = [];
+
+  const addItem = (item) => {
+    const itemKey = String(item?.item_key || "").trim();
+    if (!itemKey) {
+      reasons.add("missing_item_key");
+      return;
+    }
+    if (seen.has(itemKey)) {
+      reasons.add("duplicate_item_key");
+      return;
+    }
+    seen.add(itemKey);
+    merged.push(item);
+  };
+
+  if (append) current.forEach(addItem);
+  incoming.forEach(addItem);
+  const normalizedNextCursor = hasMore ? String(nextCursor || "").trim() : "";
+
+  return {
+    items: merged,
+    total: normalizedTotal,
+    nextCursor: normalizedNextCursor,
+    hasMore: Boolean(hasMore && normalizedNextCursor),
+    reasons: [...reasons],
+  };
+}
+
+export async function fetchContentHistory(category, limit = 12, cursorOrOffset = "") {
+  if (!["clicked", "shown", "removed"].includes(category)) {
+    throw new TypeError(`Unknown content history category: ${category}`);
+  }
+  const params = new URLSearchParams({
+    category,
+    limit: String(Math.max(1, Math.min(50, Math.floor(Number(limit) || 12)))),
+  });
+  // Cursor pagination is the current contract. Keep non-zero numeric offsets
+  // for older popup callers during migration, but never send cursor="": the
+  // backend rejects an empty opaque cursor instead of treating it as page one.
+  if (typeof cursorOrOffset === "number") {
+    const offset = Math.max(0, Math.floor(Number(cursorOrOffset) || 0));
+    if (offset > 0) params.set("offset", String(offset));
+  } else {
+    const cursor = String(cursorOrOffset || "").trim();
+    if (cursor) params.set("cursor", cursor);
+  }
+  const payload = await requestJson(`/content-history?${params}`, {
+    method: "GET",
+    timeoutMs: CONTENT_HISTORY_READ_TIMEOUT_MS,
+  });
+  return {
+    ...payload,
+    items: Array.isArray(payload?.items) ? payload.items : [],
+    total: Math.max(0, Number(payload?.total) || 0),
+    has_more: payload?.has_more === true,
+    next_cursor: payload?.has_more === true ? String(payload?.next_cursor || "") : "",
+  };
 }
 
 export async function refreshRecommendations() {
@@ -802,7 +877,10 @@ export async function fetchSourceShareSuggestion(overrides = null) {
 export async function probeConfigService(kind, config, instanceId = "") {
   return requestJson("/config/probe-service", {
     method: "POST",
-    timeoutMs: 35_000,
+    // Keep the popup alive beyond the backend's bounded 120s LLM cold-start
+    // probe window; otherwise the browser aborts a request the backend still
+    // legitimately owns.
+    timeoutMs: 125_000,
     headers: {
       "Content-Type": "application/json",
     },

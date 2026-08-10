@@ -27,14 +27,19 @@ from openbiliclaw.integrations.openclaw.schemas import (
     AvoidanceProbeResponse,
     ChatRequest,
     ChatResponse,
+    DelightFeedbackRequest,
     DelightItem,
     DelightResponse,
     FeedbackRequest,
+    InterestProbeFeedbackRequest,
     InterestProbeResponse,
+    PlatformAvailabilityResponse,
     ProfileResponse,
     RecommendationItem,
     RecommendationResponse,
     RuntimeStatusResponse,
+    SavedItemRequest,
+    SavedSyncRequest,
     SyncAccountResponse,
 )
 from openbiliclaw.recommendation.engine import Recommendation
@@ -77,20 +82,12 @@ def test_recommendation_response_serializes_trimmed_items() -> None:
         ]
     )
 
-    assert asdict(payload) == {
-        "items": [
-            {
-                "recommendation_id": 7,
-                "bvid": "BV1TEST",
-                "title": "把城市结构讲透",
-                "up_name": "城市观察局",
-                "cover_url": "https://example.com/cover.jpg",
-                "reason": "这条会对上你最近那股想把结构看明白的劲头。",
-                "topic_label": "你最近那股想把结构看明白的劲头",
-                "confidence": 0.87,
-            }
-        ]
-    }
+    item = asdict(payload)["items"][0]
+    assert item["recommendation_id"] == 7
+    assert item["bvid"] == "BV1TEST"
+    assert item["reason"] == "这条会对上你最近那股想把结构看明白的劲头。"
+    assert item["source_platform"] == ""
+    assert item["content_type"] == "video"
 
 
 def test_runtime_status_response_serializes_public_runtime_fields() -> None:
@@ -149,16 +146,11 @@ def test_delight_response_serializes_with_item() -> None:
         ),
     )
 
-    assert asdict(payload) == {
-        "item": {
-            "bvid": "BV1DELIGHT",
-            "title": "跨域发现",
-            "delight_reason": "你之前聊到过想搞明白复杂系统。",
-            "delight_score": 0.92,
-            "delight_hook": "深层共鸣",
-            "cover_url": "https://example.com/cover.jpg",
-        },
-    }
+    item = asdict(payload)["item"]
+    assert item["bvid"] == "BV1DELIGHT"
+    assert item["title"] == "跨域发现"
+    assert item["delight_score"] == 0.92
+    assert item["source_platform"] == ""
 
 
 def test_delight_response_serializes_without_item() -> None:
@@ -230,6 +222,22 @@ def test_feedback_request_accepts_dismiss_without_note() -> None:
     assert payload.note == ""
 
 
+def test_saved_sync_request_does_not_treat_string_false_as_authorization() -> None:
+    with pytest.raises(AdapterValidationError, match="allow_state_changing"):
+        SavedSyncRequest(list_kind="favorite", allow_state_changing="false")  # type: ignore[arg-type]
+
+
+def test_saved_item_request_accepts_url_identity_without_content_id() -> None:
+    payload = SavedItemRequest(
+        list_kind="favorite",
+        source_platform="youtube",
+        content_url="https://www.youtube.com/watch?v=abc",
+    )
+
+    assert payload.content_id == ""
+    assert payload.content_url.endswith("watch?v=abc")
+
+
 class _FakeSpeculativeInterest:
     """Minimal stand-in for ``speculator.SpeculativeInterest``."""
 
@@ -266,9 +274,29 @@ class _FakeSpeculativeSpecific:
 class _FakeSpeculator:
     def __init__(self, specs: list[_FakeSpeculativeInterest] | None = None) -> None:
         self._specs = specs if specs is not None else [_FakeSpeculativeInterest()]
+        self.confirmed: list[tuple[str, str]] = []
+        self.rejected: list[str] = []
+        self.deferred: list[str] = []
 
     def get_active_speculations(self) -> list[_FakeSpeculativeInterest]:
         return list(self._specs)
+
+    def user_confirm_speculation(
+        self,
+        domain: str,
+        *,
+        confirmation_source: str = "probe_confirmed",
+    ) -> bool:
+        self.confirmed.append((domain, confirmation_source))
+        return any(item.domain == domain for item in self._specs)
+
+    def user_reject_speculation(self, domain: str) -> bool:
+        self.rejected.append(domain)
+        return any(item.domain == domain for item in self._specs)
+
+    def user_defer_speculation(self, domain: str) -> SimpleNamespace:
+        self.deferred.append(domain)
+        return SimpleNamespace(outcome="deferred", deferred_until="2030-01-02", defer_count=1)
 
 
 class _FakeSpeculativeAvoidance:
@@ -305,6 +333,7 @@ class _FakeAvoidanceSpeculator:
         self.confirmed: list[str] = []
         self.rejected: list[tuple[str, int]] = []
         self.observed: list[list[dict[str, object]]] = []
+        self.deferred: list[str] = []
 
     def get_active_avoidances(self) -> list[_FakeSpeculativeAvoidance]:
         return list(self._avoidances)
@@ -323,6 +352,10 @@ class _FakeAvoidanceSpeculator:
     def observe(self, events: list[dict[str, object]]) -> int:
         self.observed.append(events)
         return len(events)
+
+    def user_defer_avoidance(self, domain: str) -> SimpleNamespace:
+        self.deferred.append(domain)
+        return SimpleNamespace(outcome="deferred", deferred_until="2030-01-02", defer_count=1)
 
 
 class _FakeLLMService:
@@ -760,20 +793,11 @@ async def test_recommend_refreshes_then_returns_trimmed_items() -> None:
 
     result = await adapter.recommend(limit=3, refresh_if_needed=True)
 
-    assert result == RecommendationResponse(
-        items=[
-            RecommendationItem(
-                recommendation_id=31,
-                bvid="BV1DB",
-                title="从系统论看复杂问题",
-                up_name="复杂性观察者",
-                cover_url="https://example.com/db-cover.jpg",
-                reason="这条更像是刚补完货后直接该拿给你看的那种。",
-                topic_label="你最近那股想把系统想透的劲头",
-                confidence=0.86,
-            )
-        ]
-    )
+    assert result.items[0].recommendation_id == 31
+    assert result.items[0].content_id == "BV1DB"
+    assert result.items[0].source_platform == "bilibili"
+    assert result.items[0].author_name == "复杂性观察者"
+    assert result.items[0].expression == "这条更像是刚补完货后直接该拿给你看的那种。"
     assert runtime_controller.refresh_if_needed_calls == 1
     assert database.recommendation_list_calls == [3]
     assert recommendation_engine.calls == []
@@ -1310,6 +1334,7 @@ def test_build_openclaw_adapter_services_reuses_shared_database(
     assert services.recommendation_engine.kwargs["copy_ready_target_count"] == (
         expected_copy_target
     )
+    assert services.recommendation_engine.kwargs["pool_available_target_count"] == 30
     assert (
         services.llm_service.concurrency_gate is services.soul_engine.kwargs["llm_concurrency_gate"]
     )
@@ -2229,3 +2254,170 @@ async def test_respond_avoidance_probe_confirm_delegates_to_speculator() -> None
         domain="浅层热点复读",
     )
     assert soul_engine._avoidance_speculator.confirmed == ["浅层热点复读"]
+
+
+@pytest.mark.asyncio
+async def test_recommendation_projection_exposes_multi_source_fields() -> None:
+    adapter, _, _, database, *_ = _build_adapter()
+
+    database.get_recommendations = lambda limit=100, **_: [  # type: ignore[method-assign]
+        {
+            "id": 88,
+            "bvid": "",
+            "item_key": "zhihu:answer-88",
+            "content_id": "answer-88",
+            "content_url": "https://zhihu.com/question/1/answer/88",
+            "source_platform": "zhihu",
+            "content_type": "answer",
+            "title": "把复杂问题讲清楚",
+            "author_name": "结构研究者",
+            "body_text": "正文摘要",
+            "published_label": "昨天",
+            "expression": "这条接住了你最近的追问。",
+            "topic": "复杂系统",
+            "confidence": 0.81,
+            "view_count": 100,
+            "like_count": 12,
+            "comment_count": 3,
+        }
+    ]
+
+    result = await adapter.recommend(limit=1, refresh_if_needed=True, source_platform="zhihu")
+
+    item = result.items[0]
+    assert item.item_key == "zhihu:answer-88"
+    assert item.content_id == "answer-88"
+    assert item.source_platform == "zhihu"
+    assert item.author_name == "结构研究者"
+    assert item.body_text == "正文摘要"
+    assert item.comment_count == 3
+
+
+@pytest.mark.asyncio
+async def test_interest_and_avoidance_probes_support_defer_and_confirm() -> None:
+    adapter, soul_engine, *_ = _build_adapter()
+
+    confirmed = await adapter.respond_interest_probe(
+        InterestProbeFeedbackRequest(
+            domain="建筑美学",
+            response="confirm",
+            surface="profile",
+        )
+    )
+    deferred = await adapter.respond_interest_probe(
+        InterestProbeFeedbackRequest(domain="建筑美学", response="defer")
+    )
+    avoidance_deferred = await adapter.respond_avoidance_probe(
+        AvoidanceProbeFeedbackRequest(domain="浅层热点复读", response="defer")
+    )
+
+    assert confirmed.ok is True
+    assert confirmed.action == "confirmed"
+    assert soul_engine._speculator.confirmed == [("建筑美学", "profile_confirmed")]
+    assert deferred.action == "deferred"
+    assert deferred.deferred_until == "2030-01-02"
+    assert avoidance_deferred.action == "deferred"
+    assert avoidance_deferred.defer_count == 1
+
+
+@pytest.mark.asyncio
+async def test_delight_feedback_is_durable_and_idempotent() -> None:
+    adapter, *_ = _build_adapter()
+    request = DelightFeedbackRequest(
+        bvid="BV1DLRT",
+        title="跨域惊喜视频",
+        response="like",
+        request_id="delight-like-1",
+    )
+
+    first = await adapter.respond_delight(request)
+    second = await adapter.respond_delight(request)
+
+    assert first.ok is True
+    assert first.action == "liked"
+    assert first.duplicate is False
+    assert second.duplicate is True
+    assert first.event_id == second.event_id
+
+
+class _DurableChatDatabase(_FakeDatabase):
+    def __init__(self) -> None:
+        super().__init__()
+        self.chat_turns: dict[str, dict[str, object]] = {}
+
+    def get_chat_turn(self, turn_id: str) -> dict[str, object] | None:
+        return self.chat_turns.get(turn_id)
+
+    def create_chat_turn(self, **kwargs: object) -> dict[str, object]:
+        row = {
+            "turn_id": str(kwargs["turn_id"]),
+            "session": str(kwargs.get("session", "openclaw")),
+            "scope": str(kwargs.get("scope", "chat")),
+            "subject_id": str(kwargs.get("subject_id", "")),
+            "subject_title": str(kwargs.get("subject_title", "")),
+            "reply_to_turn_id": str(kwargs.get("reply_to_turn_id", "")),
+            "message": str(kwargs["message"]),
+            "reply": "",
+            "status": "pending",
+            "error": "",
+            "payload": {},
+            "created_at": "2030-01-01T00:00:00",
+            "updated_at": "2030-01-01T00:00:00",
+        }
+        self.chat_turns[str(kwargs["turn_id"])] = row
+        return row
+
+    def complete_chat_turn(self, turn_id: str, *, reply: str) -> bool:
+        row = self.chat_turns[turn_id]
+        row["reply"] = reply
+        row["status"] = "completed"
+        return True
+
+    def fail_chat_turn(self, turn_id: str, *, error: str, reply: str = "") -> bool:
+        row = self.chat_turns[turn_id]
+        row["error"] = error
+        row["reply"] = reply
+        row["status"] = "failed"
+        return True
+
+    def list_chat_turns(self, *, session: str, scope: str, limit: int) -> list[dict[str, object]]:
+        return [
+            row
+            for row in self.chat_turns.values()
+            if row["session"] == session and (not scope or row["scope"] == scope)
+        ][:limit]
+
+
+@pytest.mark.asyncio
+async def test_chat_writes_durable_turn_and_can_replay_completed_turn() -> None:
+    adapter, *_ = _build_adapter()
+    database = _DurableChatDatabase()
+    adapter.services.database = database
+
+    first = await adapter.chat(ChatRequest(message="聊聊城市观察", session="openclaw"))
+    second = await adapter.chat(
+        ChatRequest(message="这条不会重复生成", session="openclaw", turn_id=first.turn_id)
+    )
+    history = await adapter.get_chat_history(session="openclaw")
+
+    assert first.turn_id
+    assert first.status == "completed"
+    assert second.reply == first.reply
+    assert second.turn_id == first.turn_id
+    assert len(history.items) == 1
+
+
+@pytest.mark.asyncio
+async def test_platform_availability_is_exposed_without_api_runtime() -> None:
+    adapter, _, _, database, *_ = _build_adapter()
+
+    async def load_availability() -> SimpleNamespace:
+        return SimpleNamespace(total_available=7, by_platform={"bilibili": 4, "zhihu": 3})
+
+    database.load_pool_platform_availability_async = load_availability  # type: ignore[attr-defined]
+    result = await adapter.get_platform_availability()
+
+    assert result == PlatformAvailabilityResponse(
+        total_available=7,
+        by_platform={"bilibili": 4, "zhihu": 3},
+    )

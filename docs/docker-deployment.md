@@ -346,13 +346,24 @@ docker exec -it openbiliclaw-backend cat /app/runtime/logs/openbiliclaw.log
 
 ### 备份数据
 
+桌面 Web 的 `.obcbackup` 迁移 API 坚持**后端观察到的真实 loopback + 同源**边界。默认 Docker bridge / 端口转发下，宿主机浏览器在容器内通常表现为 bridge gateway，因此配置页导入 / 导出可能按设计返回 `403 local_only`；LAN、Caddy 或 TLS 远程入口也不能用密码 / Bearer 绕过。Docker 跨机器迁移请继续使用停止容器后的 volume 冷拷贝，避免运行中的 SQLite 与 WAL 被拆开：
+
 ```bash
-# 备份数据库
+# 先停止后端写入（Ollama 可继续运行）
+docker compose stop openbiliclaw-backend
+
+# 备份整个数据目录（数据库、画像、Cookie、图片缓存等）
 docker cp openbiliclaw-backend:/app/runtime/data ./backup-data
 
-# 备份配置
+# 备份配置；config.local.toml 不存在时该命令会失败，可忽略
 docker cp openbiliclaw-backend:/app/runtime/config.toml ./config-backup.toml
+docker cp openbiliclaw-backend:/app/runtime/config.local.toml ./config-local-backup.toml
+
+# 备份完成后重新启动
+docker compose start openbiliclaw-backend
 ```
+
+把冷备复制到另一台机器时，应在目标后端停止后写入对应 named volumes，并保留目标机自己的端口、网络、TLS、证书与 API auth 配置；不要把源机器的代理、证书或外部 CLI 登录误当作可移植用户数据。自定义部署只有在请求确实被后端安全解析为 loopback 时才能使用 `.obcbackup` 的四条 API（导出 / 导入 / 状态 / 取消）；它仍是未加密敏感包，虽会排除源机整段 `[api.auth]`，仍可能包含模型 / 来源 Key 和平台 Cookie。范围、环境变量提示与重启应用语义见[配置参考](modules/config.md#配置页跨机器迁移)。
 
 ### 彻底重置
 

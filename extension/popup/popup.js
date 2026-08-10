@@ -122,6 +122,7 @@ import {
   fetchProfileSummary,
   fetchProjectStats,
   fetchRecommendations,
+  fetchContentHistory,
   fetchRuntimeStatus,
   fetchSourceShareSuggestion,
   fetchSourcesStatus,
@@ -131,6 +132,7 @@ import {
   startEmbeddingRepair,
   startInit,
   readCachedConfigSnapshot,
+  reconcileContentHistoryPage,
   reportRecommendationClick,
   reshuffleRecommendations,
   refreshRecommendations,
@@ -279,13 +281,17 @@ const elements = {
   poolTopics: document.getElementById("poolTopics"),
   delightSlot: document.getElementById("delightSlot"),
   tabRecommend: document.getElementById("tabRecommend"),
+  tabLibrary: document.getElementById("tabLibrary"),
   tabWatchLater: document.getElementById("tabWatchLater"),
   tabFavorites: document.getElementById("tabFavorites"),
+  tabHistory: document.getElementById("tabHistory"),
   tabProfile: document.getElementById("tabProfile"),
   tabChat: document.getElementById("tabChat"),
   viewRecommend: document.getElementById("viewRecommend"),
+  viewLibrary: document.getElementById("viewLibrary"),
   viewWatchLater: document.getElementById("viewWatchLater"),
   viewFavorites: document.getElementById("viewFavorites"),
+  viewHistory: document.getElementById("viewHistory"),
   viewProfile: document.getElementById("viewProfile"),
   viewChat: document.getElementById("viewChat"),
   watchLaterList: document.getElementById("watchLaterList"),
@@ -296,6 +302,8 @@ const elements = {
   watchLaterSyncStatus: document.getElementById("watchLaterSyncStatus"),
   favoritesSyncAll: document.getElementById("favoritesSyncAll"),
   favoritesSyncStatus: document.getElementById("favoritesSyncStatus"),
+  historyRefresh: document.getElementById("historyRefresh"),
+  historySections: document.getElementById("historySections"),
   profileEmpty: document.getElementById("profileEmpty"),
   profileEmptyTitle: document.getElementById("profileEmptyTitle"),
   profileEmptyText: document.getElementById("profileEmptyText"),
@@ -460,6 +468,33 @@ const THUMBS_DOWN_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 14V4"/><path d="M9 18.8 10 14H4.6a1.8 1.8 0 0 1-1.7-2.2l1.5-6A2.4 2.4 0 0 1 6.7 4H17"/><path d="M17 14l-4.5 5.3A2 2 0 0 1 9 18v-4"/></svg>';
 const MESSAGE_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/></svg>';
+const HISTORY_IMAGE_ICON_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>';
+const HISTORY_RESTORE_ICON_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>';
+
+const CONTENT_HISTORY_PAGE_SIZE = 12;
+const CONTENT_HISTORY_SECTIONS = [
+  { category: "clicked", eyebrow: "Opened", title: "主动点开过", description: "你明确选择打开的内容，最近一次操作排在前面。" },
+  { category: "shown", eyebrow: "Passed by", title: "出现过，但没点开", description: "曾进入推荐列表、但近 30 天没有打开记录的内容。" },
+  { category: "removed", eyebrow: "Recently removed", title: "最近移除", description: "从保存列表移除、忽略或标记不感兴趣的内容。" },
+];
+const contentHistoryState = Object.fromEntries(CONTENT_HISTORY_SECTIONS.map(({ category }) => [
+  category,
+  {
+    items: [],
+    total: 0,
+    nextCursor: "",
+    hasMore: false,
+    loading: false,
+    loadingMore: false,
+    error: "",
+    notice: "",
+    refreshRequired: false,
+  },
+]));
+let contentHistoryGeneration = 0;
+let contentHistoryLoadedAt = 0;
 
 const CHAT_PLACEHOLDERS = [
   // 想法与内容判断类
@@ -634,13 +669,86 @@ function initRecommendationAutoLoadIntent() {
   });
 }
 
-function setActiveTab(tabName) {
+const POPUP_LIBRARY_STORAGE_KEY = "openbiliclaw.popup.contentLibraryTab";
+const POPUP_LIBRARY_TABS = ["watchLater", "favorites", "history"];
+const popupLibraryScroll = new Map();
+let popupLibraryTab = "watchLater";
+let popupLibraryVisible = false;
+
+function normalizePopupLibraryTab(value, fallback = "watchLater") {
+  const normalized = String(value || "").trim().toLowerCase();
+  return {
+    watchlater: "watchLater",
+    "watch-later": "watchLater",
+    watch_later: "watchLater",
+    favorites: "favorites",
+    favorite: "favorites",
+    history: "history",
+  }[normalized] || fallback;
+}
+
+function storedPopupLibraryTab() {
+  try { return normalizePopupLibraryTab(localStorage.getItem(POPUP_LIBRARY_STORAGE_KEY)); }
+  catch { return "watchLater"; }
+}
+
+function persistPopupLibraryTab(tab) {
+  try { localStorage.setItem(POPUP_LIBRARY_STORAGE_KEY, tab); } catch { /* unavailable */ }
+}
+
+function loadPopupLibraryTab(tab) {
+  if (tab === "watchLater") void loadWatchLater();
+  else if (tab === "favorites") void loadFavorites();
+  else void refreshContentHistory();
+}
+
+function setActiveLibraryTab(value, { focus = false, entering = false, forceLoad = false } = {}) {
+  const tabName = normalizePopupLibraryTab(value, popupLibraryTab);
+  const changed = popupLibraryTab !== tabName;
+  if (popupLibraryVisible && changed && elements.content instanceof HTMLElement) {
+    popupLibraryScroll.set(popupLibraryTab, elements.content.scrollTop);
+  }
+  popupLibraryTab = tabName;
+  persistPopupLibraryTab(tabName);
+  const tabs = [
+    ["watchLater", elements.tabWatchLater, elements.viewWatchLater],
+    ["favorites", elements.tabFavorites, elements.viewFavorites],
+    ["history", elements.tabHistory, elements.viewHistory],
+  ];
+  for (const [name, button, panel] of tabs) {
+    const selected = name === tabName;
+    button?.classList.toggle("is-active", selected);
+    button?.setAttribute("aria-selected", String(selected));
+    if (button instanceof HTMLButtonElement) button.tabIndex = selected ? 0 : -1;
+    if (panel instanceof HTMLElement) panel.hidden = !selected;
+  }
+  if (changed || entering || forceLoad) loadPopupLibraryTab(tabName);
+  if ((changed || entering) && elements.content instanceof HTMLElement) {
+    requestAnimationFrame(() => {
+      elements.content.scrollTop = popupLibraryScroll.get(tabName) || 0;
+      if (focus) elements.viewLibrary?.querySelector('.library-tab[aria-selected="true"]')?.focus();
+    });
+  } else if (focus) {
+    elements.viewLibrary?.querySelector('.library-tab[aria-selected="true"]')?.focus();
+  }
+}
+
+function setActiveTab(requestedTab, { libraryTab = "" } = {}) {
+  const legacyChild = POPUP_LIBRARY_TABS.includes(requestedTab)
+    ? normalizePopupLibraryTab(requestedTab)
+    : "";
+  const tabName = legacyChild ? "library" : requestedTab;
+  if (!["recommend", "library", "profile", "chat"].includes(tabName)) return;
+  const enteringLibrary = tabName === "library" && !popupLibraryVisible;
+  if (state.activeTab === "library" && tabName !== "library" && elements.content instanceof HTMLElement) {
+    popupLibraryScroll.set(popupLibraryTab, elements.content.scrollTop);
+  }
+  popupLibraryVisible = tabName === "library";
   state.activeTab = tabName;
 
   const tabs = [
     ["recommend", elements.tabRecommend, elements.viewRecommend],
-    ["watchLater", elements.tabWatchLater, elements.viewWatchLater],
-    ["favorites", elements.tabFavorites, elements.viewFavorites],
+    ["library", elements.tabLibrary, elements.viewLibrary],
     ["profile", elements.tabProfile, elements.viewProfile],
     ["chat", elements.tabChat, elements.viewChat],
   ];
@@ -662,11 +770,8 @@ function setActiveTab(tabName) {
   if (tabName === "recommend") {
     queueRecommendationLoadCheck();
   }
-  if (tabName === "watchLater") {
-    void loadWatchLater();
-  }
-  if (tabName === "favorites") {
-    void loadFavorites();
+  if (tabName === "library") {
+    setActiveLibraryTab(libraryTab || legacyChild || storedPopupLibraryTab(), { entering: enteringLibrary });
   }
   if (tabName === "chat") {
     scrollChatMessagesToBottom();
@@ -1202,14 +1307,26 @@ function buildSavedCard(listKind, item, { list, empty, toggles }) {
 function buildSavedCardMedia(item) {
   const media = document.createElement("span");
   media.className = "saved-card-cover";
+  let fallbackShown = false;
+  const showFallback = () => {
+    if (fallbackShown) return;
+    fallbackShown = true;
+    media.classList.add("is-fallback");
+    media.innerHTML = HISTORY_IMAGE_ICON_SVG;
+  };
   if (item.cover_url) {
     const image = document.createElement("img");
     image.alt = "";
     image.decoding = "async";
+    image.addEventListener("error", showFallback, { once: true });
     media.append(image);
-    void setProxyImageSrc(image, item.cover_url);
+    void setProxyImageSrc(image, item.cover_url)
+      .then((loaded) => {
+        if (!loaded || (image.complete && image.naturalWidth === 0)) showFallback();
+      })
+      .catch(showFallback);
   } else {
-    media.classList.add("is-fallback");
+    showFallback();
   }
   return media;
 }
@@ -1222,6 +1339,392 @@ async function loadFavorites() {
     status: elements.favoritesSyncStatus,
     toggles: favoriteToggles,
   });
+}
+
+function historyTextElement(tagName, className, text) {
+  const element = document.createElement(tagName);
+  if (className) element.className = className;
+  element.textContent = String(text || "");
+  return element;
+}
+
+function contentHistoryEventLabel(item, category) {
+  if (category === "clicked") return "点开";
+  if (category === "shown") return "出现";
+  return {
+    watch_later: "从稍后再看移除",
+    favorite: "从收藏移除",
+    dismiss: "已忽略",
+    dislike: "不感兴趣",
+  }[item.context] || "已移除";
+}
+
+function contentHistoryRemovedContexts(item) {
+  const contexts = Array.isArray(item?.contexts) ? item.contexts : [];
+  if (contexts.length) return contexts.filter((entry) => entry && typeof entry.context === "string");
+  if (!item?.context) return [];
+  item.contexts = [{
+    context: item.context,
+    occurred_at: item.occurred_at,
+    restored: item.restored === true,
+    restoring: item.restoring === true,
+  }];
+  return item.contexts;
+}
+
+function contentHistoryRestoreLabel(context) {
+  return context === "favorite" ? "重新收藏" : "重新加入稍后";
+}
+
+function contentHistoryTime(value) {
+  const text = String(value || "").trim();
+  if (!text) return "时间未知";
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(text)
+    ? `${text.replace(" ", "T")}Z`
+    : text;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return text;
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+  }).format(date);
+}
+
+function contentHistoryUrl(item) {
+  return String(item.content_url || buildContentUrl({
+    ...item,
+    bvid: item.content_id,
+  }) || "").trim();
+}
+
+function openContentHistoryItem(item, category) {
+  const url = contentHistoryUrl(item);
+  if (!url) return;
+  const clickReport = reportRecommendationClick({
+    recommendation_id: item.recommendation_id,
+    bvid: item.content_id,
+    content_id: item.content_id,
+    content_url: url,
+    source_platform: item.source_platform,
+    title: item.title,
+    up_name: item.author_name,
+  });
+  if (category === "shown") {
+    void clickReport.then((reported) => {
+      if (reported) return refreshContentHistory(true);
+      return undefined;
+    });
+  }
+  window.open(url, "_blank");
+}
+
+function buildContentHistoryCard(item, category) {
+  const card = document.createElement("article");
+  card.className = "history-card";
+  card.dataset.historyItemKey = String(item.item_key || "");
+
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "history-card-open";
+  const titleText = String(item.title || item.body_text || "这条内容暂时没有标题").trim();
+  open.setAttribute("aria-label", `打开：${titleText}`);
+  open.disabled = !contentHistoryUrl(item);
+  open.addEventListener("click", () => openContentHistoryItem(item, category));
+
+  const media = document.createElement("span");
+  media.className = "history-card-media";
+  if (item.cover_url) {
+    const image = document.createElement("img");
+    image.alt = `${titleText} 的封面`;
+    image.setAttribute("loading", "lazy");
+    image.setAttribute("fetchpriority", "low");
+    image.decoding = "async";
+    image.addEventListener("error", () => {
+      media.innerHTML = HISTORY_IMAGE_ICON_SVG;
+    }, { once: true });
+    media.append(image);
+    void setProxyImageSrc(image, item.cover_url);
+  } else {
+    media.innerHTML = HISTORY_IMAGE_ICON_SVG;
+  }
+
+  const copy = document.createElement("span");
+  copy.className = "history-card-copy";
+  copy.append(
+    historyTextElement("strong", "history-card-title", titleText),
+    historyTextElement("span", "history-card-author", item.author_name || platformDisplayName(item.source_platform)),
+  );
+  const meta = document.createElement("span");
+  meta.className = "history-card-meta";
+  const contexts = category === "removed" ? contentHistoryRemovedContexts(item) : [];
+  meta.append(
+    historyTextElement("span", "", category === "removed" ? `${contexts.length || 1} 项记录` : contentHistoryEventLabel(item, category)),
+    historyTextElement("time", "", contentHistoryTime(item.occurred_at)),
+  );
+  copy.append(meta);
+  open.append(media, copy);
+  card.append(open);
+
+  if (contexts.length) {
+    const contextList = document.createElement("div");
+    contextList.className = "history-contexts";
+    contextList.setAttribute("aria-label", "移除原因");
+    for (const context of contexts) {
+      const row = document.createElement("div");
+      row.className = "history-context-row";
+      const contextCopy = document.createElement("span");
+      contextCopy.className = "history-context-copy";
+      contextCopy.append(
+        historyTextElement("span", "", contentHistoryEventLabel(context, "removed")),
+        historyTextElement("time", "", contentHistoryTime(context.occurred_at)),
+      );
+      row.append(contextCopy);
+      if (["watch_later", "favorite"].includes(context.context)) {
+        const restore = document.createElement("button");
+        restore.type = "button";
+        restore.className = "history-restore";
+        restore.disabled = context.restored === true;
+        if (context.restoring === true) restore.setAttribute("aria-disabled", "true");
+        restore.dataset.historyContext = context.context;
+        restore.innerHTML = HISTORY_RESTORE_ICON_SVG;
+        restore.append(document.createTextNode(
+          context.restoring ? "恢复中…" : context.restored ? "已恢复" : contentHistoryRestoreLabel(context.context),
+        ));
+        restore.addEventListener("click", async () => {
+          if (context.restoring || context.restored) return;
+          const focusToken = contentHistoryFocusToken({
+            category: "removed",
+            itemKey: String(item.item_key || ""),
+            context: context.context,
+          });
+          context.restoring = true;
+          renderContentHistory();
+          restoreContentHistoryFocus(focusToken);
+          let restored = false;
+          try {
+            await saveItem(context.context, item);
+            context.restored = true;
+            restored = true;
+            if (item.context === context.context) item.restored = true;
+            if (context.context === "favorite") favoriteToggles.setSaved(item.item_key, true);
+            else watchLaterToggles.setSaved(item.item_key, true);
+            setHint(context.context === "favorite" ? "已重新收藏。" : "已重新加入稍后再看。", "success");
+          } catch (error) {
+            setHint(error?.message || "恢复失败，请稍后重试。", "error");
+          } finally {
+            context.restoring = false;
+            renderContentHistory();
+            restoreContentHistoryFocus(focusToken, { preferAction: !restored });
+          }
+        });
+        row.append(restore);
+      }
+      contextList.append(row);
+    }
+    card.append(contextList);
+  }
+  return card;
+}
+
+function buildContentHistorySection(section) {
+  const page = contentHistoryState[section.category];
+  const container = document.createElement("section");
+  container.className = "history-section";
+  container.dataset.historyCategory = section.category;
+  const heading = document.createElement("div");
+  heading.className = "history-section-head";
+  const title = document.createElement("div");
+  const titleHeading = historyTextElement("h3", "", section.title);
+  titleHeading.tabIndex = -1;
+  title.append(
+    historyTextElement("p", "view-kicker", section.eyebrow),
+    titleHeading,
+  );
+  heading.append(
+    title,
+    historyTextElement("span", "history-count", page.loading && !page.items.length ? "读取中" : `${page.total} 条`),
+  );
+  container.append(
+    heading,
+    historyTextElement("p", "history-description", section.description),
+  );
+
+  if (page.error && !page.items.length) {
+    const empty = historyTextElement("div", "history-empty", page.error);
+    const retry = historyTextElement("button", "history-more", "重试");
+    retry.type = "button";
+    retry.dataset.historyRetry = section.category;
+    retry.addEventListener("click", () => void loadContentHistoryCategory(
+      section.category,
+      false,
+      contentHistoryGeneration,
+      contentHistoryFocusToken({ category: section.category, action: "retry" }),
+    ));
+    empty.append(retry);
+    container.append(empty);
+  } else if (page.loading && !page.items.length) {
+    const loading = historyTextElement("div", "history-empty", "正在整理这段历史…");
+    loading.setAttribute("role", "status");
+    container.append(loading);
+  } else if (!page.items.length) {
+    container.append(historyTextElement("div", "history-empty", "近 30 天还没有这类记录。"));
+  } else {
+    const list = document.createElement("div");
+    list.className = "history-list";
+    page.items.forEach((item) => list.append(buildContentHistoryCard(item, section.category)));
+    container.append(list);
+  }
+
+  if (page.items.length && (page.error || page.notice)) {
+    const message = historyTextElement(
+      "p",
+      `history-page-message ${page.error ? "is-error" : "is-notice"}`,
+      page.error || page.notice,
+    );
+    message.setAttribute("role", page.error ? "alert" : "status");
+    container.append(message);
+  }
+
+  const refreshingExisting = page.loading && page.items.length > 0;
+  if (
+    refreshingExisting
+    || page.refreshRequired
+    || (page.error && page.items.length)
+    || page.hasMore
+  ) {
+    const label = refreshingExisting
+      ? "刷新中…"
+      : page.loadingMore
+      ? "加载中…"
+      : page.refreshRequired
+        ? "重试刷新列表"
+        : page.error
+          ? "重试加载更多"
+          : "加载更多";
+    const more = historyTextElement("button", "history-more", label);
+    more.type = "button";
+    more.dataset[page.refreshRequired || refreshingExisting ? "historyRetry" : "historyMore"] = section.category;
+    if (page.loading || page.loadingMore) more.setAttribute("aria-disabled", "true");
+    more.addEventListener("click", () => void loadContentHistoryCategory(
+      section.category,
+      !page.refreshRequired && !refreshingExisting,
+      contentHistoryGeneration,
+      contentHistoryFocusToken({
+        category: section.category,
+        action: page.refreshRequired || refreshingExisting ? "retry" : "more",
+      }),
+    ));
+    container.append(more);
+  }
+  return container;
+}
+
+function renderContentHistory() {
+  if (!(elements.historySections instanceof HTMLElement)) return;
+  elements.historySections.replaceChildren(...CONTENT_HISTORY_SECTIONS.map(buildContentHistorySection));
+}
+
+function contentHistoryFocusToken(token) {
+  return {
+    ...token,
+    scrollTop: Number(elements.content?.scrollTop) || 0,
+  };
+}
+
+function restoreContentHistoryFocus(token, { preferAction = true } = {}) {
+  if (!(elements.historySections instanceof HTMLElement) || !token) return;
+  const section = [...elements.historySections.querySelectorAll("[data-history-category]")]
+    .find((entry) => entry.dataset.historyCategory === token.category);
+  if (!section) return;
+  const card = token.itemKey
+    ? [...section.querySelectorAll("[data-history-item-key]")]
+      .find((entry) => entry.dataset.historyItemKey === token.itemKey)
+    : null;
+  let target = null;
+  if (card && preferAction && token.context) {
+    target = [...card.querySelectorAll("[data-history-context]")].find((button) => (
+      button.dataset.historyContext === token.context && !button.disabled
+    ));
+  }
+  if (card && !target) {
+    target = card.querySelector("[data-history-context]:not(:disabled):not([aria-disabled='true'])")
+      || card.querySelector(".history-card-open:not(:disabled)");
+  }
+  if (!target && token.action) {
+    target = section.querySelector(`[data-history-${token.action}]`)
+      || section.querySelector("[data-history-more], [data-history-retry]");
+  }
+  target ||= section.querySelector("h3[tabindex='-1']");
+  if (elements.content instanceof HTMLElement) elements.content.scrollTop = token.scrollTop;
+  target?.focus({ preventScroll: true });
+  if (elements.content instanceof HTMLElement) elements.content.scrollTop = token.scrollTop;
+}
+
+async function loadContentHistoryCategory(category, append, generation = contentHistoryGeneration, focusToken = null) {
+  const page = contentHistoryState[category];
+  if (!page || page.loading || page.loadingMore) return;
+  if (append) page.loadingMore = true;
+  else page.loading = true;
+  page.error = "";
+  page.notice = "";
+  page.refreshRequired = false;
+  renderContentHistory();
+  restoreContentHistoryFocus(focusToken);
+  try {
+    const payload = await fetchContentHistory(
+      category,
+      CONTENT_HISTORY_PAGE_SIZE,
+      append ? page.nextCursor : "",
+    );
+    if (generation !== contentHistoryGeneration) return;
+    const reconciled = reconcileContentHistoryPage({
+      items: page.items,
+      incomingItems: payload.items,
+      incomingTotal: payload.total,
+      nextCursor: payload.next_cursor,
+      hasMore: payload.has_more,
+      append,
+    });
+    page.items = reconciled.items;
+    page.total = reconciled.total;
+    page.nextCursor = reconciled.nextCursor;
+    page.hasMore = reconciled.hasMore;
+  } catch (error) {
+    if (generation !== contentHistoryGeneration) return;
+    page.error = error?.message || "历史记录加载失败，请稍后重试。";
+  } finally {
+    if (generation !== contentHistoryGeneration) return;
+    page.loading = false;
+    page.loadingMore = false;
+    renderContentHistory();
+    restoreContentHistoryFocus(focusToken);
+  }
+}
+
+async function refreshContentHistory(force = false) {
+  if (!force && contentHistoryLoadedAt && Date.now() - contentHistoryLoadedAt < 5_000) return;
+  contentHistoryGeneration += 1;
+  const generation = contentHistoryGeneration;
+  contentHistoryLoadedAt = Date.now();
+  Object.values(contentHistoryState).forEach((page) => {
+    page.items = [];
+    page.total = 0;
+    page.nextCursor = "";
+    page.hasMore = false;
+    page.loading = false;
+    page.loadingMore = false;
+    page.error = "";
+    page.notice = "";
+    page.refreshRequired = false;
+  });
+  await Promise.allSettled(CONTENT_HISTORY_SECTIONS.map(({ category }) => (
+    loadContentHistoryCategory(category, false, generation)
+  )));
+}
+
+function bindContentHistory() {
+  if (elements.historyRefresh instanceof HTMLButtonElement) {
+    elements.historyRefresh.addEventListener("click", () => void refreshContentHistory(true));
+  }
 }
 
 function showRecommendationEmptyState(title, message) {
@@ -6929,20 +7432,48 @@ async function handleManualRefresh() {
 function bindTabs() {
   const bindings = [
     [elements.tabRecommend, "recommend"],
-    [elements.tabWatchLater, "watchLater"],
-    [elements.tabFavorites, "favorites"],
+    [elements.tabLibrary, "library"],
     [elements.tabProfile, "profile"],
     [elements.tabChat, "chat"],
   ];
 
-  for (const [button, tabName] of bindings) {
+  bindings.forEach(([button, tabName], index) => {
     if (!(button instanceof HTMLButtonElement)) {
-      continue;
+      return;
     }
-    button.addEventListener("click", () => {
-      setActiveTab(tabName);
+    button.addEventListener("click", () => setActiveTab(tabName));
+    button.addEventListener("keydown", (event) => {
+      let nextIndex = null;
+      if (event.key === "ArrowRight") nextIndex = (index + 1) % bindings.length;
+      else if (event.key === "ArrowLeft") nextIndex = (index - 1 + bindings.length) % bindings.length;
+      else if (event.key === "Home") nextIndex = 0;
+      else if (event.key === "End") nextIndex = bindings.length - 1;
+      if (nextIndex === null) return;
+      event.preventDefault();
+      setActiveTab(bindings[nextIndex][1]);
+      bindings[nextIndex][0]?.focus();
     });
-  }
+  });
+
+  const libraryBindings = [
+    [elements.tabWatchLater, "watchLater"],
+    [elements.tabFavorites, "favorites"],
+    [elements.tabHistory, "history"],
+  ];
+  libraryBindings.forEach(([button, tabName], index) => {
+    if (!(button instanceof HTMLButtonElement)) return;
+    button.addEventListener("click", () => setActiveLibraryTab(tabName, { forceLoad: true }));
+    button.addEventListener("keydown", (event) => {
+      let nextIndex = null;
+      if (event.key === "ArrowRight") nextIndex = (index + 1) % libraryBindings.length;
+      else if (event.key === "ArrowLeft") nextIndex = (index - 1 + libraryBindings.length) % libraryBindings.length;
+      else if (event.key === "Home") nextIndex = 0;
+      else if (event.key === "End") nextIndex = libraryBindings.length - 1;
+      if (nextIndex === null) return;
+      event.preventDefault();
+      setActiveLibraryTab(libraryBindings[nextIndex][1], { focus: true });
+    });
+  });
 }
 
 function bindProfileHistoryLoading() {
@@ -9841,8 +10372,10 @@ async function maybeShowEmbeddingBanner() {
 async function initializePopup() {
   const params = new URLSearchParams(window.location.search);
   const requestedTab = params.get("tab");
+  const requestedLibraryTab = params.get("section") || params.get("library") || "";
   state.delightHighlightBvid = params.get("delight")?.trim() || "";
   bindTabs();
+  bindContentHistory();
   bindProfileHistoryLoading();
   initRecommendationAutoLoadIntent();
   bindRefreshButton();
@@ -9856,9 +10389,10 @@ async function initializePopup() {
 
   bindMessages();
   setActiveTab(
-    requestedTab === "profile" || requestedTab === "chat" || requestedTab === "recommend"
+    ["recommend", "library", "watchLater", "favorites", "history", "profile", "chat"].includes(requestedTab)
       ? requestedTab
       : "recommend",
+    { libraryTab: requestedLibraryTab },
   );
   setHint("先看看本地后端连上没。");
   await initializeRecommendations();

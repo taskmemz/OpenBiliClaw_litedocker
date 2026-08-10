@@ -66,7 +66,14 @@ def test_subject_normalization_maps_catalog_fields_without_fake_engagement() -> 
     assert item.body_text == "未来社会的故事"
     assert item.cover_url == "https://lain.bgm.tv/cover.jpg"
     assert item.favorite_count == 15
-    assert item.view_count == item.like_count == item.comment_count == 0
+    assert (
+        item.view_count
+        == item.like_count
+        == item.comment_count
+        == item.share_count
+        == item.danmaku_count
+        == 0
+    )
     assert item.rating_score == 9.2
     assert item.rating_count == 9959
     assert item.source_rank == 1

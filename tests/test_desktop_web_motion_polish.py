@@ -26,10 +26,7 @@ def test_scrollbar_gutter_and_page_enter_animation_are_declared() -> None:
     assert "from { opacity: 0; }" in app_css
     assert "to { opacity: 1; }" in app_css
     assert "translate: 0 6px" not in app_css
-    assert (
-        "#homePage, #watchLaterPage, #favoritesPage, #profilePage, #chatPage, #settingsPage"
-        in app_css
-    )
+    assert "#homePage, #contentLibraryPage, #profilePage, #chatPage, #settingsPage" in app_css
     assert "animation: page-enter" in app_css
 
 

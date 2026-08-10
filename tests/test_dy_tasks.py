@@ -239,6 +239,31 @@ def test_dy_task_queue_claims_pending_task_until_terminal_status(
     assert queue.next_pending() is None
 
 
+def test_dy_task_queue_does_not_claim_second_task_while_first_lease_is_active(
+    database: Database,
+) -> None:
+    queue = DyTaskQueue(database)
+    first_id = queue.enqueue_with_id("feed", {"max_items": 3})
+    second_id = queue.enqueue_with_id("search", {"keywords": ["人工智能"]})
+    assert first_id is not None
+    assert second_id is not None
+
+    first = queue.next_pending()
+    assert first is not None
+    assert first["id"] == first_id
+    assert queue.next_pending() is None
+
+    database.conn.execute(
+        "UPDATE dy_tasks SET claimed_at = datetime('now', '-16 minutes') WHERE id = ?",
+        (first_id,),
+    )
+    database.conn.commit()
+    reclaimed = queue.next_pending()
+    assert reclaimed is not None
+    assert reclaimed["id"] == first_id
+    assert reclaimed["status"] == "in_progress"
+
+
 def test_dy_task_queue_finds_recent_bootstrap_task(
     database: Database,
 ) -> None:

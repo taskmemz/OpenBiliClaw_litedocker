@@ -170,6 +170,16 @@ class DouyinPluginSearchClient:
         """Expose direct cookie for existing diagnostics/tests."""
         return self._direct_client.cookie
 
+    @property
+    def discovery_cycle_timeout_seconds(self) -> float:
+        """Maximum wall time one strategy cycle may spend on plugin tasks.
+
+        A strategy can fan out into several search/hot/feed calls. Exposing the
+        shared budget prevents those calls from each consuming a fresh full
+        wait window when the extension is offline.
+        """
+        return self._wait_seconds + min(self._poll_interval_seconds, 1.0) + 0.25
+
     async def search_aweme(self, keyword: str, *, limit: int = 30) -> list[dict[str, object]]:
         """Search via the browser plugin; direct-cookie fallback is opt-in diagnostics only."""
         keyword = keyword.strip()
@@ -414,14 +424,42 @@ class DouyinPluginSearchClient:
         task_id: str,
     ) -> tuple[dict[str, Any], DouyinTaskOutcome]:
         deadline = asyncio.get_running_loop().time() + self._wait_seconds
-        while True:
-            task = queue.get(task_id)
-            status = str((task or {}).get("status", "")).strip()
-            if status in {"completed", "failed"}:
-                break
-            if asyncio.get_running_loop().time() >= deadline:
-                return {}, "timeout"
-            await asyncio.sleep(self._poll_interval_seconds)
+        try:
+            while True:
+                task = queue.get(task_id)
+                status = str((task or {}).get("status", "")).strip()
+                if status in {"completed", "failed"}:
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    if queue.fail(
+                        task_id,
+                        error="wait_timeout",
+                        debug={"wait_seconds": self._wait_seconds},
+                    ):
+                        return {}, "timeout"
+                    # A terminal callback may have won the race with the timeout
+                    # transition. Re-read it instead of misreporting success as
+                    # a timeout.
+                    task = queue.get(task_id)
+                    if str((task or {}).get("status", "")).strip() in {
+                        "completed",
+                        "failed",
+                    }:
+                        break
+                    return {}, "timeout"
+                await asyncio.sleep(self._poll_interval_seconds)
+        except asyncio.CancelledError:
+            # A cycle-level deadline or process cancellation must not strand an
+            # extension task in pending/in_progress. ``fail`` is atomic and
+            # refuses to overwrite a callback that already reached a terminal
+            # state.
+            with suppress(Exception):
+                queue.fail(
+                    task_id,
+                    error="wait_cancelled",
+                    debug={"wait_seconds": self._wait_seconds},
+                )
+            raise
 
         if not task or task.get("status") != "completed":
             return {}, "failed"

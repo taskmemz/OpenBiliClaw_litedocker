@@ -106,7 +106,13 @@ def test_discovery_candidate_row_round_trips_to_discovered_content(tmp_path: Pat
             )
         ]
     )
-    row = db.claim_discovery_candidates_for_eval(limit=1)[0]
+    row = {
+        **db.claim_discovery_candidates_for_eval(limit=1)[0],
+        "temporal_class": "versioned",
+        "temporal_confidence": 0.84,
+        "temporal_reason": "内容依赖产品版本",
+        "temporal_policy_version": "v1",
+    }
 
     item = row_to_discovered_content(row)
 
@@ -128,6 +134,10 @@ def test_discovery_candidate_row_round_trips_to_discovered_content(tmp_path: Pat
     assert item.rating_score == 9.2
     assert item.rating_count == 9959
     assert item.source_rank == 1
+    assert item.temporal_class == "versioned"
+    assert item.temporal_confidence == 0.84
+    assert item.temporal_reason == "内容依赖产品版本"
+    assert item.temporal_policy_version == "v1"
 
 
 def test_discovery_candidate_row_defaults_missing_platform_to_bilibili() -> None:

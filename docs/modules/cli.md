@@ -79,11 +79,18 @@ openbiliclaw [--log-level DEBUG|INFO|WARNING|ERROR] <命令>
 | `ledger` | 查看画像更新台账（`--line` 逐行 / `--days` / `--write-point` 过滤） | ✅ |
 | `delight` | 手动查看当前惊喜推荐候选 | ✅ |
 | `probe` | 手动查看并确认猜测兴趣方向 | ✅ |
-| `python -m openbiliclaw.integrations.openclaw.cli next-avoidance-probe` | OpenClaw JSON bridge：拉取下一条不喜欢领域探针 | ✅ |
-| `python -m openbiliclaw.integrations.openclaw.cli respond-avoidance-probe` | OpenClaw JSON bridge：确认 / 否认 / 多聊避雷探针 | ✅ |
+| `python -m openbiliclaw.integrations.openclaw.cli capabilities` | Agent Bridge capability negotiation：协议版本、宿主名和完整 skill 清单 | ✅ |
+| `python -m openbiliclaw.integrations.openclaw.cli next-avoidance-probe` | Agent JSON bridge：拉取下一条不喜欢领域探针 | ✅ |
+| `python -m openbiliclaw.integrations.openclaw.cli respond-avoidance-probe` | Agent JSON bridge：确认 / 否认 / 暂缓 / 多聊避雷探针 | ✅ |
+| `python -m openbiliclaw.integrations.openclaw.cli respond-interest-probe` | Agent JSON bridge：确认 / 否认 / 暂缓 / 多聊兴趣探针 | ✅ |
+| `python -m openbiliclaw.integrations.openclaw.cli respond-delight` | Agent JSON bridge：惊喜卡片 view / like / dislike / dismiss / chat | ✅ |
+| `python -m openbiliclaw.integrations.openclaw.cli activity-feed` | Agent JSON bridge：读取活动流 | ✅ |
+| `python -m openbiliclaw.integrations.openclaw.cli platform-availability` | Agent JSON bridge：读取平台库存可用量 | ✅ |
+| `python -m openbiliclaw.integrations.openclaw.cli save-local/list-saved/remove-saved/sync-saved` | Agent JSON bridge：本地优先保存与显式授权同步 | ✅ |
 
-CLI/OpenClaw 保持兼容但不新增卡片选择 UI，也不伪造 `reply_to_turn_id` 或
-`dialogue_binding`。它们继续走显式 `legacy_direct` 对话入口；三端图形客户端的
+CLI/Agent Bridge 保持兼容但不新增卡片选择 UI，也不伪造 `reply_to_turn_id` 或
+`dialogue_binding`。它们继续走显式 `legacy_direct` 对话入口；chat 现在会返回并持久化
+自己的 `turn_id`，但不加入 API runtime 的 settlement queue；三端图形客户端的
 server-owned binding、context preview 与卡片 action 不改变 CLI 的既有契约。
 
 ## 详细说明
@@ -96,7 +103,9 @@ server-owned binding、context preview 与卡片 action 不改变 CLI 的既有�
 `danmaku_fetch_limit` 和 `danmaku_max_chars`；手动 `recommend` 的预热范围与 daemon/API 使用同一配置。
 CLI 组合根也会把 `[scheduler].copy_ready_target_count` 规范为
 `min(max(copy_ready_target_count, 0), max(pool_target_count, 0))` 后注入推荐引擎，与 API 和
-OpenClaw 的文案水位语义一致；显式设为 `0` 时保留 legacy drain-all 回滚行为。
+OpenClaw 的文案水位语义一致，同时注入 `pool_target_count`：正数 copy 水位会优先补齐当前
+topic 展示窗口可兑现的公开库存缺口，再维持 unrestricted copy-ready 水位；显式设为 `0`
+时保留 legacy drain-all 回滚行为。
 
 ```bash
 $ openbiliclaw config-show
@@ -306,10 +315,12 @@ $ openbiliclaw start --host 0.0.0.0 --port 9000
 
 适合本地直接运行或调试场景。若只希望本机访问，把 `[api].host` 改为 `127.0.0.1`，或启动时传 `--host 127.0.0.1`。
 
-启动前会先做两件事：
+`start` 与 `serve-api` 都会先取得项目根和 canonical `data_dir` 的 migration runtime lock；如果存在已校验的 pending 或未完成 journal，会在任何业务数据库访问前完成应用或恢复。锁会持续到后端退出，另一个指向同一数据目录的受支持后端无法并发启动。迁移应用后会重新读取配置并补锁实际运行目录；无法取得任一锁时拒绝启动。
+
+随后 `start` 会按固定顺序做两件事：
 
 1. 检查 `data/openbiliclaw.db` 是否完整；如果检测到损坏，会拒绝启动并提示先执行 `openbiliclaw db-repair`
-2. 在数据库健康且距离上次冷备超过 24 小时时，自动生成一份冷备到 `data/backups/`
+2. 在数据库健康且距离上次冷备超过 24 小时时，自动生成一份冷备到 `data/backups/`；该冷备严格早于 guided-init / runtime 持久 SQLite 连接创建，避免普通文件复制干扰 POSIX WAL 锁
 
 数据库健康后、API server 启动前，`start` 还会执行自启动相关的轻量 reconcile：
 
@@ -375,6 +386,7 @@ TLS enabled 时，证书检查、SSL context 和 socket bind 在 uvicorn 前同�
 原因并让 `serve-api` 非零退出，不会继续显示“HTTPS 已启动”。API wildcard host 会转换成
 可连接的 loopback（`0.0.0.0 → 127.0.0.1`、`:: → ::1`）供代理连接。
 推荐容器内使用该命令作为启动入口。
+`serve-api` 与 `start` 共用上述 migration runtime lock、pending apply / journal recovery 和迁移后实际数据目录补锁流程；容器启动不会绕过迁移事务。它不执行 `start` 专属的 24 小时数据库冷备。
 当 `scheduler.pause_on_extension_disconnect=true` 时，`serve-api` 与 `start` 一样会在 uvicorn 启动前打印 extension presence WARN，提醒容器后端若没有插件客户端连接，后台 LLM 工作会在宽限期后暂停。
 当配置进入降级模式时，`serve-api` 也会打印同一张 `降级模式 / Degraded mode` 面板；容器或脚本可继续通过 `/api/config` 写入修复配置，成功响应会原地启用新 registry，不需要重启服务。
 
@@ -520,9 +532,16 @@ $ openbiliclaw probe
 2. 复杂系统
 ```
 
-### OpenClaw JSON bridge: avoidance probes
+### Agent JSON bridge: avoidance and current capabilities
 
-不喜欢领域探针目前通过 OpenClaw bridge 暴露，而不是新增顶层 `openbiliclaw` 命令。它返回稳定 JSON，供 OpenClaw / Codex / Claude Code 等 agent 调用。
+不喜欢领域探针、兴趣探针、惊喜反馈和新一代多源推荐能力通过 Agent Bridge 暴露，而不是新增顶层 `openbiliclaw` 命令。它返回稳定 JSON，供 OpenClaw / Hermes / WorkBuddy / Codex / Claude Code 等 agent 调用。
+
+宿主第一次启动或升级后先协商：
+
+```bash
+$ uv run python -m openbiliclaw.integrations.openclaw.cli capabilities
+{"ok": true, "data": {"protocol_version": "agent-bridge/v2", "host_names": ["openclaw", "hermes", "workbuddy"], "skill_names": ["..."]}}
+```
 
 ```bash
 $ uv run python -m openbiliclaw.integrations.openclaw.cli next-avoidance-probe
@@ -538,7 +557,22 @@ $ uv run python -m openbiliclaw.integrations.openclaw.cli respond-avoidance-prob
 
 - `confirm`：用户确认“不喜欢 / 需要避开”，后端写入 `preference.disliked_topics`，同步 soul layer，并触发候选池清理。
 - `reject`：用户否认“不排斥这个方向”，只进入 cooldown 和反馈历史，不写画像。
+- `defer`：暂缓本次探针并返回 `deferred_until/defer_count`，不会直接写永久拒绝。
 - `chat`：进入带 `avoidance_probe` scope 的上下文对话；明确确认或否认的聊天会转成对应反馈。
+
+兴趣探针使用相同的四态协议：
+
+```bash
+$ uv run python -m openbiliclaw.integrations.openclaw.cli respond-interest-probe \
+  --domain "建筑美学" --response defer
+```
+
+`recommend` 还支持 `--source-platform`、重复传入的 `--exclude-item-id`，以及当前 UI
+对应的 `reshuffle` / `append`。输出字段优先使用 `item_key/content_id/source_platform`，
+同时保留 `bvid/up_name` 兼容别名。
+
+`sync-saved` 是唯一会从 Agent bridge 触发外部账号 native-save 的入口，必须带
+`--allow-state-changing`；`save-local`、`list-saved` 和 `remove-saved` 只操作本地 membership。
 
 `listen` 默认转发 `delight.candidate`、`interest.probe` 和 `avoidance.probe`：
 
@@ -1111,7 +1145,7 @@ $ openbiliclaw discover-douyin \
   --no-evaluate
 ```
 
-`discover-douyin` 的 `--source` 只接受 `search` / `hot` / `feed`；不传时默认三者都跑。`--keyword` 不传时从 Soul 画像兴趣生成搜索词；`hot` 会自动取 hot board 热词，不需要手动传关键词；`feed` 直接从抖音首页推荐流召回，不需要关键词。
+`discover-douyin` 的 `--source` 只接受 `search` / `hot` / `feed`；不传时默认三者都跑。`--keyword` 不传时从 Soul 画像兴趣生成搜索词；`hot` 会自动取 hot board 热词，不需要手动传关键词；`feed` 直接从抖音首页推荐流召回，不需要关键词。插件链路的一次命令共享一个 wall-clock wait budget：首个 search / hot / feed 等待到期后，剩余分支不再串行各等 180 秒。超时任务会原子落成 `failed + wait_timeout`（上层取消为 `wait_cancelled`），CLI 返回非零并提示检查扩展在线状态或调大 `OPENBILICLAW_DY_DISCOVERY_SEARCH_WAIT_SECONDS`；该任务不会继续留在 `pending`。
 
 xiaohongshu 渠道并不直接抓取内容，而是调用 `XhsTaskProducer.produce_if_due()` 将 Soul 画像改写成关键词写入 `xhs_tasks` 表，由浏览器扩展的后台调度器在隐藏 Tab 中抓取。新配置默认每日搜索预算 20、producer 间隔 20 分钟；pending + in-progress 搜索任务达到 5 条时返回 `backlog`，不会继续生成关键词。若返回 `throttled` 可加 `--force` 跳过本次 producer 时间闸，但 `--force` 不会绕过积压门、每日预算、领取端 ±25% 抖动或平台风控冷却；若返回 `no_profile` 需先执行 `openbiliclaw init`。
 

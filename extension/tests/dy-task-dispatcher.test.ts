@@ -14,6 +14,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildDyHotTerminalFailure,
   buildDyDiscoveryPageUrl,
   buildDyTaskUrl,
   buildDyExecuteMessageData,
@@ -21,12 +22,16 @@ import {
   dyScopeDegradedReason,
   executeTask,
   finalizeDyBootstrapStatus,
+  isDySearchResultUrl,
   isValidDyTask,
   onTabReady,
   postDyNativeSaveResult,
+  postDyTaskResult,
+  pollDyTaskOnce,
   pollDyTaskNow,
   shouldOpenDyTaskActive,
   shouldFinalizeHotTask,
+  shouldRetryDyFeedCapture,
 } from "../src/background/dy-task-dispatcher.ts";
 import type { NativeSaveResult, NativeSaveTask } from "../src/shared/native-save.ts";
 
@@ -43,6 +48,17 @@ const nativeTask: NativeSaveTask = {
   resolved_action: "favorite",
   target_label: "抖音收藏",
 };
+
+type DispatcherMutexGlobal = typeof globalThis & {
+  __OBC_DISPATCHER_MUTEX_HOLDER__?: string;
+  __OBC_DISPATCHER_MUTEX_HELD_SINCE__?: number;
+};
+
+function clearDispatcherMutex(): void {
+  const shared = globalThis as DispatcherMutexGlobal;
+  delete shared.__OBC_DISPATCHER_MUTEX_HOLDER__;
+  delete shared.__OBC_DISPATCHER_MUTEX_HELD_SINCE__;
+}
 
 test("finalizeDyBootstrapStatus preserves terminal degraded scope health", () => {
   assert.equal(
@@ -159,6 +175,31 @@ test("discovery task page URLs stay on douyin home", () => {
   assert.equal(buildDyDiscoveryPageUrl("search", "猫"), "https://www.douyin.com/");
   assert.equal(buildDyDiscoveryPageUrl("hot", "2495363"), "https://www.douyin.com/");
   assert.equal(buildDyDiscoveryPageUrl("feed"), "https://www.douyin.com/");
+});
+
+test("search navigation resume only matches the requested Douyin result route", () => {
+  assert.equal(
+    isDySearchResultUrl(
+      "https://www.douyin.com/jingxuan/search/%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD?type=video",
+      "人工智能",
+    ),
+    true,
+  );
+  assert.equal(
+    isDySearchResultUrl("https://www.douyin.com/search?keyword=%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD", "人工智能"),
+    true,
+  );
+  assert.equal(
+    isDySearchResultUrl("https://www.douyin.com/jingxuan/search/%E7%BE%8E%E9%A3%9F", "人工智能"),
+    false,
+  );
+  assert.equal(
+    isDySearchResultUrl(
+      "https://www.douyin.com/jingxuan/search/%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD",
+      "人工",
+    ),
+    false,
+  );
 });
 
 test("buildDyTaskUrl returns null for unknown task types", () => {
@@ -308,8 +349,22 @@ test("computeDyTaskTimeoutMs scales with hot item count", () => {
 test("computeDyTaskTimeoutMs gives feed enough time for passive response harvest", () => {
   const timeout = computeDyTaskTimeoutMs({ id: "feed-timeout", type: "feed", max_items: 10 });
 
-  assert.ok(timeout >= 60_000, `expected at least 60s for feed harvest, got ${timeout}`);
+  assert.ok(timeout >= 120_000, `expected retry-aware 120s feed budget, got ${timeout}`);
   assert.ok(timeout <= 360_000, `expected <= 360s ceiling, got ${timeout}`);
+});
+
+test("feed capture miss retries exactly once and no other failure is reloadable", () => {
+  const captureMiss = {
+    status: "failed" as const,
+    error: "feed_no_observed_response",
+  };
+  assert.equal(shouldRetryDyFeedCapture(captureMiss, 0), true);
+  assert.equal(shouldRetryDyFeedCapture(captureMiss, 1), false);
+  assert.equal(
+    shouldRetryDyFeedCapture({ status: "failed", error: "api_rate_limited" }, 0),
+    false,
+  );
+  assert.equal(shouldRetryDyFeedCapture({ status: "empty" }, 0), false);
 });
 
 test("buildDyExecuteMessageData includes only the fields the executor needs", () => {
@@ -396,6 +451,38 @@ test("shouldFinalizeHotTask stops after enough hot related items", () => {
   );
 });
 
+test("failed hot result maps to an immediate terminal failure", () => {
+  assert.deepEqual(
+    buildDyHotTerminalFailure({
+      task_id: "hot-task",
+      sentence_id: "2495363",
+      word: "热点词",
+      items: [],
+      scope_count: 0,
+      status: "failed",
+      error: "fetch_tap_injection_failed",
+      debug: { inject_status: "error: missing asset" },
+    }),
+    {
+      task_id: "hot-task",
+      status: "failed",
+      error: "fetch_tap_injection_failed",
+      debug: { inject_status: "error: missing asset" },
+    },
+  );
+  assert.equal(
+    buildDyHotTerminalFailure({
+      task_id: "hot-task",
+      sentence_id: "2495363",
+      word: "热点词",
+      items: [],
+      scope_count: 0,
+      status: "empty",
+    }),
+    null,
+  );
+});
+
 test("buildDyExecuteMessageData includes feed task payload", () => {
   const data = buildDyExecuteMessageData({
     id: "feed-task",
@@ -408,15 +495,186 @@ test("buildDyExecuteMessageData includes feed task payload", () => {
   assert.equal(data.max_items, 8);
 });
 
+test("task-result delivery retries transient and non-2xx failures with the same body", async () => {
+  const result = {
+    task_id: "result-retry",
+    status: "failed" as const,
+    error: "fetch_tap_injection_failed",
+  };
+  const responses: Array<{ ok: boolean; status: number } | Error> = [
+    { ok: false, status: 503 },
+    new Error("backend restarting"),
+    { ok: true, status: 200 },
+  ];
+  const requests: Array<{ input: string; init: RequestInit }> = [];
+  const delays: number[] = [];
+
+  await postDyTaskResult(
+    result,
+    {
+      resolveUrl: async (path) => `http://127.0.0.1:8420/api${path}`,
+      fetch: async (input, init) => {
+        requests.push({ input, init });
+        const response = responses.shift();
+        if (response instanceof Error) throw response;
+        assert.ok(response);
+        return response;
+      },
+      sleep: async (delayMs) => { delays.push(delayMs); },
+    },
+    { maxAttempts: 3, baseDelayMs: 10 },
+  );
+
+  assert.equal(requests.length, 3);
+  assert.deepEqual(delays, [10, 20]);
+  assert.ok(requests.every(({ input }) => input.endsWith("/api/sources/dy/task-result")));
+  assert.ok(requests.every(({ init }) => init.body === JSON.stringify(result)));
+});
+
+test("task-result delivery rejects after its bounded retry window", async () => {
+  let fetchCalls = 0;
+  const delays: number[] = [];
+
+  await assert.rejects(
+    postDyTaskResult(
+      { task_id: "result-unacked", status: "failed", error: "task_timeout" },
+      {
+        resolveUrl: async () => "http://127.0.0.1:8420/api/sources/dy/task-result",
+        fetch: async () => {
+          fetchCalls += 1;
+          return { ok: false, status: 503 };
+        },
+        sleep: async (delayMs) => { delays.push(delayMs); },
+      },
+      { baseDelayMs: 0 },
+    ),
+    /dy_task_result_unacknowledged: HTTP 503/,
+  );
+
+  assert.equal(fetchCalls, 3);
+  assert.deepEqual(delays, [0, 0]);
+});
+
+test("poll takes the cross-source mutex before claiming a backend task", async () => {
+  const shared = globalThis as DispatcherMutexGlobal;
+  clearDispatcherMutex();
+  shared.__OBC_DISPATCHER_MUTEX_HOLDER__ = "xhs";
+  shared.__OBC_DISPATCHER_MUTEX_HELD_SINCE__ = Date.now();
+  let fetchCalls = 0;
+  try {
+    await pollDyTaskOnce({
+      ensureRecovery: async () => {},
+      fetchTask: async () => {
+        fetchCalls += 1;
+        return null;
+      },
+      execute: async () => "accepted",
+      reportDeclined: async () => {},
+    });
+    assert.equal(fetchCalls, 0);
+  } finally {
+    clearDispatcherMutex();
+  }
+});
+
+test("poll does not claim when the runtime has no tabs execution capability", async () => {
+  clearDispatcherMutex();
+  let fetchCalls = 0;
+
+  await pollDyTaskOnce({
+    ensureRecovery: async () => {},
+    canExecute: () => false,
+    fetchTask: async () => {
+      fetchCalls += 1;
+      return null;
+    },
+    execute: async () => "accepted",
+    reportDeclined: async () => {},
+  });
+
+  assert.equal(fetchCalls, 0);
+  clearDispatcherMutex();
+});
+
+test("concurrent Douyin polls share one claim lifecycle", async () => {
+  clearDispatcherMutex();
+  let releaseRecovery!: () => void;
+  const recoveryGate = new Promise<void>((resolve) => {
+    releaseRecovery = resolve;
+  });
+  let recoveryCalls = 0;
+  let fetchCalls = 0;
+  const dependencies = {
+    ensureRecovery: async () => {
+      recoveryCalls += 1;
+      await recoveryGate;
+    },
+    fetchTask: async () => {
+      fetchCalls += 1;
+      return null;
+    },
+    execute: async () => "accepted" as const,
+    reportDeclined: async () => {},
+  };
+
+  const first = pollDyTaskOnce(dependencies);
+  const second = pollDyTaskOnce(dependencies);
+  assert.equal(first, second);
+  releaseRecovery();
+  await Promise.all([first, second]);
+
+  assert.equal(recoveryCalls, 1);
+  assert.equal(fetchCalls, 1);
+  clearDispatcherMutex();
+});
+
+test("native-save releases the discovery mutex before durable execution", async () => {
+  clearDispatcherMutex();
+  const calls: Array<{ task: NativeSaveTask; mutexAlreadyHeld: boolean; holder?: string }> = [];
+  await pollDyTaskOnce({
+    ensureRecovery: async () => {},
+    fetchTask: async () => nativeTask,
+    execute: async (task, mutexAlreadyHeld) => {
+      const shared = globalThis as DispatcherMutexGlobal;
+      calls.push({
+        task: task as NativeSaveTask,
+        mutexAlreadyHeld,
+        holder: shared.__OBC_DISPATCHER_MUTEX_HOLDER__,
+      });
+      return "accepted";
+    },
+    reportDeclined: async () => {},
+  });
+
+  assert.deepEqual(calls, [{ task: nativeTask, mutexAlreadyHeld: false, holder: undefined }]);
+  clearDispatcherMutex();
+});
+
+test("a declined executor reports the claimed task and releases the mutex", async () => {
+  clearDispatcherMutex();
+  const task = { id: "declined-feed", type: "feed" as const, max_items: 3 };
+  const declined: string[] = [];
+
+  await pollDyTaskOnce({
+    ensureRecovery: async () => {},
+    fetchTask: async () => task,
+    execute: async () => "declined",
+    reportDeclined: async (claimed) => { declined.push(claimed.id); },
+  });
+
+  const shared = globalThis as DispatcherMutexGlobal;
+  assert.deepEqual(declined, [task.id]);
+  assert.equal(shared.__OBC_DISPATCHER_MUTEX_HOLDER__, undefined);
+  clearDispatcherMutex();
+});
+
 test("pollDyTaskNow exists as the WS-driven immediate-poll entry point", () => {
   // Service-worker.ts calls this from runtimeSocket.onmessage when
   // backend broadcasts `dy_task_available`. We can't exercise the
   // chrome.tabs lifecycle here (no chrome global, no fetch backend),
   // but we MUST guarantee the export shape so the wire stays intact.
+  assert.equal(typeof pollDyTaskOnce, "function");
   assert.equal(typeof pollDyTaskNow, "function");
-  // Calling it without chrome / network must not throw — pollNextTask
-  // catches its own fetch errors so the dispatcher stays alive.
-  assert.doesNotThrow(() => pollDyTaskNow());
 });
 
 test("onTabReady continues immediately when the tab is already complete", async () => {

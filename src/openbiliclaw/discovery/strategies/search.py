@@ -43,6 +43,26 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The 2026-08 historical discovery replay found that ordinary Bilibili search
+# supplied very little <=7-day content.  Production compositions therefore
+# reserve one bounded ``pubdate`` request and at most five rows per refresh. The
+# dataclass default stays disabled so alternate/test compositions remain
+# backwards compatible unless they deliberately opt into the lane.
+RECENT_SUPPLY_LANE_QUERIES = 1
+RECENT_SUPPLY_LANE_PAGE_SIZE = 5
+
+
+@dataclass(frozen=True)
+class _SearchRequest:
+    """One bounded Bilibili search request with its supply-lane provenance."""
+
+    query_index: int
+    query: str
+    page: int
+    page_size: int
+    order: str = "totalrank"
+    discovery_lane: str = ""
+
 
 @dataclass
 class SearchStrategy(DiscoveryStrategy):
@@ -56,6 +76,8 @@ class SearchStrategy(DiscoveryStrategy):
     queries_per_run: int = 8
     page_size: int = 10
     max_pages: int = 1
+    recent_lane_queries_per_run: int = 0
+    recent_lane_page_size: int = RECENT_SUPPLY_LANE_PAGE_SIZE
     llm_evaluation: bool = True
     score_threshold: float = 0.60
     last_intermediates: dict[str, object] = field(default_factory=dict)
@@ -125,25 +147,16 @@ class SearchStrategy(DiscoveryStrategy):
         anchor_list = interest_anchors(profile)
         candidates: list[DiscoveredContent] = []
         candidates_by_query: dict[int, list[DiscoveredContent]] = {}
+        recent_candidates_by_query: dict[int, list[DiscoveredContent]] = {}
         seen_bvids: set[str] = set()
-        # Respect per-strategy search budget to avoid exhausting IP-level quota.
-        effective_queries = queries
-        if self.concurrency is not None:
-            budget = self.concurrency.search_budget_per_strategy
-            max_queries = budget // max(1, self.max_pages)
-            if len(effective_queries) > max_queries:
-                logger.debug(
-                    "Search: trimming queries from %d to %d (search budget)",
-                    len(effective_queries),
-                    max_queries,
-                )
-                effective_queries = effective_queries[:max_queries]
-
-        request_plan = [
-            (query_index, query, page)
-            for query_index, query in enumerate(effective_queries)
-            for page in range(1, self.max_pages + 1)
-        ]
+        effective_queries, request_plan = self._build_request_plan(queries)
+        recent_request_count = sum(bool(request.discovery_lane) for request in request_plan)
+        if recent_request_count:
+            self.last_intermediates["recent_lane"] = {
+                "order": "pubdate",
+                "request_count": recent_request_count,
+                "page_size": max(1, int(self.recent_lane_page_size)),
+            }
         # Use a dedicated API client for search to avoid session-level
         # rate-limiting from B站.  The shared client accumulates request
         # history from other strategies (trending, related_chain, explore)
@@ -161,7 +174,12 @@ class SearchStrategy(DiscoveryStrategy):
                     await close()
 
         api_result_count = 0
-        for (query_index, query, page), outcome in zip(request_plan, gathered, strict=True):
+        recent_api_result_count = 0
+        recent_unique_count = 0
+        for request, outcome in zip(request_plan, gathered, strict=True):
+            query_index = request.query_index
+            query = request.query
+            page = request.page
             if isinstance(outcome, BaseException):
                 logger.error(
                     "Search query failed: %s",
@@ -183,14 +201,17 @@ class SearchStrategy(DiscoveryStrategy):
                 )
                 continue
             api_result_count += len(outcome)
+            if request.discovery_lane:
+                recent_api_result_count += len(outcome)
             search_results = outcome
             for item_index, item in enumerate(search_results):
                 content = self._map_search_result(
                     item,
                     query=query,
                     query_index=query_index,
-                    item_index=item_index + (page - 1) * self.page_size,
+                    item_index=item_index + (page - 1) * request.page_size,
                     interest_anchors=anchor_list,
+                    discovery_lane=request.discovery_lane,
                 )
                 if content is None or content.bvid in seen_bvids:
                     continue
@@ -200,7 +221,11 @@ class SearchStrategy(DiscoveryStrategy):
                     content.source_keyword_id = keyword_ids.get(query)
                 seen_bvids.add(content.bvid)
                 candidates.append(content)
-                candidates_by_query.setdefault(query_index, []).append(content)
+                if request.discovery_lane:
+                    recent_candidates_by_query.setdefault(query_index, []).append(content)
+                    recent_unique_count += 1
+                else:
+                    candidates_by_query.setdefault(query_index, []).append(content)
 
         logger.info(
             "Search: %d queries, %d API results, %d unique candidates",
@@ -208,16 +233,34 @@ class SearchStrategy(DiscoveryStrategy):
             api_result_count,
             len(candidates),
         )
+        if recent_request_count:
+            recent_stats = self.last_intermediates.get("recent_lane")
+            if isinstance(recent_stats, dict):
+                recent_stats.update(
+                    {
+                        "api_results": recent_api_result_count,
+                        "unique_candidates": recent_unique_count,
+                    }
+                )
+
+        ordered_candidates = self._interleave_search_lanes(
+            candidates_by_query,
+            recent_candidates_by_query,
+        )
 
         if not self.llm_evaluation or discovery_raw_candidate_mode_enabled():
-            return candidates[:limit]
+            # Preserve the legacy request-order result when the lane is disabled;
+            # when enabled, round-robin is what guarantees a bounded recent row
+            # can reach a small raw-candidate window instead of sitting at tail.
+            raw_candidates = ordered_candidates if recent_request_count else candidates
+            return raw_candidates[:limit]
 
         evaluator = ContentDiscoveryEngine(
             llm_service=self.llm_service,
             database=self.database,
             concurrency=self.concurrency,
         )
-        eval_candidates = self._interleave_query_candidates(candidates_by_query)
+        eval_candidates = ordered_candidates
         eval_candidates = trim_candidates_for_llm(
             eval_candidates,
             limit=limit,
@@ -242,6 +285,57 @@ class SearchStrategy(DiscoveryStrategy):
             )
         return results
 
+    def _build_request_plan(
+        self,
+        queries: list[str],
+    ) -> tuple[list[str], list[_SearchRequest]]:
+        """Build a base + recent request plan within the existing API budget."""
+
+        max_pages = max(1, int(self.max_pages))
+        desired_recent = min(max(0, int(self.recent_lane_queries_per_run)), len(queries))
+        effective_queries = list(queries)
+        budget: int | None = None
+        if self.concurrency is not None:
+            budget = max(1, int(self.concurrency.search_budget_per_strategy))
+            # Reserve recent capacity only when at least one complete normal
+            # query still fits.  The lane therefore cannot silently exceed the
+            # strategy's existing request budget.
+            recent_reservation = min(desired_recent, max(0, budget - max_pages))
+            primary_budget = max(1, budget - recent_reservation)
+            max_queries = primary_budget // max_pages
+            if len(effective_queries) > max_queries:
+                logger.debug(
+                    "Search: trimming queries from %d to %d (search budget + recent lane)",
+                    len(effective_queries),
+                    max_queries,
+                )
+                effective_queries = effective_queries[:max_queries]
+
+        request_plan = [
+            _SearchRequest(
+                query_index=query_index,
+                query=query,
+                page=page,
+                page_size=max(1, int(self.page_size)),
+            )
+            for query_index, query in enumerate(effective_queries)
+            for page in range(1, max_pages + 1)
+        ]
+        remaining_budget = desired_recent if budget is None else max(0, budget - len(request_plan))
+        recent_count = min(desired_recent, len(effective_queries), remaining_budget)
+        request_plan.extend(
+            _SearchRequest(
+                query_index=query_index,
+                query=query,
+                page=1,
+                page_size=max(1, int(self.recent_lane_page_size)),
+                order="pubdate",
+                discovery_lane="recent",
+            )
+            for query_index, query in enumerate(effective_queries[:recent_count])
+        )
+        return effective_queries, request_plan
+
     @staticmethod
     def _interleave_query_candidates(
         candidates_by_query: dict[int, list[DiscoveredContent]],
@@ -259,6 +353,33 @@ class SearchStrategy(DiscoveryStrategy):
                 if depth < len(bucket):
                     interleaved.append(bucket[depth])
         return interleaved
+
+    @classmethod
+    def _interleave_search_lanes(
+        cls,
+        candidates_by_query: dict[int, list[DiscoveredContent]],
+        recent_candidates_by_query: dict[int, list[DiscoveredContent]],
+    ) -> list[DiscoveredContent]:
+        """Round-robin normal queries plus the bounded recent supply lane."""
+
+        if not recent_candidates_by_query:
+            return cls._interleave_query_candidates(candidates_by_query)
+        ordered_buckets: list[list[DiscoveredContent]] = []
+        query_indices = sorted(set(candidates_by_query) | set(recent_candidates_by_query))
+        for query_index in query_indices:
+            normal = candidates_by_query.get(query_index)
+            if normal:
+                ordered_buckets.append(normal)
+            recent = recent_candidates_by_query.get(query_index)
+            if recent:
+                ordered_buckets.append(recent)
+        max_depth = max((len(bucket) for bucket in ordered_buckets), default=0)
+        return [
+            bucket[depth]
+            for depth in range(max_depth)
+            for bucket in ordered_buckets
+            if depth < len(bucket)
+        ]
 
     def create_backfill_strategy(self) -> DiscoveryStrategy | None:
         return replace(
@@ -298,7 +419,7 @@ class SearchStrategy(DiscoveryStrategy):
     async def _execute_search_queries(
         self,
         client: SupportsSearchClient,
-        request_plan: list[tuple[int, str, int]],
+        request_plan: list[_SearchRequest],
     ) -> list[object]:
         """Execute search queries sequentially with delay + storm backoff.
 
@@ -320,7 +441,9 @@ class SearchStrategy(DiscoveryStrategy):
         gathered: list[object] = []
         consecutive_empty = 0
         storm_aborted = False
-        for i, (_, query, page) in enumerate(request_plan):
+        for i, request in enumerate(request_plan):
+            query = request.query
+            page = request.page
             if storm_aborted:
                 gathered.append([])
                 continue
@@ -340,11 +463,21 @@ class SearchStrategy(DiscoveryStrategy):
                 # so this is purely a desync between queries.
                 await asyncio.sleep(0.5 + random.uniform(0.0, 0.5))
             try:
-                result = await client.search(
-                    query,
-                    page=page,
-                    page_size=self.page_size,
-                )
+                if request.discovery_lane:
+                    result = await client.search(
+                        query,
+                        page=page,
+                        page_size=request.page_size,
+                        order=request.order,
+                    )
+                else:
+                    # Keep the legacy call shape for alternate clients that
+                    # implement the old protocol without an ``order`` kwarg.
+                    result = await client.search(
+                        query,
+                        page=page,
+                        page_size=request.page_size,
+                    )
             except Exception as exc:
                 gathered.append(exc)
                 # An exception path doesn't count as v_voucher storm
@@ -590,6 +723,7 @@ class SearchStrategy(DiscoveryStrategy):
         query_index: int,
         item_index: int,
         interest_anchors: list[tuple[str, float]],
+        discovery_lane: str = "",
     ) -> DiscoveredContent | None:
         bvid = str(item.get("bvid", "")).strip()
         if not bvid:
@@ -627,6 +761,7 @@ class SearchStrategy(DiscoveryStrategy):
                 source_strategy=self.name,
             ),
             source_strategy=self.name,
+            discovery_lane=discovery_lane,
             relevance_score=min(1.0, pre_score),
             published_at=published.published_at,
             published_label=published.published_label,

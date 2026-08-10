@@ -155,6 +155,26 @@ class TestDyNextTask:
         assert body["type"] == "bootstrap_profile"
         assert body["scopes"] == ["dy_post", "dy_collect", "dy_like", "dy_follow"]
 
+    def test_returns_204_for_second_task_while_first_claim_lease_is_active(
+        self,
+        dy_task_client: tuple[TestClient, Database, RecordingMemoryManager],
+    ) -> None:
+        client, db, _memory = dy_task_client
+        from openbiliclaw.sources.dy_tasks import DyTaskQueue
+
+        queue = DyTaskQueue(db)
+        first_id = queue.enqueue_with_id("feed", {"max_items": 3}, daily_budget=10)
+        second_id = queue.enqueue_with_id("search", {"keywords": ["人工智能"]}, daily_budget=10)
+        assert first_id is not None
+        assert second_id is not None
+
+        first = client.get("/api/sources/dy/next-task")
+        blocked = client.get("/api/sources/dy/next-task")
+
+        assert first.status_code == 200
+        assert first.json()["id"] == first_id
+        assert blocked.status_code == 204
+
 
 class TestDyTaskResult:
     def test_rejects_missing_task_id(

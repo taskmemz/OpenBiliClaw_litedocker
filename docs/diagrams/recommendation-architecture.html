@@ -310,7 +310,7 @@
   <rect x="60" y="396" width="1020" height="44" rx="6" fill="#2a1525" stroke="#f778ba" stroke-width="1.3"/>
   <circle cx="86" cy="418" r="13" fill="#f778ba"/><text x="86" y="422" text-anchor="middle" fill="#0d1117" font-size="11" font-weight="700">6</text>
   <text x="112" y="415" fill="#f778ba" font-size="11" font-weight="600">PoolCurator.score_candidates() — 可选二次评分 (仅当注入 _curator)</text>
-  <text x="112" y="430" fill="#8b949e" font-size="9">build_context() → score_override{bvid→rec_score} 替换 relevance 排序；同时给出 amplification_guard (over-budget keys)</text>
+  <text x="112" y="430" fill="#8b949e" font-size="9">score_override + amplification_guard；同步记录 aggregate Top10/50/100 no-bonus shadow（不改 serving）</text>
 
   <line x1="570" y1="440" x2="570" y2="452" stroke="#f778ba" stroke-width="1.3" marker-end="url(#s2)"/>
 
@@ -371,7 +371,7 @@
 
   <!-- rec_score formula -->
   <rect x="20" y="20" width="1100" height="52" rx="8" fill="#2a1525" stroke="#f778ba" stroke-width="2"/>
-  <text x="570" y="42" text-anchor="middle" fill="#f778ba" font-size="13" font-weight="700">rec_score = relevance·0.30 + freshness·0.20 − topic_fatigue·0.25 − source_monotony·0.15 + serendipity·0.20</text>
+  <text x="570" y="42" text-anchor="middle" fill="#f778ba" font-size="13" font-weight="700">rec_score = relevance·0.30 + temporal_bonus·0.10 − topic_fatigue·0.25 − source_monotony·0.15 + serendipity·0.20</text>
   <text x="570" y="62" text-anchor="middle" fill="#8b949e" font-size="10">+ feedback 调整 (权重体系之外，加性) − 0.35 (若放大 key 超预算) → floor 到 0.0</text>
 
   <!-- 5 dimension cards -->
@@ -384,11 +384,11 @@
 
   <rect x="244" y="92" width="212" height="118" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.3"/>
   <rect x="244" y="92" width="212" height="6" rx="3" fill="#3fb950"/>
-  <text x="350" y="118" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="600">freshness</text>
-  <text x="350" y="135" text-anchor="middle" fill="#8b949e" font-size="9">权重 0.20</text>
-  <text x="350" y="152" text-anchor="middle" fill="#8b949e" font-size="9">sigmoid 半衰 3d</text>
-  <text x="350" y="169" text-anchor="middle" fill="#8b949e" font-size="9">1/(1+e^((age−3)/1))</text>
-  <text x="350" y="190" text-anchor="middle" fill="#6e7681" font-size="9">缺时间戳 → 0.5</text>
+  <text x="350" y="118" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="600">temporal bonus</text>
+  <text x="350" y="135" text-anchor="middle" fill="#8b949e" font-size="9">权重 0.10</text>
+  <text x="350" y="152" text-anchor="middle" fill="#8b949e" font-size="9">published_at + class/confidence</text>
+  <text x="350" y="169" text-anchor="middle" fill="#8b949e" font-size="9">breaking/current/versioned: 1/14/120d</text>
+  <text x="350" y="190" text-anchor="middle" fill="#6e7681" font-size="9">缺时间 / 低置信 / unknown → 0</text>
 
   <rect x="468" y="92" width="212" height="118" rx="8" fill="#161b22" stroke="#da3633" stroke-width="1.3"/>
   <rect x="468" y="92" width="212" height="6" rx="3" fill="#da3633"/>
@@ -410,7 +410,7 @@
   <text x="1018" y="118" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="600">serendipity (加)</text>
   <text x="1018" y="135" text-anchor="middle" fill="#8b949e" font-size="9">权重 0.20</text>
   <text x="1018" y="152" text-anchor="middle" fill="#8b949e" font-size="9">explore→1.0</text>
-  <text x="1018" y="169" text-anchor="middle" fill="#8b949e" font-size="9">trending→0.5 · 其它 0</text>
+  <text x="1018" y="169" text-anchor="middle" fill="#8b949e" font-size="9">仅 explore→1.0 · 其它 0</text>
   <text x="1018" y="190" text-anchor="middle" fill="#6e7681" font-size="9">奖励跨域/新源</text>
 
   <!-- feedback adjustments -->
@@ -657,7 +657,7 @@
   <text x="576" y="46" text-anchor="middle" fill="#f778ba" font-size="13" font-weight="600">PoolCurator 评分</text>
   <line x1="412" y1="56" x2="740" y2="56" stroke="#30363d" stroke-width="1"/>
   <text x="416" y="80" fill="#f778ba" font-size="10">relevance 权重</text><text x="736" y="80" text-anchor="end" fill="#8b949e" font-size="10">0.30</text>
-  <text x="416" y="104" fill="#f778ba" font-size="10">freshness 权重</text><text x="736" y="104" text-anchor="end" fill="#8b949e" font-size="10">0.20 (半衰 3d)</text>
+  <text x="416" y="104" fill="#f778ba" font-size="10">temporal bonus 权重</text><text x="736" y="104" text-anchor="end" fill="#8b949e" font-size="10">0.10 (半衰 1/14/120d)</text>
   <text x="416" y="128" fill="#f778ba" font-size="10">topic_fatigue 权重</text><text x="736" y="128" text-anchor="end" fill="#8b949e" font-size="10">0.25 (由 0.15 上调)</text>
   <text x="416" y="152" fill="#f778ba" font-size="10">source_monotony 权重</text><text x="736" y="152" text-anchor="end" fill="#8b949e" font-size="10">0.15</text>
   <text x="416" y="176" fill="#f778ba" font-size="10">serendipity 权重</text><text x="736" y="176" text-anchor="end" fill="#8b949e" font-size="10">0.20</text>
@@ -729,7 +729,8 @@
 <div class="src-card">
   <div class="src-head" style="color:#f778ba">C. 排序与多样性 &mdash; PoolCurator 五维 + MMR + 放大保护</div>
   <div class="src-body"><ol>
-    <li><b>五维综合分</b> rec_score = 相关度×0.30 + 新鲜度×0.20 − 话题疲劳×0.25 − 来源单调×0.15 + 惊喜度×0.20，再叠加反馈调整（踩 UP −0.20 / 踩话题 −0.10 / 喜欢话题 +0.05…），最后超预算方向 −0.35，分数下限 0。</li>
+    <li><b>五维综合分</b> rec_score = 相关度×0.30 + 发布时间时效奖励×0.10 − 话题疲劳×0.25 − 来源单调×0.15 + 惊喜度×0.20。时效奖励只给发布时间明确、分类可靠的 breaking/current/versioned；旧常青内容和缺时间内容不受罚。</li>
+    <li><b>时效排序 shadow</b>：在 MMR 前聚合比较含 bonus 与 no-bonus 的 Top10/50/100 overlap/Jaccard 和 class/source/age 进入退出；不保存候选身份或文本，写失败不影响 serving。</li>
     <li><b>MMR 多样性</b>：每一步都选「相关度高 <b>且</b> 和已选内容不太像」的，两者各占 0.5；相似度用<b>向量余弦</b>，能抓到字符串看不出的「同题不同标签」重复。</li>
     <li><b>数量上限</b>：每话题 1~2 条、每风格 max(1,min(3,…))、广义话题 2/3/4（最硬，几乎不放宽）。</li>
     <li><b>放大保护</b>：刚确认的新兴趣，若 24 小时内占比≥0.25 算「超预算」，每批最多 floor(limit×0.25) 条，防止一个新方向刷屏。<span class="sub">⚠ 注意：当前 <code>serve()</code> 没有注入「新确认方向」，所以这道保护默认是<b>休眠</b>的，需由别处显式注入才生效。</span></li>
@@ -795,8 +796,8 @@
   <tr><td class="term">mark shown</td><td>把选中项标记为「已展示」，脱离式后台执行、不占响应时间。</td></tr>
 
   <tr class="grp"><td colspan="2">③ 评分与多样性</td></tr>
-  <tr><td class="term">PoolCurator</td><td>候选池二次评分器：综合五维算 rec_score 覆盖排序。</td></tr>
-  <tr><td class="term">rec_score</td><td>综合推荐分 = 相关 0.30 + 新鲜 0.20 − 话题疲劳 0.25 − 来源单调 0.15 + 惊喜 0.20，再加反馈调整。</td></tr>
+  <tr><td class="term">PoolCurator</td><td>候选池二次评分器：综合五维算 rec_score 覆盖排序，并 best-effort 写 aggregate-only no-bonus shadow。</td></tr>
+  <tr><td class="term">rec_score</td><td>综合推荐分 = 相关 0.30 + 发布时间时效奖励 0.10 − 话题疲劳 0.25 − 来源单调 0.15 + 惊喜 0.20，再加反馈调整。</td></tr>
   <tr><td class="term">topic_fatigue / source_monotony / serendipity</td><td>话题疲劳（同话题看多了降权）/ 来源单调（同来源太多降权）/ 惊喜度（跨域加分）。</td></tr>
   <tr><td class="term">topic / style / broad cap</td><td>每话题 / 每风格 / 每广义话题在一批里的数量上限，保证多样性。</td></tr>
   <tr><td class="term">amplification guard 放大保护</td><td>新确认的兴趣每批限量（floor(limit×0.25)），防止一个方向刷屏；当前 serve() 里默认休眠。</td></tr>

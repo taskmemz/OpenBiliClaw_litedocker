@@ -6,8 +6,9 @@ lights (see ``docs/plans/2026-07-18-source-auth-contract-spec.md`` D1/D2). This
 module defines the replacement: four dimensions that vary independently, plus
 an explicit statement of *how strong* the evidence behind the verdict is.
 
-Wave A ships this alongside the legacy fields without changing them. See
-``legacy.py`` for why the old ``state`` is passed through rather than derived.
+This ships alongside compatibility fields in the old vocabulary. See
+``legacy.py`` for why those fields remain provider-owned rather than globally
+derived from the orthogonal dimensions.
 """
 
 from __future__ import annotations
@@ -119,9 +120,9 @@ class SourceAuthContract(BaseModel):
     detail: str = ""
 
     # ── Legacy compatibility (Wave A only) ────────────────────────────────
-    # The pre-existing ``state``/``logged_in`` values, carried verbatim from the
-    # provider. Wave A promises byte-identical legacy output, and the old state
-    # is NOT derivable from the fields above — see legacy.py for the proof.
+    # The old ``state``/``logged_in`` vocabulary, owned by each provider. The
+    # old state is NOT globally derivable from the fields above — see legacy.py
+    # for the proof — though a provider may map stronger evidence into it.
     # Delete once all three frontends read the orthogonal fields.
     legacy_state: str = Field(default="missing", exclude=False)
     legacy_logged_in: bool = False

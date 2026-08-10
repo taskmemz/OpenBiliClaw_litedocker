@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 import pytest
@@ -353,6 +354,55 @@ async def test_strategy_records_each_keyword_outcome_independently() -> None:
         "超时词": "timeout",
     }
     assert strategy.last_intermediates["source_outcomes"] == {"search": "timeout"}
+
+
+@pytest.mark.asyncio
+async def test_strategy_uses_one_wall_clock_budget_for_all_plugin_branches() -> None:
+    class OfflinePluginClient(_FakeDouyinClient):
+        discovery_cycle_timeout_seconds = 0.01
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def search_aweme(
+            self,
+            keyword: str,
+            *,
+            limit: int = 30,
+        ) -> list[dict[str, object]]:
+            self.calls.append(f"search:{keyword}")
+            await asyncio.sleep(1)
+            return []
+
+        async def get_hot_board(self, *, limit: int = 30) -> list[dict[str, object]]:
+            self.calls.append("hot")
+            return []
+
+        async def get_recommend_feed(self, *, limit: int = 30) -> list[dict[str, object]]:
+            self.calls.append("feed")
+            return []
+
+    client = OfflinePluginClient()
+    strategy = DouyinDirectStrategy(
+        client=client,
+        sources=("search", "hot", "feed"),
+        seed_keywords=("词一", "词二"),
+        llm_evaluation=False,
+    )
+
+    items = await strategy.discover(_profile(), limit=10)
+
+    assert items == []
+    assert client.calls == ["search:词一"]
+    assert strategy.last_intermediates["keyword_outcomes"] == {
+        "词一": "timeout",
+        "词二": "timeout",
+    }
+    assert strategy.last_intermediates["source_outcomes"] == {
+        "search": "timeout",
+        "hot": "timeout",
+        "feed": "timeout",
+    }
 
 
 @pytest.mark.asyncio

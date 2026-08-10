@@ -167,3 +167,51 @@ test("Chrome and Firefox manifests do not request tabs permission", () => {
     assert.equal(manifest.permissions?.includes("tabs"), false);
   }
 });
+
+test("Douyin fetch tap starts in the MAIN world before page requests", () => {
+  const root = process.cwd();
+  const manifests = [
+    {
+      manifest: JSON.parse(readFileSync(join(root, "manifest.json"), "utf8")) as {
+        content_scripts?: Array<{
+          matches?: string[];
+          js?: string[];
+          run_at?: string;
+          world?: string;
+        }>;
+      },
+      script: "dist/main/dy-fetch-tap.js",
+    },
+    {
+      manifest: JSON.parse(
+        readFileSync(join(root, "manifest.firefox.json"), "utf8"),
+      ) as {
+        content_scripts?: Array<{
+          matches?: string[];
+          js?: string[];
+          run_at?: string;
+          world?: string;
+        }>;
+      },
+      script: "main/dy-fetch-tap.js",
+    },
+  ];
+
+  for (const { manifest, script } of manifests) {
+    const entry = manifest.content_scripts?.find((candidate) =>
+      candidate.js?.includes(script),
+    );
+    assert.ok(entry, `missing Douyin MAIN-world content script: ${script}`);
+    assert.deepEqual(entry.matches, ["*://*.douyin.com/*"]);
+    assert.equal(entry.run_at, "document_start");
+    assert.equal(entry.world, "MAIN");
+    const isolatedIndex = manifest.content_scripts?.findIndex((candidate) =>
+      candidate.js?.some((asset) => asset.endsWith("content/douyin.js")),
+    );
+    const mainIndex = manifest.content_scripts?.indexOf(entry);
+    assert.ok(
+      isolatedIndex !== undefined && mainIndex !== undefined && isolatedIndex < mainIndex,
+      "the isolated replay listener must register before the MAIN-world tap",
+    );
+  }
+});

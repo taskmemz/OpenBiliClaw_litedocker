@@ -31,6 +31,149 @@ import { registerE2EExecutor } from "./e2e-executor.ts";
 import { installNativeSaveExecutor } from "./native-save/runtime.ts";
 import { saveDouyin, verifyDouyin } from "./native-save/douyin.ts";
 
+const PASSIVE_DISCOVERY_REPLAY_LIMIT = 256;
+const PASSIVE_DISCOVERY_REPLAY_TTL_MS = 120_000;
+const PASSIVE_DISCOVERY_SCOPES = new Set<DouyinSearchScope>([
+  "dy_search",
+  "dy_hot",
+  "dy_feed",
+]);
+
+interface PassiveDiscoveryReplayEntry {
+  item: DouyinSearchItem;
+  receivedAt: number;
+}
+
+/**
+ * Preserve early MAIN-world discovery messages until a task executor attaches.
+ *
+ * The MAIN tap runs at document_start so it can observe Douyin's first feed
+ * request. The isolated task listener is intentionally attached later, after
+ * the task tab is complete. Without a bounded replay buffer, the first response
+ * can land in that gap and a healthy feed is misreported as empty.
+ */
+export class DouyinPassiveDiscoveryReplayBuffer {
+  private readonly entries = new Map<string, PassiveDiscoveryReplayEntry>();
+  private readonly responseTimes = new Map<DouyinSearchScope, number[]>();
+  private readonly maxItems: number;
+  private readonly ttlMs: number;
+  private readonly now: () => number;
+
+  constructor(
+    maxItems: number = PASSIVE_DISCOVERY_REPLAY_LIMIT,
+    ttlMs: number = PASSIVE_DISCOVERY_REPLAY_TTL_MS,
+    now: () => number = Date.now,
+  ) {
+    this.maxItems = maxItems;
+    this.ttlMs = ttlMs;
+    this.now = now;
+  }
+
+  ingest(scopeValue: unknown, values: unknown): number {
+    const scope = normalizePassiveDiscoveryScope(scopeValue);
+    if (!scope || !Array.isArray(values)) return 0;
+    const receivedAt = this.now();
+    this.prune(receivedAt);
+    const responseTimes = this.responseTimes.get(scope) ?? [];
+    responseTimes.push(receivedAt);
+    this.responseTimes.set(scope, responseTimes.slice(-this.maxResponseCount()));
+
+    let added = 0;
+    for (const value of values) {
+      const key = passiveDiscoveryItemKey(value);
+      if (!key) continue;
+      if (!key.startsWith(`${scope}:`)) continue;
+      if (!this.entries.has(key)) added += 1;
+      this.entries.delete(key);
+      this.entries.set(key, {
+        item: value as DouyinSearchItem,
+        receivedAt,
+      });
+    }
+    const limit = Math.max(1, Math.floor(this.maxItems));
+    while (this.entries.size > limit) {
+      const oldest = this.entries.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.entries.delete(oldest);
+    }
+    return added;
+  }
+
+  drain(scope: DouyinSearchScope): {
+    items: DouyinSearchItem[];
+    responsesObserved: number;
+  } {
+    this.prune(this.now());
+    const items: DouyinSearchItem[] = [];
+    for (const [key, entry] of this.entries) {
+      if (!key.startsWith(`${scope}:`)) continue;
+      items.push(entry.item);
+      this.entries.delete(key);
+    }
+    const responsesObserved = this.responseTimes.get(scope)?.length ?? 0;
+    this.responseTimes.delete(scope);
+    return { items, responsesObserved };
+  }
+
+  private prune(now: number): void {
+    const ttlMs = Math.max(0, this.ttlMs);
+    for (const [key, entry] of this.entries) {
+      if (now - entry.receivedAt <= ttlMs) continue;
+      this.entries.delete(key);
+    }
+    for (const [scope, responseTimes] of this.responseTimes) {
+      const fresh = responseTimes.filter((receivedAt) => now - receivedAt <= ttlMs);
+      if (fresh.length > 0) {
+        this.responseTimes.set(scope, fresh);
+      } else {
+        this.responseTimes.delete(scope);
+      }
+    }
+  }
+
+  private maxResponseCount(): number {
+    return Math.max(1, Math.min(64, Math.floor(this.maxItems)));
+  }
+}
+
+function normalizePassiveDiscoveryScope(value: unknown): DouyinSearchScope | null {
+  const scope = String(value ?? "").trim() as DouyinSearchScope;
+  return PASSIVE_DISCOVERY_SCOPES.has(scope) ? scope : null;
+}
+
+function passiveDiscoveryItemKey(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  const item = value as Partial<DouyinSearchItem>;
+  const scope = normalizePassiveDiscoveryScope(item.scope);
+  if (!scope) return "";
+  const awemeId = String(item.aweme_id ?? "").trim();
+  return awemeId ? `${scope}:${awemeId}` : "";
+}
+
+const passiveDiscoveryReplayBuffer = new DouyinPassiveDiscoveryReplayBuffer();
+const activePassiveDiscoveryScopes = new Set<DouyinSearchScope>();
+
+function cachePassiveDiscoveryMessage(event: MessageEvent): void {
+  if (!isSameWindowSameOriginDouyinMessage(event, window)) return;
+  const data = event.data as Record<string, unknown> | null;
+  if (!data || typeof data !== "object") return;
+  if (data.type !== "OPENBILICLAW_DOUYIN_SEARCH_PAGE") return;
+  const values = Array.isArray(data.items) ? data.items : [];
+  const scope =
+    normalizePassiveDiscoveryScope(data.scope) ??
+    normalizePassiveDiscoveryScope(
+      (values.find((item) => item && typeof item === "object") as
+        | Partial<DouyinSearchItem>
+        | undefined)?.scope,
+    );
+  if (!scope || activePassiveDiscoveryScopes.has(scope)) return;
+  passiveDiscoveryReplayBuffer.ingest(scope, values);
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("message", cachePassiveDiscoveryMessage);
+}
+
 let behaviorCollectorStarted = false;
 
 function startDouyinBehaviorCollector(): void {
@@ -170,6 +313,8 @@ interface SearchExecuteMessage {
   keyword: string;
   max_items: number;
   debug_inject_status?: string;
+  /** Resume collection in the new document after the UI caused a full navigation. */
+  resume_after_navigation?: boolean;
 }
 
 interface HotExecuteMessage {
@@ -203,7 +348,10 @@ interface SearchResultPayload {
     ui_triggered?: boolean;
     search_navigation_ok?: boolean;
     search_submit_method?: string;
+    navigation_resumed?: boolean;
     passive_items_harvested?: number;
+    passive_responses_observed?: number;
+    early_buffer_items?: number;
     scroll_rounds?: number;
     inject_status?: string;
     page_url?: string;
@@ -224,6 +372,9 @@ interface HotResultPayload {
     api_items_harvested: number;
     api_error?: string;
     dom_items_harvested?: number;
+    passive_items_harvested?: number;
+    passive_responses_observed?: number;
+    early_buffer_items?: number;
     seed_aweme_id?: string;
     ui_triggered?: boolean;
     inject_status?: string;
@@ -242,6 +393,9 @@ interface FeedResultPayload {
     api_pages_fetched: number;
     api_items_harvested: number;
     dom_items_harvested: number;
+    passive_items_harvested?: number;
+    passive_responses_observed?: number;
+    early_buffer_items?: number;
     api_error?: string;
     inject_status?: string;
     page_url?: string;
@@ -447,7 +601,7 @@ async function resolveDouyinBootstrapSecUid(): Promise<{
 async function harvestSearchViaApiBridge(
   keyword: string,
   maxItems: number,
-  timeoutMs: number = 45_000,
+  timeoutMs: number = 20_000,
 ): Promise<{ items: DouyinSearchItem[]; pages: number; error?: string }> {
   return new Promise((resolve) => {
     const requestId = `obc_dy_search_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -645,29 +799,138 @@ export function douyinDiscoveryExecutionPolicy(): {
   };
 }
 
+export function classifyDouyinDiscoveryCompletion(input: {
+  source: "search" | "hot" | "feed";
+  itemCount: number;
+  injectStatus?: string;
+  fetchTapInstallStatus: "unknown" | "installed" | "skipped_no_sdk";
+  apiError?: string;
+  uiTriggered?: boolean;
+  searchNavigationOk?: boolean;
+  alternateCollectionCompleted?: boolean;
+  passiveResponsesObserved?: number;
+  domItemsHarvested?: number;
+}): { status: "ok" | "empty" | "failed"; error?: string } {
+  if (input.itemCount > 0) return { status: "ok" };
+
+  const injectStatus = String(input.injectStatus ?? "").trim().toLowerCase();
+  if (injectStatus === "scripting_api_missing" || /^error(?:\s*:|$)/.test(injectStatus)) {
+    return { status: "failed", error: "fetch_tap_injection_failed" };
+  }
+
+  if (input.source === "search") {
+    if (input.uiTriggered === false) {
+      return { status: "failed", error: "search_ui_not_triggered" };
+    }
+    if (input.searchNavigationOk === false) {
+      return { status: "failed", error: "search_navigation_failed" };
+    }
+  }
+  if (input.source === "hot" && input.uiTriggered === false) {
+    return { status: "failed", error: "hot_ui_not_triggered" };
+  }
+
+  const apiError = String(input.apiError ?? "").trim().toLowerCase();
+  if (apiError) {
+    if (/\b429\b|rate[\s_-]*limit|too many requests|too frequent|hit_shark|请求频繁/.test(apiError)) {
+      return { status: "failed", error: "api_rate_limited" };
+    }
+    if (/\btimeout\b|timed[\s_-]*out|\babort(?:ed|error)?\b/.test(apiError)) {
+      return { status: "failed", error: "api_timeout" };
+    }
+    if (
+      /\b(?:http(?:\s+status)?|status(?:\s+code)?)\s*[:=_-]?\s*[45]\d{2}\b/.test(apiError)
+    ) {
+      return { status: "failed", error: "api_http_error" };
+    }
+    return { status: "failed", error: "api_collection_failed" };
+  }
+
+  if (input.fetchTapInstallStatus === "skipped_no_sdk") {
+    return { status: "failed", error: "fetch_tap_sdk_unavailable" };
+  }
+  const feedObservationReported = input.passiveResponsesObserved !== undefined;
+  if (
+    input.source === "feed" &&
+    input.fetchTapInstallStatus === "installed" &&
+    feedObservationReported &&
+    Number(input.passiveResponsesObserved ?? 0) <= 0
+  ) {
+    return { status: "failed", error: "feed_no_observed_response" };
+  }
+  if (
+    input.fetchTapInstallStatus === "installed" ||
+    input.alternateCollectionCompleted === true
+  ) {
+    return { status: "empty" };
+  }
+  return { status: "failed", error: "fetch_tap_status_unknown" };
+}
+
 interface PassiveDiscoveryCollector {
   detach: () => void;
   /** How many items arrived passively (page-issued responses via fetch-tap). */
   passiveCount: () => number;
+  /** How many matching page responses were observed, including valid empty responses. */
+  responseCount: () => number;
+  /** How many unique items were replayed from before task-listener attachment. */
+  earlyBufferCount: () => number;
+}
+
+export function shouldReplayEarlyDiscoveryItems(
+  scope: DouyinSearchScope,
+  resumeAfterNavigation: boolean,
+): boolean {
+  return scope !== "dy_search" || resumeAfterNavigation;
 }
 
 function attachPassiveDiscoveryCollector(
   allItems: DouyinSearchItem[],
+  scope: DouyinSearchScope,
+  replayEarly: boolean = true,
 ): PassiveDiscoveryCollector {
-  let passiveCount = 0;
+  const drained = passiveDiscoveryReplayBuffer.drain(scope);
+  // A normal search execution attaches before submitting its keyword. Any
+  // buffered dy_search rows therefore belong to the previous keyword and
+  // must be discarded. A full-navigation resume runs in a fresh document and
+  // does need the early response captured before the resumed collector.
+  const early = shouldReplayEarlyDiscoveryItems(scope, replayEarly)
+    ? drained
+    : { items: [] as DouyinSearchItem[], responsesObserved: 0 };
+  allItems.push(...early.items);
+  activePassiveDiscoveryScopes.add(scope);
+  let passiveCount = early.items.length;
+  let responseCount = early.responsesObserved;
   const onMessage = (event: MessageEvent): void => {
     if (!isSameWindowSameOriginDouyinMessage(event, window)) return;
     const data = event?.data as Record<string, unknown> | null;
     if (!data || typeof data !== "object") return;
     if (data.type !== "OPENBILICLAW_DOUYIN_SEARCH_PAGE") return;
     if (!Array.isArray(data.items)) return;
-    passiveCount += data.items.length;
-    allItems.push(...(data.items as DouyinSearchItem[]));
+    const messageScope =
+      normalizePassiveDiscoveryScope(data.scope) ??
+      normalizePassiveDiscoveryScope(
+        (data.items.find((item) => item && typeof item === "object") as
+          | Partial<DouyinSearchItem>
+          | undefined)?.scope,
+      );
+    if (messageScope !== scope) return;
+    responseCount += 1;
+    const matchingItems = (data.items as DouyinSearchItem[]).filter(
+      (item) => item.scope === scope,
+    );
+    passiveCount += matchingItems.length;
+    allItems.push(...matchingItems);
   };
   window.addEventListener("message", onMessage);
   return {
-    detach: () => window.removeEventListener("message", onMessage),
+    detach: () => {
+      window.removeEventListener("message", onMessage);
+      activePassiveDiscoveryScopes.delete(scope);
+    },
     passiveCount: () => passiveCount,
+    responseCount: () => responseCount,
+    earlyBufferCount: () => early.items.length,
   };
 }
 
@@ -708,11 +971,13 @@ export function isDouyinSearchResultUrl(href: string, keyword?: string): boolean
   try {
     const url = new URL(href, "https://www.douyin.com");
     const path = decodeURIComponent(url.pathname);
-    if (!path.includes("/search/")) return false;
+    const segments = path.split("/").filter(Boolean);
+    const searchIndex = segments.lastIndexOf("search");
+    if (searchIndex < 0) return false;
     const trimmedKeyword = String(keyword ?? "").trim();
     if (!trimmedKeyword) return true;
     return (
-      path.includes(`/search/${trimmedKeyword}`) ||
+      (segments[searchIndex + 1] ?? "") === trimmedKeyword ||
       url.searchParams.get("keyword") === trimmedKeyword ||
       url.searchParams.get("q") === trimmedKeyword
     );
@@ -1467,15 +1732,29 @@ async function runSearch(msg: SearchExecuteMessage): Promise<SearchResultPayload
   let searchNavigationOk = false;
   let searchSubmitMethod = "none";
   const allItems: DouyinSearchItem[] = [];
-  const passiveCollector = attachPassiveDiscoveryCollector(allItems);
+  const passiveCollector = attachPassiveDiscoveryCollector(
+    allItems,
+    "dy_search",
+    msg.resume_after_navigation === true,
+  );
 
   try {
     reinjectFetchTap();
     await sleep(POST_INSTALL_SETTLE_MS);
-    const triggerResult = await triggerSearchUi(msg.keyword);
-    uiTriggered = triggerResult.submitted;
-    searchNavigationOk = triggerResult.navigated;
-    searchSubmitMethod = triggerResult.method;
+    if (msg.resume_after_navigation) {
+      // A real button/Enter submission may perform a full document load. The
+      // original isolated-world promise disappears in that case, so the
+      // dispatcher re-sends the task into the new document and asks us to
+      // resume at collection. Never submit the search a second time here.
+      uiTriggered = true;
+      searchNavigationOk = isDouyinSearchResultUrl(location.href, msg.keyword);
+      searchSubmitMethod = "navigation_resume";
+    } else {
+      const triggerResult = await triggerSearchUi(msg.keyword);
+      uiTriggered = triggerResult.submitted;
+      searchNavigationOk = triggerResult.navigated;
+      searchSubmitMethod = triggerResult.method;
+    }
     await sleep(2_000);
 
     // Passive-first pagination: scroll the REAL results container so the
@@ -1532,12 +1811,23 @@ async function runSearch(msg: SearchExecuteMessage): Promise<SearchResultPayload
         apiError = String(err);
       }
     }
+    const completion = classifyDouyinDiscoveryCompletion({
+      source: "search",
+      itemCount: items.length,
+      injectStatus: msg.debug_inject_status,
+      fetchTapInstallStatus: _lastFetchTapInstallStatus,
+      apiError,
+      uiTriggered,
+      searchNavigationOk,
+      alternateCollectionCompleted: apiPagesFetched > 0 && !apiError,
+    });
     return {
       task_id: msg.task_id,
       keyword: msg.keyword,
       items,
       scope_count: items.length,
-      status: items.length > 0 ? "ok" : "empty",
+      status: completion.status,
+      ...(completion.error ? { error: completion.error } : {}),
       debug: {
         fetch_tap_install_status: _lastFetchTapInstallStatus,
         api_pages_fetched: apiPagesFetched,
@@ -1547,7 +1837,10 @@ async function runSearch(msg: SearchExecuteMessage): Promise<SearchResultPayload
         ui_triggered: uiTriggered,
         search_navigation_ok: searchNavigationOk,
         search_submit_method: searchSubmitMethod,
+        navigation_resumed: msg.resume_after_navigation === true,
         passive_items_harvested: passiveCollector.passiveCount(),
+        passive_responses_observed: passiveCollector.responseCount(),
+        early_buffer_items: passiveCollector.earlyBufferCount(),
         scroll_rounds: scrollRounds,
         inject_status: msg.debug_inject_status,
         page_url: location.href,
@@ -1571,7 +1864,10 @@ async function runSearch(msg: SearchExecuteMessage): Promise<SearchResultPayload
         ui_triggered: uiTriggered,
         search_navigation_ok: searchNavigationOk,
         search_submit_method: searchSubmitMethod,
+        navigation_resumed: msg.resume_after_navigation === true,
         passive_items_harvested: passiveCollector.passiveCount(),
+        passive_responses_observed: passiveCollector.responseCount(),
+        early_buffer_items: passiveCollector.earlyBufferCount(),
         scroll_rounds: scrollRounds,
         inject_status: msg.debug_inject_status,
         page_url: location.href,
@@ -1593,7 +1889,7 @@ async function runHot(msg: HotExecuteMessage): Promise<HotResultPayload> {
   let uiTriggered = false;
   const fallbackSeedAwemeId = String(msg.seed_aweme_id ?? "").trim();
   const allItems: DouyinSearchItem[] = [];
-  const detachPassiveCollector = attachPassiveDiscoveryCollector(allItems).detach;
+  const passiveCollector = attachPassiveDiscoveryCollector(allItems, "dy_hot");
 
   try {
     reinjectFetchTap();
@@ -1647,19 +1943,32 @@ async function runHot(msg: HotExecuteMessage): Promise<HotResultPayload> {
         apiError = String(err);
       }
     }
+    const completion = classifyDouyinDiscoveryCompletion({
+      source: "hot",
+      itemCount: items.length,
+      injectStatus: msg.debug_inject_status,
+      fetchTapInstallStatus: _lastFetchTapInstallStatus,
+      apiError,
+      uiTriggered,
+      alternateCollectionCompleted: apiPagesFetched > 0 && !apiError,
+    });
     return {
       task_id: msg.task_id,
       sentence_id: msg.sentence_id,
       word: msg.word,
       items,
       scope_count: items.length,
-      status: items.length > 0 ? "ok" : "empty",
+      status: completion.status,
+      ...(completion.error ? { error: completion.error } : {}),
       debug: {
         fetch_tap_install_status: _lastFetchTapInstallStatus,
         api_pages_fetched: apiPagesFetched,
         api_items_harvested: apiItemsHarvested,
         api_error: apiError,
         dom_items_harvested: domItemsHarvested,
+        passive_items_harvested: passiveCollector.passiveCount(),
+        passive_responses_observed: passiveCollector.responseCount(),
+        early_buffer_items: passiveCollector.earlyBufferCount(),
         seed_aweme_id: seedAwemeId,
         ui_triggered: uiTriggered,
         inject_status: msg.debug_inject_status,
@@ -1682,6 +1991,9 @@ async function runHot(msg: HotExecuteMessage): Promise<HotResultPayload> {
         api_items_harvested: apiItemsHarvested,
         api_error: apiError || String(err),
         dom_items_harvested: domItemsHarvested,
+        passive_items_harvested: passiveCollector.passiveCount(),
+        passive_responses_observed: passiveCollector.responseCount(),
+        early_buffer_items: passiveCollector.earlyBufferCount(),
         seed_aweme_id: seedAwemeId,
         ui_triggered: uiTriggered,
         inject_status: msg.debug_inject_status,
@@ -1689,7 +2001,7 @@ async function runHot(msg: HotExecuteMessage): Promise<HotResultPayload> {
       },
     };
   } finally {
-    detachPassiveCollector();
+    passiveCollector.detach();
   }
 }
 
@@ -1701,7 +2013,7 @@ async function runFeed(msg: FeedExecuteMessage): Promise<FeedResultPayload> {
   let domItemsHarvested = 0;
   let apiError = "";
   const allItems: DouyinSearchItem[] = [];
-  const detachPassiveCollector = attachPassiveDiscoveryCollector(allItems).detach;
+  const passiveCollector = attachPassiveDiscoveryCollector(allItems, "dy_feed");
 
   try {
     reinjectFetchTap();
@@ -1712,6 +2024,7 @@ async function runFeed(msg: FeedExecuteMessage): Promise<FeedResultPayload> {
         document,
         location.origin,
         maxItems,
+        true,
       ).map((item) => ({ ...item, scope: "dy_feed" as const }));
       domItemsHarvested = Math.max(domItemsHarvested, domItems.length);
       allItems.push(...domItems);
@@ -1720,16 +2033,29 @@ async function runFeed(msg: FeedExecuteMessage): Promise<FeedResultPayload> {
     }
 
     const items = filterDiscoveryItemsForScope(allItems, "dy_feed", maxItems);
+    const completion = classifyDouyinDiscoveryCompletion({
+      source: "feed",
+      itemCount: items.length,
+      injectStatus: msg.debug_inject_status,
+      fetchTapInstallStatus: _lastFetchTapInstallStatus,
+      apiError,
+      passiveResponsesObserved: passiveCollector.responseCount(),
+      domItemsHarvested,
+    });
     return {
       task_id: msg.task_id,
       items,
       scope_count: items.length,
-      status: items.length > 0 ? "ok" : "empty",
+      status: completion.status,
+      ...(completion.error ? { error: completion.error } : {}),
       debug: {
         fetch_tap_install_status: _lastFetchTapInstallStatus,
         api_pages_fetched: apiPagesFetched,
         api_items_harvested: apiItemsHarvested,
         dom_items_harvested: domItemsHarvested,
+        passive_items_harvested: passiveCollector.passiveCount(),
+        passive_responses_observed: passiveCollector.responseCount(),
+        early_buffer_items: passiveCollector.earlyBufferCount(),
         api_error: apiError,
         inject_status: msg.debug_inject_status,
         page_url: location.href,
@@ -1748,13 +2074,16 @@ async function runFeed(msg: FeedExecuteMessage): Promise<FeedResultPayload> {
         api_pages_fetched: apiPagesFetched,
         api_items_harvested: apiItemsHarvested,
         dom_items_harvested: domItemsHarvested,
+        passive_items_harvested: passiveCollector.passiveCount(),
+        passive_responses_observed: passiveCollector.responseCount(),
+        early_buffer_items: passiveCollector.earlyBufferCount(),
         api_error: apiError || String(err),
         inject_status: msg.debug_inject_status,
         page_url: location.href,
       },
     };
   } finally {
-    detachPassiveCollector();
+    passiveCollector.detach();
   }
 }
 
@@ -1776,6 +2105,12 @@ export function isValidSearchExecuteMessage(value: unknown): value is SearchExec
   if (typeof v.task_id !== "string" || !v.task_id) return false;
   if (typeof v.keyword !== "string" || !v.keyword.trim()) return false;
   if (typeof v.max_items !== "number") return false;
+  if (
+    v.resume_after_navigation !== undefined &&
+    typeof v.resume_after_navigation !== "boolean"
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -1795,6 +2130,12 @@ export function isValidFeedExecuteMessage(value: unknown): value is FeedExecuteM
   if (typeof v.max_items !== "number") return false;
   return Number.isFinite(v.max_items) && v.max_items > 0;
 }
+
+// A SPA URL change keeps the original isolated world alive while the
+// background navigation watcher may also send a resume message. Keep one
+// execution per task/keyword in a document; a genuine full navigation gets a
+// fresh JS world and therefore accepts the resume exactly once.
+const activeSearchExecutions = new Set<string>();
 
 export function registerDyScopeExecutor(): void {
   if (typeof chrome === "undefined" || !chrome.runtime || !chrome.runtime.onMessage) return;
@@ -1825,12 +2166,21 @@ export function registerDyScopeExecutor(): void {
         return false;
       }
 
-      void runSearch(data).then((result) => {
-        chrome.runtime.sendMessage({ action: "DY_SEARCH_RESULT", data: result }).catch(() => {
-          // The dispatcher timeout is the retry/failure path if the worker
-          // disappears before the result can be delivered.
+      const executionKey = `${data.task_id}\u0000${data.keyword}`;
+      if (activeSearchExecutions.has(executionKey)) return false;
+      activeSearchExecutions.add(executionKey);
+      void runSearch(data)
+        .then((result) => {
+          return chrome.runtime
+            .sendMessage({ action: "DY_SEARCH_RESULT", data: result })
+            .catch(() => {
+              // The dispatcher timeout is the retry/failure path if the worker
+              // disappears before the result can be delivered.
+            });
+        })
+        .finally(() => {
+          activeSearchExecutions.delete(executionKey);
         });
-      });
 
       return false;
     },

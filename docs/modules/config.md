@@ -21,6 +21,25 @@ CLI / 源码运行仍按普通错误处理：配置文件损坏时直接暴露�
 
 配置读取接口把所有 API Key、Cookie、令牌及代理 URL userinfo 视为**只写秘密**：`GET /api/config` 始终返回掩码；旧客户端携带的 `?reveal_keys=true` 仅作兼容参数接受，不能再导出原值。桌面 Web 与扩展只请求普通 `/api/config`，扩展写入 `chrome.storage` 的也只是掩码快照。设置输入留空或回传掩码仍表示“保持原值”，新值只通过 `PUT /api/config` 写入。
 
+## 配置页跨机器迁移
+
+桌面 Web 的「设置 → 通用 → 数据迁移」可以在旧机器导出 `.obcbackup`，再到新机器选择该文件导入。这里的“全部信息”指**全部可移植用户状态**：磁盘上的 `config.toml` 与 `config.local.toml` 会先合并（不读取环境变量覆盖），移除 `[api.auth]` 后扁平化为包内单份 `config/config.toml`，其中仍包括文件中保存的模型 Key 与来源凭据；其余还包括当前进程已锁定的 active data dir 中的主 SQLite 和其它数据库、画像 / 记忆、平台 Cookie 文件、图片缓存，以及白名单内的桌面主题与滚动偏好。若刚在线保存了尚待重启的新 `data_dir`，配置快照仍来自磁盘两层，但数据成员不会提前改从新目录读取。它不是系统镜像，也不会复制日志、已有备份、embedding 派生缓存、评测 / 临时缓存、证书、自启动文件、OpenBiliClaw Web / 扩展访问会话、外部 CLI 凭据或环境变量值；平台 Cookie 则是明确包含的敏感登录态。源机器的 API 登录开关、密码 / password hash、session secret、受信代理、Bearer Origin 和扩展设备 key 都属于整段 `[api.auth]`，不会写入包。
+
+`.obcbackup` 是**未加密的敏感 ZIP**。只有在可信设备之间传递，并像保护 API Key / Cookie 一样保护和及时删除它。manifest 的 `source_omitted_environment_variables` 会列出源机器导出时有值、会影响运行结果的环境变量名称（`OPENBILICLAW_*`、Gemini 标准 Key、系统代理 / CA），但不会写入这些变量的值；如果源机器的有效配置依赖它们，目标机需自行重新提供。导入响应 / staged 状态中的 `target_active_environment_variables` 则是导入当时目标进程有值、重启后仍可能覆盖文件配置的环境变量快照；重启前如果环境改变，应以实际启动环境为准。两者都不是“已迁移的值”。
+
+导入不会在当前 API 进程里热替换配置或前端偏好。后端会先完整校验并暂存，设置页显示“需要重启”；下一次受支持的后端启动取得独占迁移锁并成功应用后，才写入规范化后的新 `config.toml`、替换后端数据并让设置页应用白名单桌面偏好。每个浏览器按 applied status 的 `migration_id` 在本地记录一次性交接回执，同一迁移的偏好只应用一次，所以用户之后修改主题、色相或滚动设置不会被持久存在的旧 status 再覆盖；每次打开「通用」仍会强制向后端对账，而不是只依赖页面启动时的缓存。来源机的 local overlay 已扁平化，不会以 `config.local.toml` 身份恢复；目标机原 `config.local.toml` 会按存在情况改名为 `config.local.toml.pre-import-<id>.bak`，其机器专属 / auth 取值已先合并进新 `config.toml` 的保留基线。
+
+以下机器专属字段始终采用**目标机器**的当前值，不从迁移包覆盖：
+
+- `general.data_dir` 与 `[storage]`（包括 `db_path`）；
+- `[api].host` / `[api].port`；
+- `[logging].directory` / `[logging].filename`；
+- `[network]`、`[tls_proxy]`、`[autostart]`；
+- `sources.browser_cdp_url`；
+- `bilibili.proxy` 与 `bilibili.browser_executable`（目标机网络策略和本机浏览器路径）。
+
+`[api.auth]` 也整段以**目标机器应用时的最新磁盘值**为基线：迁移包不提供或覆盖其中任何来源字段，重启应用会重新读取目标机两层配置，不使用暂存时的陈旧 auth 快照。应用时只执行安全收口——生成新的文件 `api.auth.session_secret`，把 `api.auth.extension_access_enabled` 设为 `false` 并清空 `extension_access_keys`；prepared DB 还把 `auth_epoch` 严格提升为 `max(来源 prepared DB epoch, 目标 active DB epoch) + 1`、删除来源 password fingerprint，启动后再按目标凭据 reconcile。因此目标机既有的门禁开关、密码凭据、会话 TTL、loopback / proxy / Origin 策略继续保留，但来源 / 目标旧 Web 会话都会失效（即使 session secret 由目标环境固定），扩展远程设备也需重新生成 key 并配对。目标数据目录里的 `certs/` 与 `autostart/` 文件会保留。详细包格式、校验和回滚流程见[存储层](storage.md#可移植数据迁移)，HTTP 契约见[后端 API](api.md#本机数据迁移)。
+
 ## 配置段落
 
 插件、桌面 Web 和移动 Web 的「保存时自动同步到对应平台」都从 API 读取，默认关闭。插件与移动 Web 的配置 GET/PUT 使用 AbortController 有界 timeout；插件的同一 deadline 从后端地址解析开始，覆盖初次设备会话交换、401 强制换票、受保护请求与响应解析，认证 fetch 接收同一 AbortSignal。移动 Web 使用模态设置对话框：Escape 可关闭、Tab 焦点留在对话框内，关闭后回到原设置按钮；配置 GET 超时或失败时保存与开关保持禁用，用户必须通过「重试加载」成功取得当前值后才能写回，避免用默认 false 覆盖未知远端状态。
@@ -30,7 +49,7 @@ CLI / 源码运行仍按普通错误处理：配置文件损坏时直接暴露�
 | 键 | 类型 | 默认值 | 说明 |
 |----|------|--------|------|
 | `language` | string | `"zh"` | Agent 输出语言（`zh` / `en`） |
-| `data_dir` | string | `"data"` | 数据目录（记忆、Cookie、数据库） |
+| `data_dir` | string | `"data"` | 数据目录（记忆、Cookie、数据库）；通过配置 API 改动时只持久化，完整重启后才切换 |
 
 ### `[api]`
 
@@ -1021,6 +1040,7 @@ Awareness seam 固定为 `legacy`。未发布的聚合字段
 - 首次启动的模板包含一个等待填写 Key 的 DeepSeek 占位实例；若用户在 `/setup/` 改选其他 Provider，向导会读取 `GET /api/config.issues`，只把其中明确指向 `llm.instances.<id>.*` 的 blocking 旧实例设为 `enabled=false` 并从全局链移除。被显式自定义模块链引用的实例不会被自动改写，正常或仅 warning 的既有实例也会保留；完整多实例整理仍由桌面/插件设置页负责。校验 400 会按 `ConfigUpdateResponse.config.issues` 展示具体原因，不再把响应 JSON 截成一段不可读文本。
 - 写盘前会先用新配置构建 LLM registry；blocking issue 会返回 400 且不写入 `config.toml`。
 - 写盘前会生成 `config.toml.bak`。持久化成功后接口统一返回 `202 apply_state="queued"` 和单调 `apply_revision`；后台热重载失败会恢复最后一次已生效的磁盘与内存 runtime 配置，并广播 `config_reload_failed`。如果恢复本身失败，状态接口保留人工恢复提示。
+- `general.data_dir` 是热重载的明确例外：如果请求值解析后的 canonical 路径不同于当前 `RuntimeContext` 已打开并由进程级锁保护的数据目录，接口会把新路径写入 `config.toml`，但本进程排队应用其它字段时仍强制使用旧的 active data dir，并在 202 响应返回 `restart_required=true`。当前数据库 / MemoryManager 和同一请求中的抖音、X 外部凭据读写都继续落在 active data dir；只有完整退出并重新启动、取得新目录的 canonical runtime lock 后才切换。`GET /api/config/apply-status` 的 `applied` 只表示可热重载部分已经应用，不表示新数据目录已启用。
 - 热重载与唯一 `DialogueSettlementQueue` 交接时保持 admission 开放，直到旧 worker 的 active job 与 backlog 真正排空，再在无 `await` 临界段原子暂停、撤销旧 permit 并注册新 worker；因此保存配置期间的聊天/待聊请求不再被直接丢弃。对话 LLM 单请求上限为 20 分钟，安全 drain 窗口相应为 25 分钟；桌面/插件自己的 60 秒请求预算到期只表示后端仍在等待安全切换，不会取消后端保存。超过 25 分钟才回滚，空字符串 `TimeoutError` 会转换为可读诊断。
 
 ## 模型列表发现（不写配置）
@@ -1036,13 +1056,13 @@ OpenAI-compatible 协议没有列举 reasoning effort 能力的标准接口；�
 | `ok` | 请求是否完成。校验失败时为 `false`。 |
 | `reloaded` | 是否已热重载运行时组件。 |
 | `rollback_applied` | 热重载失败后是否已从 `config.toml.bak` 回滚。 |
-| `restart_required` | 新配置是否已写入但无法原地激活、需要重启 daemon 的异常兜底。正常保存和成功的降级恢复都返回 `false`。 |
+| `restart_required` | 已写入的配置是否仍需完整重启才能全部生效。canonical `data_dir` 与当前 active data dir 不同时固定为 `true`；路径未变的正常保存和成功降级恢复为 `false`，异常 bootstrap 也可能为 `true`。 |
 | `apply_state` | 后台应用阶段：持久化成功的响应为 `queued`；状态接口还会返回 `applying`、`applied` 或 `failed`。 |
 | `apply_revision` | 单调递增的后台应用修订号；与 `GET /api/config/apply-status` 的 `requested_revision` / `applied_revision` 对应。 |
 | `config` | 保存后或回滚后的配置快照，API Key 仍默认 masked。 |
 | `message` | 给 UI 展示的人类可读状态。 |
 
-当 daemon 因 LLM registry 配置错误进入降级模式时，`GET /api/config` 会返回 `degraded=true`、`degraded_reason="llm_registry_unavailable"` 和 blocking issues。`PUT /api/config` 写入通过校验的修复配置后，会复用降级上下文已经保留的数据库、MemoryManager、事件总线和稳定 total gate，通过 `RuntimeContext.rebuild_from_config()` 原子构造完整运行时；成功后同步清除 context / `app.state` 的 degraded 状态、重绑 API 自有 feedback scheduler，并调用 `restart_background_tasks()`，返回 `reloaded=true / restart_required=false`。因此 `/setup/` 会在同一进程中立即进入账号连接步骤，插件与桌面设置页也会立即读到可用状态。核心构造失败会恢复 `config.toml.bak`、保持 503 guard 并返回 `ok=false`；只有没有旧文件可回滚且新配置已经落盘等异常 bootstrap 才使用 `restart_required=true`。前端保留短期续接标记与 `/api/ping` 轮询，仅用于兼容旧后端和该兜底响应。
+当 daemon 因 LLM registry 配置错误进入降级模式时，`GET /api/config` 会返回 `degraded=true`、`degraded_reason="llm_registry_unavailable"` 和 blocking issues。`PUT /api/config` 写入通过校验的修复配置后，会复用降级上下文已经保留的数据库、MemoryManager、事件总线和稳定 total gate，通过 `RuntimeContext.rebuild_from_config()` 原子构造完整运行时；成功后同步清除 context / `app.state` 的 degraded 状态、重绑 API 自有 feedback scheduler，并调用 `restart_background_tasks()`。只要 `data_dir` 未改变，响应为 `reloaded=true / restart_required=false`，`/setup/` 会在同一进程中立即进入账号连接步骤，插件与桌面设置页也会立即读到可用状态；如果同时改了 `data_dir`，其它修复仍可在本进程生效，但目录切换继续要求完整重启。核心构造失败会恢复 `config.toml.bak`、保持 503 guard 并返回 `ok=false`；没有旧文件可回滚且新配置已经落盘等异常 bootstrap 也会使用 `restart_required=true`。前端保留短期续接标记与 `/api/ping` 轮询，仅用于兼容旧后端和需要重启的响应。
 
 ## 环境变量
 

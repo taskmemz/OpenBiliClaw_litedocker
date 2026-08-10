@@ -83,7 +83,7 @@ This is the core differentiator: the system **guesses domains you might enjoy bu
 
 ### 🔒 100% local, 100% yours
 
-All data lives in a single SQLite file on your disk. LLM calls use your own API key by default, with an experimental option to reuse local Codex CLI ChatGPT OAuth credentials. No cloud, no accounts, no one else can see your profile. How this Agent grows is entirely your call — send feedback, chat with it, swap LLMs, edit the database, whatever you want.
+Core behavior, recommendation, and dialogue data lives in SQLite on your disk; config, profiles, credentials, and caches also stay in local files. LLM calls use your own API key by default, with an experimental option to reuse local Codex CLI ChatGPT OAuth credentials. There is no OpenBiliClaw-operated cloud account, and no one else can see your profile. How this Agent grows is entirely your call — send feedback, chat with it, swap LLMs, migrate it, or edit the database.
 
 > 💡 **How it compares**
 >
@@ -337,14 +337,14 @@ The backend serves both a desktop and a mobile Web UI. Neither syncs cookies or 
 openbiliclaw start
 ```
 
-- **Desktop**: open `http://127.0.0.1:8420/web` (or `http://127.0.0.1:8420/`, auto-redirects). Two-column editorial layout with recommendations, profile, chat, messages, and settings all on one page.
-- **Mobile**: click the phone icon in the extension header to scan the QR code, or type `http://<your-LAN-IP>:8420/m/` manually. Best for browsing recommendations, profile, and chat on your phone.
+- **Desktop**: open `http://127.0.0.1:8420/web` (or `http://127.0.0.1:8420/`, auto-redirects). Two-column editorial layout with recommendations, 30-day history, profile, chat, messages, and settings all on one page.
+- **Mobile**: click the phone icon in the extension header to scan the QR code, or type `http://<your-LAN-IP>:8420/m/` manually. Best for browsing recommendations, revisiting 30-day history, profile, and chat on your phone.
 
 > During `openbiliclaw init`, you'll be asked whether to allow LAN access (default Y). If you chose N or want to change it later, edit `[api].host` in `config.toml` (`0.0.0.0` = LAN-reachable over available IPv4 and IPv6, `127.0.0.1` = local only). QR links prefer IPv4 and automatically use a bracketed IPv6 literal when IPv4 is unavailable.
 
 After opening `/m/`, save it as a home-screen shortcut: on iPhone / iPad, use Safari's Share menu and choose "Add to Home Screen"; on Android Chrome / Chromium browsers, use the menu item "Install app" or "Add to Home screen". LAN HTTP may only create a shortcut in some Android browsers; full PWA install prompts are more reliable behind HTTPS in a trusted local setup.
 
-The app has five bottom tabs: Recommendations, Watch Later, Favorites, Profile, and Chat. Recommendations support reshuffle, load more, like, not interested, watch later, favorite, comments, and contextual chat. Watch Later and Favorites manage your saved lists. Profile shows the personality sketch, core traits, interests, and cognition updates. Chat shares the main chat history with the extension.
+The bottom bar now has four top-level tabs: Recommendations, Content Library, Profile, and Chat. Content Library contains Watch Later, Favorites, and History as child tabs. History pages through the last 30 days as opened, surfaced-but-unopened, and recently removed content; multiple removal contexts stay on one card, and Favorite and Watch Later can be restored independently. Old direct links to the three former tabs migrate to the matching Content Library child.
 
 <details>
 <summary>No AI agent: run the one-line installer yourself</summary>
@@ -497,19 +497,20 @@ npm run package
 
 </details>
 
-## 🤖 Integrate with OpenClaw / AI Coding Agents
+## 🤖 Integrate with OpenClaw / Hermes / WorkBuddy Agents
 
-This repo ships a [workspace skill](skills/openbiliclaw-adapter/SKILL.md). Point any skill-aware AI coding agent (OpenClaw / Claude Code / Codex CLI / Cursor, etc.) at this checkout and it can drive your local OpenBiliClaw directly.
+This repo ships a [workspace skill](skills/openbiliclaw-adapter/SKILL.md) and a versioned, host-neutral Agent Bridge. Point any skill-aware or local-JSON-capable agent (OpenClaw / Hermes / WorkBuddy / Claude Code / Codex CLI / Cursor, etc.) at this checkout and it can drive your local OpenBiliClaw directly.
 
 ### What you get after integration
 
 - ✨ **Proactive recommendations** — the system continuously discovers content in the background; when it finds a high-scoring surprise, it pushes to OpenClaw via WebSocket — **you don't have to ask**
-- 🔮 **Proactive interest probing** — the system guesses you might be into a new domain, generates a hypothesis and a question, and has OpenClaw come ask you "does this direction resonate?" — your answer automatically refines the profile
-- 🧭 **Proactive avoidance probing** — the system can also ask whether a low-quality form, style boundary, or topic shape is something you want to avoid; OpenClaw uses `next-avoidance-probe` / `respond-avoidance-probe`, and nothing is filtered until you confirm it
-- 💬 **Socratic dialogue** — not just interest confirmation; OpenClaw can have deep conversations: probing motivations, proposing hypotheses, confirming understanding — the more you talk, the better it knows you
+- 🔮 **Proactive interest probing** — confirm, reject, defer, or discuss speculative interests
+- 🧭 **Proactive avoidance probing** — the same four-state contract for content boundaries; nothing is filtered until you confirm it
+- 💬 **Durable Socratic dialogue** — every supported storage backend can return a stable `turn_id` and history for retries and host changes
 - 📖 **Read the current soul profile** — MBTI, core traits, deep needs, interest domains
-- 🎯 **Fetch personalized recommendations on demand** — with explanations, confidence scores, and topic labels
-- 💬 **Write feedback back into the learning loop** — `like` / `dislike` / `comment` instantly update the profile and pool scoring
+- 🎯 **Fetch multi-source recommendations** — platform scope, reshuffle, append, inventory availability, explanations and content metadata
+- 💬 **Write durable feedback back into the learning loop** — recommendation and delight-card actions are idempotent
+- 💾 **Local-first saved lists** — favorite/watch-later membership is local; native sync requires explicit authorization
 - 🔄 **Sync Bilibili account signals** — pull history / favorites / following and feed them into the memory system
 
 ### One-sentence integration prompt
@@ -517,7 +518,7 @@ This repo ships a [workspace skill](skills/openbiliclaw-adapter/SKILL.md). Point
 Paste the following into OpenClaw (or Claude Code / Codex CLI / Cursor) — it will read the guide and wire everything up:
 
 ```text
-Please follow https://raw.githubusercontent.com/whiteguo233/OpenBiliClaw/main/docs/openclaw-quickstart.md to integrate this repository into OpenClaw (use Bash `curl` to fetch the document, NOT WebFetch — WebFetch summarises markdown and drops critical commands).
+Please follow https://raw.githubusercontent.com/whiteguo233/OpenBiliClaw/main/docs/openclaw-quickstart.md to integrate this repository into the Agent Bridge (target host: OpenClaw; use Bash `curl` to fetch the document, NOT WebFetch — WebFetch summarises markdown and drops critical commands).
 ```
 
 ### Usage examples
@@ -565,9 +566,9 @@ Of course, the traditional "you ask → it answers" flow works too:
 >
 > **OpenClaw** (internally runs `recommend --limit 3`, formats and replies)
 
-The whole loop stays local — OpenClaw just calls the CLI bridge; your profile and data never leave the SQLite file on your disk.
+The whole loop stays local — the agent host just calls the CLI bridge; your profile and data never leave the SQLite file on your disk.
 
-> 📖 Full command reference and troubleshooting: [OpenClaw Integration Guide](docs/openclaw-quickstart.md).
+> 📖 Full command reference and troubleshooting: [Agent Bridge Integration Guide](docs/openclaw-quickstart.md) and [capability contract](docs/agent-integration.md). Hosts should run `capabilities` at startup instead of caching an old subset.
 
 ## ✨ Key Features
 
@@ -580,10 +581,12 @@ The whole loop stays local — OpenClaw just calls the CLI bridge; your profile 
 - 💬 **Warm Recommendations** — friend-like explanations of why you'd enjoy something, not "because you watched similar videos"
 - 🔄 **Continuous Learning** — Socratic dialogue + behavioral analysis + instant feedback; it understands you better over time
 - ⭐ **Local-First Favorites / Watch Later** — cards save to local SQLite first and auto-sync stays off by default; desktop Web hydrates the sidebar count badges on first load; the 2026-07-14 real-account regression completed both actions across all seven platforms as `synced/already_synced`
+- 🕘 **30-Day Content History** — extension, desktop, and mobile share opened, surfaced-but-unopened, and recently removed views; covers are paged and lazy-loaded, and removed local saves can be restored
 - 🧩 **Browser Extension** — Chrome / Edge / Brave / Arc / Firefox; side-panel recommendations + cross-site behavior collection, install and go
 - 🚀 **Guided Init in the UI** — the packaged `/setup/` wizard, Desktop Web, and the extension can all initialize with one click; no terminal required
+- 📦 **Cross-Machine Migration** — export/import portable config, SQLite, profiles, cookies, and the image cache from Desktop settings; imports are validated and staged, can be inspected or cancelled, then apply on restart with rollback copies. `.obcbackup` contains plaintext secrets but excludes the source machine's API-login password, session-signing secret, and extension device keys
 - 🔬 **Self-Optimizing Eval Loops** — five modules each carry an LLM-as-judge loop that improves prompt quality over rounds
-- 🔒 **Fully Private** — all data in local SQLite, LLM calls use your own key, each instance is built for exactly one person
+- 🔒 **Fully Private** — SQLite, config, profiles, and caches stay local; LLM calls use your own key, and each instance is built for exactly one person
 - 🔌 **Local Embedding** — optional Ollama + bge-m3, CPU-only, no extra API key
 - 🔧 **Fully Controllable** — create multiple independent channels of the same LLM type and drag global or per-module failover chains; edit your profile or add custom Skills
 
@@ -603,10 +606,21 @@ background ─ background admission (default 3) ──────┘
 guided init: signals → preferences → full profile commit → discover → evaluate → copy → canonical ready
                                                               └→ optional probes after terminal state
 
+Agent hosts (OpenClaw / Hermes / WorkBuddy)
+        → capabilities(agent-bridge/v2) + JSON CLI / skill descriptors
+        → integrations.agent alias / integrations.openclaw compatibility adapter
+        → runtime / soul / recommendation / saved_sync owners
+
 config recovery draft (normal or degraded; business APIs remain gated)
              ├→ /api/config/probe-service → temporary registry → total gate
              └→ /api/config/discover-models → exact instance GET /models (no write)
                                            → editable model list + local effort advisory
+Douyin supply: daemon presence gate (explicit manual calls bypass it) → one shared plugin-cycle budget
+              → terminal dy_task → pending_eval; absent means zero enqueue, failures back off
+local migration: export → config minus api.auth + online SQLite snapshot + portable files → plaintext .obcbackup
+                 import(request_id) → processing(upload/validate) → private stage ↔ status/cancel
+                                    ↘ General-open force reconcile; applied prefs once/browser/migration_id
+                                    → restart + project/canonical data-dir locks → replace | rollback
 durable reply: reply_to_turn_id + fixed time/payload → POST-time frozen binding → pending SQLite → rowid-serial reply worker → visible completion CAS (app-stable dialogue lease)
 post-reply learning/object settlement: independent 11-kind typed queue → actual worker + guard
 confirmation entry (pending list/cards) → one anchor(kind+ref+generation) → frozen admission / relation matrix
@@ -618,7 +632,7 @@ confirmation entry (pending list/cards) → one anchor(kind+ref+generation) → 
                           ├→ one context digest → prompt/history/event/learn/settlement provenance
                           ├→ action local≤1s: completed 200 / blocked 202 → popup/mobile/desktop poll 1/2/5s, ≤30s
                           └→ confusion FIFO≤5 / head fencing / 12h recovery
-config save: persist → HTTP 202 queued/apply_revision → latest-wins background apply queue → apply-status / final receipt
+config save: persist → HTTP 202 queued/apply_revision → latest-wins background apply queue → apply-status / final receipt; data_dir is persisted only and switches after a full restart
 config hot reload: accepting drain old worker → atomic pause/revoke → new worker; 25m safety window
 realtime: runtime-stream 20s idle heartbeat → transient close shows reconnecting and retries
 images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3, fg priority)
@@ -645,6 +659,7 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 ├─────────┴──────────┴───────────┴───────────────┤
 │ Events/recommendation clicks → generic durable cursor ─┐ │
 │ Content feedback → content_feedback durable cursor ────┴→ atomic buffer+cursor checkpoint │
+│ 30-day history: click events + recommendations + saved_item_removals → paged/lazy UI │
 │ dislike: exact card hides synchronously; durable topic → final history/serve/push recheck │
 │ discovery may keep broad search; async semantic purge optimizes inventory, not correctness │
 │ cold start fence+task admission → listener; background recovery → tick_if_buffered │
@@ -652,6 +667,9 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 │ Dialogue → typed settlement worker → learning       │
 │ Legacy batch only when rollback flag=false     │
 │ Init barrier: profile commit → discover/evaluate/copy → ready │
+│ Bilibili supply: relevance search + budgeted 1×5 pubdate recent lane → shared evaluation │
+│ Evaluation: time-neutral relevance + Agent temporal class → high-confidence publication bonus │
+│ Temporal shadow: bonus vs no-bonus Top10/50/100 aggregates → class/source/age audit (no serving change) │
 │ Images: proxy fg + refresh prefetch → app-stable 4/3 lane → singleflight/atomic cache │
 │ Soul cognition: dual pending cooldown · one anchor · worker-only settlement · winner receipt · confusion FIFO · ledger · deep gate │
 │   LLM adapters · Source adapters (SourceAdapter) │
@@ -659,6 +677,7 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 │ Optional visual prewarm: covers / profile centroids / keyframes + danmaku │
 │ provenance (provider/model/dim/sampling) → empty-success / retryable fail │
 │ Config recovery draft (normal/degraded) → temp probe / exact /models (no write) │
+│ Local migration: checksummed .obcbackup → request-id pending ↔ status/cancel → restart replace/rollback │
 │ Source-family registry: alias · strategy · URL host │
 │             → pool accounting · durable seen_items ledger │
 │ Bangumi public API → search/ranked/date producer → shared eval │
@@ -667,8 +686,8 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 │ Named cognition views → task gate: compact only for awareness_confusions; others legacy │
 │ Token diet: per-offset preference packing; weighted recent/judged/relevant/important insight≤40 → full merge │
 │ Keyword planner → safe 24h cross-digest pending reconcile → deficit/generate/claim (0=hard expiry) │
-│ Admitted backlog → fill copy-ready watermark deficit → async refill after serve (0=legacy drain-all) │
-│ API projected stock → 3×30 workers → serial admit; OpenClaw first batch≤4 → copy≤4/no split retry → UI │
+│ Admitted backlog → copy watermark ∪ visible topic-slot gap → eligible-first copy (0=legacy drain-all) │
+│ API projected=available+eligible copy-pending+evaluated → 3×30 workers → serial admit → UI │
 │ API raw-empty → wake under-share sources now → real progress resets / duplicate-only waves back off │
 │ Delight gate: formal copy/topic ready + seen_items guard → score/snapshot → UI × writes seen ledger │
 │ Inventory API/OpenClaw startup hook → recover/maintain → expose LLM │
@@ -687,7 +706,7 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 │ exact OpenBiliClaw / YouTube Watch Later targets → safe task-result    │
 │ trusted-local E2E exact auth → one saved-sync item → six-field callback │
 │ unsupported_adapter_missing retryable · unsupported_content_type local-only │
-│ Canonical ID · Local-first sync · Task poll · SQLite (events · seen ledger · pool · recs · saved/tasks)│
+│ Canonical ID · Local-first sync · Task poll · SQLite (events · seen ledger · pool · recs · saved/tasks · removal snapshots)│
 │ Six adapters → broker → shared MV3 recovery barrier → Reddit/X/YT/XHS/DY/Zhihu executors (6/6 fixture + real-account)│
 └────────────────────────────────────────────────┘
 
@@ -864,7 +883,7 @@ If OpenBiliClaw gave you back control of your feed, [a star](https://github.com/
 
 ## Privacy at a glance
 
-Default data flow: browser extension → your configured local OpenBiliClaw backend → SQLite on your machine. The extension does not send data to servers operated by OpenBiliClaw developers. If you configure a cloud LLM or embedding provider, the relevant content is sent to that provider according to your configuration. See the [Privacy Policy](docs/privacy.md).
+Default data flow: browser extension → your configured local OpenBiliClaw backend → SQLite / data files on your machine. The extension does not send data to servers operated by OpenBiliClaw developers. If you configure a cloud LLM or embedding provider, the relevant content is sent to that provider according to your configuration. A `.obcbackup` you explicitly export from Settings may contain model/source API keys, cookies, your profile, and history, and it is **not encrypted**. It excludes the source machine's entire API-auth section (including passwords, sessions, and device keys), but must still be transferred only between trusted devices. See the [Privacy Policy](docs/privacy.md).
 
 ## 📄 License
 

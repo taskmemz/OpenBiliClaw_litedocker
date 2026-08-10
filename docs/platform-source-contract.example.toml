@@ -1,0 +1,192 @@
+# Copy this file, freeze the contract before implementation, then run:
+#   PYTHONPATH="$PWD/src" "$SOURCE_SKILL_PYTHON" scripts/audit_platform_source.py \
+#     --contract <copy>.toml --check --json
+#
+# This example describes the current Bangumi integration. The audit is a
+# registration inventory only; PASS is not semantic or real-E2E proof.
+
+schema_version = 1
+canonical_slug = "bangumi"
+display_name = "Bangumi"
+integration_level = "full" # full | discovery-only | capability-increment | audit-only
+aliases = ["bgm"]
+hosts = ["bgm.tv", "bangumi.tv"]
+content_types = ["subject", "anime", "book", "game", "music", "real"]
+
+[transport]
+kind = "official-api"
+owner = "backend"
+entrypoints = [
+  "src/openbiliclaw/sources/bangumi_client.py",
+  "src/openbiliclaw/sources/bangumi.py",
+]
+route_aliases = []
+fallback_owner = "none"
+requires_overseas_network = true
+routed_by_network_mode = true
+network_policy = "Backend httpx follows the shared overseas network mode; direct bypasses trust_env and system/custom own proxy routing."
+
+[transport.capability_routes]
+discover = "backend:official-api:anonymous-or-token"
+profile = "backend:official-api:anonymous-or-token"
+bootstrap = "backend:official-api:init-and-on-demand"
+identity = "extension:identity-callback:observed-then-authoritatively-verified"
+
+[identity]
+item_id = "Bangumi subject id, stored as the namespaced item key bangumi:<subject_id>"
+url = "Canonical https://bgm.tv/subject/<subject_id> URL"
+dedupe = "Canonical source family plus subject id; aliases bgm/bangumi collapse before dedupe"
+account_scope = "Token /v0/me account first, then explicit/config username, then extension identity"
+
+[auth]
+mode = "anonymous-with-optional-credentials"
+credential_kinds = ["token"]
+verify_action = "live_probe"
+write_path = "config-only" # unified | config-only | none
+account_resolution = "token /v0/me > explicit or configured username > verified extension identity"
+identity_evidence = "observed extension uid/username remains unverified until bgm.tv positively matches both"
+login_cookie_names = []
+login_state_path = "callback" # none | callback | credential
+
+[auth.capability_modes]
+# Keys must exactly match enabled contract capabilities. Values are restricted
+# to anonymous | optional-credential | login-required.
+discover = "optional-credential"
+profile = "optional-credential"
+bootstrap = "optional-credential"
+identity = "login-required"
+
+[auth.capability_required]
+# Core discover/profile/bootstrap/incremental/native-save capabilities cannot
+# be set false merely to avoid their auth or implementation gate. Optional
+# identity/account-resolution fallbacks may be false.
+discover = true
+profile = true
+bootstrap = true
+identity = false
+
+[upstream]
+success_content_types = ["application/json"]
+pagination = "Official page/limit API; lanes rotate fairly and an invalid high cursor gets one bounded reset"
+terminal_evidence = "HTTP success plus a valid JSON envelope; malformed/error/challenge payloads are not valid-empty"
+terminal_policy = "Only a valid decoded envelope may be complete/empty; rate limits, schema drift, and transport errors stay degraded/failed."
+partial_policy = "Retain accepted rows when another mode/page fails; do not advance completeness or missing-item inference."
+publication_time_policy = "Bangumi catalog rows have no authoritative publication instant, so discovery time is never substituted as platform time."
+
+[discover]
+modes = ["search", "ranked", "latest"]
+search_generation = "Both merged KeywordPlanner generation and inspiration-axis generation feed search claims"
+budget = "Independent daily per-mode budgets charged only after global dedupe and final retention"
+cursor = "Persistent per-mode/type cursor with one bounded reset when upstream totals shrink"
+
+[profile]
+signals = true
+incremental = false
+refresh_mode = "init-and-on-demand" # none | init-only | on-demand | init-and-on-demand | incremental
+
+[extension]
+task = "identity-only" # none | identity-only | browser-task
+hosts = ["bgm.tv", "bangumi.tv"]
+task_marker = false
+background = true
+early_response = false
+cookie_sync = false
+
+[surfaces]
+cli = true
+setup = true
+desktop = true
+mobile = true
+extension_popup = true
+source_status = true
+credentials = true
+recommendation = true
+
+# "mapped" means every declared fetch branch must populate the canonical
+# *_count field. "unavailable" is a structural absence, not a zero placeholder.
+[engagement]
+view = "unavailable"
+like = "unavailable"
+favorite = "mapped"
+comment = "unavailable"
+share = "unavailable"
+danmaku = "unavailable"
+
+[media]
+image = "proxy" # none | direct | proxy
+image_hosts = ["lain.bgm.tv"]
+deep_link = "browser-fallback" # none | browser-fallback | native
+native_save = false
+
+[e2e]
+safe_actions = ["read-identity", "fetch-public-collection", "search", "ranked", "latest"]
+mutating_actions = []
+
+[e2e.safe_assertions]
+read-identity = "upstream-state-unchanged"
+fetch-public-collection = "upstream-state-unchanged"
+search = "upstream-state-unchanged"
+ranked = "upstream-state-unchanged"
+latest = "upstream-state-unchanged"
+
+[e2e.safe_postconditions]
+read-identity = "The callback reports observed identity only; no upstream account or collection state changes."
+fetch-public-collection = "Only upstream GETs occur; returned rows may enter a temporary acceptance database, never production memory."
+search = "Only upstream search reads occur; no upstream account, interest, or collection state changes."
+ranked = "Only the public ranked catalog is read; no upstream account or collection state changes."
+latest = "Only the public latest catalog is read; no upstream account or collection state changes."
+
+[events]
+strategy_prefixes = ["bangumi-", "bangumi_"]
+mappings = "Collection statuses map to canonical favorite/like/view or feedback(dislike) events; catalog discovery remains discovery evidence."
+scope_caps = "Bootstrap scope and item budgets are backend-owned and frozen before upstream pagination."
+
+[task]
+lease = "N/A for identity-only extension reporting; backend API fetches own bounded request lifetimes."
+idle_deadline = "N/A for identity-only reporting; API requests have bounded transport timeouts."
+absolute_deadline = "N/A for identity-only reporting; init/discover budgets bound total work."
+retry = "Official API transient retry and cursor reset are bounded; accepted partial rows survive."
+buffer = "Identity bridge is installed at document_start and carries no response body/cookie buffer."
+
+[smoke]
+storage_scope = "isolated-only"
+
+[smoke.sinks]
+task = "forbidden"
+task_result = "forbidden"
+seen = "forbidden"
+affinity = "forbidden"
+snapshot = "forbidden"
+schedule = "forbidden"
+event_ingress = "forbidden"
+memory = "forbidden"
+profile = "forbidden"
+
+# Every disabled/unsupported conditional capability needs a non-empty reason.
+# These reasons are the provenance for N/A rows; a generic route or renderer
+# existing elsewhere never turns into platform coverage by itself.
+[exclusions]
+"profile.incremental" = "Bangumi signals refresh during explicit init/fetch; no post-init incremental sync is claimed."
+"extension.task-marker" = "The Bangumi extension path reports identity only and never opens a task-mode tab."
+"extension.early-response" = "Identity comes from stable page globals/navigation, not an early network response."
+"extension.cookie-sync" = "Bangumi identity reporting reads no Cookie values and deliberately has no cookie-sync path."
+"engagement.view" = "The Bangumi catalog API does not expose a canonical view count."
+"engagement.like" = "Catalog ratings are not social likes and stay in rating_score/rating_count."
+"engagement.comment" = "The selected catalog endpoints do not expose a canonical comment count."
+"engagement.share" = "The selected catalog endpoints do not expose a canonical share count."
+"engagement.danmaku" = "Bangumi has no Bilibili-style danmaku metric."
+"media.deep-link" = "No reliable official Bangumi URL scheme is claimed; mobile deliberately opens the web URL."
+"media.native-save" = "Bangumi discovery and profile import are read-only; no platform mutation adapter is claimed."
+
+[exclusion_tests]
+"profile.incremental" = ["tests/test_platform_source_contract_example.py::test_bangumi_refresh_is_explicit_not_incremental"]
+"extension.task-marker" = ["tests/test_platform_source_contract_example.py::test_bangumi_identity_extension_has_no_task_marker_or_task_protocol"]
+"extension.early-response" = ["tests/test_platform_source_contract_example.py::test_bangumi_identity_does_not_use_early_response_capture"]
+"extension.cookie-sync" = ["tests/test_platform_source_contract_example.py::test_bangumi_identity_does_not_use_cookie_sync"]
+"engagement.view" = ["tests/test_bangumi_source.py::test_subject_normalization_maps_catalog_fields_without_fake_engagement"]
+"engagement.like" = ["tests/test_bangumi_source.py::test_subject_normalization_maps_catalog_fields_without_fake_engagement"]
+"engagement.comment" = ["tests/test_bangumi_source.py::test_subject_normalization_maps_catalog_fields_without_fake_engagement"]
+"engagement.share" = ["tests/test_bangumi_source.py::test_subject_normalization_maps_catalog_fields_without_fake_engagement"]
+"engagement.danmaku" = ["tests/test_bangumi_source.py::test_subject_normalization_maps_catalog_fields_without_fake_engagement"]
+"media.deep-link" = ["tests/test_platform_source_contract_example.py::test_bangumi_deep_link_is_web_fallback_without_native_scheme"]
+"media.native-save" = ["tests/test_platform_source_contract_example.py::test_bangumi_has_no_native_save_adapter"]

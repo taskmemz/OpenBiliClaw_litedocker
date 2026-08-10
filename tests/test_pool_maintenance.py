@@ -684,17 +684,18 @@ def test_recover_suppressed_allows_over_quota_source_to_fill_global_gap(
     )
 
 
-def test_recover_suppressed_does_not_oscillate_on_topic_window_misses(
+def test_recover_suppressed_uses_seen_filtered_topic_headroom_without_oscillation(
     tmp_path: Path,
 ) -> None:
-    """Recovery must only keep rows that actually grow canonical availability.
+    """Recovery fills seen-filtered topic headroom once, then stays stable.
 
     The production failure behind this case alternated forever between
     restoring suppressed rows and trimming the same rows back out. Rows from a
     topic already at the public three-item window can only displace an existing
-    item, while a low-ranked row from an apparently underfilled topic may still
-    miss the SQL top-three window because a viewed row occupies a higher rank.
-    Neither shape can fill the one-item global deficit.
+    item. A viewed row no longer occupies that canonical topic window, so the
+    low-ranked fresh row in the second topic must fill the real one-item gap
+    exactly once while maintenance suppresses the viewed head; the next pass
+    must then be mutation-free.
     """
     db = _database(tmp_path)
     for index, score in enumerate((0.93, 0.92, 0.91)):
@@ -763,13 +764,25 @@ def test_recover_suppressed_does_not_oscillate_on_topic_window_misses(
             "SELECT bvid, pool_status FROM content_cache ORDER BY bvid"
         ).fetchall()
     }
-    assert all(result.available_before == result.available_after == 5 for result in results)
-    assert all(result.raw_before == result.raw_after == 5 for result in results)
-    assert all(result.recovered_suppressed == 0 for result in results)
-    assert all(result.mutation_count == 0 for result in results)
+    first, second = results
+    assert (first.available_before, first.available_after) == (5, 6)
+    assert (first.raw_before, first.raw_after) == (5, 6)
+    assert first.recovered_suppressed == 1
+    assert first.mutation_count == 2
+    assert (second.available_before, second.available_after) == (6, 6)
+    assert (second.raw_before, second.raw_after) == (6, 6)
+    assert second.recovered_suppressed == 0
+    assert second.mutation_count == 0
     assert all(result.has_more is False for result in results)
-    assert after_statuses == before_statuses
-    assert all(after_statuses[bvid] == "suppressed" for bvid in suppressed_ids)
+    expected_statuses = dict(before_statuses)
+    expected_statuses["BV_WINDOW_TOO_LOW"] = "fresh"
+    expected_statuses["BV_WINDOW_FRESH_2"] = "suppressed"
+    assert after_statuses == expected_statuses
+    assert all(
+        after_statuses[bvid] == "suppressed"
+        for bvid in suppressed_ids
+        if bvid != "BV_WINDOW_TOO_LOW"
+    )
 
 
 def test_raw_ceiling_blocks_recovery_and_stops_on_untrimmable_excess(

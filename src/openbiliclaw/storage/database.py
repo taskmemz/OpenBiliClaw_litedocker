@@ -46,6 +46,11 @@ from openbiliclaw.discovery.prefilter_audit import (
     PREFILTER_AUDIT_RETENTION_DAYS,
     validate_prefilter_storage_record,
 )
+from openbiliclaw.discovery.temporal import (
+    TEMPORAL_POLICY_VERSION,
+    normalize_temporal_class,
+    normalize_temporal_confidence,
+)
 from openbiliclaw.published_time import normalize_published_time
 from openbiliclaw.saved_sync.identity import (
     canonical_source_platform,
@@ -90,6 +95,56 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _normalize_content_history_source_platform(value: object) -> str:
+    """Use the shared registry while rejecting tokens unsafe for item keys."""
+    canonical = normalize_source_platform(str(value or ""))
+    if (
+        not canonical
+        or len(canonical) > 128
+        or ":" in canonical
+        or any(character.isspace() for character in canonical)
+        or any(unicodedata.category(character).startswith("C") for character in canonical)
+    ):
+        return ""
+    return canonical
+
+
+def _normalize_content_history_item_key(value: object) -> str:
+    """Canonicalize only the platform prefix of a persisted item key."""
+    raw = str(value or "").strip()
+    if (
+        not raw
+        or len(raw) > 2048
+        or any(character.isspace() for character in raw)
+        or any(unicodedata.category(character).startswith("C") for character in raw)
+    ):
+        return ""
+    platform, separator, suffix = raw.partition(":")
+    if not platform or not separator or not suffix:
+        return ""
+    canonical_platform = _normalize_content_history_source_platform(platform)
+    if not canonical_platform:
+        return ""
+    normalized = f"{canonical_platform}:{suffix}"
+    return normalized if len(normalized) <= 2048 else ""
+
+
+def _content_history_item_key_platform(value: object) -> str:
+    """Return the canonical platform prefix carried by an item key."""
+    normalized = _normalize_content_history_item_key(value)
+    platform, separator, suffix = normalized.partition(":")
+    return platform if separator and suffix else ""
+
+
+def _content_history_item_key_content_id(value: object) -> str:
+    """Recover a raw stable ID from a canonical key when one is available."""
+    normalized = _normalize_content_history_item_key(value)
+    _platform, separator, suffix = normalized.partition(":")
+    if not separator or not suffix or suffix.startswith("url:"):
+        return ""
+    return suffix
+
+
 @dataclass(frozen=True)
 class EventInsertResult:
     """One durable event insert/deduplication result."""
@@ -116,6 +171,12 @@ _CARD_SETTLEMENT_EFFECT_KEY_RE = re.compile(r"\Adialogue:[0-9a-f]{64}:[a-z_]+\Z"
 _PROFILE_LEDGER_EFFECT_KEY_RE = re.compile(
     r"\Adialogue:[0-9a-f]{64}:(?:ledger|derived:[0-9a-f]{64})\Z"
 )
+# Aggregate-only temporal ranking shadows are tiny (one row per serve), so 30
+# days / 5,000 rows retains several calibration windows without turning an
+# observability feature into unbounded user-data growth.
+_TEMPORAL_RANKING_AUDIT_RETENTION_DAYS = 30
+_TEMPORAL_RANKING_AUDIT_MAX_ROWS = 5_000
+_TEMPORAL_RANKING_AUDIT_POLICY = "temporal-ranking-shadow-v1"
 
 
 def _validated_card_settlement_ref(ref: object) -> str:
@@ -295,6 +356,8 @@ class _RawTrimPlan:
 # pragmatic middle ground.
 _LOCK_RETRY_ATTEMPTS = 8
 _LOCK_RETRY_SLEEP_SECONDS = 0.02
+CONTENT_HISTORY_RETENTION_DAYS = 30
+_CONTENT_HISTORY_CATEGORIES = frozenset({"clicked", "shown", "removed"})
 # CALIBRATION PROVENANCE: the recommendation endpoint has a 3s hard tail
 # target. Recommendation persistence inherits the existing eight-attempt retry
 # loop, so each attempt waits at most 250ms (about 2.14s including retry sleeps)
@@ -942,6 +1005,10 @@ CREATE TABLE IF NOT EXISTS content_cache (
     source_rank INTEGER DEFAULT 0,
     relevance_score REAL DEFAULT 0.0,
     relevance_reason TEXT DEFAULT '',
+    temporal_class TEXT DEFAULT 'unknown',
+    temporal_confidence REAL DEFAULT 0.0,
+    temporal_reason TEXT DEFAULT '',
+    temporal_policy_version TEXT DEFAULT 'v1',
     pool_expression TEXT DEFAULT '',
     pool_topic_label TEXT DEFAULT '',
     candidate_tier TEXT DEFAULT 'primary',
@@ -1009,6 +1076,10 @@ CREATE TABLE IF NOT EXISTS discovery_candidates (
     franchise_key         TEXT NOT NULL DEFAULT '',
     relevance_score       REAL NOT NULL DEFAULT 0.0,
     relevance_reason      TEXT NOT NULL DEFAULT '',
+    temporal_class        TEXT NOT NULL DEFAULT 'unknown',
+    temporal_confidence   REAL NOT NULL DEFAULT 0.0,
+    temporal_reason       TEXT NOT NULL DEFAULT '',
+    temporal_policy_version TEXT NOT NULL DEFAULT 'v1',
     pool_expression       TEXT NOT NULL DEFAULT '',
     pool_topic_label      TEXT NOT NULL DEFAULT '',
     eval_error            TEXT NOT NULL DEFAULT '',
@@ -1173,6 +1244,23 @@ CREATE INDEX IF NOT EXISTS idx_prefilter_shadow_created
     ON evaluator_prefilter_shadow_audit(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_prefilter_shadow_platform_context
     ON evaluator_prefilter_shadow_audit(platform_class, context_class, created_at);
+
+-- Aggregate-only counterfactual for the recommendation temporal bonus. It
+-- intentionally stores no content identity, title, URL, author, or keyword.
+CREATE TABLE IF NOT EXISTS temporal_ranking_shadow_audit (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_version            TEXT NOT NULL,
+    candidate_count           INTEGER NOT NULL,
+    parseable_published_count INTEGER NOT NULL,
+    bonus_eligible_count      INTEGER NOT NULL,
+    class_counts_json         TEXT NOT NULL DEFAULT '{}',
+    source_counts_json        TEXT NOT NULL DEFAULT '{}',
+    age_bucket_counts_json    TEXT NOT NULL DEFAULT '{}',
+    top_k_metrics_json        TEXT NOT NULL DEFAULT '[]',
+    created_at                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_temporal_ranking_shadow_created
+    ON temporal_ranking_shadow_audit(created_at, id);
 
 -- v0.3.174+ (cognitive profile pipeline Phase 0): append-only audit ledger
 -- for profile write points. One row per profile-mutating action, recorded
@@ -1445,6 +1533,59 @@ def _normalize_admission_min_score(value: object) -> float:
     return score
 
 
+def _normalize_temporal_fields_for_storage(
+    *,
+    temporal_class: object,
+    temporal_confidence: object,
+    temporal_reason: object,
+) -> tuple[str, float, str, str]:
+    """Validate temporal evaluator metadata before it reaches SQLite."""
+
+    normalized_class = normalize_temporal_class(temporal_class)
+    try:
+        normalized_confidence = normalize_temporal_confidence(temporal_confidence)
+    except (OverflowError, TypeError, ValueError):
+        normalized_confidence = 0.0
+    raw_confidence: float | None = None
+    if not isinstance(temporal_confidence, bool) and isinstance(temporal_confidence, int | float):
+        try:
+            raw_confidence = float(temporal_confidence)
+        except (OverflowError, TypeError, ValueError):
+            raw_confidence = None
+    confidence_is_valid = (
+        raw_confidence is not None
+        and math.isfinite(raw_confidence)
+        and 0.0 <= raw_confidence <= 1.0
+    )
+    normalized_reason = temporal_reason.strip() if isinstance(temporal_reason, str) else ""
+    reason_is_valid = bool(normalized_reason)
+    is_neutral_default = (
+        normalized_class == "unknown"
+        and isinstance(temporal_class, str)
+        and temporal_class.strip().lower() == "unknown"
+        and confidence_is_valid
+        and normalized_confidence == 0.0
+        and isinstance(temporal_reason, str)
+        and not normalized_reason
+    )
+    if normalized_class == "unknown" or not confidence_is_valid or not reason_is_valid:
+        if not is_neutral_default:
+            logger.warning(
+                "Invalid temporal metadata coerced to unknown "
+                "(class_type=%s, confidence_type=%s, reason_type=%s)",
+                type(temporal_class).__name__,
+                type(temporal_confidence).__name__,
+                type(temporal_reason).__name__,
+            )
+        return ("unknown", 0.0, "", TEMPORAL_POLICY_VERSION)
+    return (
+        normalized_class,
+        normalized_confidence,
+        normalized_reason,
+        TEMPORAL_POLICY_VERSION,
+    )
+
+
 class Database:
     """Lightweight SQLite wrapper for OpenBiliClaw.
 
@@ -1504,6 +1645,7 @@ class Database:
         self._ensure_recommendation_feedback_columns()
         self._ensure_content_cache_runtime_columns()
         self._ensure_content_cache_relevance_columns()
+        self._ensure_content_cache_temporal_columns()
         self._ensure_content_cache_topic_columns()
         self._ensure_content_cache_pool_copy_columns()
         self._ensure_content_cache_delight_columns()
@@ -1525,6 +1667,7 @@ class Database:
         self._ensure_discovery_keywords_table()
         self._ensure_favorites_table()
         self._ensure_saved_sync_tables()
+        self._ensure_content_history_tables()
         self._ensure_user_visual_clusters_table()
         self._ensure_auth_state_table()
         self._ensure_init_runs_table()
@@ -1574,6 +1717,33 @@ class Database:
             check_same_thread=False,
         )
         connection.row_factory = sqlite3.Row
+        # SQL projections must use the same platform alias registry as Python
+        # ingestion.  Register the shared helper instead of copying aliases
+        # into CASE expressions that would drift as platforms evolve.
+        connection.create_function(
+            "normalize_source_platform",
+            1,
+            _normalize_content_history_source_platform,
+            deterministic=True,
+        )
+        connection.create_function(
+            "normalize_content_history_item_key",
+            1,
+            _normalize_content_history_item_key,
+            deterministic=True,
+        )
+        connection.create_function(
+            "content_history_item_key_platform",
+            1,
+            _content_history_item_key_platform,
+            deterministic=True,
+        )
+        connection.create_function(
+            "content_history_item_key_content_id",
+            1,
+            _content_history_item_key_content_id,
+            deterministic=True,
+        )
         if enforce_foreign_keys:
             connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
@@ -3789,6 +3959,205 @@ class Database:
             "incomplete": int(row["incomplete"] or 0),
         }
 
+    # ------------------------------------------------------------------
+    # Recommendation temporal-ranking shadow audit
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _temporal_audit_count_map(value: object, *, expected_total: int) -> dict[str, int]:
+        """Validate one aggregate count map without accepting content identity."""
+
+        if not isinstance(value, Mapping):
+            raise ValueError("temporal ranking audit count map must be an object")
+        normalized: dict[str, int] = {}
+        for raw_key, raw_count in value.items():
+            key = str(raw_key).strip().lower()
+            if re.fullmatch(r"[a-z0-9_<>\-=]{1,32}", key) is None:
+                raise ValueError("temporal ranking audit count-map key is invalid")
+            if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count < 0:
+                raise ValueError("temporal ranking audit counts must be non-negative integers")
+            normalized[key] = raw_count
+        if sum(normalized.values()) != expected_total:
+            raise ValueError("temporal ranking audit count map has the wrong total")
+        return dict(sorted(normalized.items()))
+
+    def record_temporal_ranking_shadow_audit(self, audit: Mapping[str, Any]) -> int:
+        """Persist one privacy-safe ranking counterfactual with bounded retention."""
+
+        policy_version = str(audit.get("policy_version") or "")
+        if policy_version != _TEMPORAL_RANKING_AUDIT_POLICY:
+            raise ValueError("unsupported temporal ranking audit policy")
+
+        def _count(name: str) -> int:
+            value = audit.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"temporal ranking audit {name} must be non-negative")
+            return value
+
+        candidate_count = _count("candidate_count")
+        parseable_count = _count("parseable_published_count")
+        eligible_count = _count("bonus_eligible_count")
+        if parseable_count > candidate_count or eligible_count > parseable_count:
+            raise ValueError("temporal ranking audit coverage counts are inconsistent")
+
+        class_counts = self._temporal_audit_count_map(
+            audit.get("class_counts"),
+            expected_total=candidate_count,
+        )
+        source_counts = self._temporal_audit_count_map(
+            audit.get("source_counts"),
+            expected_total=candidate_count,
+        )
+        age_bucket_counts = self._temporal_audit_count_map(
+            audit.get("age_bucket_counts"),
+            expected_total=candidate_count,
+        )
+
+        raw_top_k = audit.get("top_k_metrics")
+        if not isinstance(raw_top_k, list) or len(raw_top_k) > 3:
+            raise ValueError("temporal ranking audit top-k metrics must be a bounded list")
+        scalar_count_keys = {
+            "requested_top_k",
+            "effective_top_k",
+            "overlap_count",
+            "positional_match_count",
+            "baseline_parseable_published",
+            "effective_parseable_published",
+            "baseline_bonus_eligible",
+            "effective_bonus_eligible",
+        }
+        count_map_keys = {
+            "baseline_classes",
+            "effective_classes",
+            "entered_classes",
+            "exited_classes",
+            "baseline_sources",
+            "effective_sources",
+            "entered_sources",
+            "exited_sources",
+            "baseline_age_buckets",
+            "effective_age_buckets",
+            "entered_age_buckets",
+            "exited_age_buckets",
+        }
+        allowed_keys = scalar_count_keys | count_map_keys | {"jaccard"}
+        top_k_metrics: list[dict[str, object]] = []
+        for raw_metric in raw_top_k:
+            if not isinstance(raw_metric, Mapping) or set(raw_metric) != allowed_keys:
+                raise ValueError("temporal ranking audit top-k metric schema is invalid")
+            metric: dict[str, object] = {}
+            normalized_scalar_counts: dict[str, int] = {}
+            for key in scalar_count_keys:
+                value = raw_metric.get(key)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError("temporal ranking audit top-k counts must be non-negative")
+                normalized_scalar_counts[key] = value
+                metric[key] = value
+            effective_top_k = normalized_scalar_counts["effective_top_k"]
+            requested_top_k = normalized_scalar_counts["requested_top_k"]
+            overlap_count = normalized_scalar_counts["overlap_count"]
+            if (
+                requested_top_k not in {10, 50, 100}
+                or effective_top_k > min(requested_top_k, candidate_count)
+                or overlap_count > effective_top_k
+            ):
+                raise ValueError("temporal ranking audit top-k bounds are inconsistent")
+            raw_jaccard = raw_metric.get("jaccard")
+            if isinstance(raw_jaccard, bool) or not isinstance(raw_jaccard, int | float):
+                raise ValueError("temporal ranking audit jaccard must be numeric")
+            jaccard = float(raw_jaccard)
+            if not math.isfinite(jaccard) or not 0.0 <= jaccard <= 1.0:
+                raise ValueError("temporal ranking audit jaccard must be finite in [0, 1]")
+            metric["jaccard"] = jaccard
+            changed = effective_top_k - overlap_count
+            for key in count_map_keys:
+                expected = changed if key.startswith(("entered_", "exited_")) else effective_top_k
+                metric[key] = self._temporal_audit_count_map(
+                    raw_metric.get(key),
+                    expected_total=expected,
+                )
+            top_k_metrics.append(metric)
+
+        cursor = self._execute_write(
+            """
+            INSERT INTO temporal_ranking_shadow_audit (
+                policy_version,
+                candidate_count,
+                parseable_published_count,
+                bonus_eligible_count,
+                class_counts_json,
+                source_counts_json,
+                age_bucket_counts_json,
+                top_k_metrics_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                policy_version,
+                candidate_count,
+                parseable_count,
+                eligible_count,
+                json.dumps(class_counts, sort_keys=True, separators=(",", ":")),
+                json.dumps(source_counts, sort_keys=True, separators=(",", ":")),
+                json.dumps(age_bucket_counts, sort_keys=True, separators=(",", ":")),
+                json.dumps(top_k_metrics, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+        self._execute_write(
+            """
+            DELETE FROM temporal_ranking_shadow_audit
+            WHERE created_at < datetime('now', ?)
+            """,
+            (f"-{_TEMPORAL_RANKING_AUDIT_RETENTION_DAYS} days",),
+        )
+        self._execute_write(
+            """
+            DELETE FROM temporal_ranking_shadow_audit
+            WHERE id IN (
+                SELECT id
+                FROM temporal_ranking_shadow_audit
+                ORDER BY created_at DESC, id DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (_TEMPORAL_RANKING_AUDIT_MAX_ROWS,),
+        )
+        return int(cursor.lastrowid or 0)
+
+    def query_temporal_ranking_shadow_audit(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return retained aggregate-only temporal ranking shadows."""
+
+        sql = """
+            SELECT id,
+                   policy_version,
+                   candidate_count,
+                   parseable_published_count,
+                   bonus_eligible_count,
+                   class_counts_json,
+                   source_counts_json,
+                   age_bucket_counts_json,
+                   top_k_metrics_json,
+                   created_at
+            FROM temporal_ranking_shadow_audit
+            ORDER BY id ASC
+        """
+        params: tuple[Any, ...] = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (max(0, int(limit)),)
+        results: list[dict[str, Any]] = []
+        for raw_row in self.conn.execute(sql, params).fetchall():
+            row = dict(raw_row)
+            row["class_counts"] = json.loads(str(row.pop("class_counts_json")))
+            row["source_counts"] = json.loads(str(row.pop("source_counts_json")))
+            row["age_bucket_counts"] = json.loads(str(row.pop("age_bucket_counts_json")))
+            row["top_k_metrics"] = json.loads(str(row.pop("top_k_metrics_json")))
+            results.append(row)
+        return results
+
     def query_llm_usage_by_day(
         self,
         *,
@@ -4214,6 +4583,15 @@ class Database:
             kwargs.get("published_at"),
             label=kwargs.get("published_label"),
         )
+        temporal = _normalize_temporal_fields_for_storage(
+            temporal_class=kwargs.get("temporal_class", "unknown"),
+            temporal_confidence=kwargs.get("temporal_confidence", 0.0),
+            temporal_reason=kwargs.get("temporal_reason", ""),
+        )
+        has_explicit_temporal = all(
+            field in kwargs
+            for field in ("temporal_class", "temporal_confidence", "temporal_reason")
+        )
         source_platform = str(kwargs.get("source_platform", "bilibili") or "").strip()
         raw_content_id = str(kwargs.get("content_id", bvid) or "").strip()
         identity_content_id = raw_content_id if source_platform else bvid.strip()
@@ -4258,6 +4636,10 @@ class Database:
                 bookmark_count,
                 relevance_score,
                 relevance_reason,
+                temporal_class,
+                temporal_confidence,
+                temporal_reason,
+                temporal_policy_version,
                 pool_expression,
                 pool_topic_label,
                 candidate_tier,
@@ -4277,7 +4659,7 @@ class Database:
             VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(bvid) DO UPDATE SET
                 title = excluded.title,
@@ -4345,6 +4727,25 @@ class Database:
                     content_cache.relevance_reason,
                     ''
                 ),
+                temporal_class = CASE
+                    WHEN ? THEN excluded.temporal_class
+                    ELSE COALESCE(content_cache.temporal_class, 'unknown')
+                END,
+                temporal_confidence = CASE
+                    WHEN ? THEN excluded.temporal_confidence
+                    ELSE COALESCE(content_cache.temporal_confidence, 0.0)
+                END,
+                temporal_reason = CASE
+                    WHEN ? THEN excluded.temporal_reason
+                    ELSE COALESCE(content_cache.temporal_reason, '')
+                END,
+                temporal_policy_version = CASE
+                    WHEN ? THEN excluded.temporal_policy_version
+                    ELSE COALESCE(
+                        NULLIF(content_cache.temporal_policy_version, ''),
+                        'v1'
+                    )
+                END,
                 pool_expression = COALESCE(
                     NULLIF(excluded.pool_expression, ''),
                     content_cache.pool_expression,
@@ -4440,6 +4841,10 @@ class Database:
                 kwargs.get("bookmark_count", 0),
                 kwargs.get("relevance_score", 0.0),
                 kwargs.get("relevance_reason", ""),
+                temporal[0],
+                temporal[1],
+                temporal[2],
+                temporal[3],
                 kwargs.get("pool_expression", ""),
                 kwargs.get("pool_topic_label", ""),
                 kwargs.get("candidate_tier", "primary"),
@@ -4454,6 +4859,10 @@ class Database:
                 float(kwargs.get("rating_score", 0.0) or 0.0),
                 max(0, int(kwargs.get("rating_count", 0) or 0)),
                 max(0, int(kwargs.get("source_rank", 0) or 0)),
+                has_explicit_temporal,
+                has_explicit_temporal,
+                has_explicit_temporal,
+                has_explicit_temporal,
                 EXPLORE_STRATEGY,
                 EXPLORE_ADMISSION_MIN_SCORE,
                 self._pool_admission_min_score(),
@@ -4918,6 +5327,11 @@ class Database:
             candidate_id = int(evaluation.get("candidate_id") or evaluation.get("id") or 0)
             if candidate_id <= 0:
                 continue
+            temporal = _normalize_temporal_fields_for_storage(
+                temporal_class=evaluation.get("temporal_class", "unknown"),
+                temporal_confidence=evaluation.get("temporal_confidence", 0.0),
+                temporal_reason=evaluation.get("temporal_reason", ""),
+            )
             cursor = self._execute_write(
                 """
                 UPDATE discovery_candidates
@@ -4928,6 +5342,10 @@ class Database:
                     franchise_key = ?,
                     relevance_score = ?,
                     relevance_reason = ?,
+                    temporal_class = ?,
+                    temporal_confidence = ?,
+                    temporal_reason = ?,
+                    temporal_policy_version = ?,
                     pool_expression = ?,
                     pool_topic_label = ?,
                     eval_error = ?,
@@ -4947,6 +5365,10 @@ class Database:
                     str(evaluation.get("franchise_key") or ""),
                     float(evaluation.get("relevance_score") or evaluation.get("score") or 0.0),
                     str(evaluation.get("relevance_reason") or evaluation.get("reason") or ""),
+                    temporal[0],
+                    temporal[1],
+                    temporal[2],
+                    temporal[3],
                     str(evaluation.get("pool_expression") or ""),
                     str(evaluation.get("pool_topic_label") or ""),
                     str(evaluation.get("eval_error") or ""),
@@ -4971,6 +5393,11 @@ class Database:
             candidate_id = int(evaluation.get("candidate_id") or evaluation.get("id") or 0)
             if candidate_id <= 0:
                 continue
+            temporal = _normalize_temporal_fields_for_storage(
+                temporal_class=evaluation.get("temporal_class", "unknown"),
+                temporal_confidence=evaluation.get("temporal_confidence", 0.0),
+                temporal_reason=evaluation.get("temporal_reason", ""),
+            )
             cursor = self._execute_write(
                 """
                 UPDATE discovery_candidates
@@ -4981,6 +5408,10 @@ class Database:
                     franchise_key = ?,
                     relevance_score = ?,
                     relevance_reason = ?,
+                    temporal_class = ?,
+                    temporal_confidence = ?,
+                    temporal_reason = ?,
+                    temporal_policy_version = ?,
                     pool_expression = ?,
                     pool_topic_label = ?,
                     eval_error = ?,
@@ -5001,6 +5432,10 @@ class Database:
                     str(evaluation.get("franchise_key") or ""),
                     float(evaluation.get("relevance_score") or evaluation.get("score") or 0.0),
                     str(evaluation.get("relevance_reason") or evaluation.get("reason") or ""),
+                    temporal[0],
+                    temporal[1],
+                    temporal[2],
+                    temporal[3],
                     str(evaluation.get("pool_expression") or ""),
                     str(evaluation.get("pool_topic_label") or ""),
                     str(evaluation.get("eval_error") or ""),
@@ -5354,8 +5789,37 @@ class Database:
         )
         return [dict(row) for row in cursor.fetchall()]
 
-    def get_unrecommended_content(self, limit: int = 100) -> list[dict[str, Any]]:
-        """Get cached content that has not been recommended yet."""
+    def get_unrecommended_content(
+        self,
+        limit: int = 100,
+        *,
+        source_platforms: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get cached content that has not been recommended yet.
+
+        When ``source_platforms`` is supplied, filtering happens in SQL before
+        balancing and limiting. Blank legacy platform values count as
+        ``bilibili`` so old Bilibili cache rows remain eligible without opening
+        a cross-platform backfill path.
+        """
+        platform_sql = ""
+        platform_params: tuple[str, ...] = ()
+        if source_platforms is not None:
+            normalized_platforms = tuple(
+                dict.fromkeys(
+                    normalize_source_platform(platform, default=_BILIBILI_SOURCE_FAMILY)
+                    for platform in source_platforms
+                    if str(platform or "").strip()
+                )
+            )
+            if not normalized_platforms:
+                return []
+            placeholders = ",".join("?" for _ in normalized_platforms)
+            platform_sql = (
+                "AND COALESCE(NULLIF(LOWER(TRIM(c.source_platform)), ''), 'bilibili') "
+                f"IN ({placeholders})"
+            )
+            platform_params = normalized_platforms
         admission_sql, admission_params = self._pool_admission_sql(
             score_expr="COALESCE(c.relevance_score, 0.0)",
             source_expr="c.source",
@@ -5365,6 +5829,7 @@ class Database:
             SELECT c.*
             FROM content_cache AS c
             WHERE {admission_sql}
+              {platform_sql}
               AND NOT EXISTS (
                 SELECT 1
                 FROM recommendations AS r
@@ -5378,7 +5843,7 @@ class Database:
                 c.bvid ASC
             LIMIT ?
             """,
-            (*admission_params, max(limit * 5, 50)),
+            (*admission_params, *platform_params, max(limit * 5, 50)),
         )
         rows = [dict(row) for row in cursor.fetchall()]
         rows = self._exclude_viewed_rows(
@@ -5470,113 +5935,41 @@ class Database:
         # Over-fetch widely so the per-group filter still leaves headroom
         # for the downstream balance pass.
         fetch_limit = max(limit * 8, 80)
-        admission_sql, admission_params = self._pool_admission_sql()
-        guard_sql = _xhs_self_author_guard_sql()
-        guard_params = _xhs_self_author_guard_params(xhs_self_nickname)
-        delight_threshold = self.dynamic_delight_threshold(
-            default_threshold=_DELIGHT_CLAIM_MIN_SCORE
-        )
-        delight_guard_sql = _delight_claim_guard_sql()
-        if max_per_topic_group <= 0:
-            sql = f"""
-                SELECT *
-                FROM content_cache
-                WHERE COALESCE(pool_status, 'fresh') = 'fresh'
-                  AND COALESCE(feedback_type, '') != 'dislike'
-                  AND {admission_sql}
-                  AND COALESCE(pool_expression, '') != ''
-                  AND COALESCE(pool_topic_label, '') != ''
-                  AND COALESCE(style_key, '') != ''
-                  AND COALESCE(topic_group, '') != ''
-                  AND (
-                    source_platform != 'xiaohongshu'
-                    OR content_url LIKE '%xsec_token=%'
-                  )
-                  {guard_sql}
-                  {delight_guard_sql}
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM recommendations AS r
-                    WHERE r.bvid = content_cache.bvid
-                  )
-                ORDER BY
-                    CASE candidate_tier WHEN 'primary' THEN 0 ELSE 1 END ASC,
-                    relevance_score DESC,
-                    last_scored_at DESC,
-                    view_count DESC,
-                    bvid ASC
-                LIMIT ?
-            """
-            params: tuple[Any, ...] = (
-                *admission_params,
-                *guard_params,
-                delight_threshold,
-                fetch_limit,
-            )
-        else:
-            # Per-group rank via window function: keep the top-N classified
-            # items of each topic_group, then order the remainder by relevance.
-            sql = f"""
-                WITH ranked AS (
-                    SELECT *,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY topic_group
-                               ORDER BY
-                                   relevance_score DESC,
-                                   last_scored_at DESC,
-                                   view_count DESC,
-                                   bvid ASC
-                           ) AS group_rank
-                    FROM content_cache
-                    WHERE COALESCE(pool_status, 'fresh') = 'fresh'
-                      AND COALESCE(feedback_type, '') != 'dislike'
-                      AND {admission_sql}
-                      AND COALESCE(pool_expression, '') != ''
-                      AND COALESCE(pool_topic_label, '') != ''
-                      AND COALESCE(style_key, '') != ''
-                      AND COALESCE(topic_group, '') != ''
-                      AND (
-                        source_platform != 'xiaohongshu'
-                        OR content_url LIKE '%xsec_token=%'
-                      )
-                      {guard_sql}
-                      {delight_guard_sql}
-                      AND NOT EXISTS (
-                        SELECT 1
-                        FROM recommendations AS r
-                        WHERE r.bvid = content_cache.bvid
-                      )
-                )
-                SELECT * FROM ranked
-                WHERE group_rank <= ?
-                ORDER BY
-                    CASE candidate_tier WHEN 'primary' THEN 0 ELSE 1 END ASC,
-                    relevance_score DESC,
-                    last_scored_at DESC,
-                    view_count DESC,
-                    bvid ASC
-                LIMIT ?
-            """
-            params = (
-                *admission_params,
-                *guard_params,
-                delight_threshold,
-                max_per_topic_group,
-                fetch_limit,
-            )
-        cursor = self.conn.execute(sql, params)
-        rows = [dict(row) for row in cursor.fetchall()]
         viewed_content_keys = (
             self.get_recent_viewed_content_keys()
             if _viewed_content_keys is None
             else _viewed_content_keys
         )
-        rows = self._exclude_viewed_rows(
-            rows,
-            viewed_content_keys,
-            limit=len(rows),
+        canonical_rows = self._load_available_pool_candidate_rows_on(
+            self.conn,
+            max_per_topic_group=max_per_topic_group,
+            xhs_self_nickname=xhs_self_nickname,
+            _viewed_content_keys=viewed_content_keys,
         )
+        head_bvids = [str(row["bvid"]) for row in canonical_rows[:fetch_limit]]
+        rows = self._load_content_cache_rows_by_bvid_on(self.conn, head_bvids)
         return self._balance_pool_rows(rows, limit=limit)
+
+    @staticmethod
+    def _load_content_cache_rows_by_bvid_on(
+        conn: sqlite3.Connection,
+        bvids: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """Load full cache rows while preserving a canonical bvid order."""
+
+        ordered_bvids = [str(bvid) for bvid in bvids if str(bvid)]
+        if not ordered_bvids:
+            return []
+        by_bvid: dict[str, dict[str, Any]] = {}
+        for offset in range(0, len(ordered_bvids), 500):
+            chunk = ordered_bvids[offset : offset + 500]
+            placeholders = ", ".join("?" for _ in chunk)
+            cursor = conn.execute(
+                f"SELECT * FROM content_cache WHERE bvid IN ({placeholders})",
+                chunk,
+            )
+            by_bvid.update((str(row["bvid"]), dict(row)) for row in cursor.fetchall())
+        return [by_bvid[bvid] for bvid in ordered_bvids if bvid in by_bvid]
 
     def _pool_servable_where_clause_on(
         self,
@@ -5816,107 +6209,115 @@ class Database:
             "*"
             if full_rows
             else (
-                "bvid, source, source_platform, content_url, topic_group, "
+                "bvid, content_id, source, source_platform, content_url, topic_group, "
                 "candidate_tier, relevance_score, last_scored_at, view_count"
             )
         )
-        if max_per_topic_group > 0:
-            cursor = conn.execute(
-                f"""
-                WITH ranked AS (
-                    SELECT {projection},
-                           ROW_NUMBER() OVER (
-                               PARTITION BY topic_group
-                               ORDER BY
-                                   relevance_score DESC,
-                                   last_scored_at DESC,
-                                   view_count DESC,
-                                   bvid ASC
-                           ) AS group_rank
-                    FROM content_cache
-                    WHERE COALESCE(pool_status, 'fresh') = 'fresh'
-                      AND COALESCE(feedback_type, '') != 'dislike'
-                      AND {admission_sql}
-                      AND COALESCE(pool_expression, '') != ''
-                      AND COALESCE(pool_topic_label, '') != ''
-                      AND COALESCE(style_key, '') != ''
-                      AND COALESCE(topic_group, '') != ''
-                      AND (
-                        source_platform != 'xiaohongshu'
-                        OR content_url LIKE '%xsec_token=%'
-                      )
-                      {guard_sql}
-                      {delight_guard_sql}
-                      AND NOT EXISTS (
-                        SELECT 1
-                        FROM recommendations AS r
-                        WHERE r.bvid = content_cache.bvid
-                      )
-                )
-                SELECT {projection}
-                FROM ranked
-                WHERE group_rank <= ?
-                ORDER BY
-                    CASE candidate_tier WHEN 'primary' THEN 0 ELSE 1 END ASC,
-                    relevance_score DESC,
-                    last_scored_at DESC,
-                    view_count DESC,
-                    bvid ASC
-                """,
-                (*admission_params, *guard_params, delight_threshold, max_per_topic_group),
-            )
-        else:
-            cursor = conn.execute(
-                f"""
-                SELECT {projection}
-                FROM content_cache
-                WHERE COALESCE(pool_status, 'fresh') = 'fresh'
-                  AND COALESCE(feedback_type, '') != 'dislike'
-                  AND {admission_sql}
-                  AND COALESCE(pool_expression, '') != ''
-                  AND COALESCE(pool_topic_label, '') != ''
-                  AND COALESCE(style_key, '') != ''
-                  AND COALESCE(topic_group, '') != ''
-                  AND (
-                    source_platform != 'xiaohongshu'
-                    OR content_url LIKE '%xsec_token=%'
-                  )
-                  {guard_sql}
-                  {delight_guard_sql}
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM recommendations AS r
-                    WHERE r.bvid = content_cache.bvid
-                  )
-                ORDER BY
-                    CASE candidate_tier WHEN 'primary' THEN 0 ELSE 1 END ASC,
-                    relevance_score DESC,
-                    last_scored_at DESC,
-                    view_count DESC,
-                    bvid ASC
-                """,
-                (*admission_params, *guard_params, delight_threshold),
-            )
+        cursor = conn.execute(
+            f"""
+            SELECT {projection}
+            FROM content_cache
+            WHERE COALESCE(pool_status, 'fresh') = 'fresh'
+              AND COALESCE(feedback_type, '') != 'dislike'
+              AND {admission_sql}
+              AND COALESCE(pool_expression, '') != ''
+              AND COALESCE(pool_topic_label, '') != ''
+              AND COALESCE(style_key, '') != ''
+              AND COALESCE(topic_group, '') != ''
+              AND (
+                source_platform != 'xiaohongshu'
+                OR content_url LIKE '%xsec_token=%'
+              )
+              {guard_sql}
+              {delight_guard_sql}
+              AND NOT EXISTS (
+                SELECT 1
+                FROM recommendations AS r
+                WHERE r.bvid = content_cache.bvid
+              )
+            ORDER BY
+                CASE candidate_tier WHEN 'primary' THEN 0 ELSE 1 END ASC,
+                relevance_score DESC,
+                last_scored_at DESC,
+                view_count DESC,
+                bvid ASC
+            """,
+            (*admission_params, *guard_params, delight_threshold),
+        )
+        rows = [dict(row) for row in cursor.fetchall()]
         viewed_content_keys = (
             self._recent_viewed_content_keys_on(conn)
             if _viewed_content_keys is None
             else _viewed_content_keys
         )
-        rows: list[dict[str, Any]] = []
-        for row in cursor.fetchall():
+        filtered = self._filter_available_pool_candidate_rows(
+            rows,
+            viewed_content_keys=viewed_content_keys,
+        )
+        return self._apply_pool_topic_window(
+            filtered,
+            max_per_topic_group=max_per_topic_group,
+        )
+
+    @staticmethod
+    def _filter_available_pool_candidate_rows(
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        viewed_content_keys: set[str],
+    ) -> list[dict[str, Any]]:
+        """Apply the Python half of the canonical availability gate."""
+
+        filtered: list[dict[str, Any]] = []
+        for row in rows:
             row_dict = dict(row)
             if not str(row_dict.get("bvid", "")).strip():
                 continue
-            if self._is_viewed_row(row_dict, viewed_content_keys):
+            if Database._is_viewed_row(row_dict, viewed_content_keys):
                 continue
             if not _is_linkable_pool_source(
-                row["source"],
-                row["source_platform"],
-                row["content_url"],
+                row_dict.get("source"),
+                row_dict.get("source_platform"),
+                row_dict.get("content_url"),
             ):
                 continue
-            rows.append(row_dict)
-        return rows
+            filtered.append(row_dict)
+        return filtered
+
+    @staticmethod
+    def _apply_pool_topic_window(
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        max_per_topic_group: int,
+    ) -> list[dict[str, Any]]:
+        """Apply topic rank after canonical seen/linkability filtering.
+
+        Topic-local ranking intentionally excludes ``candidate_tier`` while
+        the returned global order retains it, matching the former SQL window
+        function's two distinct orderings.
+        """
+
+        topic_cap = max(0, int(max_per_topic_group))
+        materialized = [dict(row) for row in rows]
+        if topic_cap <= 0:
+            return materialized
+
+        rows_by_topic: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in materialized:
+            rows_by_topic[str(row.get("topic_group") or "")].append(row)
+
+        selected_bvids: set[str] = set()
+        for topic_rows in rows_by_topic.values():
+            # Stable multi-pass sorting mirrors relevance DESC, timestamp DESC,
+            # view_count DESC, bvid ASC without letting candidate_tier leak in.
+            topic_rows.sort(key=lambda row: str(row.get("bvid") or ""))
+            topic_rows.sort(key=lambda row: int(row.get("view_count") or 0), reverse=True)
+            topic_rows.sort(key=lambda row: str(row.get("last_scored_at") or ""), reverse=True)
+            topic_rows.sort(
+                key=lambda row: float(row.get("relevance_score") or 0.0),
+                reverse=True,
+            )
+            selected_bvids.update(str(row.get("bvid") or "") for row in topic_rows[:topic_cap])
+        return [row for row in materialized if str(row.get("bvid") or "") in selected_bvids]
 
     def count_pool_available_candidates_by_source(
         self, *, max_per_topic_group: int = 3, xhs_self_nickname: str = ""
@@ -6235,26 +6636,28 @@ class Database:
             xhs_self_nickname=xhs_self_nickname,
             _viewed_content_keys=viewed_content_keys,
         )
-        copy_ready = len(
-            self._load_available_pool_candidate_rows_on(
-                self.conn,
-                max_per_topic_group=0,
-                xhs_self_nickname=xhs_self_nickname,
-                _viewed_content_keys=viewed_content_keys,
-            )
+        copy_ready_rows = self._load_available_pool_candidate_rows_on(
+            self.conn,
+            max_per_topic_group=0,
+            xhs_self_nickname=xhs_self_nickname,
+            _viewed_content_keys=viewed_content_keys,
+        )
+        pending_copy_rows = self._load_admitted_pending_copy_rows_on(
+            self.conn,
+            xhs_self_nickname=xhs_self_nickname,
+            _viewed_content_keys=viewed_content_keys,
+        )
+        pending_available_rows = self._select_admitted_pending_available_rows(
+            pending_copy_rows,
+            copy_ready_rows=copy_ready_rows,
         )
         return {
             "available": available,
-            "copy_ready": copy_ready,
+            "copy_ready": len(copy_ready_rows),
             "raw": raw_count + discovery_pending_count,
             "pending": pending_count + discovery_pending_count,
-            "admitted_pending_copy": len(
-                self._load_admitted_pending_copy_rows_on(
-                    self.conn,
-                    xhs_self_nickname=xhs_self_nickname,
-                    _viewed_content_keys=viewed_content_keys,
-                )
-            ),
+            "admitted_pending_copy": len(pending_copy_rows),
+            "admitted_pending_available": len(pending_available_rows),
             "pending_eval": pending_eval_count,
             "evaluated_pending": evaluated_pending_count,
         }
@@ -6334,6 +6737,41 @@ class Database:
             if max_rows is not None and len(rows) >= max_rows:
                 break
         return rows
+
+    @staticmethod
+    def _select_admitted_pending_available_rows(
+        pending_copy_rows: Sequence[Mapping[str, Any]],
+        *,
+        copy_ready_rows: Sequence[Mapping[str, Any]],
+        max_per_topic_group: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Return pending-copy rows that can increase public availability.
+
+        Public availability exposes at most ``max_per_topic_group`` ready rows
+        from each topic after canonical seen/linkability filtering. A pending
+        row therefore adds one public slot only while its topic has remaining
+        headroom. ``pending_copy_rows`` is already in canonical copy priority
+        order, so this also produces a stable availability-first prefix.
+        """
+
+        topic_cap = max(0, int(max_per_topic_group))
+        if topic_cap <= 0:
+            return [dict(row) for row in pending_copy_rows]
+
+        ready_by_topic: defaultdict[str, int] = defaultdict(int)
+        for row in copy_ready_rows:
+            ready_by_topic[str(row.get("topic_group") or "")] += 1
+
+        selected_by_topic: defaultdict[str, int] = defaultdict(int)
+        selected: list[dict[str, Any]] = []
+        for row in pending_copy_rows:
+            topic_group = str(row.get("topic_group") or "")
+            remaining = topic_cap - ready_by_topic[topic_group]
+            if selected_by_topic[topic_group] >= max(0, remaining):
+                continue
+            selected.append(dict(row))
+            selected_by_topic[topic_group] += 1
+        return selected
 
     def count_pool_candidates_by_source(self) -> dict[str, int]:
         """Return fresh pool counts grouped by discovery source family."""
@@ -7038,7 +7476,8 @@ class Database:
 
         The former implementation re-ran the full servability window after
         every restored row. A 300-row recovery therefore performed hundreds
-        of window-function scans while holding ``BEGIN IMMEDIATE``. We model
+        of canonical availability scans while holding ``BEGIN IMMEDIATE``.
+        We model
         the availability/source counters in memory; the caller then validates
         the batch against one canonical availability scan and reverts any
         speculative rows that did not produce net-new inventory.
@@ -8489,7 +8928,11 @@ class Database:
         return rows[:limit]
 
     def get_pool_candidates_needing_copy(
-        self, limit: int = 20, *, xhs_self_nickname: str = ""
+        self,
+        limit: int = 20,
+        *,
+        xhs_self_nickname: str = "",
+        eligible_available_first: bool = False,
     ) -> list[dict[str, Any]]:
         """Return fresh pool candidates missing precomputed popup copy.
 
@@ -8497,13 +8940,41 @@ class Database:
         be classified before expression generation.  This prevents
         unclassified items (e.g. raw XHS notes) from getting an expression
         and leaking through the serve gate without proper relevance scoring.
+
+        With ``eligible_available_first``, rows whose completed copy can add a
+        slot to the public per-topic availability window are returned before
+        deeper same-topic rows.  The complete admitted backlog remains
+        selectable after that prefix, preserving copy-watermark fills.
         """
         self._ensure_fresh_read()
-        return self._load_admitted_pending_copy_rows_on(
+        max_rows = max(0, int(limit))
+        if max_rows == 0:
+            return []
+        viewed_content_keys = self.get_recent_viewed_content_keys()
+        pending_rows = self._load_admitted_pending_copy_rows_on(
             self.conn,
             xhs_self_nickname=xhs_self_nickname,
-            limit=limit,
+            _viewed_content_keys=viewed_content_keys,
         )
+        if not eligible_available_first:
+            return pending_rows[:max_rows]
+
+        copy_ready_rows = self._load_available_pool_candidate_rows_on(
+            self.conn,
+            max_per_topic_group=0,
+            xhs_self_nickname=xhs_self_nickname,
+            _viewed_content_keys=viewed_content_keys,
+        )
+        eligible_rows = self._select_admitted_pending_available_rows(
+            pending_rows,
+            copy_ready_rows=copy_ready_rows,
+        )
+        eligible_ids = {str(row.get("bvid") or "") for row in eligible_rows}
+        ordered = [
+            *eligible_rows,
+            *(row for row in pending_rows if str(row.get("bvid") or "") not in eligible_ids),
+        ]
+        return ordered[:max_rows]
 
     def update_pool_copy(
         self,
@@ -9060,6 +9531,901 @@ class Database:
             recommendation_ids,
         )
 
+    def prune_content_history(
+        self,
+        *,
+        retention_days: int = CONTENT_HISTORY_RETENTION_DAYS,
+    ) -> int:
+        """Delete saved-removal snapshots outside the bounded history window."""
+        days = max(1, int(retention_days))
+        cursor = self._execute_write(
+            """
+            DELETE FROM saved_item_removals
+            WHERE removed_at < datetime('now', ?)
+            """,
+            (f"-{days} days",),
+        )
+        return max(0, int(cursor.rowcount or 0))
+
+    def list_content_history(
+        self,
+        category: str,
+        *,
+        limit: int = 12,
+        offset: int = 0,
+        retention_days: int = CONTENT_HISTORY_RETENTION_DAYS,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return an offset-compatible page for legacy callers."""
+        items, total, _has_more, _next_position = self.list_content_history_page(
+            category,
+            limit=limit,
+            offset=offset,
+            retention_days=retention_days,
+        )
+        return items, total
+
+    def list_content_history_page(
+        self,
+        category: str,
+        *,
+        limit: int = 12,
+        offset: int = 0,
+        cursor: tuple[str, int, int, str, int, int, int] | None = None,
+        retention_days: int = CONTENT_HISTORY_RETENTION_DAYS,
+    ) -> tuple[
+        list[dict[str, Any]],
+        int,
+        bool,
+        tuple[str, int, int, str, int, int, int] | None,
+    ]:
+        """Return one page of the 30-day content-history projection.
+
+        ``clicked`` is projected from recommendation-owned click events,
+        ``shown`` from recommendation rows without a matching click, and
+        ``removed`` from saved-list removal snapshots plus explicit card
+        dismiss/dislike feedback.  Rows are deduplicated by canonical item key
+        within each category so repeated exposure does not flood the UI.
+        """
+        normalized_category = str(category or "").strip().lower()
+        if normalized_category not in _CONTENT_HISTORY_CATEGORIES:
+            raise ValueError(f"unsupported content history category: {category!r}")
+        page_limit = max(1, min(100, int(limit)))
+        if cursor is not None:
+            if offset:
+                raise ValueError("content history cursor cannot be combined with offset")
+            (
+                occurred_at,
+                source_kind,
+                source_id,
+                item_key,
+                event_anchor,
+                recommendation_anchor,
+                removal_anchor,
+            ) = cursor
+            if (
+                not isinstance(occurred_at, str)
+                or not occurred_at
+                or len(occurred_at) > 64
+                or any(unicodedata.category(character).startswith("C") for character in occurred_at)
+                or not isinstance(source_kind, int)
+                or isinstance(source_kind, bool)
+                or source_kind < 0
+                or source_kind > 2
+                or not isinstance(source_id, int)
+                or isinstance(source_id, bool)
+                or source_id < 0
+                or source_id > (1 << 63) - 1
+                or not isinstance(item_key, str)
+                or not item_key
+                or len(item_key) > 2048
+                or any(character.isspace() for character in item_key)
+                or any(unicodedata.category(character).startswith("C") for character in item_key)
+                or any(
+                    not isinstance(anchor, int)
+                    or isinstance(anchor, bool)
+                    or anchor < 0
+                    or anchor > (1 << 63) - 1
+                    for anchor in (event_anchor, recommendation_anchor, removal_anchor)
+                )
+            ):
+                raise ValueError("invalid content history cursor position")
+        # Python integers are unbounded, while SQLite LIMIT/OFFSET bindings are
+        # signed 64-bit integers.  The HTTP boundary rejects larger values;
+        # keep the storage API defensive for direct callers too.
+        page_offset = max(0, min((1 << 63) - 1, int(offset)))
+        days = max(1, min(365, int(retention_days)))
+        cutoff = f"-{days} days"
+        self._ensure_fresh_read()
+
+        cursor_anchors: tuple[int | None, int | None, int | None] = (
+            (None, None, None) if cursor is None else (cursor[4], cursor[5], cursor[6])
+        )
+        history_snapshot_cte = """
+            history_snapshot AS MATERIALIZED (
+                SELECT
+                    COALESCE(
+                        ?,
+                        (SELECT COALESCE(MAX(id), 0) FROM events),
+                        0
+                    ) AS event_anchor,
+                    COALESCE(
+                        ?,
+                        (SELECT COALESCE(MAX(id), 0) FROM recommendations),
+                        0
+                    ) AS recommendation_anchor,
+                    COALESCE(
+                        ?,
+                        (SELECT COALESCE(MAX(id), 0) FROM saved_item_removals),
+                        0
+                    ) AS removal_anchor
+            )
+        """
+
+        recent_clicks_cte = """
+            recent_click_facts AS MATERIALIZED (
+                SELECT
+                    e.id AS source_id,
+                    0 AS source_kind,
+                    e.created_at AS occurred_at,
+                    NULLIF(CAST(json_extract(e.metadata, '$.recommendation_id') AS INTEGER), 0)
+                        AS raw_recommendation_id,
+                    CASE
+                        WHEN json_type(e.metadata, '$.source_platform') IS NULL
+                          OR json_type(e.metadata, '$.source_platform') = 'null'
+                          OR (
+                              json_type(e.metadata, '$.source_platform') = 'text'
+                              AND trim(json_extract(
+                                  e.metadata, '$.source_platform'
+                              )) = ''
+                          ) THEN 'bilibili'
+                        WHEN json_type(e.metadata, '$.source_platform') != 'text'
+                            THEN ''
+                        ELSE normalize_source_platform(
+                            json_extract(e.metadata, '$.source_platform')
+                        )
+                    END AS source_platform,
+                    COALESCE(
+                        NULLIF(json_extract(e.metadata, '$.content_id'), ''),
+                        NULLIF(json_extract(e.metadata, '$.bvid'), ''),
+                        ''
+                    ) AS content_id,
+                    COALESCE(
+                        NULLIF(json_extract(e.metadata, '$.content_url'), ''),
+                        NULLIF(e.url, ''),
+                        ''
+                    ) AS content_url,
+                    COALESCE(NULLIF(e.title, ''), '') AS event_title,
+                    COALESCE(
+                        NULLIF(json_extract(e.metadata, '$.up_name'), ''),
+                        NULLIF(json_extract(e.metadata, '$.author'), ''),
+                        ''
+                    ) AS event_author
+                FROM events AS e
+                CROSS JOIN history_snapshot AS snapshot
+                WHERE e.event_type = 'click'
+                  AND e.id <= snapshot.event_anchor
+                  AND e.created_at >= datetime('now', ?)
+                  AND json_valid(e.metadata)
+                  AND (
+                      json_extract(e.metadata, '$.source') = 'recommendation_click'
+                      OR json_extract(e.metadata, '$.event_namespace') = 'recommendation'
+                  )
+            ),
+            recent_clicks AS MATERIALIZED (
+                SELECT
+                    facts.source_id,
+                    facts.source_kind,
+                    facts.occurred_at,
+                    COALESCE(r.id, facts.raw_recommendation_id) AS recommendation_id,
+                    COALESCE(
+                        NULLIF(normalize_content_history_item_key(r.item_key), ''),
+                        NULLIF((
+                            SELECT normalize_content_history_item_key(cc.item_key)
+                            FROM content_cache AS cc
+                            WHERE normalize_source_platform(cc.source_platform) =
+                                    facts.source_platform
+                              AND facts.source_platform != ''
+                              AND cc.content_id = facts.content_id
+                              AND cc.item_key != ''
+                            ORDER BY cc.last_scored_at DESC, cc.bvid DESC
+                            LIMIT 1
+                        ), ''),
+                        NULLIF(normalize_content_history_item_key(r.bvid), ''),
+                        NULLIF(normalize_content_history_item_key(
+                            facts.source_platform || ':' || r.bvid
+                        ), ''),
+                        NULLIF(normalize_content_history_item_key(
+                            facts.source_platform || ':' || facts.content_id
+                        ), ''),
+                        COALESCE(
+                            NULLIF(facts.source_platform, ''),
+                            'unknown'
+                        ) || ':event-' || facts.source_id
+                    ) AS resolved_item_key,
+                    COALESCE(
+                        (
+                            SELECT cc.bvid
+                            FROM content_cache AS cc
+                            WHERE cc.item_key = r.item_key
+                            ORDER BY cc.last_scored_at DESC, cc.bvid DESC
+                            LIMIT 1
+                        ),
+                        (
+                            SELECT cc.bvid
+                            FROM content_cache AS cc
+                            WHERE cc.bvid = r.bvid
+                            LIMIT 1
+                        ),
+                        (
+                            SELECT cc.bvid
+                            FROM content_cache AS cc
+                            WHERE normalize_source_platform(cc.source_platform) =
+                                    facts.source_platform
+                              AND facts.source_platform != ''
+                              AND cc.content_id = facts.content_id
+                            ORDER BY cc.last_scored_at DESC, cc.bvid DESC
+                            LIMIT 1
+                        )
+                    ) AS hydration_bvid,
+                    COALESCE(
+                        NULLIF(content_history_item_key_content_id(
+                            normalize_content_history_item_key(r.item_key)
+                        ), ''),
+                        NULLIF(content_history_item_key_content_id(
+                            normalize_content_history_item_key(r.bvid)
+                        ), ''),
+                        CASE WHEN instr(r.bvid, ':') = 0 THEN r.bvid ELSE '' END,
+                        ''
+                    ) AS recommendation_content_id,
+                    facts.source_platform,
+                    facts.content_id,
+                    facts.content_url,
+                    facts.event_title,
+                    facts.event_author
+                FROM recent_click_facts AS facts
+                LEFT JOIN recommendations AS r ON r.id = facts.raw_recommendation_id
+            )
+        """
+
+        if normalized_category == "clicked":
+            cte = (
+                "WITH "
+                + history_snapshot_cte
+                + ","
+                + recent_clicks_cte
+                + """,
+                hydrated AS (
+                    SELECT
+                        recent_clicks.source_id,
+                        recent_clicks.source_kind,
+                        recent_clicks.occurred_at,
+                        recent_clicks.recommendation_id,
+                        recent_clicks.resolved_item_key AS item_key,
+                        COALESCE(
+                            NULLIF(normalize_source_platform(c.source_platform), ''),
+                            NULLIF(content_history_item_key_platform(
+                                recent_clicks.resolved_item_key
+                            ), ''),
+                            recent_clicks.source_platform
+                        ) AS source_platform,
+                        COALESCE(
+                            NULLIF(c.content_id, ''),
+                            NULLIF(recent_clicks.content_id, ''),
+                            NULLIF(recent_clicks.recommendation_content_id, ''),
+                            ''
+                        ) AS content_id,
+                        COALESCE(
+                            NULLIF(c.content_url, ''),
+                            NULLIF(recent_clicks.content_url, ''),
+                            ''
+                        ) AS content_url,
+                        COALESCE(NULLIF(c.content_type, ''), 'video') AS content_type,
+                        COALESCE(NULLIF(c.title, ''), NULLIF(recent_clicks.event_title, ''), '')
+                            AS title,
+                        COALESCE(NULLIF(c.up_name, ''), NULLIF(c.author_name, ''),
+                                 NULLIF(recent_clicks.event_author, ''), '') AS author_name,
+                        COALESCE(c.cover_url, '') AS cover_url,
+                        COALESCE(c.body_text, '') AS body_text,
+                        '' AS context,
+                        0 AS restored,
+                        '[]' AS contexts_json
+                    FROM recent_clicks
+                    LEFT JOIN content_cache AS c
+                      ON c.bvid = recent_clicks.hydration_bvid
+                ),
+                ranked AS (
+                    SELECT hydrated.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY item_key
+                               ORDER BY occurred_at DESC, source_kind DESC, source_id DESC
+                           ) AS row_number
+                    FROM hydrated
+                ),
+                entries AS MATERIALIZED (
+                    SELECT * FROM ranked WHERE row_number = 1
+                )
+            """
+            )
+            params: tuple[Any, ...] = (*cursor_anchors, cutoff)
+        elif normalized_category == "shown":
+            cte = (
+                "WITH "
+                + history_snapshot_cte
+                + ","
+                + recent_clicks_cte
+                + """,
+                clicked_recommendation_ids AS MATERIALIZED (
+                    SELECT DISTINCT recommendation_id
+                    FROM recent_clicks
+                    WHERE recommendation_id IS NOT NULL
+                ),
+                clicked_item_keys AS MATERIALIZED (
+                    SELECT DISTINCT resolved_item_key
+                    FROM recent_clicks
+                ),
+                eligible AS MATERIALIZED (
+                    SELECT
+                        r.id AS source_id,
+                        0 AS source_kind,
+                        COALESCE(r.presented_at, r.created_at) AS occurred_at,
+                        r.id AS recommendation_id,
+                        COALESCE(
+                            NULLIF(normalize_content_history_item_key(r.item_key), ''),
+                            NULLIF((
+                                SELECT normalize_content_history_item_key(cc.item_key)
+                                FROM content_cache AS cc
+                                WHERE cc.bvid = r.bvid
+                                LIMIT 1
+                            ), ''),
+                            NULLIF((
+                                SELECT normalize_content_history_item_key(cc.item_key)
+                                FROM content_cache AS cc
+                                WHERE cc.content_id = r.bvid
+                                  AND cc.item_key != ''
+                                ORDER BY
+                                    CASE
+                                        WHEN normalize_source_platform(
+                                            cc.source_platform
+                                        ) = 'bilibili' THEN 0
+                                        ELSE 1
+                                    END,
+                                    cc.last_scored_at DESC,
+                                    cc.bvid DESC
+                                LIMIT 1
+                            ), ''),
+                            NULLIF(normalize_content_history_item_key(r.bvid), ''),
+                            NULLIF(normalize_content_history_item_key(
+                                'bilibili:' || r.bvid
+                            ), ''),
+                            'bilibili:rec-' || r.id
+                        ) AS resolved_item_key,
+                        COALESCE(
+                            (
+                                SELECT cc.bvid
+                                FROM content_cache AS cc
+                                WHERE cc.item_key = r.item_key
+                                ORDER BY cc.last_scored_at DESC, cc.bvid DESC
+                                LIMIT 1
+                            ),
+                            (
+                                SELECT cc.bvid
+                                FROM content_cache AS cc
+                                WHERE cc.bvid = r.bvid
+                                LIMIT 1
+                            ),
+                            (
+                                SELECT cc.bvid
+                                FROM content_cache AS cc
+                                WHERE cc.content_id = r.bvid
+                                ORDER BY
+                                    CASE
+                                        WHEN normalize_source_platform(
+                                            cc.source_platform
+                                        ) = 'bilibili' THEN 0
+                                        ELSE 1
+                                    END,
+                                    cc.last_scored_at DESC,
+                                    cc.bvid DESC
+                                LIMIT 1
+                            )
+                        ) AS hydration_bvid,
+                        COALESCE(
+                            NULLIF(content_history_item_key_content_id(
+                                normalize_content_history_item_key(r.item_key)
+                            ), ''),
+                            NULLIF(content_history_item_key_content_id(
+                                normalize_content_history_item_key(r.bvid)
+                            ), ''),
+                            CASE WHEN instr(r.bvid, ':') = 0 THEN r.bvid ELSE '' END,
+                            ''
+                        ) AS fallback_content_id,
+                        r.bvid
+                    FROM recommendations AS r
+                    CROSS JOIN history_snapshot AS snapshot
+                    WHERE COALESCE(r.presented_at, r.created_at) >= datetime('now', ?)
+                      AND r.id <= snapshot.recommendation_anchor
+                      AND COALESCE(r.feedback_type, '') NOT IN ('dismiss', 'dislike')
+                ),
+                hydrated AS (
+                    SELECT
+                        eligible.source_id,
+                        eligible.source_kind,
+                        eligible.occurred_at,
+                        eligible.recommendation_id,
+                        eligible.resolved_item_key AS item_key,
+                        COALESCE(
+                            NULLIF(normalize_source_platform(c.source_platform), ''),
+                            NULLIF(content_history_item_key_platform(
+                                eligible.resolved_item_key
+                            ), ''),
+                            'bilibili'
+                        ) AS source_platform,
+                        COALESCE(
+                            NULLIF(c.content_id, ''),
+                            NULLIF(eligible.fallback_content_id, ''),
+                            ''
+                        ) AS content_id,
+                        COALESCE(c.content_url, '') AS content_url,
+                        COALESCE(NULLIF(c.content_type, ''), 'video') AS content_type,
+                        COALESCE(c.title, '') AS title,
+                        COALESCE(NULLIF(c.up_name, ''), NULLIF(c.author_name, ''), '')
+                            AS author_name,
+                        COALESCE(c.cover_url, '') AS cover_url,
+                        COALESCE(c.body_text, '') AS body_text,
+                        '' AS context,
+                        0 AS restored,
+                        '[]' AS contexts_json
+                    FROM eligible
+                    LEFT JOIN content_cache AS c ON c.bvid = eligible.hydration_bvid
+                    WHERE eligible.source_id NOT IN (
+                              SELECT recommendation_id
+                              FROM clicked_recommendation_ids
+                          )
+                      AND eligible.resolved_item_key NOT IN (
+                              SELECT resolved_item_key
+                              FROM clicked_item_keys
+                          )
+                ),
+                ranked AS (
+                    SELECT hydrated.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY item_key
+                               ORDER BY occurred_at DESC, source_kind DESC, source_id DESC
+                           ) AS row_number
+                    FROM hydrated
+                ),
+                entries AS MATERIALIZED (
+                    SELECT * FROM ranked WHERE row_number = 1
+                )
+            """
+            )
+            params = (*cursor_anchors, cutoff, cutoff)
+        else:
+            cte = (
+                "WITH "
+                + history_snapshot_cte
+                + """,
+                normalized_memberships AS MATERIALIZED (
+                    SELECT
+                        list_kind,
+                        normalize_content_history_item_key(item_key) AS canonical_item_key
+                    FROM saved_memberships
+                ),
+                recent_saved_facts AS MATERIALIZED (
+                    SELECT
+                        COALESCE(
+                            NULLIF(normalize_content_history_item_key(removal.item_key), ''),
+                            NULLIF(normalize_content_history_item_key(
+                                normalize_source_platform(removal.source_platform)
+                                || ':' || removal.content_id
+                            ), ''),
+                            ''
+                        ) AS canonical_item_key,
+                        removal.*
+                    FROM saved_item_removals AS removal
+                    CROSS JOIN history_snapshot AS snapshot
+                    WHERE removal.removed_at >= datetime('now', ?)
+                      AND removal.id <= snapshot.removal_anchor
+                ),
+                recent_saved AS (
+                    SELECT
+                        removal.id AS source_id,
+                        2 AS source_kind,
+                        removal.removed_at AS occurred_at,
+                        NULL AS recommendation_id,
+                        COALESCE(
+                            NULLIF(removal.canonical_item_key, ''),
+                            'bilibili:removal-' || removal.id
+                        ) AS item_key,
+                        COALESCE(
+                            NULLIF(normalize_source_platform(removal.source_platform), ''),
+                            NULLIF(content_history_item_key_platform(
+                                removal.canonical_item_key
+                            ), ''),
+                            'bilibili'
+                        ) AS source_platform,
+                        removal.content_id,
+                        removal.content_url,
+                        removal.content_type,
+                        removal.title,
+                        removal.author_name,
+                        removal.cover_url,
+                        '' AS body_text,
+                        removal.list_kind AS context,
+                        CASE WHEN EXISTS (
+                            SELECT 1
+                            FROM normalized_memberships AS membership
+                            WHERE membership.list_kind = removal.list_kind
+                              AND removal.canonical_item_key != ''
+                              AND membership.canonical_item_key != ''
+                              AND membership.canonical_item_key =
+                                  removal.canonical_item_key
+                        ) THEN 1 ELSE 0 END AS restored
+                    FROM recent_saved_facts AS removal
+                ),
+                eligible_feedback AS MATERIALIZED (
+                    SELECT
+                        r.id AS source_id,
+                        1 AS source_kind,
+                        COALESCE(r.feedback_at, r.created_at) AS occurred_at,
+                        r.id AS recommendation_id,
+                        COALESCE(
+                            NULLIF(normalize_content_history_item_key(r.item_key), ''),
+                            NULLIF((
+                                SELECT normalize_content_history_item_key(cc.item_key)
+                                FROM content_cache AS cc
+                                WHERE cc.bvid = r.bvid
+                                LIMIT 1
+                            ), ''),
+                            NULLIF((
+                                SELECT normalize_content_history_item_key(cc.item_key)
+                                FROM content_cache AS cc
+                                WHERE cc.content_id = r.bvid
+                                  AND cc.item_key != ''
+                                ORDER BY
+                                    CASE
+                                        WHEN normalize_source_platform(
+                                            cc.source_platform
+                                        ) = 'bilibili' THEN 0
+                                        ELSE 1
+                                    END,
+                                    cc.last_scored_at DESC,
+                                    cc.bvid DESC
+                                LIMIT 1
+                            ), ''),
+                            NULLIF(normalize_content_history_item_key(r.bvid), ''),
+                            NULLIF(normalize_content_history_item_key(
+                                'bilibili:' || r.bvid
+                            ), ''),
+                            'bilibili:rec-' || r.id
+                        ) AS resolved_item_key,
+                        COALESCE(
+                            (
+                                SELECT cc.bvid
+                                FROM content_cache AS cc
+                                WHERE cc.item_key = r.item_key
+                                ORDER BY cc.last_scored_at DESC, cc.bvid DESC
+                                LIMIT 1
+                            ),
+                            (
+                                SELECT cc.bvid
+                                FROM content_cache AS cc
+                                WHERE cc.bvid = r.bvid
+                                LIMIT 1
+                            ),
+                            (
+                                SELECT cc.bvid
+                                FROM content_cache AS cc
+                                WHERE cc.content_id = r.bvid
+                                ORDER BY
+                                    CASE
+                                        WHEN normalize_source_platform(
+                                            cc.source_platform
+                                        ) = 'bilibili' THEN 0
+                                        ELSE 1
+                                    END,
+                                    cc.last_scored_at DESC,
+                                    cc.bvid DESC
+                                LIMIT 1
+                            )
+                        ) AS hydration_bvid,
+                        COALESCE(
+                            NULLIF(content_history_item_key_content_id(
+                                normalize_content_history_item_key(r.item_key)
+                            ), ''),
+                            NULLIF(content_history_item_key_content_id(
+                                normalize_content_history_item_key(r.bvid)
+                            ), ''),
+                            CASE WHEN instr(r.bvid, ':') = 0 THEN r.bvid ELSE '' END,
+                            ''
+                        ) AS fallback_content_id,
+                        r.bvid,
+                        COALESCE(r.feedback_type, 'dismiss') AS context
+                    FROM recommendations AS r
+                    CROSS JOIN history_snapshot AS snapshot
+                    WHERE r.feedback_type IN ('dismiss', 'dislike')
+                      AND COALESCE(r.feedback_at, r.created_at) >= datetime('now', ?)
+                      AND r.id <= snapshot.recommendation_anchor
+                ),
+                recent_feedback AS (
+                    SELECT
+                        eligible_feedback.source_id,
+                        eligible_feedback.source_kind,
+                        eligible_feedback.occurred_at,
+                        eligible_feedback.recommendation_id,
+                        eligible_feedback.resolved_item_key AS item_key,
+                        COALESCE(
+                            NULLIF(normalize_source_platform(c.source_platform), ''),
+                            NULLIF(content_history_item_key_platform(
+                                eligible_feedback.resolved_item_key
+                            ), ''),
+                            'bilibili'
+                        ) AS source_platform,
+                        COALESCE(
+                            NULLIF(c.content_id, ''),
+                            NULLIF(eligible_feedback.fallback_content_id, ''),
+                            ''
+                        ) AS content_id,
+                        COALESCE(c.content_url, '') AS content_url,
+                        COALESCE(NULLIF(c.content_type, ''), 'video') AS content_type,
+                        COALESCE(c.title, '') AS title,
+                        COALESCE(NULLIF(c.up_name, ''), NULLIF(c.author_name, ''), '')
+                            AS author_name,
+                        COALESCE(c.cover_url, '') AS cover_url,
+                        COALESCE(c.body_text, '') AS body_text,
+                        eligible_feedback.context,
+                        0 AS restored
+                    FROM eligible_feedback
+                    LEFT JOIN content_cache AS c
+                      ON c.bvid = eligible_feedback.hydration_bvid
+                ),
+                hydrated AS (
+                    SELECT * FROM recent_saved
+                    UNION ALL
+                    SELECT * FROM recent_feedback
+                ),
+                context_ranked AS (
+                    SELECT hydrated.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY item_key, context
+                               ORDER BY occurred_at DESC, source_kind DESC, source_id DESC
+                           ) AS context_row_number
+                    FROM hydrated
+                ),
+                latest_contexts AS MATERIALIZED (
+                    SELECT *
+                    FROM context_ranked
+                    WHERE context_row_number = 1
+                ),
+                card_ranked AS (
+                    SELECT latest_contexts.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY item_key
+                               ORDER BY
+                                   occurred_at DESC,
+                                   source_kind DESC,
+                                   source_id DESC,
+                                   context ASC
+                           ) AS card_row_number
+                    FROM latest_contexts
+                ),
+                context_summaries AS MATERIALIZED (
+                    SELECT
+                        item_key,
+                        MAX(CASE WHEN context = 'favorite' THEN occurred_at END)
+                            AS favorite_occurred_at,
+                        MAX(CASE WHEN context = 'favorite' THEN restored ELSE 0 END)
+                            AS favorite_restored,
+                        MAX(CASE WHEN context = 'favorite' THEN source_id ELSE 0 END)
+                            AS favorite_source_id,
+                        MAX(CASE WHEN context = 'watch_later' THEN occurred_at END)
+                            AS watch_later_occurred_at,
+                        MAX(CASE WHEN context = 'watch_later' THEN restored ELSE 0 END)
+                            AS watch_later_restored,
+                        MAX(CASE WHEN context = 'watch_later' THEN source_id ELSE 0 END)
+                            AS watch_later_source_id,
+                        MAX(CASE WHEN context = 'dismiss' THEN occurred_at END)
+                            AS dismiss_occurred_at,
+                        MAX(CASE WHEN context = 'dismiss' THEN source_id ELSE 0 END)
+                            AS dismiss_source_id,
+                        MAX(CASE WHEN context = 'dislike' THEN occurred_at END)
+                            AS dislike_occurred_at,
+                        MAX(CASE WHEN context = 'dislike' THEN source_id ELSE 0 END)
+                            AS dislike_source_id
+                    FROM latest_contexts
+                    GROUP BY item_key
+                ),
+                entries AS MATERIALIZED (
+                    SELECT
+                        card_ranked.source_id,
+                        card_ranked.source_kind,
+                        card_ranked.occurred_at,
+                        card_ranked.recommendation_id,
+                        card_ranked.item_key,
+                        card_ranked.source_platform,
+                        card_ranked.content_id,
+                        card_ranked.content_url,
+                        card_ranked.content_type,
+                        card_ranked.title,
+                        card_ranked.author_name,
+                        card_ranked.cover_url,
+                        card_ranked.body_text,
+                        card_ranked.context,
+                        card_ranked.restored,
+                        context_summaries.favorite_occurred_at,
+                        context_summaries.favorite_restored,
+                        context_summaries.favorite_source_id,
+                        context_summaries.watch_later_occurred_at,
+                        context_summaries.watch_later_restored,
+                        context_summaries.watch_later_source_id,
+                        context_summaries.dismiss_occurred_at,
+                        context_summaries.dismiss_source_id,
+                        context_summaries.dislike_occurred_at,
+                        context_summaries.dislike_source_id
+                    FROM card_ranked
+                    JOIN context_summaries USING (item_key)
+                    WHERE card_ranked.card_row_number = 1
+                )
+            """
+            )
+            params = (*cursor_anchors, cutoff, cutoff)
+
+        cursor_clause = ""
+        cursor_params: tuple[Any, ...] = ()
+        if cursor is not None:
+            occurred_at, source_kind, source_id, item_key = cursor[:4]
+            cursor_clause = """
+                WHERE
+                    occurred_at < ?
+                    OR (occurred_at = ? AND source_kind < ?)
+                    OR (
+                        occurred_at = ?
+                        AND source_kind = ?
+                        AND source_id < ?
+                    )
+                    OR (
+                        occurred_at = ?
+                        AND source_kind = ?
+                        AND source_id = ?
+                        AND item_key > ?
+                    )
+            """
+            cursor_params = (
+                occurred_at,
+                occurred_at,
+                source_kind,
+                occurred_at,
+                source_kind,
+                source_id,
+                occurred_at,
+                source_kind,
+                source_id,
+                item_key,
+            )
+        context_columns = ""
+        if normalized_category == "removed":
+            context_columns = """
+                , favorite_occurred_at, favorite_restored, favorite_source_id
+                , watch_later_occurred_at, watch_later_restored, watch_later_source_id
+                , dismiss_occurred_at, dismiss_source_id
+                , dislike_occurred_at, dislike_source_id
+            """
+
+        connection = self.conn
+        owns_read_snapshot = not connection.in_transaction
+        if owns_read_snapshot:
+            connection.execute("BEGIN")
+        try:
+            rows = connection.execute(
+                cte
+                + f"""
+                    SELECT
+                        item_key, source_platform, content_id, content_url,
+                        content_type, title, author_name, cover_url, body_text,
+                        recommendation_id, occurred_at, context, restored,
+                        source_kind, source_id
+                        {context_columns},
+                        (SELECT COUNT(*) FROM entries) AS history_total,
+                        (SELECT event_anchor FROM history_snapshot) AS history_event_anchor,
+                        (SELECT recommendation_anchor FROM history_snapshot)
+                            AS history_recommendation_anchor,
+                        (SELECT removal_anchor FROM history_snapshot) AS history_removal_anchor
+                    FROM entries
+                    {cursor_clause}
+                    ORDER BY occurred_at DESC, source_kind DESC, source_id DESC, item_key ASC
+                    LIMIT ? OFFSET ?
+                """,
+                (*params, *cursor_params, page_limit + 1, page_offset),
+            ).fetchall()
+            if rows:
+                total = int(rows[0]["history_total"] or 0)
+            elif page_offset > 0 or cursor is not None:
+                # An empty OFFSET/keyset page has no row to carry the scalar
+                # total.  This fallback remains in the same explicit read
+                # transaction, so it cannot observe a different WAL head.
+                count_row = connection.execute(
+                    cte + " SELECT COUNT(*) AS count FROM entries",
+                    params,
+                ).fetchone()
+                total = int(count_row["count"] or 0) if count_row is not None else 0
+            else:
+                total = 0
+        except Exception:
+            if owns_read_snapshot:
+                connection.rollback()
+            raise
+        else:
+            if owns_read_snapshot:
+                connection.commit()
+
+        has_more = len(rows) > page_limit
+        page_rows = rows[:page_limit]
+        next_position: tuple[str, int, int, str, int, int, int] | None = None
+        if has_more and page_rows:
+            last_row = page_rows[-1]
+            next_position = (
+                str(last_row["occurred_at"] or ""),
+                int(last_row["source_kind"] or 0),
+                int(last_row["source_id"] or 0),
+                str(last_row["item_key"] or ""),
+                int(last_row["history_event_anchor"] or 0),
+                int(last_row["history_recommendation_anchor"] or 0),
+                int(last_row["history_removal_anchor"] or 0),
+            )
+
+        result: list[dict[str, Any]] = []
+        for row in page_rows:
+            item = dict(row)
+            item.pop("history_total", None)
+            item.pop("history_event_anchor", None)
+            item.pop("history_recommendation_anchor", None)
+            item.pop("history_removal_anchor", None)
+            item.pop("source_kind", None)
+            item.pop("source_id", None)
+            contexts: list[dict[str, Any]] = []
+            if normalized_category == "removed":
+                context_specs = (
+                    ("favorite", "favorite", 2),
+                    ("watch_later", "watch_later", 2),
+                    ("dismiss", "dismiss", 1),
+                    ("dislike", "dislike", 1),
+                )
+                sortable_contexts: list[tuple[str, int, int, dict[str, Any]]] = []
+                for context_name, column_prefix, context_source_kind in context_specs:
+                    context_occurred_at = str(item.pop(f"{column_prefix}_occurred_at", "") or "")
+                    context_source_id = int(item.pop(f"{column_prefix}_source_id", 0) or 0)
+                    if not context_occurred_at:
+                        if context_name in {"favorite", "watch_later"}:
+                            item.pop(f"{column_prefix}_restored", None)
+                        continue
+                    context_restored = False
+                    if context_name in {"favorite", "watch_later"}:
+                        context_restored = bool(item.pop(f"{column_prefix}_restored", 0))
+                    detail = {
+                        "context": context_name,
+                        "occurred_at": context_occurred_at,
+                        "restored": context_restored,
+                    }
+                    sortable_contexts.append(
+                        (
+                            context_occurred_at,
+                            context_source_kind,
+                            context_source_id,
+                            detail,
+                        )
+                    )
+                # Establish the final ASC tie-break before the stable DESC
+                # sort for the first three order dimensions.
+                sortable_contexts.sort(key=lambda value: str(value[3]["context"]))
+                sortable_contexts.sort(
+                    key=lambda value: (value[0], value[1], value[2]),
+                    reverse=True,
+                )
+                contexts = [value[3] for value in sortable_contexts]
+            item["contexts"] = contexts
+            result.append(item)
+        return result, total, has_more, next_position
+
     def close(self) -> None:
         """Close owned workers, then every thread-affine SQLite connection."""
         for attribute in ("_maintenance_executor", "_serve_executor"):
@@ -9172,6 +10538,24 @@ class Database:
             "relevance_score": "REAL DEFAULT 0.0",
             "relevance_reason": "TEXT DEFAULT ''",
             "candidate_tier": "TEXT DEFAULT 'primary'",
+        }
+        for column_name, column_type in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            self.conn.execute(f"ALTER TABLE content_cache ADD COLUMN {column_name} {column_type}")
+
+    def _ensure_content_cache_temporal_columns(self) -> None:
+        """Backfill evaluator-owned temporal metadata for existing caches."""
+
+        existing_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(content_cache)").fetchall()
+        }
+        required_columns = {
+            "temporal_class": "TEXT DEFAULT 'unknown'",
+            "temporal_confidence": "REAL DEFAULT 0.0",
+            "temporal_reason": "TEXT DEFAULT ''",
+            "temporal_policy_version": "TEXT DEFAULT 'v1'",
         }
         for column_name, column_type in required_columns.items():
             if column_name in existing_columns:
@@ -9892,6 +11276,10 @@ class Database:
             "rating_score": "REAL NOT NULL DEFAULT 0.0",
             "rating_count": "INTEGER NOT NULL DEFAULT 0",
             "source_rank": "INTEGER NOT NULL DEFAULT 0",
+            "temporal_class": "TEXT NOT NULL DEFAULT 'unknown'",
+            "temporal_confidence": "REAL NOT NULL DEFAULT 0.0",
+            "temporal_reason": "TEXT NOT NULL DEFAULT ''",
+            "temporal_policy_version": "TEXT NOT NULL DEFAULT 'v1'",
         }
         for column_name, column_type in required_columns.items():
             if column_name in existing_columns:
@@ -12882,6 +14270,40 @@ class Database:
         )
         return [dict(row) for row in cursor.fetchall()]
 
+    def _ensure_content_history_tables(self) -> None:
+        """Create the bounded audit projection used by the history surfaces.
+
+        Recommendation exposure and click facts already have durable owners in
+        ``recommendations`` and ``events``.  Only local saved-list removals lose
+        their item snapshot during deletion, so this table records that missing
+        fact instead of duplicating all three history streams.
+        """
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS saved_item_removals (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                list_kind       TEXT NOT NULL
+                    CHECK (list_kind IN ('favorite', 'watch_later')),
+                item_key        TEXT NOT NULL,
+                source_platform TEXT NOT NULL,
+                content_id      TEXT NOT NULL,
+                content_url     TEXT NOT NULL DEFAULT '',
+                content_type    TEXT NOT NULL DEFAULT 'video',
+                title           TEXT NOT NULL DEFAULT '',
+                author_name     TEXT NOT NULL DEFAULT '',
+                cover_url       TEXT NOT NULL DEFAULT '',
+                removed_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_saved_item_removals_removed
+                ON saved_item_removals (removed_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_saved_item_removals_item
+                ON saved_item_removals (item_key, removed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_events_type_created
+                ON events (event_type, created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_recommendations_feedback_created
+                ON recommendations (feedback_type, feedback_at DESC, id DESC);
+        """)
+        self.prune_content_history()
+
     def _ensure_saved_sync_tables(self) -> None:
         """Create normalized saved-content tables and import legacy saved rows once."""
         self.conn.executescript("""
@@ -13723,6 +15145,10 @@ class Database:
         conn = self.open_connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            removed_snapshot = conn.execute(
+                self._saved_membership_select() + " WHERE m.list_kind = ? AND m.item_key = ?",
+                (normalized_kind, normalized_key),
+            ).fetchone()
             active_state = conn.execute(
                 """
                 SELECT task_id
@@ -13750,6 +15176,33 @@ class Database:
                 (normalized_kind, normalized_key),
             )
             removed = int(cursor.rowcount or 0) > 0
+            if removed and removed_snapshot is not None:
+                conn.execute(
+                    """
+                    INSERT INTO saved_item_removals (
+                        list_kind, item_key, source_platform, content_id,
+                        content_url, content_type, title, author_name, cover_url
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized_kind,
+                        normalized_key,
+                        str(removed_snapshot["source_platform"] or ""),
+                        str(removed_snapshot["content_id"] or ""),
+                        str(removed_snapshot["content_url"] or ""),
+                        str(removed_snapshot["content_type"] or "video"),
+                        str(removed_snapshot["title"] or ""),
+                        str(removed_snapshot["author_name"] or ""),
+                        str(removed_snapshot["cover_url"] or ""),
+                    ),
+                )
+            conn.execute(
+                """
+                DELETE FROM saved_item_removals
+                WHERE removed_at < datetime('now', ?)
+                """,
+                (f"-{CONTENT_HISTORY_RETENTION_DAYS} days",),
+            )
             direct_bilibili_clause = "bvid = ? OR" if legacy_bvid is not None else ""
             legacy_params = (legacy_bvid, normalized_key) if legacy_bvid else (normalized_key,)
             legacy_cursor = conn.execute(

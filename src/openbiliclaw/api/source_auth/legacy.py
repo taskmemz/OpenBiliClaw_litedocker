@@ -16,13 +16,11 @@ was written to never claim success. No function of the orthogonal fields can
 produce both answers — the legacy value carries platform-specific history that
 the new fields deliberately discard.
 
-So Wave A keeps the provider's own legacy value verbatim (guaranteeing the
-promised byte-identical output) and ships the orthogonal fields alongside it.
-The orthogonal fields are allowed to be *more* accurate than the legacy ones:
-once B站 and 抖音 gain live probes, their ``verification`` becomes ``verified``
-while ``legacy_state`` stays ``ready`` / ``unverified`` respectively. Users see
-the upgrade only when the frontends switch over (Wave B), which is exactly the
-zero-break property Wave A promises.
+The compatibility value therefore stays provider-owned and ships alongside the
+orthogonal fields. It cannot be produced by one global mapping. A provider can,
+however, intentionally move its own compatibility value when stronger evidence
+arrives: 抖音 now reports ``ready`` after a successful live probe instead of
+returning a response whose compatibility and orthogonal views disagree.
 
 What we *can* enforce is that the two views never contradict each other. That
 is what :func:`check_legacy_consistency` does, and the contract tests run it on

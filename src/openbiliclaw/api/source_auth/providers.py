@@ -14,14 +14,15 @@ quietly skip one:
 * ``auth_required`` — does this source need a credential at all?
 * ``credential`` / ``credential_origin`` — is one stored, and where?
 * ``verification`` / ``verify_method`` — what was concluded, and *how*?
-* ``legacy_state`` / ``legacy_logged_in`` — the pre-existing verdict, carried
-  verbatim.
+* ``legacy_state`` / ``legacy_logged_in`` — the compatibility verdict in the
+  old vocabulary.
 
-**The legacy fields are transcribed, never derived.** Wave A promises
-byte-identical output from the old endpoint, and the old ``state`` is provably
-not a function of the orthogonal fields (see ``legacy.py``). Each provider
-therefore repeats its historical branch structure exactly, and
-``check_legacy_consistency`` asserts the two views never contradict each other.
+**The compatibility fields remain provider-owned, never globally derived.**
+The old ``state`` is provably not a function of the orthogonal fields (see
+``legacy.py``), so each provider preserves its platform-specific semantics.
+When a provider gains stronger evidence, it may intentionally move within the
+old vocabulary too; ``check_legacy_consistency`` asserts the two views never
+contradict each other.
 
 **No provider performs network I/O.** The status endpoint is polled every ~30s
 by open settings pages; the two platforms with live probes (B站, 抖音) read a
@@ -538,9 +539,9 @@ def auth_douyin(ctx: SourceAuthContext) -> SourceAuthContract:
     ("用户未登录") when not (spec D11, refuting the old "no stable nav endpoint"
     claim). The verdict is read from the probe cache, never fetched here.
 
-    Note the legacy verdict stays ``("unverified", False)`` even when a cached
-    probe says ``verified``: that literal pair is what Wave A froze, and the
-    upgrade reaches users when the frontends switch to the orthogonal fields.
+    The compatibility fields follow the same cached verdict as the orthogonal
+    contract. Keeping ``state='unverified'`` after a successful live probe made
+    ``GET /api/sources/status`` contradict itself for legacy/agent consumers.
     """
     cfg = ctx.cfg
     dy_cfg = ctx.source_cfg("douyin")
@@ -569,6 +570,12 @@ def auth_douyin(ctx: SourceAuthContext) -> SourceAuthContract:
 
     origin: CredentialOrigin = "env" if os.environ.get(cookie_env, "").strip() else "data_file"
     verification, verified_at = _probe_verdict(ctx, "douyin", credential="present", cookie=cookie)
+    if verification == "verified":
+        legacy_state, legacy_logged_in = "ready", True
+    elif verification == "stale":
+        legacy_state, legacy_logged_in = "stale", False
+    else:
+        legacy_state, legacy_logged_in = "unverified", False
     return SourceAuthContract(
         auth_required=True,
         credential="present",
@@ -579,8 +586,8 @@ def auth_douyin(ctx: SourceAuthContext) -> SourceAuthContract:
         verify_ttl_seconds=_probe_ttl(verification),
         can_verify_now=True,
         detail=_DOUYIN_DETAIL.get(verification, _DOUYIN_DETAIL["unverified"]),
-        legacy_state="unverified",
-        legacy_logged_in=False,
+        legacy_state=legacy_state,
+        legacy_logged_in=legacy_logged_in,
     )
 
 
@@ -794,7 +801,7 @@ def auth_zhihu(ctx: SourceAuthContext) -> SourceAuthContract:
         # Timestamp columns feed only the display-only ``verified_at``. The
         # legacy branch never read them, so a row that cannot supply them must
         # cost the timestamp and nothing else — without this guard an unexpected
-        # row shape would raise out of the handler and 500 all seven platforms.
+        # row shape would raise out of the handler and 500 the entire source-status response.
         at = ""
         with suppress(Exception):
             at = str(_row_value(row, "completed_at", 4) or _row_value(row, "created_at", 3) or "")
@@ -1104,14 +1111,12 @@ def auth_bangumi(ctx: SourceAuthContext) -> SourceAuthContract:
     not, and folding it back into ``legacy_state`` would re-create the D1
     conflation the contract exists to remove.
 
-    **Known contract-shape gap (reported, not papered over):** because
-    ``auth_required=False``, the frontends render Bangumi as 「无需登录」 and
-    suppress the evidence badge even when a token is verified — ``source-auth.md``
-    is explicit that a no-credential source has no evidence to grade. The token
-    verdict is still carried honestly in these fields and surfaced via the verify
-    button's message and the ``token_state`` chip; showing it as a persistent
-    ◆ 联网验证 badge would need the contract extended with an "optional credential"
-    tier plus a frontend change, which is out of scope for this zero-frontend PR.
+    The shared renderer checks ``hasVerifiableCredential()`` before applying the
+    anonymous-source shortcut. No token therefore renders 「无需登录」, while a
+    configured token keeps its verified/failed/unverified verdict and persistent
+    evidence badge even though ``auth_required`` remains false. Runtime rejection
+    still outranks cached positive evidence through the separate ``token_state``
+    axis; see ``docs/modules/source-auth.md`` for the complete precedence rules.
     """
     bgm = ctx.source_cfg("bangumi")
     token = str(getattr(bgm, "access_token", "") or "").strip()

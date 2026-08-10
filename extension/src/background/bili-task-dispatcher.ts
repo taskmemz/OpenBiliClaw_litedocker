@@ -52,6 +52,8 @@ export interface BiliTask {
   limit?: number;
   page?: number;
   page_size?: number;
+  order?: "totalrank" | "pubdate";
+  discovery_lane?: "recent";
   source_keyword_id?: number;
 }
 
@@ -86,6 +88,7 @@ export function buildBiliTaskUrl(task: BiliTask): string | null {
   if (typeof task.page === "number" && Number.isFinite(task.page) && task.page > 1) {
     params.push(`page=${Math.floor(task.page)}`);
   }
+  if (task.order === "pubdate") params.push("order=pubdate");
   return `https://search.bilibili.com/all?${params.join("&")}`;
 }
 
@@ -100,6 +103,8 @@ export function isValidBiliTask(task: unknown): task is BiliTask {
     if (t[key] === undefined) continue;
     if (typeof t[key] !== "number" || !Number.isFinite(t[key]) || t[key] <= 0) return false;
   }
+  if (t.order !== undefined && t.order !== "totalrank" && t.order !== "pubdate") return false;
+  if (t.discovery_lane !== undefined && t.discovery_lane !== "recent") return false;
   return true;
 }
 

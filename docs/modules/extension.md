@@ -17,12 +17,12 @@
 | 统一品牌图标 | ✅ | Chrome / Edge / Brave / Firefox manifest 使用 16 / 32 / 48 / 128px 精确尺寸图标，side panel 顶部品牌标记、普通透明 PWA 图标、专用不透明 `maskable` / Apple 主屏幕图标、32px 根 favicon、首次设置页、桌面 Web、移动 Web 和 GitHub Pages 官网统一从 `assets/brand/openbiliclaw-icon.png` 派生。源图的半透明边缘已去除旧白底消光色；扩展图标、favicon 与 maskable 图标使用满幅品牌粉底，页面头图容器也用品牌粉承接透明圆角。旧字母 `B`、CSS 圆环和官网重复的内联 SVG favicon 已移除；社交分享图、Chrome Web Store 素材与 README / 官网截图通过 `build_social_preview_assets.py`、`capture_chrome_webstore_ui.py --refresh-docs` 和既有构建脚本确定性重建。 |
 | 8.1 行为采集 | ✅ | `content/kernel.ts` + `shared/platforms/*` + `service-worker.ts` 已接通统一事件链；B 站 / 小红书 / 抖音 / YouTube / X / 知乎都通过 `PlatformAdapter` 产出同一 `BehaviorEvent` 形态，平台差异只保留在 selector、内容 ID 和 action 识别中；Reddit 通过插件任务源接入初始化 saved/upvoted/subscribed 信号和 discovery search/hot/subreddit/related；click 监听在 capture 阶段执行，scroll 同时覆盖页面和内部滚动容器 |
 | 8.2 后端 API | ✅ | Python 侧 `/api/events`、`/api/health`、`/api/recommendations` 已可联调；`/api/events` 在 soul 画像明确未初始化时只返回 `not_initialized` 拒收结果，不写 memory，首轮画像信号由 guided init 的来源任务拉取 |
-| 8.3 Side Panel | ✅ | 已切到 side panel 主入口，继续复用 `popup/` 页面承载推荐 / 稍后 / 收藏 / 画像 / 对话五个 tab；顶部功能区提供「手机版」入口（v0.3.154 起为手机图形 + 「手机版」文字标签，与相邻图标同款白底样式），按当前插件后端地址和 HTTP/HTTPS scheme 生成 `/m/` 扫码链接；460px 以下窄宽度会把 Web、二维码、消息、设置按钮换到品牌区下一行靠右排列，避免和标题 / 状态徽标重叠；如果当前后端地址仍是 `127.0.0.1` / `localhost`，会以同一 scheme 调用轻量端点 `GET /api/qr-info`（不触发 embedding readiness probe）并读取响应中的 `lan_ip` 字段，用局域网 IP 生成二维码，提示为 info 状态；后端优先返回 RFC1918 IPv4 并排除 `198.18.x.x` 等 VPN/TUN 地址，没有可用 IPv4 时回退 ULA / global IPv6，二维码生成器会把 IPv6 literal 包进 `[]`；移动 Web 推荐页首屏先渲染 `/api/recommendations`，再异步补 runtime status / activity / delight，慢请求不会让页面无限停在 loading；聊天改走后端 durable turn，Chrome 丢弃或切 tab 后可恢复；惊喜推荐、兴趣猜测和避雷探针的内联聊天也会按 `scope=delight/probe/avoidance_probe` 恢复 pending/completed/failed turn；主聊天与移动/桌面 Web 共用 `session=popup&scope=chat`，聊天 Tab 可见且在线时约每 2.5 秒增量刷新历史，内容未变化不重绘，阅读旧消息时保留滚动位置；聊天 tab 激活时隐藏底部活动栏，聊天记录区独立滚动并占满上方空间，输入框固定在底部且会轮播想法、口味、自我描述、近期状态等多场景提示语 |
+| 8.3 Side Panel | ✅ | 已切到 side panel 主入口，继续复用 `popup/` 页面承载推荐 / 内容库 / 画像 / 对话四个一级 tab；内容库内用「稍后再看 / 收藏 / 历史记录」三个语义子 tab，兼容旧 `?tab=watchLater|favorites|history` 入口。历史按点开、出现未点和最近移除三组分页读取 30 天本地事实，使用 opaque cursor 续页；同一内容的多个移除 context 同卡显示，收藏和稍后再看可独立恢复，封面 lazy + low-priority 走既有代理缓存。历史读取有 12 秒截止时间；续页失败保留已有卡片并显示可访问的重试提示，坏封面显示 SVG fallback。顶部功能区提供「手机版」入口（v0.3.154 起为手机图形 + 「手机版」文字标签，与相邻图标同款白底样式），按当前插件后端地址和 HTTP/HTTPS scheme 生成 `/m/` 扫码链接；460px 以下窄宽度会把 Web、二维码、消息、设置按钮换到品牌区下一行靠右排列，避免和标题 / 状态徽标重叠；如果当前后端地址仍是 `127.0.0.1` / `localhost`，会以同一 scheme 调用轻量端点 `GET /api/qr-info`（不触发 embedding readiness probe）并读取响应中的 `lan_ip` 字段，用局域网 IP 生成二维码，提示为 info 状态；后端优先返回 RFC1918 IPv4 并排除 `198.18.x.x` 等 VPN/TUN 地址，没有可用 IPv4 时回退 ULA / global IPv6，二维码生成器会把 IPv6 literal 包进 `[]`；移动 Web 推荐页首屏先渲染 `/api/recommendations`，再异步补 runtime status / activity / delight，慢请求不会让页面无限停在 loading；聊天改走后端 durable turn，Chrome 丢弃或切 tab 后可恢复；惊喜推荐、兴趣猜测和避雷探针的内联聊天也会按 `scope=delight/probe/avoidance_probe` 恢复 pending/completed/failed turn；主聊天与移动/桌面 Web 共用 `session=popup&scope=chat`，聊天 Tab 可见且在线时约每 2.5 秒增量刷新历史，内容未变化不重绘，阅读旧消息时保留滚动位置；聊天 tab 激活时隐藏底部活动栏，聊天记录区独立滚动并占满上方空间，输入框固定在底部且会轮播想法、口味、自我描述、近期状态等多场景提示语 |
 | Durable 对话失败展示 | ✅ | side panel 的主聊天在 `turn.status === "failed"` 时优先渲染后端持久化的安全 `turn.error`，不把历史遗留 `turn.reply` 误当成功；惊喜/探针内联 turn 只有 `completed` 才显示成功并移除已处理探针，`failed` 显示 `turn.error`、恢复 handled/按钮状态并保留卡片供重试。 |
 | Issue #147 聊聊口味 Markdown 渲染 | ✅ | 主聊天、惊喜推荐和兴趣/避雷探针内嵌聊天复用 `web/shared/dialogue-confirmation.js` 的安全 Markdown renderer；popup、桌面 Web、移动 Web 的 AI 回复支持加粗、斜体、标题、列表、代码块、引用和 `http(s)` 链接，原始 HTML / `javascript:` 等不安全内容不会进入 DOM，用户消息仍按纯文本展示。 |
 | 对话确认入口（Wave C/D + 单队列 cutover） | ✅ | popup、移动 Web 与桌面 Web 共用 `web/shared/dialogue-confirmation.js` 渲染 `hypothesis` 卡片、纯提问气泡和普通文字 turn：卡片提供「准 / 不准 / 聊聊 / 稍后」四动作、可展开依据与原地结算态；纯数字、UUID、事件 / note 前缀、BVID 或裸哈希等只有机器 ID 的依据会整项过滤，过滤后为空则不渲染「依据」区。桌面「待聊确认」与插件保持同一套紧凑视觉：柔和品牌色折叠条、数字徽标、轻量箭头和单列小卡片，不再额外加入说明文案或桌面仪表盘式重容器；猜测卡片仍按标题、依据、结算状态、主次动作分层，430px 以下动作改两列，深浅主题、可见 focus 与 reduced-motion 继续沿用全局设计令牌。action 先乐观更新；同步 `200` 直接采用服务端状态，`already_settled`（包括相反 verdict）覆盖本地乐观结果。收到 `202 processing` 才复用各端既有 `fetchChatTurn` 按 `1s/2s/5s`（随后 5s）读取 durable turn，30 秒总截止；终态立即停，连续读取失败、截止或页面 abort 只把本地卡片标为 `retryable_error`，允许刷新/重试，不伪造 durable 失败。三端各自持有 action AbortController，页面卸载会终止轮询。popup 与移动 Web 的「待聊确认」列表调用 `GET /api/chat/pending-confirmations`，主动打开用 `session="popup"`；桌面端镜像相同语义并用 `session="popup"`，侧栏「聊聊口味」显示待聊计数。三端对话记录和待聊列表都使用有界独立滚动，重绘保留读者位置与已展开依据；聊天可见且在线时约每 2.5 秒增量刷新历史，快照未变化不重绘；移动端动作保持两列 44px 触控目标。待聊数字只在三端对话入口显示；service worker 不请求 `?count_only=1`，也不把待聊数写入工具栏，工具栏角标只表达后端不可达或未初始化。三端的画像/认知更新区均只读，主动确认只存在于 durable 对话卡片。后端 deprecated legacy 端点继续保留，新客户端不调用。 |
 | Turn binding 与三端对话 surface（2026-08-01） | ✅ | 本行 supersede 上一行 Wave C/D 的历史移动端只读描述：popup、mobile web、desktop web 共用 `web/shared/dialogue-confirmation.js` 的 context preview、context bar、reply quote、opaque-evidence 过滤与 stick-to-bottom 规则。`聊聊` 只 POST `reply_to_turn_id`，服务端 canonicalize；context GET 只读，失败保留 draft/target。三端都为历史与待聊列表提供独立有界滚动，重绘恢复已展开依据；移动端额外恢复草稿与焦点，并保留卡片 action/processing poll。卡片进入 terminal state 后，各端在下一次历史同步中静默清除已完成 context，避免把预期结算误报成英文错误；已知 context error 统一优先显示中文。移动端聊天页的回顶按钮对 360px 窄屏保留额外垂直间距，不与发送按钮相交。 |
-| Runtime stream 合并刷新 | ✅ | 插件 side panel、桌面 Web 和移动 Web 对 `activity.added` / `profile_updated` 等运行时事件做 debounce 与 single-flight；`refresh.pool_updated` 只合并池子状态并刷新 header / pool chips / 底部可换提示 / 空态文案，不再重拉推荐列表，避免覆盖用户已经 append 出来的历史卡片。插件 side panel 从离线转在线时（包括首次 `/api/ping` 瞬时失败但 `/api/runtime-stream` 随后连上的竞态）会立即调度推荐刷新；popup 离线期间会每 1 秒轻量重探测 `/api/ping`，runtime-stream 自身也固定每 1 秒重连，成功后停止轮询并切回在线刷新流程，避免后端已启动但插件仍停在“后端还没开张”的旧空态。 |
+| Runtime stream 合并刷新 | ✅ | 插件 side panel、桌面 Web 和移动 Web 对 `activity.added` / `profile_updated` 等运行时事件做 debounce 与 single-flight；`refresh.pool_updated` 只合并池子状态并刷新 header / pool chips / 底部可换提示 / 空态文案，不再重拉推荐列表，避免覆盖用户已经 append 出来的历史卡片。`dy_task_available` 是扩展 dispatcher 的 transport wake-up，桌面 Web 不把它投影成用户可见活动。插件 side panel 从离线转在线时（包括首次 `/api/ping` 瞬时失败但 `/api/runtime-stream` 随后连上的竞态）会立即调度推荐刷新；popup 离线期间会每 1 秒轻量重探测 `/api/ping`，runtime-stream 自身也固定每 1 秒重连，成功后停止轮询并切回在线刷新流程，避免后端已启动但插件仍停在“后端还没开张”的旧空态。 |
 | 兴趣挑战探针 UI | ✅ | `interest.probe` 和 `speculative_interests` 会保留后端的 `probe_mode` / `challenge` metadata；profile 页确认会向 `/api/interest-probes/respond` 传 `surface="profile"`，写回为 `profile_confirmed`，而 inbox / runtime probe 卡片确认保持默认 `probe_confirmed`。插件 side panel、移动 Web 和桌面 Web 会把普通 `near` 兴趣探针与 `lateral/bridge/wildcard` 挑战探针拆成不同样式和提示：普通兴趣强调继续探索，挑战探针提示“把口味往侧边推一点”，区别于避雷探针。四个可见动作固定为「确认喜欢 / 暂时搁置 / 确认不喜欢 / 多聊聊」，分别提交 `confirm / defer / reject / chat`；用户处理同一 domain 后，三端会用 handled probe key 立即从 inbox、画像页和 runtime hydration 里隐藏该探针，避免后端旧快照/缓存再次把它展示出来。 |
 | 避雷探针 UI | ✅ | popup inbox 支持 `avoidance.probe`，四个可见动作固定为「确认避雷 / 搁置避雷 / 不是雷点 / 多聊聊」，分别提交 `confirm / defer / reject / chat`；画像页显示 `speculative_avoidances` 的待确认避雷方向，确认后通过 `/api/avoidance-probes/respond` 写回后端。插件 side panel、移动 Web 和桌面 Web 会用避雷专属样式和“少看这类 / 猜错点不是”提示，区别于正向兴趣试探。移动 Web 在任一探针按钮点击后会锁住同一卡片其它动作，避免一次 active 探针被连续提交；三端也会在本地记录 handled 避雷 key，使已处理 domain 不再从 profile summary、pending probes 或 runtime stream 重复水合；消息收件箱空态不会重建 header，X 关闭入口保持可用。 |
 | 封面图代理加载 | ✅ | side panel 的推荐卡片、惊喜推荐和消息封面会用当前配置的后端 origin 拼接 `/api/image-proxy?url=...`，不再直连平台 CDN，也不再设置 `referrerPolicy`。B 站搜索采集侧会拒绝懒加载 `data:` 占位图（宁可留空由后端后续摄入补真图，v0.3.162+）。 |
@@ -79,7 +79,7 @@
 | xhs 来源关闭与风控熔断 | ✅ | `/api/sources/xhs/next-task` 在领取自动发现任务前动态检查 `sources.xiaohongshu.enabled` 与全局 scheduler；关闭后，已经排队的 search / creator / bootstrap 仍保留为 pending，但扩展不会再因它们打开页面。`content/xhs/risk-control.ts` 识别可见的安全验证、操作频繁和 429 页面，executor 只回传结构化 `rate_limited` 原因、不上传页面原文；后端据此持久化 1 小时平台冷却，冷却期间包括原生保存任务在内都不再领取。用户显式触发、且未处于风控冷却的原生保存不受 discovery 开关影响。 |
 | 抖音初始化画像任务 | ✅ | 后端可派发 `bootstrap_profile` 任务；插件依次访问抖音发布 / 收藏 / 喜欢 / 关注 scope，当前账号只接受 `profile/self` MAIN bridge 正面确认（或同一 tab 的已确认缓存）；`#RENDER_DATA` 仅在显式登录时作未确认候选，常驻 tap 不从被动请求 URL 提取身份。随后结合 DOM、fetch tap 与 API harvester 采集条目，并用 `partial` 分批回传给 `/api/sources/dy/task-result`；身份 / 分页不完整时终态为 `degraded`。动态 fetch-tap 注入兼容 release/unpacked 两种资源根布局，依次尝试 `dist/main/dy-fetch-tap.js` 与 `main/dy-fetch-tap.js` |
 | 扩展任务并发领取保护 | ✅ | XHS / 抖音 / YouTube 的 `/next-task` claim 使用短生命周期 SQLite 连接执行 `BEGIN IMMEDIATE`，避免多个 FastAPI threadpool 请求共享同一 connection 时出现嵌套事务错误 |
-| 抖音搜索任务 | ✅ | 后端可派发 `search` 任务；插件用后台 tab 先打开抖音首页，在已登录页面里模拟搜索框输入 / 点击搜索，并等待 URL 进入 `/jingxuan/search/<keyword>` 等真实搜索结果路由；任务 debug 用 `ui_triggered` 表示已提交、`search_navigation_ok` 表示已进入结果页，避免把搜索建议或登录弹窗误报成成功搜索；随后被动收集页面自身搜索响应和渲染 DOM，回传 `dy_search` 候选供 CLI smoke 和正式 `dy-plugin-search` discovery 使用；MAIN-world fetch tap 兼容 `/general/search/single/`、`/search/item/` 和新版 `/general/search/stream/` chunked JSON；runtime 会把候选写入统一待评估池；单关键词任务 timeout 为 180 秒 |
+| 抖音搜索任务 | ✅ | 后端可派发 `search` 任务；插件用后台 tab 先打开抖音首页，在已登录页面里模拟搜索框输入 / 点击搜索，并等待 URL 进入 `/jingxuan/search/<keyword>` 等真实搜索结果路由；任务 debug 用 `ui_triggered` 表示已提交、`search_navigation_ok` 表示已进入结果页，避免把搜索建议或登录弹窗误报成成功搜索；随后被动收集页面自身搜索响应和渲染 DOM，回传 `dy_search` 候选供 CLI smoke 和正式 `dy-plugin-search` discovery 使用；MAIN-world fetch tap 兼容 `/general/search/single/`、`/search/item/` 和新版 `/general/search/stream/` chunked JSON；runtime 会把候选写入统一待评估池。单任务默认等待 180 秒，但同一 discovery cycle 共享一份等待预算；后端超时 / 取消会把任务原子写成 `failed + wait_timeout/wait_cancelled`，不会留下 pending storm。 |
 | 抖音热点任务 | ✅ | 后端可派发 `hot` 任务；hot board 的 `group_id` 会作为 `seed_aweme_id` 透传，插件优先执行带 seed 的热词；后台 tab 仍从抖音首页出发模拟热榜点击并被动收集响应 / DOM，不足时用已登录页面的 related API bridge 拉取 `dy_hot` 候选供 `dy-plugin-hot-related` discovery 使用；runtime 会把候选写入统一待评估池 |
 | 抖音首页推荐流任务 | ✅ | 后端可派发 `feed` 任务；插件用后台 tab 打开已登录抖音首页，滚动推荐流触发页面加载，再被动收集 feed 响应和渲染 DOM，回传 `dy_feed` 候选供 `dy-plugin-feed` discovery 使用；runtime 会把候选写入统一待评估池 |
 | YouTube 初始化画像任务 | ✅ | 后端可派发 `bootstrap_profile` 任务；插件依次访问 `/feed/history`、`/feed/channels`、`/playlist?list=LL`，从 DOM 读取观看历史 / 订阅 / 点赞并用 `partial` 分批回传给 `/api/sources/yt/task-result` |
@@ -87,7 +87,7 @@
 | 知乎 discovery 任务 | ✅ | 后端可派发 `search` / `hot` / `feed` / `creator` / `related` 任务；插件在同一个已登录知乎任务 tab 中调用搜索、热榜、首页推荐、作者页和问题相关接口并回传 `zhihu_search` / `zhihu_hot` / `zhihu_feed` / `zhihu_creator` / `zhihu_related` 候选。归一化器会映射 answer / article / question 的标题、作者、摘要、URL 与点赞 / 收藏 / 评论指标；runtime `ZhihuDiscoveryProducer` 把这些候选以 `zhihu-search` / `zhihu-hot` / `zhihu-feed` / `zhihu-creator` / `zhihu-related` 写入统一待评估池，`openbiliclaw discover --source zhihu` 使用正式 producer 流程，`openbiliclaw discover-zhihu*` 可用于真实端到端 smoke。插件 side panel 设置页和桌面 Web 设置页都能编辑 `[sources.zhihu].source_modes` 与各分支预算；creator / related 在没有历史种子时会使用同轮 search / hot / feed 产出的作者页和内容 URL 兜底。discovery 任务不写 `/api/events`，也不触发画像初始化 |
 | 后端 endpoint 可配置 | ✅ | 设置页保存 `http/https`、裸 IPv4 / 主机名与 `1-65535` 端口；旧存储自动迁移为 HTTP。非 loopback endpoint 保存前请求 `scheme://host/*` 可选权限（WebExtension API 无法跨浏览器限定端口），拒绝则不改缓存或存储；实际请求固定配置端口，公网 host 强制 HTTPS，WebSocket 自动派生 WSS |
 | 后台 LLM 暂停配置 | ✅ | 设置页调度区提供「停止后台 LLM 请求」「关闭浏览器后停止后台」和断开宽限秒数，推荐页不再放运行时开关；后端通过 `/api/runtime-stream` presence 判断插件是否在线，空闲连接每 20 秒收到 `runtime.heartbeat`，浏览器 idle disconnect 会被 receive-side detector 及时清掉；桌面 Web 对关闭与异常统一进入重连态，不再把正常可恢复断线显示成永久断开 |
-| 配置恢复与降级模式 UI | ✅ | popup API 会缓存最近一次成功的 `/api/config` 快照；设置页打开时如果后端离线但有缓存，会用缓存填表并显示离线时间；如果后端以 `degraded=true` 返回配置，会展示 blocking issues。降级后端精确放行插件共用的 `/api/config/probe-service`、`/api/config/discover-models` 与来源比例建议，因此测试实例/整链和获取模型会使用当前表单草稿真实执行，不再被启动失败的 active registry 连带返回 503；业务 hydration 在修复前保持阻断。有效配置保存后后端原地重建 runtime，插件立即读取可用状态；旧后端或异常 bootstrap 返回 `restart_required=true` 时仍显示重启兜底。 |
+| 配置恢复与降级模式 UI | ✅ | popup API 会缓存最近一次成功的 `/api/config` 快照；设置页打开时如果后端离线但有缓存，会用缓存填表并显示离线时间；如果后端以 `degraded=true` 返回配置，会展示 blocking issues。降级后端精确放行插件共用的 `/api/config/probe-service`、`/api/config/discover-models` 与来源比例建议，因此测试实例/整链和获取模型会使用当前表单草稿真实执行，不再被启动失败的 active registry 连带返回 503；LLM probe 的客户端 timeout 为 125 秒，对齐后端有限 120 秒冷启动窗口。业务 hydration 在修复前保持阻断。有效配置保存后后端原地重建 runtime，插件立即读取可用状态；旧后端或异常 bootstrap 返回 `restart_required=true` 时仍显示重启兜底。 |
 | 配置后台应用回执 | ✅ | `PUT /api/config` 持久化成功后统一立即返回 `202 apply_state="queued"`；popup 显示 amber“已进入后台应用队列”，连续保存由后端合并为最新修订，不再等到 60 秒 AbortError 才给不确定提示。最终 `config_reloaded` 刷新数据，`config_reload_failed` 显示已恢复 last-good 的红色回执；`popup-api.requestJson()` 的 60s AbortController 仍作为旧后端或异常网络兼容兜底。后端安全 drain 上限仍为 25 分钟；待聊「打开」的 1/2/3/5 秒退避契约不变。 |
 | OpenAI 认证方式配置 | ✅ | 设置页 OpenAI provider 区域可选择 `API Key` 或 `Codex OAuth`，保存时把 `[llm.openai].auth_mode` 纳入 `/api/config` payload；后端仍负责 Codex token 导入、域名限制和配置校验 |
 | 版本与更新面板 | ✅ | 设置页调度 tab 的“版本与更新”读取 `/api/update-status` 展示后端当前 / 最新版本、状态、上次检查和错误；`github_rate_limited` / `github_unreachable` / `no_backend_tag_yet`、`dirty_worktree`、`untrusted_remote`、`branch_not_fast_forwardable` 等稳定 reason 会映射成本地化提示，避免把后端错误 key 直接露给用户。`install_mode="git"` 且发现 `backend-v*` 更新时才显示“立即应用”；`install_mode` 为空或未知时不会走自动应用分支，避免把安装方式不明的后端误当 AI / 源码安装处理。点击后若 `/api/update/apply` 被后端安全守卫以 409 拒绝，popup 会用响应体刷新状态卡并在 toast 里显示具体阻断原因，再重新读取 canonical update status，避免继续停留在旧的 `update_available` 视图。`install_mode="frozen"` 或最新 tag 为 `desktop-v*` 时只显示“前往下载新安装包”，让安装包用户去 GitHub Release 下载新安装包覆盖安装，不会误触源码快进。`popup-helpers.normalizeRuntimeStatus()` 同时保留 `/api/runtime-status` 中的 `current_version`、`latest_remote_version`、`backend_update_state` 等自动更新摘要字段，避免 runtime 状态归一化时丢失后端版本信息。 |
@@ -298,12 +298,14 @@ content executor 的 selector 策略按平台收敛在 `src/content/e2e-executor
   "task_id": "...",
   "type": "search",
   "query": "机械键盘 声音",
-  "limit": 20,
-  "page_size": 20
+  "limit": 5,
+  "page_size": 5,
+  "order": "pubdate",
+  "discovery_lane": "recent"
 }
 ```
 
-dispatcher 导航到 `https://search.bilibili.com/all?keyword=...`，等 tab ready 后发送 `BILI_TASK_EXECUTE`；如果 Chrome 报 content script listener 暂未就绪，dispatcher 会在 8 秒窗口内短重试，吸收真实页面 `complete` 早于 isolated content script 注册的时序抖动。`src/content/bili/task-executor.ts` 不在 isolated world 里直连 B 站 API，也不伪造 WBI 签名；它只等待真实搜索页渲染出 `.bili-video-card` / `.video-list-item`，从 DOM 卡片里提取 `bvid`、标题、UP 主、播放数、封面、时长和简介，再用 `BILI_TASK_RESULT` 回给 service worker。service worker POST 到 `/api/sources/bili/task-result` 后，后端把结果写入 `discovery_candidates`，继续走共享 evaluator / admission，而不是由插件直接写推荐池。
+普通任务的 `order/discovery_lane` 省略；producer 每轮只把第一个兜底任务标为上述近期 lane，并限制为 5 条。dispatcher 对该任务导航到 `https://search.bilibili.com/all?keyword=...&order=pubdate`，普通任务仍使用原 URL；它只接受 `totalrank/pubdate` 和 `recent` 这组封闭枚举。等 tab ready 后 dispatcher 发送 `BILI_TASK_EXECUTE`；如果 Chrome 报 content script listener 暂未就绪，会在 8 秒窗口内短重试，吸收真实页面 `complete` 早于 isolated content script 注册的时序抖动。`src/content/bili/task-executor.ts` 不在 isolated world 里直连 B 站 API，也不伪造 WBI 签名；它只等待真实搜索页渲染出 `.bili-video-card` / `.video-list-item`，从 DOM 卡片里提取 `bvid`、标题、UP 主、播放数、封面、时长和简介，再用 `BILI_TASK_RESULT` 回给 service worker。service worker POST 到 `/api/sources/bili/task-result` 后，后端把结果写入 `discovery_candidates`，继续走共享 evaluator / admission，而不是由插件直接写推荐池。近期结果仍使用 `source_strategy="bili-extension-search"`，只在 `source_context` 和 raw payload 中留下 `recent` provenance。
 
 真实联调可用两档验证：
 
@@ -383,11 +385,17 @@ search / creator 任务的 note 路由与被动采集共用 `NOTE_ANCHOR_SELECTO
 
 `src/content/dy/task-executor.ts` 负责在页面内切换 scope、滚动与回传。`src/main/dy-fetch-tap.ts` 运行在 MAIN world，拦截抖音页面 fetch，并对四个账号 scope 走站内分页 API harvester：作品 / 收藏 / 喜欢使用 `max_cursor`，关注使用 `max_time`。分页前不再只等页面偶然发出带 `sec_user_id` 的请求：`#RENDER_DATA` 只有显式 `isLogin=true` 时才提供候选，随后仍必须由 MAIN-world `/aweme/v1/web/user/profile/self/` 正面确认；该端点只接受 `status_code=0` 且 `user.sec_uid` 非空，冲突时以它为准，也只有它确认的结果能在同一 tab 内缓存 / 合并并发探测。常驻 fetch / XHR wrapper 不从被动请求 URL 提取或记录 `sec_user_id`；身份消息只会由用户触发的 bootstrap 身份请求返回。该 bridge 使用页面自身已登录 fetch 上下文，不传 Cookie 值；身份响应传公开 `sec_uid`，分页响应传任务所需的解析后条目，不转发未裁剪的原始响应对象。MAIN / isolated 两侧的 `postMessage` listener 都要求 `event.source === window` 且 `event.origin === window.location.origin`；这只降低跨 frame / 页面噪声误接收，不是授权边界，同页脚本仍可发消息，因此 sentinel、request ID 与 payload 校验继续保留。
 
+fetch tap 的安装状态保存在页面 Window 上，而不是单次 bundle closure：同一个 Douyin SPA 文档被 dispatcher、content script 或更新后的 bundle 重复注入时，仍然存活的 fetch / XHR wrapper 与 API listener 不会重复安装；如果页面 bundle 后来替换了 fetch 或 XHR，则下一次 SDK-ready 校验 / 动态重注入会只重包当前原语。API bridge 以 `type + requestId` 做 single-flight；完成后立即释放，悬挂请求以 120 秒 TTL 和 128 条上限清理，过期响应不再发回已经结束的 isolated listener。
+
 采集到的条目通过 `postMessage` 回到 isolated world 后进入 `BootstrapItemSink` 去重，再以 `status="partial"` 分批 POST 到 `/api/sources/dy/task-result`。全部 scope 正常完成时最终状态为 `ok`；身份仍不可得、API 首屏业务状态失败、后续 HTTP / cursor 页中断、游标缺失 / 非法 / 停滞 / 成环，或 50 页安全上限耗尽时，保留已采到的有效条目并以终态 `degraded` 完成，最终 debug 同时保存各 scope 状态与稳定原因。后端将 DB 任务标记为已结束，同时把 `result_json.status="degraded"` 留给 CLI / init 展示；终态后的迟到 partial / 重试回调会被幂等忽略，不能清除降级状态或重复传播事件。CLI 最终摘要与 API init 都把它显示为“部分完成”，阶段 1 也以 `warning / douyin_degraded` 完成，但已采事件仍参与本次画像建模；近期任务去重不会复用这个降级终态，下一次会重新入队补齐分页。新增 videos 仍按既有映射转成统一事件：发布 → `view`，收藏 → `favorite`，点赞 → `like`，关注 → `follow`。扩展不再额外 POST 临时调试事件到后端；`task-result` 中已有的结构化 `debug` 字段仍随正常任务结果传递。
 
 fetch tap 除 manifest 的 document-start 注入外，还会在 dispatcher 与 content script 的 SPA 重注入路径动态加载。Chrome/Edge 从仓库根或 release archive 加载时资源通常是 `dist/main/dy-fetch-tap.js`；部分既有 unpacked 构建把输出目录本身作为资源根，文件则是 `main/dy-fetch-tap.js`。`shared/asset-prefix.ts::runtimeAssetCandidates()` 统一生成候选，background 的 `chrome.scripting.executeScript` 与 content 的 `<script src=chrome.runtime.getURL(...)>` 都按同一顺序回退；Firefox 的空 prefix 只产生一个 `main/...`，不会重复注入。该回退只改变扩展自身文件定位，不扩大 host permission，也不触发额外平台请求。
 
-本地 `npm run build` 只更新磁盘上的 bundle，不会替正在运行的 Chrome service worker 热换代码；真实账号复测前必须在 `chrome://extensions` 对 unpacked OpenBiliClaw 点一次“重新加载”。后端 debug 若仍只出现 `Could not load file: 'dist/main/dy-fetch-tap.js'`，说明浏览器还在运行旧单路径 bundle，不能据此判断新 fallback 失败；新版本成功状态会携带实际命中的 `ok_file=<candidate>`。
+Douyin dispatcher 会先确认当前 worker 具备 `chrome.tabs.create`，再在 `/next-task` claim 前获取跨来源 mutex，并让 alarm 与 runtime-stream kick 共用同一个 poll promise；残缺运行环境或锁忙时不 claim，并发唤醒也只认领一次。claim 后 executor 用 `accepted / declined` 握手，拒绝任务会先回传失败再释放锁。注入资源明确失败、tap 未就绪、API / UI / 导航失败且零候选时，search / hot / feed 会回传稳定 `failed` 终态；hot 不再把 `failed` 继续合并成 partial 后再写 `ok`。feed 若唯一问题是 `feed_no_observed_response`，dispatcher 会在原后台 tab 最多执行一次 `tabs.reload({bypassCache:true})` 并重试，任务预算相应为 120 秒；不会激活 tab，也不会对真实空、限流、风控、登录或注入错误重试。已获得 DOM / passive 候选时仍保留有效结果，只有链路正常且确实没有内容时才使用 `empty`。task-result 回传要求后端 2xx ACK，并对同一幂等 body 做最多 3 次有界退避重试；终态未确认时不清理本地 lifecycle，也不继续认领下一条任务。
+
+扩展 mutex 只能覆盖同一 service worker。后端 `DyTaskQueue.next_pending()` 因此在 `BEGIN IMMEDIATE` 领取事务内额外检查全表未过期 `in_progress` lease：存在时返回 204，不把第二条任务交给另一个 unpacked 扩展 ID 或 Chrome profile；15 分钟过期 lease 仍按原协议优先重领并修复 staged result。
+
+本地 `npm run build` 只更新磁盘上的 bundle，不会替正在运行的 Chrome service worker 热换代码；真实账号复测前需要在 `chrome://extensions` 对 unpacked OpenBiliClaw 点一次“重新加载”，或在扩展 runtime-stream 已连接时调用本地开发端点 `POST /api/extension/reload`。后端 debug 若仍只出现 `Could not load file: 'dist/main/dy-fetch-tap.js'`，说明浏览器还在运行旧单路径 bundle，不能据此判断新 fallback 失败；新版本成功状态会携带实际命中的 `ok_file=<candidate>`。
 
 CLI 侧分两层使用这条链路：
 
@@ -426,7 +434,9 @@ CLI 侧分两层使用这条链路：
 }
 ```
 
-dispatcher 等待首页 ready 时会同时处理两种情况：正常的 `chrome.tabs.onUpdated(status="complete")`，以及抖音 SPA 没有再发完整 `complete` 事件的 fallback timer，避免任务卡住直到 `task_timeout`。search 任务按关键词数计算超时窗口，单关键词至少 180 秒，覆盖首页打开、DOM 搜索触发、搜索结果页路由确认、页面自身响应和 DOM 解析的真实耗时；后端 `DouyinPluginSearchClient` 默认也等 180 秒，避免插件刚开始执行 DOM 操作就被后端清成 stale。`src/content/douyin.ts` 会尝试触发页面搜索 UI、热点入口点击或推荐流滚动；search 会区分 `ui_triggered`（已提交）和 `search_navigation_ok`（URL 已进入真实搜索结果路由），防止搜索建议或登录弹窗被误判为搜索结果页。`src/main/dy-fetch-tap.ts` 先作为 MAIN-world 被动 fetch / XHR tap，把页面自己发出的 search / related / feed 响应转成候选，feed 兼容当前页面实际发出的 `/aweme/v2/web/module/feed/` 响应，search 兼容 `/aweme/v1/web/general/search/stream/` 返回的 chunked JSON。search / hot / feed discovery 不主动访问 `/search/...`、`/hot/...` 快捷 URL；search 在被动 fetch tap 和 DOM 解析不足时会调用已登录页面的 search API bridge 兜底，hot 会把 hot board 的 `group_id` 作为 `seed_aweme_id` 透传给扩展，优先执行带 seed 的热词，并在 DOM 点击 / 被动监听不足时用已登录页面的 related API bridge 拉取相关视频，feed 不主动调用 API bridge。搜索结果以 `scope="dy_search"`、热点结果以 `scope="dy_hot"`、首页推荐结果以 `scope="dy_feed"` 回写到 `dy_tasks.result_json`，不会转成初始化画像事件；content script 会在回传前按目标 scope 过滤候选，避免首页 feed 响应混入 search / hot 结果；`DouyinPluginSearchClient` 会把这些候选映射成 aweme-like JSON，分别以 `dy-plugin-search` / `dy-plugin-hot-related` / `dy-plugin-feed` 进入 `discovery_candidates` 待评估池，再由后端共享 evaluator 判定是否进入推荐池。插件任务空 / 超时 / 失败时默认返回空结果，direct-cookie fallback 仅保留给显式诊断路径；如果真实 search 响应带 `search_nil_info.search_nil_item="hit_shark"` 且无 `data/aweme_list`，会按抖音反爬空结果处理。
+dispatcher 等待首页 ready 时会同时处理两种情况：正常的 `chrome.tabs.onUpdated(status="complete")`，以及抖音 SPA 没有再发完整 `complete` 事件的 fallback timer，避免任务卡住直到 `task_timeout`。search 任务按关键词数计算超时窗口，单关键词至少 180 秒，覆盖首页打开、DOM 搜索触发、搜索结果页路由确认、页面自身响应和 DOM 解析的真实耗时；后端 `DouyinPluginSearchClient` 默认也等 180 秒，避免插件刚开始执行 DOM 操作就被后端清成 stale。`src/content/douyin.ts` 会尝试触发页面搜索 UI、热点入口点击或推荐流滚动；search 会区分 `ui_triggered`（已提交）和 `search_navigation_ok`（URL 已进入真实搜索结果路由），防止搜索建议或登录弹窗被误判为搜索结果页。`src/main/dy-fetch-tap.ts` 作为 manifest 声明的 MAIN-world `document_start` 被动 fetch / XHR tap，把页面自己发出的 search / related / feed 响应转成候选；如果这些消息早于任务 collector，isolated content script 会按 `scope:aweme_id` 去重，最多保留 256 条 / 120 秒，并在对应任务启动时一次性 drain。feed 兼容当前页面实际发出的 `/aweme/v2/web/module/feed/`，search 兼容 `/aweme/v1/web/general/search/stream/` chunked JSON；DOM fallback 同时识别 `a[href*="/video/"]`、`div[data-aweme-id]`、非 anchor `href` 与 `video_<id>` class，并从卡片语义文本中补标题 / 作者，因此页面不再发续请求时仍可读取当前已渲染推荐。合法空响应会增加 `passive_responses_observed`，只有响应和 DOM 都未提供内容时才是 `feed_no_observed_response`。search / hot / feed discovery 不主动访问 `/search/...`、`/hot/...` 快捷 URL；search 在被动 fetch tap 和 DOM 解析不足时会调用已登录页面的 search API bridge 兜底，hot 会把 hot board 的 `group_id` 作为 `seed_aweme_id` 透传给扩展，优先执行带 seed 的热词，并在 DOM 点击 / 被动监听不足时用已登录页面的 related API bridge 拉取相关视频，feed 不主动调用 API bridge。搜索结果以 `scope="dy_search"`、热点结果以 `scope="dy_hot"`、首页推荐结果以 `scope="dy_feed"` 回写到 `dy_tasks.result_json`，不会转成初始化画像事件；content script 会在回传前按目标 scope 过滤候选，避免首页 feed 响应混入 search / hot 结果；`DouyinPluginSearchClient` 会把这些候选映射成 aweme-like JSON，分别以 `dy-plugin-search` / `dy-plugin-hot-related` / `dy-plugin-feed` 进入 `discovery_candidates` 待评估池，再由后端共享 evaluator 判定是否进入推荐池。插件任务会区分真实 `empty` 与 `timeout / failed`：基础设施失败返回空候选但保留失败终态，direct-cookie fallback 仅保留给显式诊断路径。真实 search 响应带 `search_nil_info.search_nil_item="hit_shark"` 且无 `data/aweme_list` 时按反爬失败处理，让 runtime 使用故障退避而不是分钟级重试。
+
+search 首次首页 ready 后直接注入并提交，不再对同一 URL 做冗余 `tabs.update`；多关键词任务会为下一关键词换用新的后台首页 tab，隔离上一关键词的迟到响应与虚拟列表 DOM。dispatcher 会在提交前监听目标搜索路由；若 UI 触发真实 document navigation，新文档 ready 后用 `resume_after_navigation` 只恢复采集，若只是 SPA 路由变化，同文档 execution key 会拒绝重复执行。search API bridge 的 isolated wait 收紧为 20 秒（MAIN request 自身仍有更短 abort），避免后台标签页计时延迟把单词任务推到总看门狗边缘。
 
 CLI 入口：
 
@@ -463,6 +473,7 @@ CLI 入口：
 - 收到后台 `refresh.pool_updated` 时，推荐 tab 只更新池子数量、最近补货数量、方向提示和底部可换提示；移动 Web 空态也会用同一 runtime status 重新计算“还有多少可换 / 多少素材在整理”。不会调用 `/api/recommendations` 替换当前列表，用户已续页出来的历史内容会保留到下一次主动“换一批”或页面重新初始化。首次初始化推荐列表后会再读一次 `/api/runtime-status`，避免 `/api/recommendations` 从候选池 bootstrap 后仍显示 bootstrap 前库存
 - popup API 现在会统一规范化推荐项，追加出来的 `cover_url` 也会被收敛成可直接加载的 `https://` 地址；推荐点击 payload 会保留 `content_id / content_url / source_platform`，因此 YouTube 等跨源卡片打开后也会被后端记成对应来源，而不是落回 B 站 BV 号语义
 - 推荐、惊喜推荐和消息内封面图会通过 `popup-helpers.buildImageProxyPath()` 生成 `/api/image-proxy?url=...`，再用 `popup-backend-config.getBackendOrigin()` 拼成当前后端绝对地址；图片加载失败时保留已有 wrapper fallback，不让卡片布局塌缩
+- 内容库的收藏 / 稍后再看封面同样走当前后端图片代理；真实 403、网络错误或已缓存的失败图片都会从 DOM 移除并替换为可见 SVG 占位，插件不会保留浏览器破图图标，卡片打开按钮的可访问名称保持不变
 - 保存页刷新失败时保留最后一次成功的列表，错误行提供「重试加载」；全部 saved read/write/status/sync/task 请求都有 Abort timeout，且同一 deadline 从后端地址解析开始，覆盖初次设备会话交换、401 强制换票、受保护请求与响应解析，认证 fetch 接收同一 AbortSignal。每次成功加载会按 `sync_task_id` 去重恢复非终态 task，task→item ownership 把关联行显示为「同步中」并从单项 / 批量候选排除；side panel 重新可见时立即恢复查询，pagehide 清理 tracker。批量同步与重试加载会先捕获列表级焦点，重渲染后优先回到同一列表动作；卡片动作消失时再依次落到相邻卡片动作、列表动作、页面标题。「全部稍后看」按结果下标保留失败项，采用服务端 URL fallback `item_key` 更新状态，并把自动同步 task 纳入同一 ownership。coarse pointer 下推荐 / delight 保存按钮至少 44×44，sync 文案切换预留固定宽度。
 - `/api/recommendations/refresh` 仍保留为后台补货入口，用于继续往候选池里持续进货
 - popup 推荐卡片现在不会再把空 `expression / topic_label` 补成固定占位文案；后端预生成没完成时，这两块会直接隐藏
@@ -486,12 +497,12 @@ CLI 入口：
 - 如果某条候选的预生成文案还没补好，卡片会先只展示标题、封面和 UP 信息，不会再显示统一占位话题或默认推荐理由
 - 后台补货继续异步进行，不会阻塞 popup 立刻换片
 - pool 状态摘要现在会区分“正在补货”“这轮找到了内容但可换库存没变”“刚补进 N 条”，不再把 refresh 进行中和上一轮净新增为 0 混成同一句
-- 插件 side panel、移动 Web 和桌面 Web 统一把 `pool_available_count` 当作真实可换数量；当 `pool_available_count=0` 但 `pool_pending_count>0` 时显示“找到 N 条素材，正在整理成可换内容”，不会把待评估 / 待分类 / 待文案 / 不可打开的素材数写成“可换”。`pool_pending_eval_count` 和 `pool_evaluated_pending_count` 只作为诊断与整理状态使用。
+- 插件 side panel、移动 Web 和桌面 Web 统一把 `pool_available_count` 当作真实可换数量；只要 `pool_pending_count>0`，摘要都会在真实可换数之外显示“另有 N 条素材 / 素材已抓到，会按可换库存缺口整理”，不会把待评估 / 待分类 / 待文案 / 不可打开的素材数写成“可换”。`pool_pending_eval_count` 和 `pool_evaluated_pending_count` 只作为诊断与整理状态使用。插件首次 `/runtime-status` 失败后若先收到权威 `pool_status` stream 事件，会立即把库存状态提升为 initialized 并显示事件中的真实计数，不再把非零库存隐藏成未知/零。
 - 推荐 tab 头部现已进一步压缩成双层内容型入口：第一层只保留 `For You`、标题和 `换一批`，第二层把池子状态收成三枚紧凑 chips，让第一张推荐卡更早进入首屏
 - 推荐 tab 现在还会在头部下方展示独立的“惊喜推荐”首屏卡位：popup 启动时会主动读取 `/api/delight/pending`，runtime stream 收到新的 `delight.candidate` 也会立刻刷新这张卡
 - 推荐 tab 会展示候选池摘要：
   - `当前可换`
-  - `最近补进`
+  - `补货进展`
   - `现在在忙`
   - 三条状态仍然保留，但文案已收短成更适合 chips 的形式，例如 `还有 151 条可换 / 刚补进 6 条 / 这会儿先不补货`
   - `当前可换` 只显示真实可立即换出的数量；待整理素材会进入“素材整理 / 现在在忙”语义，不会混进可换数字
@@ -520,13 +531,15 @@ CLI 入口：
 - 惊喜推荐和兴趣猜测卡片内的 `聊一聊` 也会用 `scope=delight/probe` 写入 durable turn，回复完成后同步刷新对应卡片状态、画像摘要和最近动态；旧的 `/api/chat` 仍保留给兼容入口
 - durable chat turn 写入 SQLite `chat_turns`，不再依赖 DOM、JS 内存或 `sessionStorage` 保留主聊天历史；惊喜推荐保留 `localStorage` UI 草稿、展开态和 per-delight `turns` 作为本地兜底，权威回复状态以后端为准
 - 推荐、画像和聊天文案共享后端的 `ToneProfile`，基础风格是“老B友”，但会根据画像和近期反馈在信息密度、温度和梗感上动态调整
-- 推荐、稍后、收藏、画像、对话五个 tab 已统一为同一套浅色卡片语言，推荐内容被提升为侧边栏首屏视觉重心
+- 推荐、内容库、画像、对话四个一级 tab 已统一为同一套浅色卡片语言；内容库内的稍后再看、收藏、历史记录三个子 tab 按需加载并保留各自滚动位置，历史按 30 天三分类 cursor 分页
 
 ### 构建链路
 
 - 运行时脚本不再直接把 `tsc` 的 ESM 产物交给 Chrome
 - `scripts/build.mjs` 使用 `esbuild` 将各 content entry 和 `service-worker.ts` bundle 为可直接加载的单文件
 - `tsc --emitDeclarationOnly` 继续负责类型声明产物
+- Chrome 的 `npm run build` 只清理 / 重建 `dist/`，Firefox 的 `npm run build:firefox` 只清理 / 重建 `dist-firefox/`；Firefox 仅执行 `typecheck` 而不再把声明文件写入 Chrome 输出，因此按任意顺序连续构建都不会删除或污染另一目标的现有产物。显式 `npm run clean` 仍会同时清理两者
+- 每个 target 的 bundle 完成后都会运行 manifest 资产预检，逐项确认后台脚本、content scripts 与 `web_accessible_resources` 文件真实存在；`dy-fetch-tap.js` 等动态注入资源缺失时构建立刻失败，不再留到浏览器任务执行时才报错。也可用 `npm run verify:assets` / `npm run verify:assets:firefox` 单独复查
 - 新增构建回归测试，确保 content script 不会再次产出浏览器无法执行的 `import` 语句
 
 ## 本地开发
@@ -548,6 +561,7 @@ npm run build
 - B 站搜索兜底 opt-in 浏览器 E2E harness（默认 skip，`BILI_EXTENSION_E2E=1` 才启动真实 Chromium）
 - B 站 / 抖音 Cookie 自动同步的重试闹钟和幂等监听器
 - manifest 图标资源存在性
+- Chrome / Firefox 构建目录隔离，以及两个 manifest 的后台脚本、content scripts、WAR bundle 资产预检
 - Firefox manifest 的 version 注入、`sidebar_action` 降级路径、AMO 数据收集类别声明、Firefox zip 打包清理、AMO unlisted XPI 签名，以及 listed workflow 的元数据 / 隐私政策 / reviewer source / channel 核验
 - popup 设置页字段与 `/api/config` schema 的基础对齐
 - popup API durable chat turn：`startChatTurn()`、`fetchChatTurn()`、`fetchChatTurns()` 会分别调用 `/api/chat/turns`、`/api/chat/turns/{turn_id}` 和列表接口
@@ -615,7 +629,7 @@ npm run build
 - SQLite `events` 表已能写入 `snapshot` 事件
 - popup 能根据 `/api/ping`（连接徽章活性，404 回退 `/api/health`）、`/api/health`（embedding / profile 就绪）与 `/api/recommendations` 切换在线、空状态与推荐列表展示；如果打开时后端尚未就绪，side panel 会离线短轮询 `/api/ping`，后端启动后自动恢复在线状态并刷新推荐
 - side panel 页面反馈按钮已能经 `/api/feedback` 写回推荐表和事件层
-- side panel 现已支持 `推荐 / 稍后 / 收藏 / 画像 / 对话` 五个 tab，其中稍后再看和收藏列表与 PC Web、移动 Web 的保存语义一致
+- side panel 现已支持 `推荐 / 内容库 / 画像 / 对话` 四个一级 tab，内容库内含 `稍后再看 / 收藏 / 历史记录` 三个子项；历史与 PC Web、移动 Web 共用 30 天、三分类、cursor 分页及多 context 独立恢复语义
 - side panel 聊天信号已进入后端学习链，但仍采用受控积累，不会因为单轮聊天立即重写画像
 - side panel 聊天已支持 durable turn 恢复：主聊天、惊喜推荐内聊和兴趣猜测内聊在页面 reload 后会按 `turn_id` 从后端恢复 pending / completed / failed 状态
 - side panel 推荐、画像和聊天回复现在共用“老B友”动态语气，不再固定成一套机械模板
@@ -623,7 +637,7 @@ npm run build
 - side panel 现在还能通过 websocket 看到“开始补候选 / 当前跑到哪个策略 / 刚补进几条新的 / 这批先换好了”这类实时运行状态
 - service worker 现在会在高置信推荐出现时触发浏览器通知，并通过后端回写 `notification_sent`
 - service worker 现在也会拉取认知变化通知；如果最近系统对用户形成了新的高置信理解，会发一条更克制的“阿B 又对你多看清了一点”提醒
-- side panel 新版亮色布局已通过本地静态页面快照检查，推荐 / 稍后 / 收藏 / 画像 / 对话五个视图结构渲染正常
+- side panel 新版亮色布局已通过本地静态结构检查，四个一级视图与内容库三个子视图结构渲染正常
 - 小红书 `bootstrap_profile` 任务已通过单元测试覆盖：dispatcher 识别任务类型并能跟随 profile URL 二次执行，executor 可从 mock `__INITIAL_STATE__` 的 saved / liked / history 分组提取 scoped notes，并能用 `partial` 批次在滚动任务中持续回传新增结果
 - 抖音 `bootstrap_profile` 任务已通过扩展和后端回归覆盖：`RENDER_DATA` 只提供已显式登录的候选，`profile/self` MAIN-world bridge 对当前账号做最终权威确认（冲突时 profile 优先、未确认不缓存），API harvester 可分页拉取四个 scope 并报告后续页错误；dispatcher 的 partial 批次会在后端合并、去重并转成统一 memory 事件，身份 / 分页不完整时最终状态保持为 `degraded` 而不是伪装 `ok`
 - 抖音 `search` / `hot` / `feed` 任务已通过扩展回归覆盖：dispatcher 三类 discovery 都从抖音首页启动；search 会通过首页搜索框提交并用 `search_navigation_ok` 校验是否进入真实搜索结果路由；content script 声明 search / hot 均支持 DOM interaction + passive fetch tap + active API bridge，feed 仍是 DOM interaction + passive fetch tap；fetch / XHR tap 可被动转发页面自身 search / related / feed 响应，并按目标 scope 过滤结果；`search-douyin -k 猫 --max-items-per-keyword 10 -w 180` 可用于 smoke `dy_search` 候选，`discover-douyin --source search --keyword 猫 --limit 5 --no-cache --no-evaluate` 可预览 `dy-plugin-search` 候选
