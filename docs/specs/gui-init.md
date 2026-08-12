@@ -11,13 +11,14 @@
 
 - 四阶段严格串行：采集并批量落库 → 分析偏好 → 生成、校验并保存完整画像 → 基于该画像做内容发现、个性化评估、推荐文案与 canonical 可用性校验。`profile_ready=true` 可能在阶段 4 期间出现，但 UI 必须以 `running=true` 优先，不能提前进入完成页。
 - 桌面 Web 在上述 `initialized=true && running=true` 窗口转入终态时必须重新读取一次 runtime snapshot，替换初始化前的顶部连接徽标与侧栏库存；这次补水只同步展示，不能成为 `init_completed` 之后的第二完成门槛。
-- 阶段 1 全来源共享 1800 秒预算，B 站 600 秒、X 480 秒单来源上限；扩展轮询 collector 支持协作取消。阶段 2 使用 1500 秒（25 分钟）无完整分片进展期限与至少 2700 秒（45 分钟）绝对上限：idle 高于 1200 秒单请求超时并容纳有界 429 cooldown，不会先于 Provider 请求将其取消。阶段 3 为 1800 秒绝对上限，阶段 4 为 900 秒无进展 / 2700 秒绝对上限。阶段 1 总预算耗尽且无信号返回 `collection_timeout`，阶段 4 超时仍按画像已完成的部分成功处理。
+- 阶段 1 的基础预算是全来源共享 1800 秒，B 站 600 秒、X 480 秒单来源上限；使用默认预算时，Linux.do-only 至少给 1950 秒（32.5 分钟），Linux.do 与至少一个其它来源并选时给 3750 秒（62.5 分钟），显式 timeout override 原样生效、不扩容。扩展轮询 collector 支持协作取消。阶段 2 使用 1500 秒（25 分钟）无完整分片进展期限与至少 2700 秒（45 分钟）绝对上限：idle 高于 1200 秒单请求超时并容纳有界 429 cooldown，不会先于 Provider 请求将其取消。阶段 3 为 1800 秒绝对上限，阶段 4 为 900 秒无进展 / 2700 秒绝对上限。阶段 1 有效总预算耗尽且无信号返回 `collection_timeout`，阶段 4 超时仍按画像已完成的部分成功处理。
 - 状态分为 owner liveness 与业务 progress：`last_heartbeat_at` 证明后台任务仍在，`last_progress_at/progress_sequence` 只在业务里程碑推进；`last_activity` 仅作旧客户端 heartbeat 别名。任务退出但终态写失败会由 done callback / 状态端点立即 reconcile；无 owner 且 heartbeat 超过 120 秒的租约也会回收。
 - `stages[].progress` 支持 `{mode, done, total, note, elapsed_seconds, max_seconds}`。只有 `mode=determinate` 才显示百分比；无法量化的画像 / discovery 调用使用 indeterminate 动画和用时，不伪造“49%”。
 - popup、`/web`、`/setup` 均提供运行中取消、明确的网络错误和有限请求 deadline。轮询失败保留最后已知进度；heartbeat 新鲜但 progress 未变时说明“后台在线，仍在等待当前步骤”，heartbeat 也停止才提示可能断开。
 - run 活跃时 `GET /api/init-status` 只 peek B 站、chat、embedding 与诊断缓存，不发真实探针；热重载取消等待有 1.5 秒硬上限，忽略取消的旧任务保持被 registry 所有且不启动同名重复 loop。
 - 首个完整画像尚未提交时，daemon-owned account-sync / refresh / soul pipeline 同样停在共享 gate，不能在用户点击「开始初始化」之前抢先导入、分析或重复落库 bootstrap 历史；阶段 3 提交后仍由 active run gate 挡到阶段 4 终态。
 - `/setup` 为每个 provider 独立保留 model / Base URL / API flavor，重载会回填当前 provider 的完整非密配置，切换 provider 不得沿用上一家的模型名或残留错误。chat live probe 允许 30 秒覆盖本地 Ollama 冷启动；终态 run 的持久化失败原因优先于随后 prereq 红灯。
+- **§4「设置页重新初始化入口」已实现**：已初始化后，桌面 Web 设置页「通用 → 初始化与画像」与扩展 popup 通用 tab 提供「重新初始化 / 重建画像」按钮（`window.confirm` 二次确认 → `POST /api/init {force:true}` → 回推荐 tab 复用既有进度面板）；CLI 对应 `openbiliclaw init --force`（交互终端默认在检测到已初始化时先 y/N 确认）。force 重建复用同一四阶段流水线，不删除既有数据（事件 / 收藏 / 对话历史 / 手动编辑覆盖保留），仅重新拉取、重建画像并补足首轮发现池。**force 重初始化会清空旧推荐池**（stage 4 前把活跃行标 `pool_status='purged_by_reinit'`，按新画像重新发现），并可选 `reset_cognition` 清空旧 awareness / insight 认知层（换账号 / 大改兴趣时建议）。移动 Web 无设置页，入口按四表面契约声明排除。
 
 ## Goal
 
@@ -213,10 +214,10 @@ CLI init 独占进程;API init 跑在**活后端**里,后台有连续 refresh、
 
 ## Status Values & Reasons（契约的一部分）
 
-稳定 `reason` 还包括 `collection_timeout`（阶段 1 总预算耗尽且无信号）、`empty_signals`、`analyze_failed`、`profile_failed`、`discovery_timeout`、`douyin_degraded`、`interrupted` 与 `cancelled`；原有 `none` / `local_only` / `bilibili_not_logged_in` / `llm_not_ready` / `already_running` / `already_initialized` / `unsupported_runtime` / `init_failed` / `init_running` / `discovery_partial` / `not_running` 保持兼容。
+稳定 `reason` 还包括 `collection_timeout`（阶段 1 有效总预算耗尽且无信号）、`empty_signals`、`analyze_failed`、`profile_failed`、`discovery_timeout`、`douyin_degraded`、`linuxdo_degraded`、`interrupted` 与 `cancelled`；原有 `none` / `local_only` / `bilibili_not_logged_in` / `llm_not_ready` / `already_running` / `already_initialized` / `unsupported_runtime` / `init_failed` / `init_running` / `discovery_partial` / `not_running` 保持兼容。
 `current_stage`:`0`(未开始)/`1`拉数据/`2`分析/`3`画像/`4`发现池。
 每个 stage 的 `status`:`pending` / `running` / `ok` / `warning`(部分成功,如收藏/关注拉取失败但历史够)/ `failed`。
-`partial_success`:任一 stage 为 `warning`,或画像已生成但发现池「部分完成」时为 `true`（此时 `initialized=true`）。`reason=douyin_degraded` 表示抖音已采事件已用于画像、但至少一个 scope 未证明分页完整，下一次 bootstrap 会重新入队；discovery 类 reason 才表示推荐池后续靠常规 refresh 补齐。
+`partial_success`:任一 stage 为 `warning`,或画像已生成但发现池「部分完成」时为 `true`（此时 `initialized=true`）。`reason=douyin_degraded` 表示抖音已采事件已用于画像、但至少一个 scope 未证明分页完整；`reason=linuxdo_degraded` 表示 Linux.do 已采个人事件已用于画像、但至少一个 scope 未完成。两源的降级 bootstrap 都不进入近期任务复用，下一次会重新入队；discovery 类 reason 才表示推荐池后续靠常规 refresh 补齐。
 `bilibili_check`:`ok` / `failed` / `checking`(缓存未命中、正在校验)。
 
 ## Boundaries
@@ -249,7 +250,7 @@ CLI init 独占进程;API init 跑在**活后端**里,后台有连续 refresh、
 - **外部探测带 TTL 缓存**:chat 可用性 + B站 `validate_cookie` 都缓存(B站 成功 60s/失败 10s),`GET /api/init-status` 不在每次 poll 同步打外部服务。
 - **`force` 重建策略**:重算 soul + preference,**保留用户手动 override**(`memory/manager.py` overrides 层),不动 `content_cache`;UI 二次确认 + 明示「会重算画像」。
 - **i18n**:API 只回稳定 reason code,CN/EN 文案由 UI 拥有(插件现硬编码中文,`config.language` 存在)。
-- **部分失败语义**:画像成功但发现池失败 ⇒ stage 4 `status:"warning"` + `reason:"discovery_partial"`、`initialized=true`+`partial_success=true`(**区别于** stages 1–3 硬失败的整体 `init_failed`);B站 收藏/关注拉取失败是 `warning`(历史够即继续);**历史为空才整体 `init_failed`**。任何整体失败发 `init_failed` + 落库 + 不崩、可重试 / 可 cancel。
+- **部分失败语义**:画像成功但发现池失败 ⇒ stage 4 `status:"warning"` + `reason:"discovery_partial"`、`initialized=true`+`partial_success=true`(**区别于** stages 1–3 硬失败的整体 `init_failed`);抖音或 Linux.do bootstrap `degraded` 时已采事件继续用于画像，stage 1 为 warning，分别以 `douyin_degraded` / `linuxdo_degraded` 保存部分成功且下次重新采集；B站 收藏/关注拉取失败是 `warning`(历史够即继续);**历史为空才整体 `init_failed`**。任何整体失败发 `init_failed` + 落库 + 不崩、可重试 / 可 cancel。
 
 ## Acceptance Criteria
 

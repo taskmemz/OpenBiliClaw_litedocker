@@ -46,8 +46,9 @@ class ImageFetchCoordinator:
     """Coordinate cache-first cover fetches across all API runtime owners.
 
     The coordinator owns upstream tasks rather than attaching their lifetime to
-    any individual waiter.  Every waiter shields the shared task, so cancelling
-    one HTTP request cannot cancel a fetch still needed by another waiter.
+    any individual waiter.  Every waiter observes the shared task through
+    ``asyncio.wait``, so cancelling one HTTP request cannot cancel a fetch still
+    needed by another waiter or leave a Python 3.14 shield logger behind.
     """
 
     upstream_fetcher: CoverFetcher | None = None
@@ -111,7 +112,8 @@ class ImageFetchCoordinator:
 
         if task is None:  # pragma: no cover - construction invariant
             raise RuntimeError("image fetch task was not created")
-        return await asyncio.shield(task)
+        done, _pending = await asyncio.wait((task,))
+        return next(iter(done)).result()
 
     async def prefetch(self, url: str) -> bool:
         """Best-effort background fetch; True only for a newly stored cover."""

@@ -150,6 +150,29 @@ test("saved identity never uses a recommendation row id or namespaced legacy id 
   });
 });
 
+test("popup saved identity canonicalizes Weibo aliases and exact host boundaries", () => {
+  for (const source_platform of ["weibo", "wb", "微博"]) {
+    assert.equal(normalizeCanonicalSavedItem({
+      source_platform,
+      content_id: "5023456789012345",
+    }).source_platform, "weibo");
+  }
+  for (const content_url of [
+    "https://weibo.com/2803301701/RcExample",
+    "https://m.weibo.cn/detail/5023456789012345",
+    "https://wx1.sinaimg.cn/large/example.jpg",
+  ]) {
+    assert.equal(normalizeCanonicalSavedItem({
+      content_url,
+      content_id: "5023456789012345",
+    }).source_platform, "weibo");
+  }
+  assert.equal(normalizeCanonicalSavedItem({
+    content_url: "https://evilweibo.com/5023456789012345",
+    content_id: "5023456789012345",
+  }).source_platform, "web");
+});
+
 test("save payload normalization does not force unknown text content to video", () => {
   assert.equal(normalizeSavedItemInput({
     item_key: "twitter:url:0123456789abcdef01234567",
@@ -684,6 +707,7 @@ test("saved sync eligibility distinguishes content limits from rolling upgrades 
   for (const runtime of [popup, mobile, desktop]) {
     assert.equal(typeof runtime.isSavedSyncEligibleStatus, "function");
     assert.equal(runtime.isSavedSyncEligibleStatus("unsupported", "unsupported_content_type"), false);
+    assert.equal(runtime.isSavedSyncEligibleStatus("unsupported", "local_only_source"), false);
     assert.equal(runtime.isSavedSyncEligibleStatus("unsupported", "unsupported_adapter_missing"), true);
     assert.equal(runtime.isSavedSyncEligibleStatus("pending", "", "task-1"), false);
     assert.equal(runtime.isSavedSyncEligibleStatus("pending", "", ""), true);
@@ -705,6 +729,7 @@ test("saved sync eligibility distinguishes content limits from rolling upgrades 
   for (const source of [popupRuntime, mobileView, desktopRuntime]) {
     assert.match(source, /仅本地保存/);
     assert.match(source, /unsupported_content_type/);
+    assert.match(source, /local_only_source/);
     assert.match(source, /unsupported_adapter_missing/);
     assert.match(source, /滚动升级/);
   }
@@ -759,6 +784,13 @@ test("popup desktop and mobile expose the same truthful saved-state matrix", asy
     });
     assert.equal(contentLimit.localOnly, true);
     assert.equal(contentLimit.actionable, false);
+
+    const sourceLimit = model({
+      sync_status: "unsupported", error_code: "local_only_source",
+    });
+    assert.equal(sourceLimit.localOnly, true);
+    assert.equal(sourceLimit.actionable, false);
+    assert.match(sourceLimit.detail, /仅支持本地收藏|不会向平台创建同步任务/);
 
     const rollingUpgrade = model({
       sync_status: "unsupported", error_code: "unsupported_adapter_missing",
@@ -905,11 +937,13 @@ test("static batch buttons clear stale busy ARIA after success failure or abort 
         ["aria-disabled", "true"],
       ]);
       const button = {
+        hidden: true,
         disabled: true,
         setAttribute(name: string, value: string) { attrs.set(name, value); },
         removeAttribute(name: string) { attrs.delete(name); },
       };
       update(button, 2);
+      assert.equal(button.hidden, false, outcome);
       assert.equal(button.disabled, false, outcome);
       assert.equal(attrs.get("aria-disabled"), "false", outcome);
       assert.equal(attrs.has("aria-busy"), false, outcome);
@@ -917,11 +951,13 @@ test("static batch buttons clear stale busy ARIA after success failure or abort 
 
     const attrs = new Map([["aria-busy", "true"]]);
     const button = {
+      hidden: false,
       disabled: false,
       setAttribute(name: string, value: string) { attrs.set(name, value); },
       removeAttribute(name: string) { attrs.delete(name); },
     };
     update(button, 0);
+    assert.equal(button.hidden, true);
     assert.equal(button.disabled, true);
     assert.equal(attrs.get("aria-disabled"), "true");
     assert.equal(attrs.has("aria-busy"), false);

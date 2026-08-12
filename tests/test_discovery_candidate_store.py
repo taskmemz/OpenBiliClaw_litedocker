@@ -15,6 +15,22 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+def test_weibo_alias_is_canonicalized_before_candidate_storage() -> None:
+    item = DiscoveredContent(
+        title="微博正文",
+        content_id="post-1",
+        content_url="https://weibo.com/123/post-1",
+        source_platform="wb",
+        source_strategy="weibo-search",
+        content_type="post",
+    )
+
+    write = discovered_content_to_candidate_write(item)
+
+    assert write.source_platform == "weibo"
+    assert write.candidate_key == "weibo:post-1"
+
+
 def test_enqueue_discovery_candidates_dedupes_by_source_key(tmp_path: Path) -> None:
     db = Database(tmp_path / "test.db")
     db.initialize()

@@ -39,16 +39,27 @@ def test_demo_source_status_uses_truthful_login_states() -> None:
     assert payload["xiaohongshu"]["state"] == "ready"
     assert payload["douyin"]["state"] == "unverified"
     assert payload["reddit"]["detail"].endswith("未实时访问 Reddit 验证）。")
+    assert payload["bangumi"]["state"] == "no_auth"
+    assert payload["v2ex"]["state"] == "ready"
+    assert "PAT 为可选增强" in payload["v2ex"]["detail"]
 
 
 def test_demo_recommendations_and_delight_use_local_generated_covers() -> None:
     status, recommendations = demo_payload("/api/recommendations")
     assert status == 200
-    assert len(recommendations["items"]) == 7
-    for item in recommendations["items"]:
+    assert len(recommendations["items"]) == 9
+    covered = [item for item in recommendations["items"] if item["cover_url"]]
+    assert len(covered) == 7
+    for item in covered:
         parsed = urlsplit(item["cover_url"])
         assert parsed.scheme == "https"
         assert parsed.hostname == DEMO_COVER_HOST
+    text_cards = {
+        item["source_platform"]: item for item in recommendations["items"] if not item["cover_url"]
+    }
+    assert text_cards["v2ex"]["content_type"] == "topic"
+    assert text_cards["v2ex"]["reply_count"] == 36
+    assert text_cards["bangumi"]["content_type"] == "subject"
 
     status, delight = demo_payload("/api/delight/pending-batch")
     assert status == 200
@@ -68,7 +79,7 @@ def test_demo_cover_files_are_complete_16_by_9_images() -> None:
 
 def test_demo_image_proxy_serves_only_known_local_cover_hosts() -> None:
     _, recommendations = demo_payload("/api/recommendations")
-    cover_url = recommendations["items"][0]["cover_url"]
+    cover_url = next(item["cover_url"] for item in recommendations["items"] if item["cover_url"])
     with (
         DemoServer() as origin,
         urlopen(f"{origin}/api/image-proxy?url={quote(cover_url, safe='')}") as response,

@@ -101,6 +101,8 @@ test("Firefox AMO workflow submits a listed build with metadata and reviewer sou
   assert.ok(metadata.name?.["zh-CN"]);
   assert.ok(metadata.summary?.["en-US"]);
   assert.match(metadata.version?.approval_notes ?? "", /npm run build:firefox/);
+  assert.match(metadata.version?.approval_notes ?? "", /\*\.v2ex\.com/);
+  assert.match(metadata.version?.approval_notes ?? "", /performs no V2EX write actions/);
 });
 
 test("Firefox AMO source instructions reproduce the reviewed directory", () => {
@@ -113,6 +115,8 @@ test("Firefox AMO source instructions reproduce the reviewed directory", () => {
   assert.match(instructions, /npm ci/);
   assert.match(instructions, /npm run build:firefox/);
   assert.match(instructions, /extension\/dist-firefox/);
+  assert.match(instructions, /A2/);
+  assert.match(instructions, /never accesses, stores, or\s+sends the cookie value/);
 });
 
 test("Firefox AMO API requests use explicit JSON content negotiation", () => {

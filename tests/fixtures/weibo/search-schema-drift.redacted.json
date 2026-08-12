@@ -1,0 +1,17 @@
+{
+  "_fixture": {
+    "derived_from": "search-empty.redacted.json",
+    "purpose": "Counterexample: upstream claims results but exposes no recognized post rows",
+    "content_type": "application/json; charset=utf-8"
+  },
+  "ok": 1,
+  "data": {
+    "cardlistInfo": {
+      "total": 1
+    },
+    "cards": [
+      {"card_type": 4},
+      {"card_type": 11, "card_group": []}
+    ]
+  }
+}

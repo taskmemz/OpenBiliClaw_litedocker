@@ -24,7 +24,7 @@ const markdown = `# Chrome Web Store 商店页文案与素材
 ## Short Description
 
 \`\`\`text
-需本地后端的七平台内容发现 AI Agent：跨平台推荐、私有画像与可反馈侧边栏
+需本地后端的多平台内容发现 AI Agent：跨平台推荐、私有画像与可反馈侧边栏
 \`\`\`
 
 ## Detailed Description

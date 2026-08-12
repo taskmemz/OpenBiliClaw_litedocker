@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from openbiliclaw.memory.manager import MemoryManager
 from openbiliclaw.sources.dy_tasks import DyTaskQueue
+from openbiliclaw.sources.linuxdo_tasks import LinuxdoTaskQueue
 from openbiliclaw.sources.reddit_tasks import RedditTaskQueue
 from openbiliclaw.sources.task_result_protocol import staged_terminal_status
 from openbiliclaw.sources.xhs_tasks import XhsTaskQueue
@@ -114,6 +115,27 @@ SOURCE_CASES: tuple[dict[str, Any], ...] = (
         "state_key": "reddit_seen_item_keys",
         "bootstrap_key": "t3_source-protocol-reddit",
     },
+    {
+        "source": "linuxdo",
+        "table": "linuxdo_tasks",
+        "queue": LinuxdoTaskQueue,
+        "task_type": "bootstrap_events",
+        "task_payload": {
+            "scopes": ["linuxdo_bookmarks"],
+            "incremental": True,
+        },
+        "field": "items",
+        "item": {
+            "scope": "linuxdo_bookmarks",
+            "content_type": "post",
+            "title": "ORIGINAL linuxdo",
+            "url": "https://linux.do/t/source-protocol/987654",
+            "topic_id": 987654,
+            "content_id": "topic:987654",
+        },
+        "state_key": "linuxdo_seen_item_keys",
+        "bootstrap_key": ("sha256:" + "d" * 64 + ":linuxdo_bookmarks:topic:987654"),
+    },
 )
 
 
@@ -143,6 +165,7 @@ def durable_source_app(
                 daily_creator_budget=10,
                 task_interval_seconds=45,
             ),
+            linuxdo=SimpleNamespace(enabled=True),
         ),
         scheduler=SimpleNamespace(
             enabled=True,
@@ -192,6 +215,16 @@ def _callback(case: dict[str, Any], task_id: str, *, changed: bool = False) -> d
             "user_id": "changed-user" if changed else "original-user",
             "nickname": "changed" if changed else "original",
         }
+    if case["source"] == "linuxdo":
+        payload.update(
+            {
+                "claim_token": case.get("_claim_tokens", {}).get(task_id, ""),
+                "account_key": "sha256:" + "d" * 64,
+                "scope_counts": {"linuxdo_bookmarks": 1},
+                "response_observed": True,
+                "complete_scopes": ["linuxdo_bookmarks"],
+            }
+        )
     return payload
 
 
@@ -199,6 +232,8 @@ def _claim(client: TestClient, case: dict[str, Any], task_id: str) -> None:
     claimed = client.get(f"/api/sources/{case['source']}/next-task")
     assert claimed.status_code == 200
     assert claimed.json()["id"] == task_id
+    if case["source"] == "linuxdo":
+        case.setdefault("_claim_tokens", {})[task_id] = claimed.json()["claim_token"]
 
 
 def _expire_lease_and_reclaim(
@@ -327,12 +362,12 @@ def test_retry_repairs_crash_after_seen_key_before_terminal_flip(
     original_complete: Callable[..., bool] = queue_type.complete_staged_result
     attempts = 0
 
-    def fail_once(self: Any, current_task_id: str) -> bool:
+    def fail_once(self: Any, current_task_id: str, **kwargs: Any) -> bool:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise RuntimeError("crash before terminal flip")
-        return original_complete(self, current_task_id)
+        return original_complete(self, current_task_id, **kwargs)
 
     monkeypatch.setattr(queue_type, "complete_staged_result", fail_once)
     endpoint = f"/api/sources/{case['source']}/task-result"
@@ -358,7 +393,10 @@ def test_reddit_bootstrap_filters_old_rows_and_repeat_cycle_adds_no_events(
     flag: str,
 ) -> None:
     client, database, memory = durable_source_app
-    case = dict(SOURCE_CASES[-1], task_payload={flag: True})
+    case = dict(
+        next(case for case in SOURCE_CASES if case["source"] == "reddit"),
+        task_payload={flag: True},
+    )
     old_item = dict(case["item"], id="old-reddit", title="OLD reddit")
     new_item = dict(case["item"], id="new-reddit", title="NEW reddit")
     state = memory.load_source_bootstrap_state()
@@ -413,7 +451,7 @@ def test_reddit_seen_checkpoint_preserves_canonical_result_order(
     durable_source_app: tuple[TestClient, Database, MemoryManager],
 ) -> None:
     client, database, memory = durable_source_app
-    case = SOURCE_CASES[-1]
+    case = next(case for case in SOURCE_CASES if case["source"] == "reddit")
     first_item = dict(case["item"], id="z-first", title="FIRST reddit")
     second_item = dict(case["item"], id="a-second", title="SECOND reddit")
     queue, task_id = _enqueue(database, case)

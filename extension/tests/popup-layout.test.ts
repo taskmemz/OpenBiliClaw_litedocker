@@ -44,6 +44,7 @@ test("popup header exposes a local mobile web QR entry", () => {
   assert.match(overlayMarkup, /id="mobileQrCode"/);
   assert.match(overlayMarkup, /id="mobileQrCopy"/);
   assert.match(overlayMarkup, /id="mobileQrOpen"/);
+  assert.match(overlayMarkup, /role="dialog" aria-modal="true" aria-labelledby="mobileQrTitle"/);
   assert.match(popupJs, /createQrSvgMarkup/);
   assert.doesNotMatch(popupHtml, /api\.qrserver|chart\.googleapis/);
 });
@@ -262,11 +263,36 @@ test("recommendation card layout reserves a media cover slot", () => {
   const previewBlock = popupHtml.match(/\.recommendation-preview\s*\{[\s\S]*?\}/)?.[0] ?? "";
   const coverBlock = popupHtml.match(/\.recommendation-cover\s*\{[\s\S]*?\}/)?.[0] ?? "";
   const coverImageBlock = popupHtml.match(/\.recommendation-cover img\s*\{[\s\S]*?\}/)?.[0] ?? "";
+  const textCardBlock = popupHtml.match(/\.recommendation-cover\.is-text-card\s*\{[\s\S]*?\}/)?.[0] ?? "";
 
   assert.match(previewBlock, /flex-direction:\s*column;/);
   assert.match(coverBlock, /aspect-ratio:\s*16\s*\/\s*9;/);
   assert.match(coverBlock, /width:\s*100%;/);
   assert.match(coverImageBlock, /object-fit:\s*cover;/);
+  assert.match(textCardBlock, /aspect-ratio:\s*auto;/);
+  assert.match(textCardBlock, /min-height:\s*124px;/);
+  assert.match(textCardBlock, /max-height:\s*180px;/);
+});
+
+test("delight banner keeps usable controls and text fallbacks at narrow popup widths", () => {
+  const popupHtml = readFileSync(resolve("popup", "popup.html"), "utf8");
+  const popupJs = readFileSync(resolve("popup", "popup.js"), "utf8");
+  const thumbBlock = popupHtml.match(/\.delight-banner-thumb\s*\{[\s\S]*?\}/)?.[0] ?? "";
+  const kickerBlock = popupHtml.match(/\.delight-banner-kicker-line\s*\{[\s\S]*?\}/)?.[0] ?? "";
+  const navBlock = popupHtml.match(/\.delight-banner-nav\s*\{[\s\S]*?\}/)?.[0] ?? "";
+  const textThumbBlock = popupHtml.match(/\.delight-banner-thumb\.is-text-card\s*\{[\s\S]*?\}/)?.[0] ?? "";
+
+  assert.match(thumbBlock, /width:\s*clamp\(108px,\s*32vw,\s*136px\);/);
+  assert.match(kickerBlock, /flex-wrap:\s*wrap;/);
+  assert.match(navBlock, /width:\s*28px;/);
+  assert.match(navBlock, /height:\s*28px;/);
+  assert.match(navBlock, /flex:\s*0\s+0\s+28px;/);
+  assert.match(textThumbBlock, /aspect-ratio:\s*auto;/);
+  assert.match(popupJs, /delight\.body_text \|\| delight\.title/);
+  assert.doesNotMatch(popupJs, /row\.role = "button"/);
+  assert.match(popupJs, /const chevron = document\.createElement\("button"\)/);
+  assert.match(popupJs, /chevron\.setAttribute\("aria-expanded"/);
+  assert.match(popupJs, /event\.stopPropagation\(\);\s*toggleExpanded\(\);/);
 });
 
 test("saved cards reserve a thumbnail slot and load covers through the backend proxy", () => {
@@ -311,9 +337,35 @@ test("footer activity card keeps two lines and expandable history area", () => {
   assert.match(footerHintBlock, /font-weight:\s*700;/);
   assert.match(footerHeadlineBlock, /font-size:\s*11px;/);
   assert.match(footerHistoryBlock, /flex-direction:\s*column;/);
+  assert.match(footerHistoryBlock, /max-height:\s*clamp\(72px,\s*calc\(100dvh - 440px\),\s*360px\);/);
   assert.match(footerHintBlock, /padding-left:\s*22px;/);
   assert.match(successBlock, /background:/);
   assert.match(errorBlock, /background:/);
+});
+
+test("full-screen overlays isolate background focus and restore their triggers", () => {
+  const popupHtml = readFileSync(resolve("popup", "popup.html"), "utf8");
+  const popupJs = readFileSync(resolve("popup", "popup.js"), "utf8");
+
+  for (const [overlayId, titleId] of [
+    ["mobileQrOverlay", "mobileQrTitle"],
+    ["messagesOverlay", "messagesTitle"],
+    ["settingsOverlay", "settingsTitle"],
+  ]) {
+    assert.match(
+      popupHtml,
+      new RegExp(`id="${overlayId}"[^>]*role="dialog"[^>]*aria-modal="true"[^>]*aria-labelledby="${titleId}"`),
+    );
+  }
+  assert.match(popupJs, /function openPopupOverlay\(/);
+  assert.match(popupJs, /child\.inert = true;/);
+  assert.match(popupJs, /child\.setAttribute\("inert", ""\);/);
+  assert.match(popupJs, /child\.setAttribute\("aria-hidden", "true"\);/);
+  assert.match(popupJs, /function closePopupOverlay\(/);
+  assert.match(popupJs, /returnFocus\.focus\(\{ preventScroll: true \}\);/);
+  assert.match(popupJs, /function bindPopupOverlayKeyboard\(/);
+  assert.match(popupJs, /event\.key === "Escape"/);
+  assert.match(popupJs, /event\.key !== "Tab"/);
 });
 
 test("profile cognition cards reserve separate rows for context and explicit state", () => {

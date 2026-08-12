@@ -294,7 +294,7 @@ class TestMobileWebViewModels:
               title: "A YouTube deep dive",
               recommendation_id: 42,
               topic_label: "",
-              up_name: "这位 UP 还没认出来",
+              up_name: "这位创作者还没认出来",
             });
         """)
         )
@@ -399,7 +399,7 @@ class TestMobileWebViewModels:
               title: "一个知乎回答",
               recommendation_id: 43,
               topic_label: "",
-              up_name: "这位 UP 还没认出来",
+              up_name: "这位创作者还没认出来",
             });
 
             const missingUrl = normalizeRecommendation({
@@ -457,7 +457,7 @@ class TestMobileWebViewModels:
               title: "Local-first agents",
               recommendation_id: 44,
               topic_label: "",
-              up_name: "这位 UP 还没认出来",
+              up_name: "这位创作者还没认出来",
             });
 
             const missingUrl = normalizeRecommendation({
@@ -474,6 +474,100 @@ class TestMobileWebViewModels:
               }),
               "reddit",
             );
+          """)
+        )
+
+    def test_linuxdo_recommendation_uses_canonical_topic_url_and_text_card(self) -> None:
+        _assert_js(
+            dedent("""
+            import assert from "node:assert/strict";
+            import {
+              buildContentUrl,
+              getRecommendationCardKind,
+              getSourceLabel,
+              normalizeRecommendation,
+              normalizeSourcePlatform,
+              recommendationStats,
+            } from "./src/openbiliclaw/web/js/view-models.js";
+
+            const post = normalizeRecommendation({
+              id: 45,
+              content_id: "topic:12345",
+              title: "Linux.do 上的一篇主题",
+              source_platform: "linux.do",
+              content_type: "post",
+              body_text: "主题正文摘要",
+              cover_url: "",
+            });
+
+            assert.equal(post.source_platform, "linuxdo");
+            assert.equal(post.up_name, "这位创作者还没认出来");
+            assert.equal(getSourceLabel(post.source_platform), "Linux.do");
+            assert.equal(buildContentUrl(post), "https://linux.do/t/12345");
+            assert.deepEqual(getRecommendationCardKind(post), {
+              kind: "text",
+              coverUrl: "",
+              text: "主题正文摘要",
+            });
+            assert.equal(
+              normalizeSourcePlatform({
+                content_url: "https://linux.do/t/example/67890",
+              }),
+              "linuxdo",
+            );
+            assert.equal(
+              normalizeSourcePlatform({
+                content_url: "https://notlinux.do/t/example/67890",
+              }),
+              "web",
+            );
+          """)
+        )
+
+    def test_weibo_recommendation_alias_hosts_and_text_card_are_source_aware(self) -> None:
+        _assert_js(
+            dedent("""
+            import assert from "node:assert/strict";
+            import {
+              buildContentUrl,
+              getRecommendationCardKind,
+              getSourceLabel,
+              normalizeRecommendation,
+              normalizeSourcePlatform,
+              recommendationStats,
+            } from "./src/openbiliclaw/web/js/view-models.js";
+
+            const post = normalizeRecommendation({
+              content_id: "5023456789012345",
+              content_url: "https://m.weibo.cn/detail/5023456789012345",
+              title: "一条公开微博",
+              source_platform: "wb",
+              content_type: "post",
+              body_text: "公开微博正文。",
+              cover_url: "https://wx1.sinaimg.cn/large/example.jpg",
+              share_count: 321,
+            });
+
+            assert.equal(post.source_platform, "weibo");
+            assert.equal(getSourceLabel(post.source_platform), "微博");
+            assert.equal(buildContentUrl(post), "https://m.weibo.cn/detail/5023456789012345");
+            assert.equal(getRecommendationCardKind(post).kind, "text");
+            assert.match(recommendationStats(post), /🔁 321/);
+            assert.equal(
+              normalizeSourcePlatform({ content_url: "https://weibo.com/u/123" }),
+              "weibo",
+            );
+            assert.equal(
+              normalizeSourcePlatform({ content_url: "https://wx1.sinaimg.cn/large/a.jpg" }),
+              "weibo",
+            );
+
+            const missingUrl = normalizeRecommendation({
+              content_id: "5023456789012346",
+              source_platform: "weibo",
+              content_type: "post",
+            });
+            assert.equal(buildContentUrl(missingUrl), "");
           """)
         )
 

@@ -35,6 +35,10 @@ test("service worker starts platform task polling during hot reload bootstrap", 
   const initializeStart = source.indexOf("async function startServiceWorkerAfterRecovery");
   const initializeEnd = source.indexOf("chrome.runtime.onInstalled", initializeStart);
   const initializeBlock = source.slice(initializeStart, initializeEnd);
+  assert.ok(
+    initializeBlock.indexOf("const runtimeStreamReady = connectRuntimeStream()") <
+      initializeBlock.indexOf("await ensureLinuxdoTaskRecovery()"),
+  );
   assert.ok(initializeBlock.indexOf("await ensureNativeSaveTaskRecovery()") < initializeBlock.indexOf("startPlatformTaskPolling()"));
   assert.match(initializeBlock, /startCookieSync\(\);/);
 });

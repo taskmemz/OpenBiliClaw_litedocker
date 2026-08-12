@@ -934,10 +934,16 @@ def test_source_bootstrap_state_defaults_when_missing(tmp_path: Path) -> None:
         "yt_seen_item_keys": [],
         "zhihu_seen_item_keys": [],
         "reddit_seen_item_keys": [],
+        "linuxdo_seen_item_keys": [],
+        "linuxdo_account_key": "",
+        "v2ex_seen_item_keys": [],
+        "weibo_seen_item_keys": [],
+        "weibo_account_key": "",
         "last_source_bootstrap_sync_at": "",
         "source_incremental": {
             "cursor": "",
             "last_attempt_at": {},
+            "last_success_at": {},
             "active_task": None,
         },
     }
@@ -954,10 +960,14 @@ def test_source_bootstrap_state_round_trips_to_json(tmp_path: Path) -> None:
             "yt_seen_item_keys": ["yt_history:yt-1"],
             "zhihu_seen_item_keys": ["zhihu_favorite:zh-1"],
             "reddit_seen_item_keys": ["t3:reddit-1"],
+            "linuxdo_seen_item_keys": ["linuxdo:sha256:test:linuxdo_bookmarks:topic:42"],
+            "linuxdo_account_key": "sha256:test-account",
+            "v2ex_seen_item_keys": ["alice:favorite_topics:123"],
             "last_source_bootstrap_sync_at": "2026-05-20T12:00:00",
             "source_incremental": {
                 "cursor": "reddit",
                 "last_attempt_at": {"reddit": "2026-05-20T12:01:00+00:00"},
+                "last_success_at": {"linuxdo": "2026-05-20T12:02:00+00:00"},
                 "active_task": {"source": "reddit", "task_id": "task-1"},
             },
         }
@@ -970,10 +980,14 @@ def test_source_bootstrap_state_round_trips_to_json(tmp_path: Path) -> None:
     assert state["yt_seen_item_keys"] == ["yt_history:yt-1"]
     assert state["zhihu_seen_item_keys"] == ["zhihu_favorite:zh-1"]
     assert state["reddit_seen_item_keys"] == ["t3:reddit-1"]
+    assert state["linuxdo_seen_item_keys"] == ["linuxdo:sha256:test:linuxdo_bookmarks:topic:42"]
+    assert state["linuxdo_account_key"] == "sha256:test-account"
+    assert state["v2ex_seen_item_keys"] == ["alice:favorite_topics:123"]
     assert state["last_source_bootstrap_sync_at"] == "2026-05-20T12:00:00"
     assert state["source_incremental"] == {
         "cursor": "reddit",
         "last_attempt_at": {"reddit": "2026-05-20T12:01:00+00:00"},
+        "last_success_at": {"linuxdo": "2026-05-20T12:02:00+00:00"},
         "active_task": {"source": "reddit", "task_id": "task-1"},
     }
 

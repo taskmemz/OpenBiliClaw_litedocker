@@ -25,6 +25,9 @@ def test_source_enabled_map_reads_bilibili_switch() -> None:
         "zhihu": False,
         "reddit": False,
         "bangumi": False,
+        "linuxdo": False,
+        "weibo": False,
+        "v2ex": False,
     }
 
 
@@ -40,6 +43,9 @@ def test_default_enabled_sources_make_xiaohongshu_opt_in() -> None:
         "zhihu": False,
         "reddit": False,
         "bangumi": False,
+        "linuxdo": False,
+        "weibo": False,
+        "v2ex": False,
     }
     assert effective_pool_source_shares(config) == {"bilibili": 5}
 
@@ -144,6 +150,14 @@ def test_effective_pool_source_shares_keep_enabled_bangumi() -> None:
     config.scheduler.pool_source_shares = {"bilibili": 5, "bangumi": 2}
 
     assert effective_pool_source_shares(config) == {"bilibili": 5, "bangumi": 2}
+
+
+def test_effective_pool_source_shares_keep_enabled_linuxdo() -> None:
+    config = Config()
+    config.sources.linuxdo.enabled = True
+    config.scheduler.pool_source_shares = {"bilibili": 5, "linuxdo": 2}
+
+    assert effective_pool_source_shares(config) == {"bilibili": 5, "linuxdo": 2}
 
 
 def test_effective_pool_source_shares_backfills_enabled_zhihu_default() -> None:

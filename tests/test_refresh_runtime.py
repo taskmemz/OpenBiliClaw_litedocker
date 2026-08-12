@@ -608,6 +608,7 @@ _LOOP_BODY_ATTRS = [
     ("_loop_youtube_producer", ("_tick_youtube_producer",)),
     ("_loop_x_producer", ("_tick_x_producer",)),
     ("_loop_reddit_producer", ("_tick_reddit_producer",)),
+    ("_loop_linuxdo_producer", ("_tick_linuxdo_producer",)),
     (
         "_loop_proactive_push",
         (
@@ -1027,6 +1028,7 @@ async def test_publish_delight_if_available_includes_publication_fields() -> Non
                 "delight_score": 0.95,
                 "published_at": "2026-07-08T06:30:00Z",
                 "published_label": "3 days ago",
+                "share_count": 321,
             },
         ),
         soul_engine=_FakeSoulEngine(),
@@ -1039,6 +1041,7 @@ async def test_publish_delight_if_available_includes_publication_fields() -> Non
 
     assert len(event_hub.events) == 1
     assert_publication(event_hub.events[0])
+    assert event_hub.events[0]["share_count"] == 321
 
 
 def test_load_disliked_topic_phrases_reads_effective_dislikes() -> None:
@@ -4150,6 +4153,29 @@ async def test_reddit_producer_skips_when_reddit_at_quota() -> None:
     await controller._tick_reddit_producer()
 
     assert producer.calls == []
+
+
+async def test_linuxdo_producer_runs_when_linuxdo_under_quota() -> None:
+    producer = _FakeRedditProducer()
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=_FakeDatabase(
+            [],
+            pool_count=540,
+            source_counts={"bilibili": 480, "linuxdo": 0},
+        ),
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        pool_target_count=600,
+        pool_source_shares={"bilibili": 8, "linuxdo": 2},
+        discovery_limit=30,
+        linuxdo_producer=producer,
+    )
+
+    await controller._tick_linuxdo_producer()
+
+    assert producer.calls == [30]
 
 
 def test_pool_cap_total_trim_receives_raw_ceiling_source_quotas() -> None:

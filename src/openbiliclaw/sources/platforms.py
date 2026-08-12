@@ -13,6 +13,9 @@ PLATFORM_TWITTER = "twitter"
 PLATFORM_ZHIHU = "zhihu"
 PLATFORM_REDDIT = "reddit"
 PLATFORM_BANGUMI = "bangumi"
+PLATFORM_LINUXDO = "linuxdo"
+PLATFORM_V2EX = "v2ex"
+PLATFORM_WEIBO = "weibo"
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,24 @@ SOURCE_FAMILY_RULES = (
         url_hosts=("bgm.tv", "bangumi.tv"),
         requires_overseas_network=True,
         routed_by_network_mode=True,
+    ),
+    SourceFamilyRule(
+        family=PLATFORM_LINUXDO,
+        platform_aliases=frozenset({"linuxdo", "linux.do", "linux-do", "ldo", "l站"}),
+        source_prefixes=("linuxdo-", "linuxdo_"),
+        url_hosts=("linux.do",),
+    ),
+    SourceFamilyRule(
+        family=PLATFORM_V2EX,
+        platform_aliases=frozenset({"v2ex", "v2"}),
+        source_prefixes=("v2ex-", "v2ex_"),
+        url_hosts=("v2ex.com",),
+    ),
+    SourceFamilyRule(
+        family=PLATFORM_WEIBO,
+        platform_aliases=frozenset({"weibo", "wb", "微博"}),
+        source_prefixes=("weibo-", "weibo_"),
+        url_hosts=("weibo.com", "weibo.cn"),
     ),
 )
 

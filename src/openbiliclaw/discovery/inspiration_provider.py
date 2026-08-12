@@ -9,7 +9,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Protocol, cast
 
 from openbiliclaw.discovery.inspiration import ExaPreviewItem
@@ -810,6 +810,84 @@ class BangumiPlatformSearchBackend:
         return _dedupe_previews(previews, limit=max(1, int(limit)))
 
 
+class V2EXPlatformSearchBackend:
+    """Use V2EX's bounded public search fallback as inspiration-only grounding."""
+
+    platform = "v2ex"
+    risk_controlled = False
+
+    def __init__(self, client: object) -> None:
+        self._client = client
+
+    async def search(self, query: str, *, limit: int, pages: int = 1) -> list[ExaPreviewItem]:
+        del pages
+        search = getattr(self._client, "search_topics", None)
+        if not callable(search):
+            return []
+        page = await search(query, limit=max(1, int(limit)))
+        rows = getattr(page, "data", [])
+        previews: list[ExaPreviewItem] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            topic_id = _first_text(row.get("id"), row.get("content_id"))
+            title = _clean_title(row.get("title"))
+            url = _first_text(row.get("url"), row.get("content_url"))
+            if not url and topic_id:
+                url = f"https://www.v2ex.com/t/{topic_id}"
+            if not title or not url:
+                continue
+            node_value = row.get("node")
+            node: Mapping[str, Any] = node_value if isinstance(node_value, Mapping) else {}
+            member_value = row.get("member")
+            member: Mapping[str, Any] = member_value if isinstance(member_value, Mapping) else {}
+            highlights = _clean_highlights(
+                [
+                    _clean_title(row.get("content") or row.get("description")),
+                    _first_text(node.get("title"), node.get("name")),
+                    _first_text(member.get("username"), row.get("author_name")),
+                ]
+            )
+            previews.append(ExaPreviewItem(title=title, url=url, highlights=tuple(highlights)))
+        return _dedupe_previews(previews, limit=max(1, int(limit)))
+
+
+class WeiboPlatformSearchBackend:
+    """Use anonymous Weibo search for inspiration-only grounding."""
+
+    platform = "weibo"
+    risk_controlled = True
+
+    def __init__(self, client: object) -> None:
+        self._client = client
+
+    async def search(self, query: str, *, limit: int, pages: int = 1) -> list[ExaPreviewItem]:
+        search = getattr(self._client, "search_posts", None)
+        if not callable(search):
+            return []
+        page = await search(query, page=1, limit=max(1, int(limit)))
+        rows = getattr(page, "rows", getattr(page, "data", page))
+        if not isinstance(rows, list):
+            return []
+        from openbiliclaw.sources.weibo import weibo_post_to_content
+
+        previews: list[ExaPreviewItem] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            content = weibo_post_to_content(row, strategy="weibo-search")
+            if content is None or not content.content_url:
+                continue
+            previews.append(
+                ExaPreviewItem(
+                    title=_clean_title(content.title),
+                    url=content.content_url,
+                    highlights=tuple(_clean_highlights([content.body_text, content.author_name])),
+                )
+            )
+        return _dedupe_previews(previews, limit=max(1, int(limit)))
+
+
 def _douyin_preview(row: dict[str, Any]) -> ExaPreviewItem | None:
     aweme_id = _first_text(row.get("aweme_id"), row.get("id"), row.get("item_id"))
     title = _first_text(
@@ -992,6 +1070,8 @@ def build_platform_source_backends(
     xhs_search: PlatformSearchCallable | None = None,
     zhihu_search: PlatformSearchCallable | None = None,
     bangumi_client: object | None = None,
+    v2ex_client: object | None = None,
+    weibo_client: object | None = None,
 ) -> list[PlatformSearchBackend]:
     """Build inspiration-only backends for enabled synchronous platform sources."""
 
@@ -1055,6 +1135,13 @@ def build_platform_source_backends(
                 ),
             )
         )
+
+    v2ex_cfg = getattr(sources, "v2ex", None)
+    if bool(getattr(v2ex_cfg, "enabled", False)) and v2ex_client is not None:
+        backends.append(V2EXPlatformSearchBackend(v2ex_client))
+    weibo_cfg = getattr(sources, "weibo", None)
+    if bool(getattr(weibo_cfg, "enabled", False)) and weibo_client is not None:
+        backends.append(WeiboPlatformSearchBackend(weibo_client))
     return backends
 
 

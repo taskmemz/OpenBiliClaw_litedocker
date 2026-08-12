@@ -10,7 +10,17 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = ROOT / "docs/images/chrome-web-store/source"
 OUTPUT_DIR = ROOT / "docs/images/chrome-web-store"
 CANVAS = (1280, 800)
-PLATFORMS = ("B站", "小红书", "抖音", "YouTube", "X", "知乎", "Reddit")
+PLATFORMS = (
+    "B站",
+    "小红书",
+    "抖音",
+    "YouTube",
+    "X",
+    "知乎",
+    "Reddit",
+    "Bangumi",
+    "V2EX",
+)
 
 BG = "#11151E"
 INK = "#F8FAFC"
@@ -85,7 +95,7 @@ def _brand(image: Image.Image, draw: ImageDraw.ImageDraw, index: int) -> None:
         icon = icon_source.convert("RGBA").resize((44, 44), Image.Resampling.LANCZOS)
     image.alpha_composite(icon, (58, 38))
     draw.text((116, 42), "OpenBiliClaw", font=FONT_BRAND, fill=INK)
-    draw.text((116, 68), "本地优先的七平台内容 Agent", font=FONT_SMALL, fill=MUTED)
+    draw.text((116, 68), "本地优先的九来源内容 Agent", font=FONT_SMALL, fill=MUTED)
     draw.text((1168, 48), f"0{index} / 03", font=FONT_KICKER, fill=MUTED)
 
 
@@ -178,9 +188,9 @@ def _base(index: int) -> tuple[Image.Image, ImageDraw.ImageDraw]:
 
 def build_local_platform_slide(source_dir: Path) -> Image.Image:
     image, draw = _base(1)
-    draw.text((60, 112), "SEVEN PLATFORMS · ONE PRIVATE AGENT", font=FONT_KICKER, fill=ORANGE)
+    draw.text((60, 112), "NINE SOURCES · ONE PRIVATE AGENT", font=FONT_KICKER, fill=ORANGE)
     draw.text((60, 144), "本地私有的", font=font(46, bold=True), fill=INK)
-    draw.text((60, 202), "七平台内容 Agent", font=font(46, bold=True), fill=INK)
+    draw.text((60, 202), "九来源内容 Agent", font=font(46, bold=True), fill=INK)
     draw.text((60, 268), "把分散的信息流，变成真正懂你", font=FONT_SUBTITLE, fill=MUTED)
     draw.text((60, 302), "且可反馈的跨平台推荐。", font=FONT_SUBTITLE, fill=MUTED)
     x, y = 60, 354
@@ -236,7 +246,7 @@ def build_recommendation_slide(source_dir: Path) -> Image.Image:
     _headline(
         draw,
         "Cross-platform recommendations",
-        "一次浏览，汇合七个平台",
+        "一次浏览，汇合九个来源",
         "统一筛选、解释推荐理由，再用喜欢、不感兴趣和对话继续校准。",
         x=60,
         y=112,
@@ -339,7 +349,7 @@ def _status_legend(draw: ImageDraw.ImageDraw, *, x: int, y: int) -> None:
 
 def build_hero_slide(source_dir: Path) -> Image.Image:
     image, draw = _base(1)
-    draw.text((60, 112), "七平台内容推荐，", font=font(48, bold=True), fill=INK)
+    draw.text((60, 112), "九来源内容推荐，", font=font(48, bold=True), fill=INK)
     draw.text((60, 170), "数据默认留在本机", font=font(48, bold=True), fill=INK)
     draw.text((62, 234), "有头图、有理由，也能继续反馈调教。", font=FONT_SUBTITLE, fill=MUTED)
     _platform_row(draw, x=60, y=272)
@@ -385,7 +395,9 @@ def build_concise_three_surfaces_slide(source_dir: Path) -> Image.Image:
 def build_truthful_status_slide(source_dir: Path) -> Image.Image:
     image, draw = _base(3)
     draw.text((60, 112), "登录状态说人话，数据默认在本机", font=font(44, bold=True), fill=INK)
-    draw.text((62, 171), "区分来源开关、凭据就绪、待验证与无需登录。", font=FONT_SUBTITLE, fill=MUTED)
+    draw.text(
+        (62, 171), "区分来源开关、凭据就绪、待验证与无需登录。", font=FONT_SUBTITLE, fill=MUTED
+    )
     _status_legend(draw, x=60, y=264)
     _rounded_screenshot(
         image,

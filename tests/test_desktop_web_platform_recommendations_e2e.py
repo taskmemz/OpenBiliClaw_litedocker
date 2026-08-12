@@ -358,8 +358,10 @@ def test_platform_tabs_scope_recommendation_requests_in_chromium(
     # /api/config 与库存快照并行读取；配置快照若瞬断，前端有界重试后 Tab 集合
     # 收敛（已启用但零库存的平台只由配置快照带来）。断言前先等 Tab 并集完整。
     _wait_for(
-        lambda: {chip["filter"] for chip in _chips(chromium_page)}
-        == {"全部", "B 站", "YouTube", "知乎", "Reddit"},
+        lambda: (
+            {chip["filter"] for chip in _chips(chromium_page)}
+            == {"全部", "B 站", "YouTube", "知乎", "Reddit"}
+        ),
         message="已启用平台 Tab 集合未收敛",
     )
     chips = _chips(chromium_page)
@@ -444,8 +446,10 @@ def test_enabled_zero_stock_platform_survives_config_snapshot_retry(
     )
 
     _wait_for(
-        lambda: {chip["filter"] for chip in _chips(chromium_page)}
-        == {"全部", "B 站", "YouTube", "知乎", "Reddit"},
+        lambda: (
+            {chip["filter"] for chip in _chips(chromium_page)}
+            == {"全部", "B 站", "YouTube", "知乎", "Reddit"}
+        ),
         timeout=15.0,
         message="配置快照重试成功后仍缺少已启用平台 Tab",
     )
@@ -470,8 +474,10 @@ def test_platform_tabs_keyboard_focus_selection_and_no_horizontal_overflow(
     # /api/config 与库存快照并行读取；配置快照若瞬断，前端有界重试后 Tab 集合
     # 收敛（已启用但零库存的平台只由配置快照带来）。断言前先等 Tab 并集完整。
     _wait_for(
-        lambda: {chip["filter"] for chip in _chips(chromium_page)}
-        == {"全部", "B 站", "YouTube", "知乎", "Reddit"},
+        lambda: (
+            {chip["filter"] for chip in _chips(chromium_page)}
+            == {"全部", "B 站", "YouTube", "知乎", "Reddit"}
+        ),
         message="已启用平台 Tab 集合未收敛",
     )
 

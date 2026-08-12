@@ -9,6 +9,7 @@ from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
+from .identity import is_native_save_local_only
 from .models import (
     NATIVE_SAVE_TERMINAL_STATUSES,
     NativeSaveAction,
@@ -110,6 +111,20 @@ class SavedSyncService:
             item.item_key,
             requested_action=list_kind,
         )
+        if is_native_save_local_only(item.platform):
+            self._database.upsert_native_save_state(
+                list_kind,
+                item.item_key,
+                requested_action=list_kind,
+                status="unsupported",
+                last_error_code="local_only_source",
+                last_error_message="This source supports local saves only",
+            )
+            return SavedMembershipResult(
+                saved=True,
+                item_key=item.item_key,
+                sync_status="unsupported",
+            )
         if not auto_sync:
             return SavedMembershipResult(
                 saved=True,
@@ -145,7 +160,6 @@ class SavedSyncService:
         trigger: str,
     ) -> SavedSyncBatchResult:
         """Persist one pending task for selected eligible memberships."""
-        task_id = str(uuid.uuid4())
         selected_keys: Sequence[str] | None
         if item_keys:
             selected_keys = tuple(
@@ -155,6 +169,9 @@ class SavedSyncService:
                 raise ValueError("item_keys must contain at least one non-blank key")
         else:
             selected_keys = None
+        if self._selection_is_exclusively_local_only(list_kind, selected_keys):
+            raise ValueError("local-only saved items cannot create native sync tasks")
+        task_id = str(uuid.uuid4())
         self._database.release_stale_pending_native_sync_tasks(list_kind, selected_keys)
         self._database.reconcile_stale_native_save_claims_for_list(
             list_kind,
@@ -180,6 +197,32 @@ class SavedSyncService:
                 self._database.discard_native_sync_task(task_id)
                 raise
         return result
+
+    def _selection_is_exclusively_local_only(
+        self,
+        list_kind: SavedListKind,
+        item_keys: Sequence[str] | None,
+    ) -> bool:
+        selected = set(item_keys) if item_keys is not None else None
+        matched: set[str] = set()
+        offset = 0
+        while True:
+            rows = self._database.list_saved_memberships(list_kind, limit=200, offset=offset)
+            if not rows:
+                break
+            for row in rows:
+                item_key = str(row.get("item_key", ""))
+                if selected is not None and item_key not in selected:
+                    continue
+                matched.add(item_key)
+                if not is_native_save_local_only(str(row.get("source_platform", ""))):
+                    return False
+            if selected is not None and matched == selected:
+                return bool(matched)
+            if len(rows) < 200:
+                break
+            offset += len(rows)
+        return bool(matched) and (selected is None or matched == selected)
 
     def validate_native_save_selection(
         self,

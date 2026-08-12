@@ -2080,6 +2080,45 @@ class TestDatabase:
             assert rows[0]["pool_status"] == "purged_by_dislike"
             db.close()
 
+    def test_mark_pool_purged_by_reinit_retires_active_rows_only(self) -> None:
+        """Force re-init retires fresh/shown/suppressed rows, not prior purges."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "test.db")
+            db.initialize()
+
+            for bvid, status in (
+                ("BV1fresh", "fresh"),
+                ("BV2shown", "shown"),
+                ("BV3suppressed", "suppressed"),
+                ("BV4disliked", "purged_by_dislike"),
+            ):
+                db.cache_content(
+                    bvid,
+                    title=f"内容 {bvid}",
+                    up_name="UP",
+                    source="search",
+                    topic_key="科技",
+                    pool_topic_label="知识",
+                )
+                if status != "fresh":
+                    db.conn.execute(
+                        "UPDATE content_cache SET pool_status = ? WHERE bvid = ?",
+                        (status, bvid),
+                    )
+            db.conn.commit()
+
+            purged = db.mark_pool_purged_by_reinit()
+            assert purged == 3  # fresh + shown + suppressed
+
+            rows = db.get_cached_content(limit=10)
+            by_bvid = {row["bvid"]: row for row in rows}
+            assert by_bvid["BV1fresh"]["pool_status"] == "purged_by_reinit"
+            assert by_bvid["BV2shown"]["pool_status"] == "purged_by_reinit"
+            assert by_bvid["BV3suppressed"]["pool_status"] == "purged_by_reinit"
+            # A previous dislike purge is terminal and stays as-is.
+            assert by_bvid["BV4disliked"]["pool_status"] == "purged_by_dislike"
+            db.close()
+
     def test_purge_pool_by_disliked_topics_skips_already_recommended(self) -> None:
         """Items already in the recommendations table must not be purged."""
         with tempfile.TemporaryDirectory() as tmpdir:

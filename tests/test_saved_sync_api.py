@@ -192,6 +192,48 @@ def test_save_accepts_real_zhihu_typed_content_ids(
     assert adapter.calls == []
 
 
+def test_weibo_save_is_terminal_local_only_without_native_task(
+    saved_sync_client: tuple[TestClient, Database, _FakeBilibiliAdapter],
+) -> None:
+    client, database, adapter = saved_sync_client
+    content_id = "5023456789012345"
+    item_key = f"weibo:{content_id}"
+
+    saved = client.post(
+        "/api/saved/favorite",
+        json=_saved_item(
+            content_id,
+            source_platform="weibo",
+            content_url=f"https://m.weibo.cn/detail/{content_id}",
+            content_type="post",
+            cover_url="",
+        ),
+    )
+
+    assert saved.status_code == 200
+    assert saved.json()["item_key"] == item_key
+    assert saved.json()["sync_status"] == "unsupported"
+    assert saved.json()["sync_task_id"] == ""
+    assert saved.json()["error_code"] == "local_only_source"
+    membership = database.get_saved_membership("favorite", item_key)
+    assert membership is not None
+    assert membership["sync_status"] == "unsupported"
+    assert membership["last_error_code"] == "local_only_source"
+    assert adapter.calls == []
+
+    created = client.post(
+        "/api/saved/favorite/sync",
+        json={"item_keys": [item_key]},
+    )
+    assert created.status_code == 422
+    assert created.json()["detail"] == "invalid sync selection"
+    task_count = database.conn.execute("SELECT COUNT(*) FROM native_save_tasks").fetchone()
+    assert task_count is not None
+    assert task_count[0] == 0
+    assert database.get_saved_membership("favorite", item_key) is not None
+    assert adapter.calls == []
+
+
 def test_auto_sync_returns_pending_task_without_waiting_for_platform_io(
     saved_sync_client: tuple[TestClient, Database, _FakeBilibiliAdapter],
 ) -> None:

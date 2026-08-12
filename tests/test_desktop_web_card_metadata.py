@@ -17,6 +17,7 @@ def test_normalize_recommendation_parses_card_metadata_numbers() -> None:
     assert "duration: Number(item?.duration ?? 0) || 0" in normalize
     assert "view_count: Number(item?.view_count ?? 0) || 0" in normalize
     assert "like_count: Number(item?.like_count ?? 0) || 0" in normalize
+    assert "share_count: Number(item?.share_count ?? 0) || 0" in normalize
     assert "danmaku_count: Number(item?.danmaku_count ?? 0) || 0" in normalize
     assert "up_mid: Number(item?.up_mid ?? 0) || 0" in normalize
     assert 'duration: String(item?.duration ?? "")' not in normalize
@@ -46,6 +47,7 @@ def test_card_template_hides_zero_metadata_and_renders_video_only_duration_badge
     stats = _function_body("recommendationStats")
     assert "if (item.view_count > 0)" in stats
     assert "if (item.like_count > 0)" in stats
+    assert "if (item.share_count > 0)" in stats
     assert "if (item.danmaku_count > 0)" in stats
     assert 'return segments.join(" · ");' in stats
     assert '${stats ? `<p class="video-stats">${escapeHtml(stats)}</p>` : ""}' in APP_JS
@@ -79,7 +81,14 @@ def test_delight_card_renders_the_same_engagement_stats_as_the_grid() -> None:
     """
     # normalizeDelight carries the stat fields (same parse as the grid).
     normalize = _function_body("normalizeDelight")
-    for field in ("view_count", "like_count", "comment_count", "danmaku_count", "favorite_count"):
+    for field in (
+        "view_count",
+        "like_count",
+        "comment_count",
+        "share_count",
+        "danmaku_count",
+        "favorite_count",
+    ):
         assert f"{field}: Number(item?.{field} ?? 0) || 0" in normalize, field
 
     # The delight card fills #delightStats from recommendationStats and hides it

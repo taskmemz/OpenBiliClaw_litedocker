@@ -38,6 +38,8 @@ const PRESENTATION = {
 const PLATFORM_NAMES = {
   bilibili: "B站", youtube: "YouTube", twitter: "X", xiaohongshu: "小红书",
   douyin: "抖音", zhihu: "知乎", reddit: "Reddit", bangumi: "Bangumi",
+  linuxdo: "Linux.do",
+  douyin: "抖音", weibo: "微博", zhihu: "知乎", reddit: "Reddit", bangumi: "Bangumi", v2ex: "V2EX",
 };
 
 function esc(s) {
@@ -161,7 +163,7 @@ export function getSavedSyncViewModel(item) {
   const busy = statusKey === "syncing"
     || (statusKey === "pending" && Boolean(safeText(normalized.sync_task_id, 64)));
   const localOnly = statusKey === "unsupported"
-    && normalized.error_code === "unsupported_content_type";
+    && ["unsupported_content_type", "local_only_source"].includes(normalized.error_code);
   if (statusKey === "unsupported" && normalized.error_code === "unsupported_adapter_missing") {
     label = "待升级重试";
     tone = "warning";
@@ -176,7 +178,9 @@ export function getSavedSyncViewModel(item) {
     && !localOnly;
   let detail;
   if (localOnly) {
-    detail = "此内容类型暂不支持平台同步，仅保存在本地。";
+    detail = normalized.error_code === "local_only_source"
+      ? "此来源仅支持本地收藏，不会向平台创建同步任务。"
+      : "此内容类型暂不支持平台同步，仅保存在本地。";
   } else if (statusKey === "unsupported" && normalized.error_code === "unsupported_adapter_missing") {
     detail = "同步能力可能正在滚动升级，请更新后端与插件后重试。";
   } else if (statusKey === "unsupported") {
@@ -293,7 +297,7 @@ function createSavedView(cfg) {
           <span class="saved-head-count" id="${cfg.countId}">${total > 0 ? total : ""}</span>
         </div>
         <div class="saved-sync-toolbar">
-          <button class="btn btn-outline saved-sync-all" data-saved-list-action="sync-all" type="button" ${pending === 0 ? "disabled" : ""}>同步未同步内容（${pending}）</button>
+          ${pending > 0 ? `<button class="btn btn-outline saved-sync-all" data-saved-list-action="sync-all" type="button">同步未同步内容（${pending}）</button>` : ""}
           <span class="saved-sync-message" aria-live="polite" ${messageIsError ? 'role="alert"' : ""}>${esc(message)}</span>
           ${retained.snapshot().error ? '<button class="btn btn-outline saved-load-retry" data-saved-list-action="retry" type="button">重试加载</button>' : ""}
         </div>
@@ -508,7 +512,7 @@ function createSavedView(cfg) {
         <button class="saved-card-open" data-saved-action="open" type="button" ${url ? `data-url="${esc(url)}"` : "disabled"} aria-label="打开 ${esc(it.title || it.content_id)}">${coverHtml}</button>
         <div class="saved-card-body">
           <div class="saved-card-title">${esc(it.title || it.content_id)}</div>
-          <div class="saved-card-up">${esc(it.author_name)}</div>
+          <div class="saved-card-up">${esc([it.author_name, PLATFORM_NAMES[it.source_platform] || it.source_platform].filter(Boolean).join(" · "))}</div>
           <div class="saved-sync-line"><span class="saved-sync-chip" data-tone="${esc(it.tone)}">${esc(it.label)}</span><span>${esc(it.detail)}</span></div>
         </div>
         <div class="saved-card-actions">

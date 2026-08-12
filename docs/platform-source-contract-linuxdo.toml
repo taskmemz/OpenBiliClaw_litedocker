@@ -1,0 +1,178 @@
+schema_version = 1
+canonical_slug = "linuxdo"
+display_name = "Linux.do"
+integration_level = "full"
+aliases = ["linux.do", "linux-do", "ldo", "l站"]
+hosts = ["linux.do"]
+content_types = ["post"]
+
+[transport]
+kind = "browser-task"
+owner = "extension"
+entrypoints = [
+  "extension/src/content/linuxdo/task-executor.ts",
+  "extension/src/background/linuxdo-task-dispatcher.ts",
+  "src/openbiliclaw/sources/linuxdo_tasks.py",
+]
+route_aliases = []
+fallback_owner = "none"
+requires_overseas_network = false
+routed_by_network_mode = false
+network_policy = "All upstream reads run in a same-origin Linux.do task tab; backend proxy settings do not own this transport."
+
+[transport.capability_routes]
+discover = "extension:browser-task:public-read"
+profile = "extension:browser-task:session-current"
+bootstrap = "extension:browser-task:session-current"
+incremental = "extension:browser-task:session-current"
+cookie-sync = "extension:cookie-sync:observed-login"
+
+[identity]
+item_id = "Positive Discourse topic id stored as content_id topic:<topic_id>; the source-namespaced item key is linuxdo:topic:<topic_id>"
+url = "Canonical https://linux.do/t/<slug>/<topic_id> URL"
+dedupe = "Canonical source family plus topic id; bootstrap dedupe is additionally partitioned by verified account key and interaction scope"
+account_scope = "Opaque stable account key derived only after /session/current.json positively identifies the current user"
+
+[auth]
+mode = "capability-specific"
+credential_kinds = ["browser_session"]
+verify_action = "browser_heartbeat"
+write_path = "none"
+account_resolution = "Current same-origin /session/current.json identity is authoritative; cookie heartbeat and task history are weaker fallback evidence"
+identity_evidence = "_t presence is observed only; personal signals are accepted only with a positive /session/current.json account key"
+login_cookie_names = ["_t"]
+login_state_path = "callback"
+
+[auth.capability_modes]
+discover = "anonymous"
+profile = "login-required"
+bootstrap = "login-required"
+incremental = "login-required"
+cookie-sync = "optional-credential"
+
+[auth.capability_required]
+discover = true
+profile = true
+bootstrap = true
+incremental = true
+cookie-sync = false
+
+[upstream]
+success_content_types = ["application/json"]
+pagination = "Discourse page/offset pagination; every route validates its expected envelope and explicit next/short-page terminal evidence"
+terminal_evidence = "HTTP success, JSON content type, route-specific decoded envelope, and an observed terminal page or explicit empty collection"
+terminal_policy = "HTML challenge, login wall, malformed/error JSON, wrong envelope, 429, timeout, or unobserved response are never valid empty"
+partial_policy = "Accepted pages/scopes/inputs survive degraded/failed finals; incomplete work never advances cursor or missing-item inference"
+publication_time_policy = "Only topic-owned creation/publication time maps to published_at; matching reply time and discovery time never substitute"
+
+[discover]
+modes = ["search", "hot", "feed", "creator", "related"]
+search_generation = "Merged KeywordPlanner generation and inspiration-axis generation both allocate linuxdo keywords; KeywordFetchCoordinator claims and settles only retained results"
+budget = "Independent per-mode daily budgets charged only after global dedupe, filtering, and final retention"
+cursor = "Persistent per-mode/input page cursor with one bounded reset when upstream totals shrink or offsets become invalid"
+engagement_hydration = "Formal search/related globally cap retained rows, then hydrate only retained topic ids through same-origin /t/<id>.json; detail failures degrade instead of borrowing reply metrics"
+
+[profile]
+signals = true
+incremental = true
+refresh_mode = "incremental"
+
+[extension]
+task = "browser-task"
+hosts = ["linux.do"]
+task_marker = true
+background = true
+early_response = false
+cookie_sync = true
+
+[surfaces]
+cli = true
+setup = true
+desktop = true
+mobile = true
+extension_popup = true
+source_status = true
+credentials = true
+recommendation = true
+
+[engagement]
+view = "mapped"
+like = "mapped"
+favorite = "unavailable"
+comment = "mapped"
+share = "unavailable"
+danmaku = "unavailable"
+
+[media]
+image = "none"
+image_hosts = []
+deep_link = "browser-fallback"
+native_save = false
+
+[e2e]
+safe_actions = ["read-identity", "search", "hot", "feed", "related", "fetch-public-profile", "navigate-public-item", "scroll"]
+mutating_actions = []
+
+[e2e.safe_assertions]
+read-identity = "upstream-state-unchanged"
+search = "upstream-state-unchanged"
+hot = "upstream-state-unchanged"
+feed = "upstream-state-unchanged"
+related = "upstream-state-unchanged"
+fetch-public-profile = "upstream-state-unchanged"
+navigate-public-item = "upstream-state-unchanged"
+scroll = "upstream-state-unchanged"
+
+[e2e.safe_postconditions]
+read-identity = "Only /session/current.json is read; no upstream account state changes."
+search = "Only same-origin GET search reads occur."
+hot = "Only same-origin GET hot/top reads occur."
+feed = "Only same-origin GET latest reads occur."
+related = "Only same-origin GET topic detail plus /topics/similar_to.json reads occur."
+fetch-public-profile = "Only same-origin public creator topics are read."
+navigate-public-item = "The canonical public topic is opened without a platform mutation API."
+scroll = "The visible public page is scrolled without invoking a platform mutation API."
+
+[events]
+strategy_prefixes = ["linuxdo-", "linuxdo_"]
+mappings = "Bookmarks map to favorite, likes-given to like, and read history to view with unknown satisfaction; discovery remains candidate evidence"
+scope_caps = "Allowed scopes, account key, input counts, pages, per-scope items, profile_update, and incremental authority are backend-owned task fields"
+
+[task]
+lease = "Backend atomically admits one active Linux.do task across extension instances and binds each claim to an opaque claim token below a 35 minute lease"
+idle_deadline = "Pending pickup and claimed execution budgets are distinct; stale pending does not consume supply budget"
+absolute_deadline = "A task-shape estimator keeps legal execution below the durable lease and dispatcher deadline"
+retry = "First final is immutable; non-2xx result ACK retries the same canonical payload and partial rows survive every terminal classification"
+buffer = "Bounded credential-free task/tab/deadline/final payload recovery state survives MV3 restart; storage.session generation distinguishes full reload and refreshes the runner document before replay; state clears only after backend ACK"
+
+[smoke]
+storage_scope = "isolated-only"
+
+[smoke.sinks]
+task = "allowed"
+task_result = "allowed"
+seen = "forbidden"
+affinity = "forbidden"
+snapshot = "forbidden"
+schedule = "forbidden"
+event_ingress = "forbidden"
+memory = "forbidden"
+profile = "forbidden"
+
+[exclusions]
+"extension.early-response" = "Linux.do task requests start after the isolated content listener receives a backend-owned task; no page response tap is used."
+"engagement.favorite" = "Discourse exposes the current user's bookmark state, not a public aggregate favorite count."
+"engagement.share" = "Selected Discourse envelopes do not expose a canonical aggregate share count."
+"engagement.danmaku" = "Linux.do topics have no Bilibili-style danmaku metric."
+"media.image" = "Linux.do v1 deliberately renders text cards and does not fetch, proxy, or hotlink post images."
+"media.deep-link" = "No reliable official Linux.do native-app scheme is claimed; mobile opens the canonical HTTPS URL."
+"media.native-save" = "The source is read-only and deliberately has no upstream bookmark/favorite write adapter."
+
+[exclusion_tests]
+"extension.early-response" = ["tests/test_linuxdo_contract.py::test_linuxdo_early_response_is_not_required_when_fetch_starts_after_listener"]
+"engagement.favorite" = ["tests/test_linuxdo_contract.py::test_linuxdo_unavailable_aggregate_engagement_stays_zero"]
+"engagement.share" = ["tests/test_linuxdo_contract.py::test_linuxdo_unavailable_aggregate_engagement_stays_zero"]
+"engagement.danmaku" = ["tests/test_linuxdo_contract.py::test_linuxdo_unavailable_aggregate_engagement_stays_zero"]
+"media.image" = ["tests/test_linuxdo_contract.py::test_linuxdo_media_image_is_an_explicit_text_card_exclusion"]
+"media.deep-link" = ["tests/test_linuxdo_contract.py::test_linuxdo_media_deep_link_uses_canonical_https_browser_fallback"]
+"media.native-save" = ["tests/test_linuxdo_contract.py::test_linuxdo_has_no_native_save_adapter"]

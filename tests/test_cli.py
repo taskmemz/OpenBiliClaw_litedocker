@@ -254,6 +254,55 @@ def test_ledger_command_is_registered(runner: CliRunner) -> None:
     assert "--write-point" in options
 
 
+def test_init_command_exposes_force_option(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["init", "--help"])
+    assert result.exit_code == 0
+    options = _registered_option_names("init")
+    assert "--force" in options
+    assert "--reset-cognition" in options
+    assert "--no-backup" in options
+    assert "重新初始化" in result.output
+
+
+def test_create_reinit_backup_snapshots_db_and_memory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Force re-init backup must capture the DB + memory layers, skip .lock."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db_path = data_dir / "openbiliclaw.db"
+    db_path.write_bytes(b"fake-sqlite-bytes")
+    mem = data_dir / "memory"
+    mem.mkdir()
+    (mem / "soul.json").write_text('{"personality_portrait":"旧画像"}', encoding="utf-8")
+    (mem / "awareness.json").write_text('{"notes":[]}', encoding="utf-8")
+    (mem / "soul_profile.json.lock").write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(cli_module, "_runtime_database_path", lambda: db_path)
+    monkeypatch.setattr(cli_module, "_runtime_backup_dir", lambda: data_dir / "backups")
+
+    backup_dir = cli_module._create_reinit_backup()
+    assert backup_dir is not None
+    assert backup_dir.name.startswith("reinit-")
+    db_copies = list(backup_dir.glob("*.db"))
+    assert len(db_copies) == 1
+    assert db_copies[0].read_bytes() == b"fake-sqlite-bytes"
+    mem_backup = backup_dir / "memory"
+    assert (mem_backup / "soul.json").exists()
+    assert (mem_backup / "awareness.json").exists()
+    assert not (mem_backup / "soul_profile.json.lock").exists()
+
+
+def test_create_reinit_backup_returns_none_without_database(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No DB yet → no backup (fresh install), returns None quietly."""
+    db_path = tmp_path / "nope.db"
+    monkeypatch.setattr(cli_module, "_runtime_database_path", lambda: db_path)
+    monkeypatch.setattr(cli_module, "_runtime_backup_dir", lambda: tmp_path / "backups")
+    assert cli_module._create_reinit_backup() is None
+
+
 def test_ledger_empty_shows_no_data(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -522,6 +571,100 @@ def test_keyword_inspiration_preview_threads_persist_axes(
     assert captured["platforms"] == ["bilibili"]
     assert captured["query_kind"] == "explore"
     assert captured["persist_axes"] is True
+
+
+def test_keyword_inspiration_preview_supports_v2ex_platform_grounding(
+    monkeypatch: pytest.MonkeyPatch,
+    runner: CliRunner,
+) -> None:
+    cfg = config_module.Config()
+    cfg.sources.v2ex.enabled = True
+    captured: dict[str, object] = {}
+
+    class FakeLLMService:
+        def __init__(self, **_: object) -> None:
+            pass
+
+    class FakeSoulEngine:
+        async def get_profile(self) -> SoulProfile:
+            return SoulProfile(
+                preferences=PreferenceLayer(
+                    interests=[InterestTag(name="Agent", category="技术", weight=0.9)]
+                )
+            )
+
+    class FakeV2EXClient:
+        def __init__(self, **_: object) -> None:
+            captured["client"] = self
+
+        async def aclose(self) -> None:
+            captured["closed"] = True
+
+    class FakePlanner:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        async def preview_inspiration_keywords(
+            self,
+            platforms: list[str],
+            *,
+            profile: SoulProfile | None = None,
+            query_kind: str = "regular",
+            persist_axes: bool = False,
+        ) -> dict[str, object]:
+            captured["platforms"] = platforms
+            return {"ok": True}
+
+    def build_platform_backends(*_: object, **kwargs: object) -> list[object]:
+        captured["v2ex_client"] = kwargs.get("v2ex_client")
+        return []
+
+    _ignore_runtime_config_error(monkeypatch)
+    monkeypatch.setattr(config_module, "load_config", lambda: cfg, raising=False)
+    monkeypatch.setattr(cli_module, "_require_runtime_config", lambda: None, raising=False)
+    monkeypatch.setattr(cli_module, "_build_memory_manager", lambda: object(), raising=False)
+    monkeypatch.setattr(cli_module, "_get_runtime_database", lambda: object(), raising=False)
+    monkeypatch.setattr(cli_module, "_build_registry", lambda: object(), raising=False)
+    monkeypatch.setattr(cli_module, "_build_usage_recorder", lambda: None, raising=False)
+    monkeypatch.setattr(cli_module, "_build_soul_engine", lambda: FakeSoulEngine(), raising=False)
+    monkeypatch.setattr(cli_module, "_build_bilibili_client", lambda: object(), raising=False)
+    monkeypatch.setattr("openbiliclaw.llm.service.LLMService", FakeLLMService, raising=False)
+    monkeypatch.setattr(
+        "openbiliclaw.llm.service.module_overrides_from_config",
+        lambda loaded_cfg: {},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "openbiliclaw.runtime.keyword_planner.KeywordPlanner",
+        FakePlanner,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "openbiliclaw.sources.v2ex_client.V2EXClient",
+        FakeV2EXClient,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "openbiliclaw.discovery.inspiration_provider.build_inspiration_search_provider",
+        lambda *args, **kwargs: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "openbiliclaw.discovery.inspiration_provider.build_platform_source_backends",
+        build_platform_backends,
+        raising=False,
+    )
+
+    result = runner.invoke(
+        app,
+        ["keyword-inspiration-preview", "--platform", "v2ex", "--limit", "1"],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"ok": True}
+    assert captured["platforms"] == ["v2ex"]
+    assert captured["v2ex_client"] is captured["client"]
+    assert captured["closed"] is True
 
 
 def test_keyword_inspiration_report_command_is_registered(runner: CliRunner) -> None:
@@ -3645,6 +3788,15 @@ def test_init_guides_missing_runtime_config_interactively(
         lambda: FakeBilibiliClient(),
         raising=False,
     )
+    # Hermetic: the ambient data dir may hold a real profile (e.g. after a
+    # local E2E run), which would otherwise flip init into the re-init
+    # confirm branch and consume an extra prompt.
+    monkeypatch.setattr(
+        cli_module,
+        "_build_soul_engine",
+        lambda: SimpleNamespace(is_profile_ready=lambda: False),
+        raising=False,
+    )
     monkeypatch.setattr(cli_module, "_initialize_logging", lambda log_level_override=None: None)
     monkeypatch.setattr(
         cli_module,
@@ -3662,7 +3814,8 @@ def test_init_guides_missing_runtime_config_interactively(
     #   6. "y" — allow LAN access
     #   7-9. "" — accept Bili history/favorite/follow init limits
     #   10+. "n" — skip optional source prompts
-    #               (xhs / douyin / youtube / X / zhihu / reddit / bangumi)
+    #               (xhs / douyin / youtube / X / zhihu / reddit /
+    #                Linux.do / v2ex / weibo / bangumi)
     wizard_input = (
         "\n".join(
             [
@@ -3675,6 +3828,9 @@ def test_init_guides_missing_runtime_config_interactively(
                 "",
                 "",
                 "",
+                "n",
+                "n",
+                "n",
                 "n",
                 "n",
                 "n",
@@ -3746,6 +3902,15 @@ def test_init_guides_missing_auth_interactively(
         lambda: FakeBilibiliClient(),
         raising=False,
     )
+    # Hermetic: the ambient data dir may hold a real profile (e.g. after a
+    # local E2E run), which would otherwise flip init into the re-init
+    # confirm branch and consume an extra prompt.
+    monkeypatch.setattr(
+        cli_module,
+        "_build_soul_engine",
+        lambda: SimpleNamespace(is_profile_ready=lambda: False),
+        raising=False,
+    )
     monkeypatch.setattr(cli_module, "_initialize_logging", lambda log_level_override=None: None)
 
     # v0.3.13: auth wizard now opens with a 2-choice prompt
@@ -3753,12 +3918,12 @@ def test_init_guides_missing_auth_interactively(
     # test exercising the manual-paste path, send "2" first.
     # v0.3.89+: init asks whether to allow LAN access before the source
     # prompts. Answer yes, accept Bili signal-limit defaults, then send "n"
-    # to XHS / Douyin / YouTube / X / Zhihu / Reddit / Bangumi so this test stays focused on the
-    # cookie-prompt path.
+    # to XHS / Douyin / YouTube / X / Zhihu / Reddit / Linux.do / V2EX /
+    # Weibo / Bangumi so this test stays focused on the cookie-prompt path.
     result = runner.invoke(
         app,
         ["init"],
-        input="2\nSESSDATA=valid\ny\n\n\n\nn\nn\nn\nn\nn\nn\nn\n",
+        input="2\nSESSDATA=valid\ny\n\n\n\nn\nn\nn\nn\nn\nn\nn\nn\nn\nn\n",
     )
 
     assert result.exit_code == 1
@@ -4982,6 +5147,9 @@ def test_select_init_source_shares_accepts_suggested_ratios(
         "zhihu": 1,
         "reddit": 1,
         "bangumi": 1,
+        "linuxdo": 1,
+        "weibo": 1,
+        "v2ex": 1,
     }
 
 
@@ -5025,6 +5193,9 @@ def test_select_init_source_shares_accepts_manual_ratios(
         "zhihu": 1,
         "reddit": 1,
         "bangumi": 1,
+        "linuxdo": 1,
+        "weibo": 1,
+        "v2ex": 1,
     }
 
 
@@ -6376,6 +6547,138 @@ def test_fetch_source_commands_default_wait_is_180_seconds(
     assert observed == {"dy": 180.0, "xhs": 180.0}
 
 
+def test_kick_task_dispatcher_uses_configured_api_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested: dict[str, object] = {}
+
+    class FakeResponse:
+        def close(self) -> None:
+            requested["closed"] = True
+
+    def fake_urlopen(request: object, timeout: float) -> FakeResponse:
+        requested["url"] = getattr(request, "full_url", "")
+        requested["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "openbiliclaw.config.load_config",
+        lambda: SimpleNamespace(api=SimpleNamespace(port=8422)),
+    )
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    cli_module._kick_task_dispatcher("v2ex")
+
+    assert requested == {
+        "url": "http://127.0.0.1:8422/api/sources/v2ex/kick",
+        "timeout": 1.0,
+        "closed": True,
+    }
+
+
+def test_fetch_v2ex_is_read_only_four_scope_smoke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = CliRunner()
+    captured: dict[str, object] = {}
+
+    def fake_enqueue(**kwargs: object) -> str:
+        captured["enqueue"] = kwargs
+        return "v2ex-task"
+
+    def fake_collect(
+        task_id: str,
+        *,
+        max_wait_seconds: float,
+    ) -> tuple[list[dict[str, object]], dict[str, int], str]:
+        captured["collect"] = (task_id, max_wait_seconds)
+        return (
+            [
+                {
+                    "event_type": "publish",
+                    "title": "Topic",
+                    "metadata": {"source_platform": "v2ex"},
+                },
+                {
+                    "event_type": "favorite",
+                    "title": "Saved topic",
+                    "metadata": {"source_platform": "v2ex"},
+                },
+            ],
+            {
+                "public_topics": 1,
+                "public_replies": 2,
+                "favorite_topics": 1,
+                "favorite_nodes": 3,
+            },
+            "partial",
+        )
+
+    monkeypatch.setattr(cli_module, "_enqueue_v2ex_bootstrap_task", fake_enqueue)
+    monkeypatch.setattr(cli_module, "_collect_v2ex_bootstrap_events", fake_collect)
+    monkeypatch.setattr(
+        cli_module,
+        "_prepare_init_runtime",
+        lambda: pytest.fail("fetch-v2ex must not prepare the init runtime"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_build_memory_manager",
+        lambda: pytest.fail("fetch-v2ex must not open or write memory"),
+    )
+
+    result = runner.invoke(
+        app,
+        ["fetch-v2ex", "--username", "demo", "--force", "--wait-seconds", "5"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["enqueue"] == {
+        "username": "demo",
+        "profile_update": False,
+        "smoke_only": True,
+        "force": True,
+    }
+    assert captured["collect"] == ("v2ex-task", 5.0)
+    assert "发布" in result.output
+    assert "讨论" in result.output
+    assert "收藏主题" in result.output
+    assert "收藏 Node" in result.output
+    assert "未写入 memory" in result.output
+    assert "不作为完整收藏快照" in result.output
+
+
+def test_fetch_v2ex_identity_mismatch_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = CliRunner()
+    monkeypatch.setattr(
+        cli_module,
+        "_enqueue_v2ex_bootstrap_task",
+        lambda **_kwargs: "v2ex-task",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_collect_v2ex_bootstrap_events",
+        lambda _task_id, *, max_wait_seconds: (
+            [],
+            {
+                "public_topics": 0,
+                "public_replies": 0,
+                "favorite_topics": 0,
+                "favorite_nodes": 0,
+            },
+            "identity_mismatch",
+        ),
+    )
+
+    result = runner.invoke(app, ["fetch-v2ex"])
+
+    assert result.exit_code == 1
+    assert "身份" in result.output
+    assert "暂停" in result.output
+
+
 def test_fetch_douyin_does_not_call_prepare_init_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6857,6 +7160,120 @@ def test_discover_source_reddit_runs_formal_producer(monkeypatch: pytest.MonkeyP
 
     assert result.exit_code == 0, result.output
     assert calls == {"limit": 11}
+
+
+def test_discover_source_linuxdo_runs_formal_producer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = CliRunner()
+    calls: dict[str, int] = {}
+
+    def run_linuxdo_discovery(*, limit: int) -> None:
+        calls["limit"] = limit
+
+    monkeypatch.setattr(cli_module, "_run_linuxdo_discovery", run_linuxdo_discovery)
+
+    result = runner.invoke(app, ["discover", "--source", "linuxdo", "--limit", "11"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == {"limit": 11}
+    assert "discover-linuxdo" not in result.output
+
+
+def test_fetch_linuxdo_write_memory_is_owned_by_staged_task_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = CliRunner()
+    captured: dict[str, object] = {}
+
+    def enqueue(**kwargs: object) -> str:
+        captured["enqueue"] = kwargs
+        return "linuxdo-task"
+
+    monkeypatch.setattr(cli_module, "_enqueue_linuxdo_bootstrap_task", enqueue)
+    monkeypatch.setattr(
+        cli_module,
+        "_collect_linuxdo_bootstrap_events",
+        lambda task_id, *, max_wait_seconds: (
+            [
+                {
+                    "event_type": "favorite",
+                    "title": "Linux.do 收藏",
+                    "metadata": {"source_platform": "linuxdo"},
+                }
+            ],
+            {
+                "linuxdo_bookmarks": 1,
+                "linuxdo_likes": 0,
+                "linuxdo_read_history": 0,
+            },
+            "ok",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_write_events_to_memory",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Linux.do writes must stay inside staged task-result ingestion"
+        ),
+    )
+
+    result = runner.invoke(app, ["fetch-linuxdo", "--write-memory", "--wait-seconds", "5"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["enqueue"] == {"profile_update": True}
+    assert "按账号原子写入" in result.output
+
+
+def test_explicit_linuxdo_discovery_ignores_scheduler_master_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = config_module.Config()
+    cfg.sources.linuxdo.enabled = True
+    cfg.scheduler.enabled = False
+    captured: dict[str, object] = {}
+
+    class FakeDatabase:
+        conn = object()
+
+    class FakeSoulEngine:
+        async def get_profile(self) -> dict[str, object]:
+            return {"preferences": {"interests": [{"name": "自托管"}]}}
+
+    class FakeProducer:
+        async def produce_if_due(self, *, limit: int) -> dict[str, object]:
+            captured["limit"] = limit
+            return {"reason": "empty", "discovered": 0, "enqueued": 0}
+
+    def fake_build(**kwargs: object) -> FakeProducer:
+        captured.update(kwargs)
+        return FakeProducer()
+
+    monkeypatch.setattr(config_module, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli_module, "_require_runtime_config", lambda: None)
+    monkeypatch.setattr(cli_module, "_get_runtime_database", FakeDatabase)
+    monkeypatch.setattr(cli_module, "_build_soul_engine", FakeSoulEngine)
+    monkeypatch.setattr(cli_module, "_build_discovery_engine", object)
+    monkeypatch.setattr(
+        cli_module,
+        "_build_discovery_candidate_pipeline",
+        lambda **_kwargs: SimpleNamespace(last_admitted_items=[]),
+    )
+    monkeypatch.setattr(
+        "openbiliclaw.runtime.keyword_fetch.KeywordFetchCoordinator",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "openbiliclaw.runtime.linuxdo_producer.build_linuxdo_discovery_producer",
+        fake_build,
+    )
+    monkeypatch.setattr(cli_module, "_print_page_title", lambda *_args: None)
+    monkeypatch.setattr(cli_module, "_print_status_panel", lambda *_args: None)
+
+    cli_module._run_linuxdo_discovery(limit=5)
+
+    assert captured["require_scheduler"] is False
+    assert captured["limit"] == 5
 
 
 def test_explicit_bangumi_discovery_ignores_scheduler_master_switch(
@@ -8284,6 +8701,41 @@ def _guided_init_pipeline_doubles(monkeypatch) -> dict[str, Any]:
         raising=False,
     )
 
+    def _enqueue_linuxdo(**kwargs: object) -> str:
+        state["linuxdo_enqueue_kwargs"] = dict(kwargs)
+        return "linuxdo-task-1"
+
+    monkeypatch.setattr(
+        cli_module,
+        "_enqueue_linuxdo_bootstrap_task",
+        _enqueue_linuxdo,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_collect_linuxdo_bootstrap_events",
+        lambda task_id, **kwargs: (
+            (
+                list(state.get("linuxdo_events", [])),
+                {
+                    "linuxdo_bookmarks": 1,
+                    "linuxdo_likes": 0,
+                    "linuxdo_read_history": 0,
+                },
+                "ok",
+            )
+            if task_id
+            else (
+                [],
+                {
+                    "linuxdo_bookmarks": 0,
+                    "linuxdo_likes": 0,
+                    "linuxdo_read_history": 0,
+                },
+                "skipped",
+            )
+        ),
+    )
+
     async def _fetch_bangumi(*, username: str, token: str = ""):
         state["bangumi_fetch_token"] = token
         events = list(state.get("bangumi_events", []))
@@ -8411,6 +8863,47 @@ def test_run_guided_init_without_bilibili_builds_profile_from_zhihu(monkeypatch)
     assert state["profile_history"]
     assert state["profile_history"][0]["source_platform"] == "zhihu"
     assert state["propagated"] == state["zhihu_events"]
+
+
+def test_run_guided_init_linuxdo_uses_account_owned_staged_ingress(monkeypatch) -> None:
+    import asyncio
+
+    state = _guided_init_pipeline_doubles(monkeypatch)
+    state["linuxdo_events"] = [
+        {
+            "event_type": "favorite",
+            "title": "Linux.do 收藏",
+            "url": "https://linux.do/t/example/42",
+            "context": "在 Linux.do 收藏了《Linux.do 收藏》",
+            "metadata": {
+                "source_platform": "linuxdo",
+                "content_id": "topic:42",
+                "account_key": "linuxdo-user:7",
+            },
+        }
+    ]
+
+    result = asyncio.run(
+        cli_module.run_guided_init(
+            client=None,
+            memory=state["memory"],
+            soul_engine=state["soul"],
+            favorite_limit=0,
+            follow_limit=0,
+            include_bili=False,
+            include_xhs=False,
+            include_dy=False,
+            include_yt=False,
+            include_linuxdo=True,
+            target_pool_count=10,
+            discover_backfill=state["backfill"],
+        )
+    )
+
+    assert result.linuxdo_status == "ok"
+    assert state["linuxdo_enqueue_kwargs"]["profile_update"] is True
+    assert state["analyzed"] == state["linuxdo_events"]
+    assert state["profile_history"][0]["source_platform"] == "linuxdo"
 
 
 def test_run_guided_init_all_sources_empty_raises_empty_signals(monkeypatch) -> None:

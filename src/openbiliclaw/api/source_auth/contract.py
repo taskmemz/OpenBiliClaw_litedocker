@@ -1,7 +1,7 @@
 """Orthogonal source-auth contract.
 
 The legacy ``SourceStatusItem.state`` packs four independent questions into one
-string, which is why seven platforms ended up with mutually incomparable green
+string, which is why the original platform set ended up with mutually incomparable green
 lights (see ``docs/plans/2026-07-18-source-auth-contract-spec.md`` D1/D2). This
 module defines the replacement: four dimensions that vary independently, plus
 an explicit statement of *how strong* the evidence behind the verdict is.
@@ -16,7 +16,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Is there a credential at all? Orthogonal to whether it works.
 Credential = Literal[
@@ -57,6 +57,67 @@ VerifyMethod = Literal[
     "task_history",  # inferred from the outcome of past tasks
     "none",  # no verification capability (or none needed)
 ]
+
+# Some sources expose more than one independently authenticated capability.  A
+# V2EX public feed, for example, is usable anonymously while its browser-owned
+# account bootstrap needs a fresh signed-in session.  Keep this axis separate
+# from the source-wide compatibility fields below so a public green light can
+# never be mistaken for proof that private account collection is ready.
+CapabilityAuthMode = Literal[
+    "anonymous",
+    "optional-credential",
+    "login-required",
+]
+
+CapabilityReadinessState = Literal[
+    "ready",
+    "login_required",
+    "identity_required",
+    "identity_mismatch",
+    "identity_switch_required",
+    "stale",
+    "unavailable",
+]
+CapabilityReadiness = Literal[
+    "ready",
+    "login_required",
+    "unverified",
+    "stale",
+    "rate_limited",
+    "blocked",
+]
+
+
+class SourceCapabilityAuth(BaseModel):
+    """Authentication/readiness contract with legacy readiness projection."""
+
+    mode: CapabilityAuthMode
+    required: bool = True
+    ready: bool = False
+    state: CapabilityReadinessState = "unavailable"
+    # Compatibility projection emitted only when a legacy provider explicitly
+    # supplies it. New capability contracts expose canonical ``ready`` and
+    # ``state`` fields without growing a duplicate JSON key.
+    readiness: CapabilityReadiness | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    detail: str = ""
+
+    @model_validator(mode="after")
+    def _sync_readiness_projections(self) -> SourceCapabilityAuth:
+        fields = self.model_fields_set
+        if "readiness" in fields and "state" not in fields and "ready" not in fields:
+            self.ready = self.readiness == "ready"
+            if self.readiness == "ready":
+                self.state = "ready"
+            elif self.readiness == "login_required":
+                self.state = "login_required"
+            elif self.readiness == "stale":
+                self.state = "stale"
+            else:
+                self.state = "unavailable"
+        return self
 
 
 def normalize_timestamp(value: str) -> str:
@@ -118,6 +179,11 @@ class SourceAuthContract(BaseModel):
     # Human-readable, platform-specific note. User-facing copy lives here so the
     # frontends never hardcode per-platform strings (invariant I4).
     detail: str = ""
+    # Empty for legacy single-auth sources.  Mixed-auth sources populate every
+    # active capability declared by their platform-source contract.  Consumers
+    # must use the requested capability (normally ``bootstrap`` during guided
+    # init), not infer private readiness from ``auth_required``.
+    capabilities: dict[str, SourceCapabilityAuth] = Field(default_factory=dict)
 
     # ── Legacy compatibility (Wave A only) ────────────────────────────────
     # The old ``state``/``logged_in`` vocabulary, owned by each provider. The
@@ -139,3 +205,18 @@ class SourceAuthContract(BaseModel):
         time (CLAUDE.md pitfall #5: shared logic in the backend).
         """
         return normalize_timestamp(value)
+
+    def capability_ready(self, capability: str) -> bool:
+        """Return admission readiness for *capability*.
+
+        Sources without a capability map retain the legacy source-wide
+        behaviour. Capability-specific sources always populate the map and
+        therefore cannot accidentally fall back to ``auth_required=False``.
+        """
+
+        state = self.capabilities.get(str(capability).strip())
+        if state is not None:
+            return state.ready
+        return not self.auth_required or (
+            self.credential == "present" and self.verification == "verified"
+        )

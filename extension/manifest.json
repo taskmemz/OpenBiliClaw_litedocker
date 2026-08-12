@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "OpenBiliClaw",
-    "version": "0.3.201",
+    "version": "0.3.204",
     "description": "跨平台内容发现 AI Agent — 行为采集、画像与智能推荐",
     "permissions": [
         "activeTab",
@@ -20,6 +20,10 @@
         "*://*.zhihu.com/*",
         "*://*.reddit.com/*",
         "*://*.redd.it/*",
+        "https://linux.do/*",
+        "*://*.v2ex.com/*",
+        "*://*.weibo.com/*",
+        "*://*.weibo.cn/*",
         "*://*.x.com/*",
         "*://*.twitter.com/*",
         "*://*.bgm.tv/*",
@@ -114,11 +118,39 @@
         },
         {
             "matches": [
+                "*://*.weibo.com/*",
+                "*://*.weibo.cn/*"
+            ],
+            "js": [
+                "dist/content/weibo.js"
+            ],
+            "run_at": "document_idle"
+        },
+        {
+            "matches": [
                 "*://*.reddit.com/*",
                 "*://*.redd.it/*"
             ],
             "js": [
                 "dist/content/reddit.js"
+            ],
+            "run_at": "document_idle"
+        },
+        {
+            "matches": [
+                "https://linux.do/*"
+            ],
+            "js": [
+                "dist/content/linuxdo.js"
+            ],
+            "run_at": "document_idle"
+        },
+        {
+            "matches": [
+                "*://*.v2ex.com/*"
+            ],
+            "js": [
+                "dist/content/v2ex.js"
             ],
             "run_at": "document_idle"
         },

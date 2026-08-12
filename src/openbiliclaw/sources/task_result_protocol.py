@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -11,7 +12,18 @@ if TYPE_CHECKING:
     from openbiliclaw.storage.database import Database
 
 STAGED_TERMINAL_STATUS_FIELD = "_openbiliclaw_terminal_status"
-_TASK_TABLES = frozenset({"xhs_tasks", "dy_tasks", "yt_tasks", "zhihu_tasks", "reddit_tasks"})
+_TASK_TABLES = frozenset(
+    {
+        "xhs_tasks",
+        "dy_tasks",
+        "yt_tasks",
+        "zhihu_tasks",
+        "reddit_tasks",
+        "linuxdo_tasks",
+        "v2ex_tasks",
+        "weibo_tasks",
+    }
+)
 
 
 def parse_task_result(raw: object) -> dict[str, Any]:
@@ -38,6 +50,7 @@ def mutate_unstaged_result(
     task_id: str,
     mutate: Callable[[dict[str, Any]], dict[str, Any]],
     terminal_status: str | None = None,
+    expected_claim_token: str | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """Serialize one legacy mutation and reject it after a final is staged.
 
@@ -54,12 +67,18 @@ def mutate_unstaged_result(
     conn = database.open_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        claim_column = ", claim_token" if expected_claim_token is not None else ""
         row = conn.execute(
-            f"SELECT status, result_json FROM {table} WHERE id = ?",  # noqa: S608
+            f"SELECT status, result_json{claim_column} FROM {table} WHERE id = ?",  # noqa: S608
             (task_id,),
         ).fetchone()
         if row is None:
             raise KeyError(task_id)
+        if expected_claim_token is not None and not secrets.compare_digest(
+            str(row["claim_token"] or ""),
+            str(expected_claim_token or ""),
+        ):
+            raise PermissionError("task_claim_conflict")
         current = parse_task_result(row["result_json"])
         if str(row["status"] or "").strip() in {"completed", "failed"} or staged_terminal_status(
             current
@@ -100,6 +119,7 @@ def stage_terminal_result(
     task_id: str,
     terminal_status: str,
     merge: Callable[[dict[str, Any]], dict[str, Any]],
+    expected_claim_token: str | None = None,
 ) -> dict[str, Any]:
     """Publish a canonical final payload while leaving the task nonterminal.
 
@@ -115,12 +135,18 @@ def stage_terminal_result(
     conn = database.open_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        claim_column = ", claim_token" if expected_claim_token is not None else ""
         row = conn.execute(
-            f"SELECT status, result_json FROM {table} WHERE id = ?",  # noqa: S608
+            f"SELECT status, result_json{claim_column} FROM {table} WHERE id = ?",  # noqa: S608
             (task_id,),
         ).fetchone()
         if row is None:
             raise KeyError(task_id)
+        if expected_claim_token is not None and not secrets.compare_digest(
+            str(row["claim_token"] or ""),
+            str(expected_claim_token or ""),
+        ):
+            raise PermissionError("task_claim_conflict")
         current = parse_task_result(row["result_json"])
         if str(row["status"] or "").strip() in {"completed", "failed"}:
             conn.commit()
@@ -152,6 +178,7 @@ def complete_staged_result(
     *,
     table: str,
     task_id: str,
+    expected_claim_token: str | None = None,
 ) -> bool:
     """Flip an already-staged task terminal without replacing result_json."""
     if table not in _TASK_TABLES:
@@ -159,27 +186,35 @@ def complete_staged_result(
     conn = database.open_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        claim_column = ", claim_token" if expected_claim_token is not None else ""
         row = conn.execute(
-            f"SELECT status, result_json FROM {table} WHERE id = ?",  # noqa: S608
+            f"SELECT status, result_json{claim_column} FROM {table} WHERE id = ?",  # noqa: S608
             (task_id,),
         ).fetchone()
         if row is None:
             raise KeyError(task_id)
+        if expected_claim_token is not None and not secrets.compare_digest(
+            str(row["claim_token"] or ""),
+            str(expected_claim_token or ""),
+        ):
+            raise PermissionError("task_claim_conflict")
         status = str(row["status"] or "").strip()
         if status == "completed":
             conn.commit()
             return False
         if status == "failed":
             raise RuntimeError("failed task cannot be completed")
-        if not staged_terminal_status(row["result_json"]):
+        terminal_marker = staged_terminal_status(row["result_json"])
+        if not terminal_marker:
             raise RuntimeError("task result is not staged for completion")
+        target_status = "failed" if terminal_marker == "failed" else "completed"
         cursor = conn.execute(
             f"""
             UPDATE {table}
-            SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+            SET status = ?, completed_at = CURRENT_TIMESTAMP
             WHERE id = ? AND status NOT IN ('completed', 'failed')
             """,  # noqa: S608
-            (task_id,),
+            (target_status, task_id),
         )
         conn.commit()
         return int(cursor.rowcount or 0) == 1

@@ -233,7 +233,7 @@
             <h2 data-saved-heading tabindex="-1">稍后再看</h2>
             <p class="video-meta">你加入稍后再看的内容会在这里排队，看完随手移除即可。</p>
           </div>
-          <button class="pill-btn" id="watchLaterSyncAll" data-saved-list-action="sync-all" type="button" disabled>同步未同步内容（0）</button>
+          <button class="pill-btn" id="watchLaterSyncAll" data-saved-list-action="sync-all" type="button" disabled hidden>同步未同步内容（0）</button>
         </div>
         <p class="saved-sync-status" id="watchLaterSyncStatus" aria-live="polite"></p>
         <div class="saved-grid" id="watchLaterList"></div>
@@ -247,7 +247,7 @@
             <h2 data-saved-heading tabindex="-1">我的收藏</h2>
             <p class="video-meta">点 ★ 收藏的内容会长期留在这里，和稍后再看互相独立。</p>
           </div>
-          <button class="pill-btn" id="favoritesSyncAll" data-saved-list-action="sync-all" type="button" disabled>同步未同步内容（0）</button>
+          <button class="pill-btn" id="favoritesSyncAll" data-saved-list-action="sync-all" type="button" disabled hidden>同步未同步内容（0）</button>
         </div>
         <p class="saved-sync-status" id="favoritesSyncStatus" aria-live="polite"></p>
         <div class="saved-grid" id="favoritesList"></div>
@@ -422,7 +422,7 @@
 
         <div id="settingsPanelSources" class="settings-panel" data-settings-panel="sources" role="tabpanel" aria-labelledby="settingsTabSources" hidden>
           <p class="settings-note-inline">每个来源一张卡：卡面是开关、接入状态和候选池占比，展开后是接入方式、发现分支与预算、节流和该平台专属设置。开关改动需要保存配置才会进入或退出调度；接入状态只说明 cookie、令牌或插件任务是否可用。</p>
-          <p class="settings-note-inline">凭据一律脱敏：后端不会把原始 Cookie、令牌或 API Key 回传到页面，也不提供复制原值。手动粘贴入口只提供给后端直接带 Cookie 请求平台接口的源——B 站、抖音、X、Reddit（留空保存不会覆盖）；小红书、知乎由浏览器插件用登录态取数，YouTube 与 Bangumi 使用公开接口，不保存 Cookie。</p>
+          <p class="settings-note-inline">凭据一律脱敏：后端不会把原始 Cookie、令牌或 API Key 回传到页面，也不提供复制原值。手动粘贴入口只提供给后端直接带 Cookie 请求平台接口的源——B 站、抖音、X、Reddit（留空保存不会覆盖）；小红书、知乎由浏览器插件用登录态取数，YouTube、Bangumi 与微博公开 discovery 使用公开接口，不保存 Cookie。微博个人初始化由扩展同源任务读取登录态，后端只接收布尔状态、uid 与规范化事件。</p>
           <div id="sourceStatusList" class="source-card-list">
 
             <article class="source-status-row source-card" data-source-status="bilibili" data-source-credential="bilibili" data-open="0">
@@ -580,6 +580,57 @@
                   <h4>验证</h4>
                   <div class="settings-probe-row source-verify-row">
                     <button class="pill-btn source-verify-btn" type="button">测试连接</button>
+                    <span class="settings-probe-status source-verify-status" aria-live="polite"></span>
+                  </div>
+                </section>
+              </div>
+            </article>
+
+            <article class="source-status-row source-card" data-source-status="weibo" data-source-credential="weibo" data-open="0">
+              <div class="source-card-face" role="button" tabindex="0" aria-expanded="false" aria-controls="sourceCardBody-weibo">
+                <span class="source-card-logo" data-source-logo="weibo" aria-hidden="true">微</span>
+                <span class="source-card-head">
+                  <strong class="source-card-name">微博</strong>
+                  <span class="source-status-badges"><span class="source-source-badge">来源：加载中</span><span class="source-access-badge">接入：加载中</span><span class="source-evidence-badge" hidden></span></span>
+                  <p class="src-detail">加载中…</p>
+                  <span class="source-card-hint-slot"></span>
+                </span>
+                <span class="source-card-right">
+                  <label class="source-card-share"><span>占比</span><input id="shareWeibo" value="1" inputmode="numeric" aria-label="微博候选池占比"></label>
+                  <label class="source-card-enable"><span class="sr-only">启用微博</span><select id="weiboEnabled"><option value="on">启用</option><option value="off" selected>停用</option></select></label>
+                  <span class="source-card-chev" aria-hidden="true">▾</span>
+                </span>
+              </div>
+              <div class="source-card-body" id="sourceCardBody-weibo">
+                <section class="source-seg">
+                  <h4>接入方式</h4>
+                  <p class="seg-note">公开 search / 热榜 / 作者 discovery 使用匿名访客会话，无需用户 Cookie。显式 guided init 时，扩展会在已登录微博的同源任务页只读收藏、关注和互动，并回传规范化事件；后端不接收或保存 Cookie。网页接口并非官方稳定 API，可能随微博调整而变化。</p>
+                  <div class="source-cred-box">
+                    <div class="source-cred-line"><span class="source-credential-ro-tag">公开 + 登录态任务</span><span class="source-credential-summary">加载中…</span></div>
+                    <textarea class="source-credential-value" rows="2" readonly autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+                  </div>
+                </section>
+                <section class="source-seg">
+                  <h4>发现分支与每日预算</h4>
+                  <p class="seg-note">关掉分支即不再调度；预算是该分支每日最终保留候选条数上限。默认值兼顾匿名接口稳定性，请谨慎提高。</p>
+                  <div class="branch-table" data-branch-toggles="on">
+                    <div class="branch-head"><span></span><span>分支</span><span>每日预算</span><span>说明</span></div>
+                    <div class="branch-row"><input id="weiboModeSearch" type="checkbox" class="branch-toggle" aria-label="微博搜索分支"><span class="branch-name">搜索</span><input id="weiboDailySearchBudget" class="branch-budget" inputmode="numeric" placeholder="60" aria-label="微博每日搜索预算"><span class="branch-hint">按画像关键词搜索</span></div>
+                    <div class="branch-row"><input id="weiboModeHot" type="checkbox" class="branch-toggle" aria-label="微博热榜分支"><span class="branch-name">热榜</span><input id="weiboDailyHotBudget" class="branch-budget" inputmode="numeric" placeholder="10" aria-label="微博每日热榜预算"><span class="branch-hint">热榜主题转为正文候选</span></div>
+                    <div class="branch-row"><input id="weiboModeCreator" type="checkbox" class="branch-toggle" aria-label="微博作者分支"><span class="branch-name">作者</span><input id="weiboDailyCreatorBudget" class="branch-budget" inputmode="numeric" placeholder="30" aria-label="微博每日作者预算"><span class="branch-hint">围绕匹配作者扩展；需搜索或热榜种子</span></div>
+                  </div>
+                </section>
+                <section class="source-seg">
+                  <h4>节流</h4>
+                  <div class="inline-row">
+                    <label class="settings-field"><span>请求间隔秒数</span><input id="weiboRequestInterval" inputmode="numeric" placeholder="3"></label>
+                    <label class="settings-field"><span>最小调度间隔分钟</span><input id="weiboMinInterval" inputmode="numeric" placeholder="10"></label>
+                  </div>
+                </section>
+                <section class="source-seg">
+                  <h4>验证</h4>
+                  <div class="settings-probe-row source-verify-row">
+                    <button class="pill-btn source-verify-btn" type="button">查看接入状态</button>
                     <span class="settings-probe-status source-verify-status" aria-live="polite"></span>
                   </div>
                 </section>
@@ -875,6 +926,122 @@
               </div>
             </article>
 
+            <article class="source-status-row source-card" data-source-status="linuxdo" data-source-credential="linuxdo" data-open="0">
+              <div class="source-card-face" role="button" tabindex="0" aria-expanded="false" aria-controls="sourceCardBody-linuxdo">
+                <span class="source-card-logo" data-source-logo="linuxdo" aria-hidden="true" style="background:#1f6f43">L</span>
+                <span class="source-card-head">
+                  <strong class="source-card-name">Linux.do</strong>
+                  <span class="source-status-badges"><span class="source-source-badge">来源：加载中</span><span class="source-access-badge">接入：加载中</span><span class="source-evidence-badge" hidden></span></span>
+                  <p class="src-detail">加载中…</p>
+                  <span class="source-card-hint-slot"></span>
+                </span>
+                <span class="source-card-right">
+                  <label class="source-card-share"><span>占比</span><input id="shareLinuxdo" value="1" inputmode="numeric" aria-label="Linux.do 候选池占比"></label>
+                  <label class="source-card-enable"><span class="sr-only">启用 Linux.do</span><select id="linuxdoEnabled"><option value="on">启用</option><option value="off">停用</option></select></label>
+                  <span class="source-card-chev" aria-hidden="true">▾</span>
+                </span>
+              </div>
+              <div class="source-card-body" id="sourceCardBody-linuxdo">
+                <section class="source-seg">
+                  <h4>接入方式</h4>
+                  <p class="seg-note">公开发现无需登录；连接已登录 Linux.do 的浏览器插件后，可增强收藏、点赞和阅读记录等个人信号。登录态由插件同源读取，后端不接收或保存 Cookie。</p>
+                  <div class="source-cred-box">
+                    <div class="source-cred-line"><span class="source-credential-ro-tag">只读</span><span class="source-credential-summary">加载中…</span></div>
+                    <textarea class="source-credential-value" rows="2" readonly autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+                  </div>
+                </section>
+                <section class="source-seg">
+                  <h4>发现分支与每日预算</h4>
+                  <p class="seg-note">关掉分支即不再调度；预算是该分支每日任务次数上限，0 或留空 = 不限。</p>
+                  <div class="branch-table" data-branch-toggles="on">
+                    <div class="branch-head"><span></span><span>分支</span><span>每日预算</span><span>说明</span></div>
+                    <div class="branch-row"><input id="linuxdoModeSearch" type="checkbox" class="branch-toggle" aria-label="Linux.do 搜索分支"><span class="branch-name">搜索</span><input id="linuxdoDailySearchBudget" class="branch-budget" inputmode="numeric" placeholder="0 = 不限" aria-label="Linux.do 每日搜索预算"><span class="branch-hint">按画像关键词搜索</span></div>
+                    <div class="branch-row"><input id="linuxdoModeHot" type="checkbox" class="branch-toggle" aria-label="Linux.do 热门分支"><span class="branch-name">热门</span><input id="linuxdoDailyHotBudget" class="branch-budget" inputmode="numeric" placeholder="0 = 不限" aria-label="Linux.do 每日热门预算"><span class="branch-hint">社区热门主题</span></div>
+                    <div class="branch-row"><input id="linuxdoModeFeed" type="checkbox" class="branch-toggle" aria-label="Linux.do 最新分支"><span class="branch-name">最新</span><input id="linuxdoDailyFeedBudget" class="branch-budget" inputmode="numeric" placeholder="0 = 不限" aria-label="Linux.do 每日最新预算"><span class="branch-hint">最新主题流</span></div>
+                    <div class="branch-row"><input id="linuxdoModeCreator" type="checkbox" class="branch-toggle" aria-label="Linux.do 作者分支"><span class="branch-name">作者</span><input id="linuxdoDailyCreatorBudget" class="branch-budget" inputmode="numeric" placeholder="0 = 不限" aria-label="Linux.do 每日作者预算"><span class="branch-hint">相关作者主题</span></div>
+                    <div class="branch-row"><input id="linuxdoModeRelated" type="checkbox" class="branch-toggle" aria-label="Linux.do 相关分支"><span class="branch-name">相关</span><input id="linuxdoDailyRelatedBudget" class="branch-budget" inputmode="numeric" placeholder="0 = 不限" aria-label="Linux.do 每日相关预算"><span class="branch-hint">相关主题链</span></div>
+                  </div>
+                </section>
+                <section class="source-seg">
+                  <h4>节流与初始化</h4>
+                  <div class="inline-row">
+                    <label class="settings-field"><span>请求间隔秒数</span><input id="linuxdoRequestInterval" inputmode="numeric" min="0" max="30" placeholder="3"></label>
+                    <label class="settings-field"><span>最小调度间隔分钟</span><input id="linuxdoMinInterval" inputmode="numeric" placeholder="3"></label>
+                    <label class="settings-field"><span>初始化个人信号上限</span><input id="linuxdoBootstrapLimit" inputmode="numeric" min="1" max="300" placeholder="300"></label>
+                  </div>
+                </section>
+                <section class="source-seg">
+                  <h4>验证</h4>
+                  <div class="settings-probe-row source-verify-row">
+                    <button class="pill-btn source-verify-btn" type="button">测试连接</button>
+                    <span class="settings-probe-status source-verify-status" aria-live="polite"></span>
+                  </div>
+                </section>
+              </div>
+            </article>
+
+            <article class="source-status-row source-card" data-source-status="v2ex" data-source-credential="v2ex" data-open="0">
+              <div class="source-card-face" role="button" tabindex="0" aria-expanded="false" aria-controls="sourceCardBody-v2ex">
+                <span class="source-card-logo" data-source-logo="v2ex" aria-hidden="true">V2</span>
+                <span class="source-card-head">
+                  <strong class="source-card-name">V2EX</strong>
+                  <span class="source-status-badges"><span class="source-source-badge">来源：加载中</span><span class="source-access-badge">接入：加载中</span><span class="source-evidence-badge" hidden></span></span>
+                  <p class="src-detail">加载中…</p>
+                  <span class="source-card-hint-slot"></span>
+                </span>
+                <span class="source-card-right">
+                  <label class="source-card-share"><span>占比</span><input id="shareV2EX" value="1" inputmode="numeric" aria-label="V2EX 候选池占比"></label>
+                  <label class="source-card-enable"><span class="sr-only">启用 V2EX</span><select id="v2exEnabled"><option value="on">启用</option><option value="off">停用</option></select></label>
+                  <span class="source-card-chev" aria-hidden="true">▾</span>
+                </span>
+              </div>
+              <div class="source-card-body" id="sourceCardBody-v2ex">
+                <section class="source-seg">
+                  <h4>接入方式</h4>
+                  <p class="seg-note">使用 V2EX 官方公开只读 API、JSON/RSS Feed；不登录也能发现内容。可选 PAT 仅用于识别账号和 API 2.0 增强读取，后端不会发帖、回复、收藏或关注 Node。浏览器任务可按需读取本人主题、回复、收藏主题和收藏 Node 的公开渲染字段。</p>
+                  <div class="source-cred-box">
+                    <div class="source-cred-line"><span class="source-credential-ro-tag">脱敏</span><span class="source-credential-summary">加载中…</span></div>
+                    <textarea class="source-credential-value" rows="2" readonly autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+                  </div>
+                  <div class="inline-row">
+                    <label class="settings-field"><span>PAT（可留空）</span><input id="v2exAccessToken" type="password" maxlength="512" autocomplete="off" placeholder="可留空；匿名公开发现可直接使用"><span class="settings-field-row"><input id="v2exClearToken" type="checkbox"> 清除已保存的 PAT</span></label>
+                    <label class="settings-field"><span>公开用户名（可选）</span><input id="v2exUsername" maxlength="128" autocomplete="off" placeholder="仅作账号提示，PAT 会自动识别"></label>
+                  </div>
+                  <div class="settings-probe-row">
+                    <button class="pill-btn" id="v2exAcceptBrowserIdentity" type="button" hidden>采用当前浏览器账号</button>
+                    <button class="pill-btn" id="v2exRefreshIdentity" type="button">刷新身份</button>
+                    <span class="settings-probe-status" id="v2exIdentityStatus" aria-live="polite">身份状态加载中…</span>
+                  </div>
+                </section>
+                <section class="source-seg">
+                  <h4>发现分支与每日预算</h4>
+                  <p class="seg-note">搜索使用统一关键词规划器；Node、Tab、热门和最新分支共享候选池准入，并按来源占比参与补货。</p>
+                  <div class="branch-table" data-branch-toggles="on">
+                    <div class="branch-head"><span></span><span>分支</span><span>每日预算</span><span>说明</span></div>
+                    <div class="branch-row"><input id="v2exModeSearch" type="checkbox" class="branch-toggle" aria-label="V2EX 搜索分支"><span class="branch-name">搜索</span><input id="v2exDailySearchBudget" class="branch-budget" inputmode="numeric" placeholder="120" aria-label="V2EX 每日搜索条目"><span class="branch-hint">按画像关键词召回主题</span></div>
+                    <div class="branch-row"><input id="v2exModeNode" type="checkbox" class="branch-toggle" aria-label="V2EX Node 分支"><span class="branch-name">Node</span><input id="v2exDailyNodeBudget" class="branch-budget" inputmode="numeric" placeholder="180" aria-label="V2EX 每日 Node 条目"><span class="branch-hint">按 Node 轮转取主题</span></div>
+                    <div class="branch-row"><input id="v2exModeTab" type="checkbox" class="branch-toggle" aria-label="V2EX Tab 分支"><span class="branch-name">Tab</span><input id="v2exDailyTabBudget" class="branch-budget" inputmode="numeric" placeholder="80" aria-label="V2EX 每日 Tab 条目"><span class="branch-hint">tech / creative / qna Feed</span></div>
+                    <div class="branch-row"><input id="v2exModeHot" type="checkbox" class="branch-toggle" aria-label="V2EX 热门分支"><span class="branch-name">热门</span><input id="v2exDailyHotBudget" class="branch-budget" inputmode="numeric" placeholder="40" aria-label="V2EX 每日热门条目"><span class="branch-hint">趋势补充，不替代个性化召回</span></div>
+                    <div class="branch-row"><input id="v2exModeLatest" type="checkbox" class="branch-toggle" aria-label="V2EX 最新分支"><span class="branch-name">最新</span><input id="v2exDailyLatestBudget" class="branch-budget" inputmode="numeric" placeholder="40" aria-label="V2EX 每日最新条目"><span class="branch-hint">少量探索流量</span></div>
+                  </div>
+                </section>
+                <section class="source-seg">
+                  <h4>节流</h4>
+                  <div class="inline-row">
+                    <label class="settings-field"><span>请求间隔秒数</span><input id="v2exRequestInterval" inputmode="numeric" placeholder="2"></label>
+                    <label class="settings-field"><span>最小调度间隔分钟</span><input id="v2exMinInterval" inputmode="numeric" placeholder="5"></label>
+                  </div>
+                </section>
+                <section class="source-seg">
+                  <h4>验证</h4>
+                  <div class="settings-probe-row source-verify-row">
+                    <button class="pill-btn source-verify-btn" type="button">测试 PAT</button>
+                    <span class="settings-probe-status source-verify-status" aria-live="polite"></span>
+                  </div>
+                </section>
+              </div>
+            </article>
+
           </div>
 
           <div class="source-aux-card">
@@ -1017,6 +1184,25 @@
             <span class="settings-probe-status" id="probeNetworkProxyStatus" aria-live="polite"></span>
           </div>
           <p class="settings-note-inline" id="networkProxyHint">仅作用于海外服务（海外 AI 服务、需要海外出网的内容来源、更新检查）；B 站等国内请求始终直连。直连会忽略环境代理；自定义模式支持 http/https/socks5/socks5h。哪些来源需要海外出网，见「平台源」页每个来源的接入状态。</p>
+          <p class="settings-section-title">初始化与画像</p>
+          <section class="settings-reinit-card" aria-labelledby="reinitHeading">
+            <div class="settings-reinit-head">
+              <div>
+                <p class="settings-section-kicker">Profile rebuild</p>
+                <h3 id="reinitHeading">重新初始化</h3>
+              </div>
+              <span class="settings-reinit-badge" id="reinitStateBadge" hidden></span>
+            </div>
+            <p class="settings-reinit-copy">重新拉取所选平台的历史数据、重建完整画像并补足首轮发现池；现有事件、收藏与对话历史都会保留。<strong>旧推荐池会按新画像清空重建</strong>，适合更换平台账号或画像长期未更新时使用，会消耗较多 AI 调用。</p>
+            <div class="settings-reinit-actions">
+              <button class="pill-btn" id="reinitBtn" type="button">重新初始化 / 重建画像</button>
+              <label class="settings-reinit-option" title="换账号或大改兴趣时建议勾选：会删除旧的 LLM 观察笔记与洞察，本轮重新生成">
+                <input id="reinitResetCognition" type="checkbox" data-settings-ignore-dirty>
+                <span>同时清空旧认知观察与洞察</span>
+              </label>
+              <span class="settings-probe-status" id="reinitStatus" aria-live="polite">读取初始化状态中…</span>
+            </div>
+          </section>
           <p class="settings-section-title">数据迁移</p>
           <section class="settings-migration-card" aria-labelledby="migrationHeading">
             <div class="settings-migration-head">

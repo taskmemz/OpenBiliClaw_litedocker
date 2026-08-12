@@ -57,6 +57,7 @@ from openbiliclaw.config import Config
 from openbiliclaw.runtime.init_prereqs import InitPrereqs
 from openbiliclaw.sources.douyin_auth import DouyinCookieManager
 from openbiliclaw.sources.douyin_direct import DouyinDirectError
+from openbiliclaw.sources.linuxdo_tasks import LinuxdoTaskQueue
 from openbiliclaw.sources.x_auth import XCookieManager
 from openbiliclaw.sources.x_client import XAuthError, XClient
 from openbiliclaw.sources.zhihu_tasks import ZhihuTaskQueue
@@ -106,6 +107,7 @@ class _Case:
     enabled: bool
     feed_paused: bool = False
     # Bangumi's optional-token axis (``ok`` / ``rejected`` / ``""``); "" for the
+    # other platforms, which never set it. Frozen because it is
     # the other source-auth platforms, which never set it. Frozen because it is
     # what the frontend overlays as 「令牌已失效」, and a refactor moving Bangumi
     # onto the contract must not silently drop it.
@@ -161,6 +163,32 @@ def _seed_zhihu_task(db: Database, *, status: str, result: dict[str, object]) ->
         "(id, type, payload_json, status, result_json, created_at, completed_at) "
         "VALUES (?, ?, '{}', ?, ?, ?, ?)",
         ("task-1", "recommend", status, json.dumps(result), now, now),
+    )
+    db.conn.commit()
+
+
+def _seed_linuxdo_task(
+    db: Database,
+    *,
+    task_type: str,
+    status: str,
+    result: dict[str, object],
+) -> None:
+    """Write one Linux.do task so the no-heartbeat fallback has evidence."""
+    LinuxdoTaskQueue(db)
+    now = _sqlite_now()
+    db.conn.execute(
+        "INSERT INTO linuxdo_tasks "
+        "(id, type, payload_json, status, result_json, created_at, completed_at) "
+        "VALUES (?, ?, '{}', ?, ?, ?, ?)",
+        (
+            f"linuxdo-{task_type}-{status}",
+            task_type,
+            status,
+            json.dumps(result),
+            now,
+            now if status in {"completed", "failed"} else None,
+        ),
     )
     db.conn.commit()
 
@@ -258,6 +286,23 @@ def _yt_disabled(env: _Env) -> None:
 def _yt_enabled_with_unrelated_credentials(env: _Env) -> None:
     """Other platforms' credentials must not leak into youtube's verdict."""
     env.cfg.sources.youtube.enabled = True
+    env.cfg.bilibili.cookie = _FULL_BILI_COOKIE
+
+
+# ── weibo preconditions ─────────────────────────────────────────────
+
+
+def _weibo_enabled(env: _Env) -> None:
+    env.cfg.sources.weibo.enabled = True
+
+
+def _weibo_disabled(env: _Env) -> None:
+    env.cfg.sources.weibo.enabled = False
+
+
+def _weibo_enabled_with_unrelated_credentials(env: _Env) -> None:
+    """Account cookies for another source must never affect anonymous Weibo."""
+    env.cfg.sources.weibo.enabled = True
     env.cfg.bilibili.cookie = _FULL_BILI_COOKIE
 
 
@@ -404,6 +449,7 @@ def _reddit_credential_without_session(env: _Env) -> None:
 # ``bangumi_discovery_runs`` rows), which every case here uses.
 
 _BANGUMI_TOKEN = "bgm-personal-access-token"
+_V2EX_TOKEN = "v2ex-personal-access-token"
 
 
 def _bangumi_no_token(env: _Env) -> None:
@@ -442,6 +488,116 @@ def _bangumi_token_disabled(env: _Env) -> None:
     """A saved token on a switched-off source — the credential is idle."""
     env.cfg.sources.bangumi.enabled = False
     env.cfg.sources.bangumi.access_token = _BANGUMI_TOKEN
+
+
+# ── linuxdo preconditions ───────────────────────────────────────────
+
+
+def _linuxdo_no_heartbeat(env: _Env) -> None:
+    env.cfg.sources.linuxdo.enabled = True
+
+
+def _linuxdo_heartbeat_fresh(env: _Env) -> None:
+    env.cfg.sources.linuxdo.enabled = True
+    _seed_browser_login_state(
+        env.db,
+        prefix="linuxdo",
+        logged_in=True,
+        when_iso=_iso_hours_ago(0.1),
+    )
+
+
+def _linuxdo_heartbeat_stale(env: _Env) -> None:
+    env.cfg.sources.linuxdo.enabled = False
+    _seed_browser_login_state(
+        env.db,
+        prefix="linuxdo",
+        logged_in=True,
+        when_iso=_iso_hours_ago(73),
+    )
+
+
+def _linuxdo_heartbeat_logged_out(env: _Env) -> None:
+    env.cfg.sources.linuxdo.enabled = True
+    _seed_browser_login_state(
+        env.db,
+        prefix="linuxdo",
+        logged_in=False,
+        when_iso=_iso_hours_ago(0.1),
+    )
+
+
+def _linuxdo_bootstrap_completed(env: _Env) -> None:
+    env.cfg.sources.linuxdo.enabled = True
+    _seed_linuxdo_task(
+        env.db,
+        task_type="bootstrap_events",
+        status="completed",
+        result={
+            "_openbiliclaw_terminal_status": "degraded",
+            "items": [{"topic_id": "1"}, {"topic_id": "2"}],
+        },
+    )
+
+
+def _linuxdo_discovery_completed(env: _Env) -> None:
+    env.cfg.sources.linuxdo.enabled = True
+    _seed_linuxdo_task(
+        env.db,
+        task_type="search",
+        status="completed",
+        result={
+            "_openbiliclaw_terminal_status": "ok",
+            "items": [{"topic_id": "1"}, {"topic_id": "2"}],
+        },
+    )
+
+
+def _linuxdo_task_login_required(env: _Env) -> None:
+    env.cfg.sources.linuxdo.enabled = True
+    _seed_linuxdo_task(
+        env.db,
+        task_type="bootstrap_events",
+        status="failed",
+        result={"error": "linuxdo_login_required"},
+    )
+
+
+def _linuxdo_task_failed(env: _Env) -> None:
+    env.cfg.sources.linuxdo.enabled = True
+    _seed_linuxdo_task(
+        env.db,
+        task_type="search",
+        status="failed",
+        result={"error": "linuxdo_timeout"},
+    )
+
+
+def _linuxdo_task_pending(env: _Env) -> None:
+    env.cfg.sources.linuxdo.enabled = True
+    _seed_linuxdo_task(
+        env.db,
+        task_type="bootstrap_events",
+        status="pending",
+        result={},
+    )
+
+
+def _v2ex_no_token(env: _Env) -> None:
+    """Enabled, anonymous — public V2EX discovery needs no credential."""
+    env.cfg.sources.v2ex.enabled = True
+
+
+def _v2ex_token_unverified(env: _Env) -> None:
+    """An optional PAT is present but has not been live-checked yet."""
+    env.cfg.sources.v2ex.enabled = True
+    env.cfg.sources.v2ex.access_token = _V2EX_TOKEN
+
+
+def _v2ex_token_disabled(env: _Env) -> None:
+    """A saved PAT remains inert while the source is switched off."""
+    env.cfg.sources.v2ex.enabled = False
+    env.cfg.sources.v2ex.access_token = _V2EX_TOKEN
 
 
 # ── the frozen contract ──────────────────────────────────────────────
@@ -528,6 +684,31 @@ _CASES: dict[str, _Case] = {
         False,
         detail="尚未收到小红书浏览器登录态；插件连接后会在本地同步。",
         enabled=False,
+    ),
+    # weibo — anonymous discovery plus capability-specific browser heartbeat.
+    "weibo-no-heartbeat": _Case(
+        "weibo",
+        _weibo_enabled,
+        "no_auth",
+        True,
+        detail="尚未运行微博内容发现。 初始化本人事件需要浏览器登录态。",
+        enabled=True,
+    ),
+    "weibo-disabled": _Case(
+        "weibo",
+        _weibo_disabled,
+        "no_auth",
+        True,
+        detail="微博来源未启用。",
+        enabled=False,
+    ),
+    "weibo-unrelated-credentials": _Case(
+        "weibo",
+        _weibo_enabled_with_unrelated_credentials,
+        "no_auth",
+        True,
+        detail="尚未运行微博内容发现。 初始化本人事件需要浏览器登录态。",
+        enabled=True,
     ),
     # douyin — cookie presence alone is unverified; a later live probe can move it.
     "douyin-cookie-file": _Case(
@@ -788,6 +969,116 @@ _CASES: dict[str, _Case] = {
         enabled=False,
         token_state="ok",
     ),
+    # linuxdo — anonymous-public discovery with an optional extension heartbeat.
+    "linuxdo-no-heartbeat": _Case(
+        "linuxdo",
+        _linuxdo_no_heartbeat,
+        "no_auth",
+        True,
+        detail=("Linux.do 公开发现无需登录；连接已登录插件后可同步个人收藏、点赞和阅读记录。"),
+        enabled=True,
+    ),
+    "linuxdo-heartbeat-fresh": _Case(
+        "linuxdo",
+        _linuxdo_heartbeat_fresh,
+        "no_auth",
+        True,
+        detail="Linux.do 公开发现可用；浏览器登录态已连接，可同步个人收藏、点赞和阅读记录。",
+        enabled=True,
+    ),
+    "linuxdo-heartbeat-stale-disabled": _Case(
+        "linuxdo",
+        _linuxdo_heartbeat_stale,
+        "no_auth",
+        True,
+        detail="Linux.do 公开发现仍可用；个人登录态已过期，请连接插件刷新。",
+        enabled=False,
+    ),
+    "linuxdo-heartbeat-logged-out": _Case(
+        "linuxdo",
+        _linuxdo_heartbeat_logged_out,
+        "no_auth",
+        True,
+        detail="Linux.do 公开发现可用；浏览器当前未登录，个人信号同步暂不可用。",
+        enabled=True,
+    ),
+    "linuxdo-task-history-bootstrap-completed": _Case(
+        "linuxdo",
+        _linuxdo_bootstrap_completed,
+        "no_auth",
+        True,
+        detail=(
+            "Linux.do 公开发现可用；最近个人信号同步降级完成（2 条），"
+            "浏览器会话可用于收藏、点赞和阅读记录。"
+        ),
+        enabled=True,
+    ),
+    "linuxdo-task-history-discovery-completed": _Case(
+        "linuxdo",
+        _linuxdo_discovery_completed,
+        "no_auth",
+        True,
+        detail=(
+            "Linux.do 公开发现最近任务完成（search，2 条）；"
+            "公开任务不证明浏览器已登录，个人信号仍需登录态。"
+        ),
+        enabled=True,
+    ),
+    "linuxdo-task-history-login-required": _Case(
+        "linuxdo",
+        _linuxdo_task_login_required,
+        "no_auth",
+        True,
+        detail=(
+            "Linux.do 公开发现仍可用；最近任务提示需要登录，"
+            "请在当前浏览器登录 Linux.do 后重试个人信号同步。"
+        ),
+        enabled=True,
+    ),
+    "linuxdo-task-history-failed": _Case(
+        "linuxdo",
+        _linuxdo_task_failed,
+        "no_auth",
+        True,
+        detail=(
+            "Linux.do 最近任务失败（search）：linuxdo_timeout；"
+            "公开发现仍可用，该运行错误无法判断个人登录态。"
+        ),
+        enabled=True,
+    ),
+    "linuxdo-task-history-pending": _Case(
+        "linuxdo",
+        _linuxdo_task_pending,
+        "no_auth",
+        True,
+        detail=("Linux.do 任务正在等待插件执行（bootstrap_events / pending）；公开发现无需登录。"),
+        enabled=True,
+    ),
+    # v2ex — anonymous public discovery with an optional API 2.0 PAT.
+    "v2ex-no-token": _Case(
+        "v2ex",
+        _v2ex_no_token,
+        "no_auth",
+        True,
+        detail="公开源 · 无需登录；可选填 PAT 以识别账号并增强 Node / Topic API。",
+        enabled=True,
+    ),
+    "v2ex-token-unverified": _Case(
+        "v2ex",
+        _v2ex_token_unverified,
+        "no_auth",
+        True,
+        detail="已保存 V2EX 个人令牌，尚未联网确认；可点「测试连接」验证。",
+        enabled=True,
+    ),
+    "v2ex-token-disabled": _Case(
+        "v2ex",
+        _v2ex_token_disabled,
+        "no_auth",
+        True,
+        detail="已保存 V2EX 个人令牌，尚未联网确认；可点「测试连接」验证。",
+        enabled=False,
+    ),
 }
 
 
@@ -894,8 +1185,168 @@ def test_sources_status_legacy_fields_are_frozen(case_id: str, contract_env: _En
     assert check_legacy_consistency(case.platform, contract) == []
 
 
+@pytest.mark.parametrize(
+    ("setup", "credential", "origin", "verification", "has_timestamp"),
+    [
+        (_linuxdo_bootstrap_completed, "present", "extension", "verified", True),
+        (_linuxdo_discovery_completed, "none", "none", "unverified", False),
+        (_linuxdo_task_login_required, "none", "none", "failed", True),
+        (_linuxdo_task_failed, "none", "none", "unverified", False),
+        (_linuxdo_task_pending, "none", "none", "unverified", False),
+    ],
+    ids=["bootstrap-success", "public-success", "login-required", "failed", "pending"],
+)
+def test_linuxdo_task_history_fallback_preserves_optional_auth(
+    contract_env: _Env,
+    setup: Callable[[_Env], None],
+    credential: str,
+    origin: str,
+    verification: str,
+    has_timestamp: bool,
+) -> None:
+    setup(contract_env)
+    item = _status_payload(contract_env)["linuxdo"]
+    contract = SourceAuthContract.model_validate(item["auth"])
+
+    assert (item["state"], item["logged_in"]) == ("no_auth", True)
+    assert contract.auth_required is False
+    assert contract.verify_method == "task_history"
+    assert (contract.credential, contract.credential_origin) == (credential, origin)
+    assert contract.verification == verification
+    assert bool(contract.verified_at) is has_timestamp
+    assert check_legacy_consistency("linuxdo", contract) == []
+
+
+def test_linuxdo_newer_session_probe_takes_precedence_over_cookie_heartbeat(
+    contract_env: _Env,
+) -> None:
+    _linuxdo_task_login_required(contract_env)
+    _seed_browser_login_state(
+        contract_env.db,
+        prefix="linuxdo",
+        logged_in=True,
+        when_iso=_iso_hours_ago(0.1),
+    )
+
+    contract = SourceAuthContract.model_validate(_status_payload(contract_env)["linuxdo"]["auth"])
+    assert contract.verify_method == "task_history"
+    assert contract.verification == "failed"
+    assert contract.credential == "none"
+    assert contract.capabilities["discover"].readiness == "ready"
+    assert contract.capabilities["profile"].readiness == "login_required"
+
+
+def test_linuxdo_authoritative_logout_survives_a_newer_positive_cookie_heartbeat(
+    contract_env: _Env,
+) -> None:
+    _linuxdo_task_login_required(contract_env)
+    contract_env.db.conn.execute(
+        "UPDATE linuxdo_tasks SET completed_at = ?, created_at = ?",
+        (_iso_hours_ago(2), _iso_hours_ago(2)),
+    )
+    contract_env.db.conn.commit()
+    _seed_browser_login_state(
+        contract_env.db,
+        prefix="linuxdo",
+        logged_in=True,
+        when_iso=_iso_hours_ago(0.1),
+    )
+
+    contract = SourceAuthContract.model_validate(_status_payload(contract_env)["linuxdo"]["auth"])
+
+    assert contract.verify_method == "task_history"
+    assert contract.verification == "failed"
+    assert contract.credential == "none"
+    assert contract.capabilities["profile"].readiness == "login_required"
+
+
+def test_linuxdo_stale_task_success_no_longer_admits_personal_capabilities(
+    contract_env: _Env,
+) -> None:
+    _linuxdo_bootstrap_completed(contract_env)
+    contract_env.db.conn.execute(
+        "UPDATE linuxdo_tasks SET completed_at = ?, created_at = ?",
+        (_iso_hours_ago(73), _iso_hours_ago(73)),
+    )
+    contract_env.db.conn.commit()
+
+    contract = SourceAuthContract.model_validate(_status_payload(contract_env)["linuxdo"]["auth"])
+
+    assert contract.verify_method == "task_history"
+    assert contract.verification == "stale"
+    assert contract.capabilities["discover"].readiness == "ready"
+    assert contract.capabilities["profile"].readiness == "stale"
+    assert contract.capability_ready("profile") is False
+
+
+def test_linuxdo_stale_logout_can_be_retried_after_a_fresh_cookie_heartbeat(
+    contract_env: _Env,
+) -> None:
+    _linuxdo_task_login_required(contract_env)
+    contract_env.db.conn.execute(
+        "UPDATE linuxdo_tasks SET completed_at = ?, created_at = ?",
+        (_iso_hours_ago(73), _iso_hours_ago(73)),
+    )
+    contract_env.db.conn.commit()
+    _seed_browser_login_state(
+        contract_env.db,
+        prefix="linuxdo",
+        logged_in=True,
+        when_iso=_iso_hours_ago(0.1),
+    )
+
+    contract = SourceAuthContract.model_validate(_status_payload(contract_env)["linuxdo"]["auth"])
+
+    assert contract.verify_method == "browser_heartbeat"
+    assert contract.verification == "unverified"
+    assert contract.capabilities["profile"].readiness == "ready"
+
+
+def test_linuxdo_pending_retry_does_not_hide_last_authoritative_logout(
+    contract_env: _Env,
+) -> None:
+    _linuxdo_task_login_required(contract_env)
+    _seed_linuxdo_task(
+        contract_env.db,
+        task_type="bootstrap_events",
+        status="pending",
+        result={},
+    )
+    _seed_browser_login_state(
+        contract_env.db,
+        prefix="linuxdo",
+        logged_in=True,
+        when_iso=_iso_hours_ago(0.1),
+    )
+
+    contract = SourceAuthContract.model_validate(_status_payload(contract_env)["linuxdo"]["auth"])
+
+    assert contract.verify_method == "task_history"
+    assert contract.verification == "failed"
+    assert contract.capabilities["bootstrap"].readiness == "login_required"
+
+
+@pytest.mark.parametrize("verification", ["failed", "unverified"])
+def test_linuxdo_optional_task_history_evidence_is_a_narrow_consistency_exception(
+    verification: str,
+) -> None:
+    contract = SourceAuthContract(
+        auth_required=False,
+        credential="none",
+        credential_origin="none",
+        verification=verification,  # type: ignore[arg-type]
+        verify_method="task_history",
+        legacy_state="no_auth",
+        legacy_logged_in=True,
+    )
+
+    assert check_legacy_consistency("linuxdo", contract) == []
+    assert check_legacy_consistency("bangumi", contract) != []
+
+
 def test_contract_covers_every_platform_with_at_least_three_preconditions() -> None:
-    """Spec Phase 0 gate: 7 platforms x >=3 preconditions = >=21 cases."""
+    """Spec Phase 0 gate: every platform has at least three frozen cases."""
+    """Spec Phase 0 gate: every registered platform has >=3 preconditions."""
     per_platform: dict[str, int] = {}
     for case in _CASES.values():
         per_platform[case.platform] = per_platform.get(case.platform, 0) + 1
@@ -909,10 +1360,13 @@ def test_contract_covers_every_platform_with_at_least_three_preconditions() -> N
         "zhihu",
         "reddit",
         "bangumi",
+        "linuxdo",
+        "v2ex",
+        "weibo",
     }
     thin = {platform: n for platform, n in per_platform.items() if n < 3}
     assert not thin, f"platforms with fewer than 3 preconditions: {thin}"
-    assert len(_CASES) >= 24
+    assert len(_CASES) >= 27
 
 
 def test_auth_dimensions_are_orthogonal() -> None:
@@ -1064,6 +1518,14 @@ _EXPECTED_VERIFY_METHODS = {
     # method 知乎 has. The action ``VERIFY_ACTIONS['bangumi']`` is still
     # ``live_probe`` (see the bangumi verify tests below, which supply a token).
     "bangumi": "none",
+    # Linux.do public discovery works anonymously. Without a browser heartbeat
+    # there is no credential verdict to verify, so the current method is none;
+    # the fixed verify action remains browser_heartbeat.
+    "linuxdo": "none",
+    "weibo": "none",
+    # V2EX is anonymous by default; its optional PAT only becomes probeable
+    # after the caller supplies a token.
+    "v2ex": "none",
 }
 
 
@@ -1127,7 +1589,12 @@ def test_verify_action_table_covers_every_platform() -> None:
 def test_verify_returns_200_and_declared_method_for_every_platform(
     slug: str, contract_env: _Env
 ) -> None:
-    """Every registered platform answers with its declared evidence strength.
+    """Every platform answers the route with its declared evidence strength.
+
+    Run with no credentials anywhere, so no platform has anything to probe —
+    which is also why the outbound guard can be absolute here: a verify with
+    nothing to verify must not reach for the network on any platform.
+    Every registered platform answers with its declared evidence strength.
 
     Run with no credentials anywhere, so no platform has anything to probe —
     which is also why the outbound guard can be absolute here: a verify with
@@ -1687,7 +2154,7 @@ async def test_bilibili_verdict_is_dropped_when_the_cookie_goes_away(
     assert contract.verification == "unverified"
 
 
-# ── browser-heartbeat round trip (小红书 / 知乎) ──────────────────────
+# ── browser-heartbeat round trip (小红书 / 知乎 / Linux.do) ─────────
 
 
 async def test_unknown_browser_heartbeat_source_never_falls_back_to_zhihu() -> None:
@@ -1712,14 +2179,16 @@ async def test_unknown_browser_heartbeat_source_never_falls_back_to_zhihu() -> N
 
 
 @pytest.mark.parametrize(
-    ("slug", "prefix"), [("xiaohongshu", "xhs"), ("zhihu", "zhihu")], ids=["xhs", "zhihu"]
+    ("slug", "prefix"),
+    [("xiaohongshu", "xhs"), ("zhihu", "zhihu"), ("linuxdo", "linuxdo")],
+    ids=["xhs", "zhihu", "linuxdo"],
 )
 async def test_verify_browser_heartbeat_waits_for_the_extension(
     contract_env: _Env, slug: str, prefix: str
 ) -> None:
     """The extension answers, the heartbeat row moves, the verdict follows.
 
-    These two platforms are the reason ``verify_method`` has to exist: the
+    These extension-backed platforms are why ``verify_method`` has to exist: the
     backend holds a login *bool*, never their cookie, so it is architecturally
     incapable of probing them itself. The only verification available is a
     round trip through the browser.
@@ -1750,14 +2219,47 @@ async def test_verify_browser_heartbeat_waits_for_the_extension(
 
     assert hub.events == [f"{prefix}_login_state_sync_requested"]
     assert result.contract.verify_method == "browser_heartbeat"
-    assert result.contract.verification == "verified"
-    assert result.outcome == "verified"
+    expected_verification = "unverified" if slug == "linuxdo" else "verified"
+    assert result.contract.verification == expected_verification
+    assert result.outcome == ("indeterminate" if slug == "linuxdo" else "verified")
     assert result.changed is True
     assert check_legacy_consistency(slug, result.contract) == []
 
 
+async def test_weibo_browser_heartbeat_roundtrip_updates_verification(
+    contract_env: _Env,
+) -> None:
+    """微博 login-state callback is the sole backend auth evidence."""
+    _weibo_enabled(contract_env)
+    _seed_browser_login_state(
+        contract_env.db, prefix="weibo", logged_in=True, when_iso=_iso_hours_ago(73)
+    )
+
+    class _RespondingHub:
+        async def publish(self, event: dict[str, object]) -> bool:
+            assert event["type"] == "weibo_login_state_sync_requested"
+            _seed_browser_login_state(
+                contract_env.db, prefix="weibo", logged_in=True, when_iso=_iso_hours_ago(0)
+            )
+            return True
+
+    result = await verify_source(
+        "weibo",
+        cfg=contract_env.cfg,
+        database=contract_env.db,
+        event_hub=_RespondingHub(),
+    )
+
+    assert result.contract.verify_method == "browser_heartbeat"
+    assert result.contract.verification == "verified"
+    assert result.contract.capabilities["bootstrap"].readiness == "ready"
+    assert result.changed is True
+
+
 @pytest.mark.parametrize(
-    ("slug", "prefix"), [("xiaohongshu", "xhs"), ("zhihu", "zhihu")], ids=["xhs", "zhihu"]
+    ("slug", "prefix"),
+    [("xiaohongshu", "xhs"), ("zhihu", "zhihu"), ("linuxdo", "linuxdo")],
+    ids=["xhs", "zhihu", "linuxdo"],
 )
 async def test_verify_browser_heartbeat_answering_logged_out_says_so(
     contract_env: _Env, slug: str, prefix: str
@@ -1796,7 +2298,9 @@ async def test_verify_browser_heartbeat_answering_logged_out_says_so(
 
 
 @pytest.mark.parametrize(
-    ("slug", "prefix"), [("xiaohongshu", "xhs"), ("zhihu", "zhihu")], ids=["xhs", "zhihu"]
+    ("slug", "prefix"),
+    [("xiaohongshu", "xhs"), ("zhihu", "zhihu"), ("linuxdo", "linuxdo")],
+    ids=["xhs", "zhihu", "linuxdo"],
 )
 async def test_verify_browser_heartbeat_without_extension_is_indeterminate(
     contract_env: _Env, slug: str, prefix: str
@@ -1826,7 +2330,7 @@ async def test_verify_browser_heartbeat_without_extension_is_indeterminate(
     )
 
     # The state we already had is unchanged and still reported honestly...
-    assert result.contract.verification == "verified"
+    assert result.contract.verification == ("unverified" if slug == "linuxdo" else "verified")
     # ...but this attempt verified nothing, and says so.
     assert result.outcome == "indeterminate"
     assert result.changed is False
@@ -2027,9 +2531,10 @@ def test_credential_write_states_what_it_could_not_verify(contract_env: _Env) ->
     """Every accepted write says how far it actually checked (invariants I3/I5).
 
     The platforms differ irreducibly: B站 and 抖音 can be probed, X can only be
-    inferred from real traffic, Reddit is a local file read, and 小红书 / 知乎
-    hand the backend a bare boolean it can never audit. A single "saved ✓" for
-    all five would be the same lie the one-word ``state`` field told.
+    inferred from real traffic, Reddit is a local file read, and 小红书 / 知乎 /
+    Linux.do hand the backend a bare boolean it can never audit. A single
+    "saved ✓" for all of them would be the same lie the one-word ``state`` field
+    told.
     """
     _stub_live_probe(contract_env)
     _seed_browser_login_state(
@@ -2045,6 +2550,8 @@ def test_credential_write_states_what_it_could_not_verify(contract_env: _Env) ->
             ("reddit", {"value": "reddit_session=rs; loid=l"}),
             ("xiaohongshu", {"kind": "login_state", "value": True}),
             ("zhihu", {"kind": "login_state", "value": True}),
+            ("linuxdo", {"kind": "login_state", "value": True}),
+            ("v2ex", {"kind": "login_state", "value": True}),
         ):
             response = client.post(f"/api/sources/{slug}/credential", json=body)
             assert response.status_code == 200, response.text
@@ -2064,7 +2571,7 @@ def test_credential_write_states_what_it_could_not_verify(contract_env: _Env) ->
     assert accepted["bilibili"]["checked"] == "live_probe"
     assert accepted["douyin"]["checked"] == "live_probe"
     # ...and the ones that cannot be probed say *that*, with a reason.
-    for slug in ("twitter", "reddit", "xiaohongshu", "zhihu"):
+    for slug in ("twitter", "reddit", "xiaohongshu", "zhihu", "linuxdo", "v2ex"):
         assert accepted[slug]["checked"] != "live_probe", slug
         assert accepted[slug]["unverified_reason"], f"{slug} accepted a write without saying why"
 
@@ -2295,6 +2802,7 @@ def test_superseded_credential_endpoints_are_marked_deprecated(contract_env: _En
 
 
 # ── Phase 4: credential form descriptors ──────────────────────────────
+# The form descriptor exists so three frontends can render every platform
 # The form descriptor exists so three frontends can render every registered platform
 # with no per-platform branches (invariant I4). These tests guard the two ways
 # that promise can rot: a platform shipping without a descriptor (the branch
@@ -2312,6 +2820,7 @@ def _credentials_payload(env: _Env) -> dict[str, Any]:
 
 @pytest.mark.parametrize("slug", sorted(CREDENTIAL_SPECS))
 def test_every_platform_ships_a_credential_form(contract_env: _Env, slug: str) -> None:
+    """Every platform carries a ``form``, so no surface has to invent one."""
     """Every registered platform carries a form, so no surface has to invent one."""
     payload = _credentials_payload(contract_env)
     form = payload[slug]["form"]
@@ -2380,6 +2889,7 @@ def test_form_actions_are_backed_by_a_real_capability(contract_env: _Env, slug: 
 
     assert "clear" not in actions, slug
     assert "copy" not in actions, slug
+    # POST /api/sources/{slug}/verify serves every platform, YouTube included.
     # POST /api/sources/{slug}/verify serves every registered source, YouTube included.
     assert "verify" in actions, slug
     for entry in form["actions"]:
@@ -2400,13 +2910,13 @@ def test_extension_only_platforms_expose_no_writable_input(contract_env: _Env) -
         slug for slug, item in payload.items() if item["form"]["kind"] == "extension_only"
     }
 
-    assert extension_only == {"xiaohongshu", "zhihu"}, extension_only
+    assert extension_only == {"xiaohongshu", "zhihu", "linuxdo"}, extension_only
     for slug in extension_only:
         form = payload[slug]["form"]
         assert form["placeholder"] == "", slug
         assert form["required_keys"] == [], slug
         # Nothing to type, but there is still somewhere to go and something to
-        # check -- an unactionable row is what made these two feel broken.
+        # check -- an unactionable row is what made these sources feel broken.
         actions = {entry["action"] for entry in form["actions"]}
         assert {"verify", "open_login_window"} <= actions, slug
 

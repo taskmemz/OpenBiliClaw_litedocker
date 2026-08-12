@@ -84,7 +84,7 @@ def _recommendations() -> list[dict[str, Any]]:
             "07-agent-memory.png",
         ),
     )
-    return [
+    items = [
         {
             "id": index,
             "bvid": f"demo-{platform}-{index}",
@@ -103,6 +103,40 @@ def _recommendations() -> list[dict[str, Any]]:
         }
         for index, (platform, title, author, topic, cover) in enumerate(rows, 1)
     ]
+    bangumi = {
+        "id": 8,
+        "bvid": "demo-bangumi-8",
+        "content_id": "demo-bangumi-8",
+        "content_url": "https://bgm.tv/subject/8",
+        "source_platform": "bangumi",
+        "title": "把长期兴趣放回时间线：一部作品的重看价值",
+        "up_name": "Bangumi",
+        "topic_label": "动画与叙事",
+        "cover_url": "",
+        "content_type": "subject",
+        "body_text": "一部作品隔几年再看，常会显出初见时忽略的叙事层次与时代纹理。",
+        "expression": "它与你持续关注的叙事结构相连，也提供了跨年份回看的新角度。",
+        "feedback_type": "",
+    }
+    v2ex = {
+        "id": 9,
+        "bvid": "demo-v2ex-9",
+        "content_id": "demo-v2ex-9",
+        "content_url": "https://www.v2ex.com/t/123456",
+        "source_platform": "v2ex",
+        "title": "现在大家怎么管理 Agent 上下文？",
+        "up_name": "alice",
+        "author_name": "alice",
+        "topic_label": "程序员",
+        "tags": ["programmer", "程序员"],
+        "cover_url": "",
+        "content_type": "topic",
+        "body_text": "从本地持久化、摘要压缩到跨设备迁移，大家分享了各自管理 Agent 长上下文的做法。",
+        "reply_count": 36,
+        "expression": "你最近持续关注本地运行、上下文压缩和可迁移性，这个讨论正好交汇三者。",
+        "feedback_type": "",
+    }
+    return [v2ex, *items, bangumi]
 
 
 def _delight_items() -> list[dict[str, Any]]:
@@ -149,6 +183,16 @@ def _sources_status() -> dict[str, dict[str, Any]]:
             "enabled": True,
             "state": "unverified",
             "detail": "本地已保存 Reddit 接入信息（未实时访问 Reddit 验证）。",
+        },
+        "bangumi": {
+            "enabled": True,
+            "state": "no_auth",
+            "detail": "公开内容发现无需登录；公开用户名仅用于可选画像初始化。",
+        },
+        "v2ex": {
+            "enabled": True,
+            "state": "ready",
+            "detail": "公开发现正常；浏览器登录身份已观察，PAT 为可选增强。",
         },
     }
 
@@ -228,13 +272,15 @@ def demo_payload(path: str) -> tuple[int, Any]:
             "pool_size": 112,
             "pool_refresh_state": "idle",
             "pool_source_shares": {
-                "bilibili": 0.22,
-                "xiaohongshu": 0.17,
-                "douyin": 0.11,
-                "youtube": 0.14,
-                "twitter": 0.12,
-                "zhihu": 0.13,
-                "reddit": 0.11,
+                "bilibili": 0.18,
+                "xiaohongshu": 0.14,
+                "douyin": 0.09,
+                "youtube": 0.11,
+                "twitter": 0.10,
+                "zhihu": 0.11,
+                "reddit": 0.09,
+                "bangumi": 0.08,
+                "v2ex": 0.10,
             },
             "configured_sources": {key: {"enabled": True} for key in _sources_status()},
             "unread_count": 2,

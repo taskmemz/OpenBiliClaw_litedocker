@@ -96,7 +96,7 @@
 
 | 任务 | 状态 | 说明 |
 |------|------|------|
-| 4.1 事件层 | ✅ | SQLite 写入 + 按类型/时间/关键词查询 + 统计；正式事件类型为 `view/dialogue/pause/seek/search/favorite/like/coin/comment/click/scroll/hover/snapshot/reshuffle/feedback/follow/share`；入库前会为缺失 `metadata.signal_strength` 的事件补统一证据强度，已有平台自定义值不覆盖。单条与批量传播都通过 `asyncio.to_thread` 进入 storage 独立短连接事务，不阻塞 API loop，也不跨线程共享 SQLite transaction。`reshuffle` 是强度 `0.1`、satisfaction-neutral 的单批导航事件，不等价于其中每条内容的 `dismiss`。v0.3.x 每行带 `inferred_satisfaction` + `satisfaction_reason`（写入时由 `classify_event_satisfaction` 决定），`query_events(satisfaction_modes=...)` 支持按 positive/negative/neutral/unknown 过滤，`unknown` 同时匹配 pre-migration 的 NULL 行；`query_events_since(after_event_id, event_types)` 提供按 `id ASC` 的游标增量读取，供反馈批学习这类严格 cursor 消费方避免 newest-first limit 跳过旧事件 |
+| 4.1 事件层 | ✅ | SQLite 写入 + 按类型/时间/关键词查询 + 统计；正式事件类型为 `view/dialogue/pause/seek/search/favorite/like/coin/comment/discussion_reply/publish/click/scroll/hover/snapshot/reshuffle/feedback/follow/share`；入库前会为缺失 `metadata.signal_strength` 的事件补统一证据强度，已有平台自定义值不覆盖。`publish` 表示用户主动发布主题但不推断其对主题观点的满意度；`discussion_reply` 表示来源侧聚合后的参与讨论事实，不等价于赞同主楼；`reshuffle` 是强度 `0.1`、satisfaction-neutral 的单批导航事件，不等价于其中每条内容的 `dismiss`。v0.3.x 每行带 `inferred_satisfaction` + `satisfaction_reason`（写入时由 `classify_event_satisfaction` 决定），`query_events(satisfaction_modes=...)` 支持按 positive/negative/neutral/unknown 过滤，`unknown` 同时匹配 pre-migration 的 NULL 行；`query_events_since(after_event_id, event_types)` 提供按 `id ASC` 的游标增量读取，供反馈批学习这类严格 cursor 消费方避免 newest-first limit 跳过旧事件 |
 | 4.2 偏好层 | ✅ | LLM structured extraction + 合并 + 衰减 |
 | 4.3 灵魂层 | ✅ | 初始画像生成 + `profile` CLI 展示 |
 | 4.4 觉察层 + 洞察层 | ✅ | 觉察笔记、洞察假设、反馈更新 |
@@ -106,7 +106,8 @@
 | 持续刷新状态 | ✅ | `discovery_runtime.json` 记录候选池刷新、通知游标、最近处理事件位置、正向/负向 probe 冷却、probe distance 历史和短期探索 buffer |
 | 认知变化状态 | ✅ | `cognition_updates.json` 记录关键认知变化、通知状态和来源 |
 | 账户同步状态 | ✅ | `account_sync_state.json` 记录历史/收藏/关注同步游标、已见 ID 集合、签名、最近错误，以及最多 8 个去重后的 `{stage,kind}` 结构化同步问题 |
-| 多源 bootstrap 去重与周期状态 | ✅ | `source_bootstrap_state.json` 记录 XHS / 抖音 / YouTube / 知乎 / Reddit 已进入事件路径的 bootstrap identity key，每源按响应顺序保留最新 5,000 个；同文件的 `source_incremental` 保存 round-robin cursor、逐源最后真实创建时间和当前 active task。所有写入经 `update_source_bootstrap_state()` 的文件锁 + 原子 replace，避免并发 task-result / scheduler 丢更新 |
+| 多源 bootstrap 去重与周期状态 | ✅ | `source_bootstrap_state.json` 记录 XHS / 抖音 / YouTube / 知乎 / Reddit / Linux.do 已进入事件路径的 bootstrap identity key，每源按响应顺序保留最新 5,000 个；同文件的 `source_incremental` 保存 round-robin cursor、逐源最后真实创建时间和当前 active task。所有写入经 `update_source_bootstrap_state()` 的文件锁 + 原子 replace，避免并发 task-result / scheduler 丢更新 |
+| 多源 bootstrap 去重与周期状态 | ✅ | `source_bootstrap_state.json` 记录 XHS / 抖音 / YouTube / 知乎 / Reddit / V2EX 已进入事件路径的 bootstrap identity key，每源按响应顺序保留最新 5,000 个；V2EX key 带后端 resolved username 前缀，账号切换不共用去重集合。同文件的 `source_incremental` 保存 round-robin cursor、逐源最后真实创建时间和当前 active task。所有写入经 `update_source_bootstrap_state()` 的文件锁 + 原子 replace，避免并发 task-result / scheduler 丢更新 |
 | 用户画像覆盖层 | ✅ | `profile_overrides.json` 存用户对画像的手动编辑（文本/标量固定 + 列表/兴趣树增删）；`load/save_profile_overrides` 读写，`sync_profile_files` 渲染人类可读镜像前叠加覆盖层，确保编辑在画像重建后仍反映在 `soul_profile.md/.json` |
 | 插件聊天回合 | ✅ | SQLite `chat_turns` 持久化 side panel 主聊天、惊喜推荐内聊、兴趣猜测内聊和避雷探针内聊的 pending/completed/failed 状态 |
 | JSON 状态原子读写 | ✅ | `memory/json_state.py` 提供共享同一进程内锁/跨进程文件锁的 `read_json_state()` 与 `update_json_state()`，写侧再以 `os.replace` 发布；`discovery_runtime.json` 的 probe 反馈历史、冷却 map、短期探索 buffer 等运行态通过 mutator 更新并合并旧快照，避免安装包常驻进程/后台任务并发保存时丢掉用户点击反馈。对话锚在 LLM 返回后的 ref+generation 二次校验使用锁内读，因此不会观察到写到一半的代次。 |
@@ -129,7 +130,7 @@ memory.initialize()
 
 # 写入事件
 await memory.propagate_event({
-    "event_type": "view",           # view|dialogue|pause|seek|search|favorite|like|coin|comment|click|scroll|hover|snapshot|reshuffle|feedback|follow|share
+    "event_type": "view",           # view|dialogue|pause|seek|search|favorite|like|coin|comment|discussion_reply|publish|click|scroll|hover|snapshot|reshuffle|feedback|follow|share
     "url": "https://www.bilibili.com/video/BV1xx",
     "title": "视频标题",
     "metadata": {"bvid": "BV1xx"},  # 缺失 signal_strength 时会按事件类型补默认值
@@ -433,7 +434,8 @@ data/memory/
 |------|------|-----------|
 | `feedback_state.json` | 记录反馈处理游标、v1 rollout provenance 与 owner-v2 cutover fence，避免升级重放和稳态重复分析 | SoulEngine |
 | `account_sync_state.json` | 历史/收藏/关注的增量同步游标、同秒历史 bvid 集合、收藏 bvid 集合、关注 mid 集合、签名，以及有界的分阶段错误诊断 | AccountSyncService |
-| `source_bootstrap_state.json` | 五个扩展账号来源的有界已传播 identity key，以及周期回拉 cursor / attempt / active-task 状态 | FastAPI source task endpoints / SourceIncrementalSync |
+| `source_bootstrap_state.json` | 六个扩展账号来源（XHS / 抖音 / YouTube / 知乎 / Reddit / Linux.do）的有界已传播 identity key，以及周期回拉 cursor / attempt / active-task 状态 | FastAPI source task endpoints / SourceIncrementalSync |
+| `source_bootstrap_state.json` | 六个扩展账号来源的有界已传播 identity key，以及周期回拉 cursor / attempt / active-task 状态 | FastAPI source task endpoints / SourceIncrementalSync |
 | `discovery_runtime.json` | 候选池刷新时间、通知游标、最近话题、近期 probe domain / axis / distance 历史、显式 probe feedback 历史、短期探索 buffer | RefreshController / OpenClaw / FastAPI |
 | `avoidance_state.json` | 不喜欢领域探针的 active/cooldown 列表和生命周期状态 | AvoidanceSpeculator / FastAPI |
 | `insight_candidates.json` | 聊天中提取的候选洞察，等待置信度达标 | SoulEngine |
@@ -497,4 +499,5 @@ data_dir = "data"  # 记忆 JSON 文件存储在 data/memory/ 下
 12. **候选池运行状态分层**：`discovery_runtime.json` 只负责刷新与通知游标，不与 `feedback_state.json`、`insight_candidates.json` 或画像数据混存
 13. **认知变化单独留痕**：`cognition_updates.json` 保存系统最近形成的关键理解变化，既供插件通知使用，也让画像页能回显”最近记住了什么”
 14. **账户同步状态单独持久化**：`account_sync_state.json` 记录 history / favorites / following 的增量游标、已见 ID 集合、稳定签名与有界的 `{stage,kind}` 错误清单，既避免每轮全量重灌事件层和同秒历史游标导致重复画像分析，也让 runtime-status 无需解析原始异常文本即可定位失败环节
-15. **多源 bootstrap 去重与调度状态独立持久化**：`source_bootstrap_state.json` 保存 XHS / 抖音 / YouTube / 知乎 / Reddit 已见 bootstrap identity key（每源最新 5,000）及 `source_incremental` 调度投影，不塞进画像 JSON；`update_source_bootstrap_state(mutator)` 在同一进程锁、跨进程文件锁内读改写并以 `os.replace` 发布。task-result 保留首份 canonical 原始结果，durable ingress 成功后再按响应顺序写 seen-key，失败时不翻 terminal，可由租约重领修复
+15. **多源 bootstrap 去重与调度状态独立持久化**：`source_bootstrap_state.json` 保存 XHS / 抖音 / YouTube / 知乎 / Reddit / Linux.do 已见 bootstrap identity key（每源最新 5,000）及 `source_incremental` 调度投影，不塞进画像 JSON；`update_source_bootstrap_state(mutator)` 在同一进程锁、跨进程文件锁内读改写并以 `os.replace` 发布。task-result 保留首份 canonical 原始结果，durable ingress 成功后再按响应顺序写 seen-key，失败时不翻 terminal，可由租约重领修复
+15. **多源 bootstrap 去重与调度状态独立持久化**：`source_bootstrap_state.json` 保存 XHS / 抖音 / YouTube / 知乎 / Reddit / V2EX 已见 bootstrap identity key（每源最新 5,000）及 `source_incremental` 调度投影，不塞进画像 JSON；V2EX key 额外按 resolved username 隔离。`update_source_bootstrap_state(mutator)` 在同一进程锁、跨进程文件锁内读改写并以 `os.replace` 发布。task-result 保留首份 canonical 原始结果，durable ingress 成功后再按响应顺序写 seen-key，失败时不翻 terminal，可由租约重领修复；V2EX 收藏撤回作为 `feedback/retraction` 弱证据进入同一事件层，折价历史 positive 而不删除事实

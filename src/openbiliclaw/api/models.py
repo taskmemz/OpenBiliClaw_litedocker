@@ -20,7 +20,7 @@ from pydantic import (
     model_validator,
 )
 
-from openbiliclaw.api.source_auth.contract import SourceAuthContract
+from openbiliclaw.api.source_auth.contract import SourceAuthContract, SourceCapabilityAuth
 from openbiliclaw.saved_sync.identity import canonical_source_platform, make_item_key
 from openbiliclaw.sources.platforms import CANONICAL_SOURCE_FAMILIES, normalize_source_platform
 
@@ -196,6 +196,10 @@ class InitPrerequisitesOut(BaseModel):
     embedding_pull_status: str = ""
     embedding_required: bool = False
     enabled_platforms: list[str] = Field(default_factory=list)
+    # Per-source, per-capability readiness projected from the same backend
+    # contract as /api/sources/status.  Guided-init clients use ``bootstrap``;
+    # they must not equate anonymous discovery readiness with account readiness.
+    source_capabilities: dict[str, dict[str, SourceCapabilityAuth]] = Field(default_factory=dict)
 
 
 class InitStatusOut(BaseModel):
@@ -259,6 +263,7 @@ class RecommendationOut(BaseModel):
     # so the card stats row is not left with a lone like count.
     favorite_count: int = 0
     comment_count: int = 0
+    share_count: int = 0
     rating_score: float = 0.0
     rating_count: int = 0
     source_rank: int = 0
@@ -523,11 +528,12 @@ class PendingDelightOut(BaseModel):
     content_type: str = "video"
     body_text: str = ""
     # Engagement stats (from content_cache), so the delight card can show the
-    # same ▶ / 👍 / 💬 metadata row as the recommendation grid. 0 = unknown /
+    # same ▶ / 👍 / 💬 / 🔁 metadata row as the recommendation grid. 0 = unknown /
     # not fetched (platforms that don't populate a metric render nothing).
     view_count: int = 0
     like_count: int = 0
     comment_count: int = 0
+    share_count: int = 0
     danmaku_count: int = 0
     favorite_count: int = 0
     rating_score: float = 0.0
@@ -722,6 +728,34 @@ class ZhihuLoginStateResponse(BaseModel):
     updated_at: str = ""
 
 
+class LinuxdoLoginStateIn(BaseModel):
+    """Privacy-preserving Linux.do login state reported by the extension."""
+
+    logged_in: StrictBool
+
+
+class LinuxdoLoginStateResponse(BaseModel):
+    """Result of persisting the browser-observed Linux.do login state."""
+
+    ok: bool = True
+    logged_in: bool
+    updated_at: str = ""
+
+
+class WeiboLoginStateIn(BaseModel):
+    """Privacy-preserving Weibo login state reported by the extension."""
+
+    logged_in: StrictBool
+
+
+class WeiboLoginStateResponse(BaseModel):
+    """Result of persisting the browser-observed Weibo login state."""
+
+    ok: bool = True
+    logged_in: bool
+    updated_at: str = ""
+
+
 class XStatusResponse(BaseModel):
     """Current X (Twitter) source health (spec §7).
 
@@ -760,7 +794,7 @@ class SourceStatusItem(BaseModel):
       or its saved credential file is invalid.
     - ``expired`` / ``blocked`` — X live-health states.
     - ``rate_limited`` — X live-health or XHS persisted safety cooldown.
-    - ``no_auth``    — source needs no login (YouTube, public).
+    - ``no_auth``    — source needs no login (YouTube / Weibo public paths).
     - ``disabled``   — source switched off in config (Bangumi only, and only
       until it moves onto ``auth``, where scheduling and credential state are
       separate dimensions rather than two values of one field).
@@ -782,13 +816,20 @@ class SourceStatusItem(BaseModel):
     detail: str = ""
     logged_in: bool = False
     # Discovery sub-feed/task execution is circuit-broken independently of the
-    # login verdict (currently X For-You and XHS platform safety cooldown).
+    # login verdict (X For-You, XHS safety cooldown, and Weibo 429 cooldown).
     feed_paused: bool = False
+    # Discovery health is independent of authentication. Anonymous sources can
+    # remain correctly labelled ``no_auth`` while their most recent fetch is
+    # partial, failed, or cooling down. Empty means the source does not expose a
+    # separate discovery-health projection yet.
+    discovery_state: Literal[
+        "", "disabled", "unverified", "ready", "partial", "error", "rate_limited"
+    ] = ""
     # ``None`` means "this source has no auth contract", the honest answer for a
     # backend older than the contract — not a missing value to be defaulted away
     # (a default-constructed contract reads ``auth_required=True`` +
     # ``credential="none"``, which renders as 「需要登录」 and would be a fabricated
-    # verdict for a public source — the overclaim invariant I3 forbids). All eight
+    # verdict for a public source — the overclaim invariant I3 forbids). All nine
     # sources now ship a real contract: Bangumi resolved the "auth optional" shape
     # by staying ``auth_required=False`` (anonymous-public) while its optional
     # personal token reports ``verify_method='live_probe'`` when configured. The
@@ -827,6 +868,9 @@ class SourcesStatusResponse(BaseModel):
     zhihu: SourceStatusItem = Field(default_factory=SourceStatusItem)
     reddit: SourceStatusItem = Field(default_factory=SourceStatusItem)
     bangumi: SourceStatusItem = Field(default_factory=SourceStatusItem)
+    linuxdo: SourceStatusItem = Field(default_factory=SourceStatusItem)
+    v2ex: SourceStatusItem = Field(default_factory=SourceStatusItem)
+    weibo: SourceStatusItem = Field(default_factory=SourceStatusItem)
 
 
 class SourceVerifyResponse(BaseModel):
@@ -997,6 +1041,9 @@ class SourcesCredentialsResponse(BaseModel):
     zhihu: SourceCredentialItem = Field(default_factory=SourceCredentialItem)
     reddit: SourceCredentialItem = Field(default_factory=SourceCredentialItem)
     bangumi: SourceCredentialItem = Field(default_factory=SourceCredentialItem)
+    linuxdo: SourceCredentialItem = Field(default_factory=SourceCredentialItem)
+    v2ex: SourceCredentialItem = Field(default_factory=SourceCredentialItem)
+    weibo: SourceCredentialItem = Field(default_factory=SourceCredentialItem)
 
 
 class NotificationAckIn(BaseModel):
@@ -2130,6 +2177,61 @@ class BangumiSourceConfigOut(BaseModel):
     bootstrap_limit: int = 300
 
 
+class LinuxdoSourceConfigOut(BaseModel):
+    enabled: bool = False
+    source_modes: list[str] = Field(
+        default_factory=lambda: ["search", "hot", "feed", "creator", "related"]
+    )
+    daily_search_budget: int = 0
+    daily_hot_budget: int = 0
+    daily_feed_budget: int = 0
+    daily_creator_budget: int = 0
+    daily_related_budget: int = 0
+    request_interval_seconds: int = Field(default=3, ge=0, le=30)
+    min_interval_minutes: int = 3
+    bootstrap_limit: int = Field(default=300, ge=1, le=300)
+
+
+class V2EXSourceConfigOut(BaseModel):
+    enabled: bool = False
+    username: str = ""
+    access_token_set: bool = False
+    token_env: str = "OPENBILICLAW_V2EX_TOKEN"
+    source_modes: list[str] = Field(
+        default_factory=lambda: ["search", "node", "tab", "hot", "latest"]
+    )
+    tab_modes: list[str] = Field(default_factory=lambda: ["tech", "creative", "qna"])
+    node_allowlist: list[str] = Field(default_factory=list)
+    node_blocklist: list[str] = Field(default_factory=lambda: ["sandbox"])
+    node_downweight: list[str] = Field(default_factory=lambda: ["promotions", "jobs", "deals"])
+    daily_search_budget: int = 120
+    daily_node_budget: int = 180
+    daily_tab_budget: int = 80
+    daily_hot_budget: int = 40
+    daily_latest_budget: int = 40
+    request_interval_seconds: int = 2
+    min_interval_minutes: int = 5
+    detail_fetch_limit: int = 15
+    reply_enrichment_limit: int = 10
+    max_topic_chars: int = 6000
+    max_reply_digest_chars: int = 1200
+    max_profile_nodes: int = 12
+    bootstrap_topics_limit: int = 100
+    bootstrap_replies_limit: int = 300
+    bootstrap_favorites_limit: int = 300
+    bootstrap_max_pages_per_scope: int = 20
+
+
+class WeiboSourceConfigOut(BaseModel):
+    enabled: bool = False
+    source_modes: list[str] = Field(default_factory=lambda: ["search", "hot", "creator"])
+    daily_search_budget: int = 60
+    daily_hot_budget: int = 10
+    daily_creator_budget: int = 30
+    request_interval_seconds: int = 3
+    min_interval_minutes: int = 10
+
+
 class SourcesConfigOut(BaseModel):
     browser: SourcesBrowserConfigOut = Field(default_factory=SourcesBrowserConfigOut)
     bilibili: BilibiliSourceConfigOut = Field(default_factory=BilibiliSourceConfigOut)
@@ -2140,6 +2242,9 @@ class SourcesConfigOut(BaseModel):
     zhihu: ZhihuSourceConfigOut = Field(default_factory=ZhihuSourceConfigOut)
     reddit: RedditSourceConfigOut = Field(default_factory=RedditSourceConfigOut)
     bangumi: BangumiSourceConfigOut = Field(default_factory=BangumiSourceConfigOut)
+    linuxdo: LinuxdoSourceConfigOut = Field(default_factory=LinuxdoSourceConfigOut)
+    v2ex: V2EXSourceConfigOut = Field(default_factory=V2EXSourceConfigOut)
+    weibo: WeiboSourceConfigOut = Field(default_factory=WeiboSourceConfigOut)
 
 
 class SchedulerConfigOut(BaseModel):
@@ -2151,12 +2256,15 @@ class SchedulerConfigOut(BaseModel):
     copy_ready_target_count: int = Field(default=90, ge=0, le=600)
     pool_source_shares: dict[str, int] = Field(default_factory=dict)
     account_sync_interval_hours: int = 6
+    source_incremental_enabled: bool = False
     source_incremental_hours: int = 24
     xhs_incremental_hours: int | None = None
-    douyin_incremental_hours: int | None = None
+    douyin_incremental_hours: int | None = 0
     youtube_incremental_hours: int | None = None
     zhihu_incremental_hours: int | None = None
     reddit_incremental_hours: int | None = None
+    linuxdo_incremental_hours: int | None = None
+    v2ex_incremental_hours: int | None = None
     refresh_check_interval_seconds: int = 60
     eval_min_batch_size: int = Field(default=15, ge=1, le=90)
     eval_max_wait_seconds: float = Field(default=90.0, ge=0.0, le=600.0)

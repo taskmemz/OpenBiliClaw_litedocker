@@ -8,6 +8,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -35,6 +36,10 @@ def _queue_class(
             statuses: tuple[str, ...] | None = None,
         ) -> dict[str, Any] | None:
             captured["recent_call"] = (task_type, recent_hours, statuses)
+            if recent is None:
+                return None
+            if statuses is not None and str(recent.get("status", "")) not in statuses:
+                return None
             return recent
 
         def enqueue_with_id(
@@ -105,7 +110,40 @@ _PLATFORMS = (
             "profile_update": False,
         },
     ),
+    (
+        "enqueue_linuxdo_bootstrap",
+        "openbiliclaw.sources.linuxdo_tasks.LinuxdoTaskQueue",
+        "bootstrap_events",
+        {
+            "scopes": [
+                "linuxdo_bookmarks",
+                "linuxdo_likes",
+                "linuxdo_read_history",
+            ],
+            "max_items_per_scope": 300,
+            "request_interval_seconds": 3,
+            "profile_update": False,
+        },
+    ),
+    (
+        "enqueue_weibo_bootstrap",
+        "openbiliclaw.sources.weibo_tasks.WeiboTaskQueue",
+        "bootstrap_events",
+        {
+            "scopes": ["weibo_favorites", "weibo_following", "weibo_mentions"],
+            "max_items_per_scope": 300,
+            "profile_update": False,
+        },
+    ),
 )
+
+
+def test_weibo_bootstrap_registry_uses_durable_task_table() -> None:
+    from openbiliclaw.sources import source_bootstrap
+    from openbiliclaw.sources.task_result_protocol import _TASK_TABLES
+
+    assert ("weibo", "weibo_tasks", "bootstrap_events") in source_bootstrap._BOOTSTRAP_TASK_TABLES
+    assert "weibo_tasks" in _TASK_TABLES
 
 
 @pytest.mark.parametrize(
@@ -155,7 +193,11 @@ def test_force_false_reuses_recent_task(
     monkeypatch.setattr(
         queue_path,
         _queue_class(
-            recent={"id": "recent-task-id", "status": "completed"},
+            recent={
+                "id": "recent-task-id",
+                "status": "completed",
+                "result_json": json.dumps({"_openbiliclaw_terminal_status": "ok"}),
+            },
             captured=captured,
         ),
     )
@@ -242,13 +284,46 @@ def test_incremental_marker_is_opt_in_and_preserves_profile_update_fields(
 
     assert result.created is True
     assert captured["payload"]["incremental"] is True
-    if helper_name in {"enqueue_zhihu_bootstrap", "enqueue_reddit_bootstrap"}:
+    assert "incremental_owner" not in captured["payload"]
+    if helper_name in {
+        "enqueue_zhihu_bootstrap",
+        "enqueue_reddit_bootstrap",
+        "enqueue_linuxdo_bootstrap",
+    }:
         assert captured["payload"]["profile_update"] is False
+
+    captured.clear()
+    monkeypatch.setattr(queue_path, _queue_class(captured=captured))
+    getattr(source_bootstrap, helper_name)(
+        _FakeDatabase(),
+        force=True,
+        incremental=True,
+        incremental_owner="scheduler",
+    )
+    assert captured["payload"]["incremental_owner"] == "scheduler"
 
     captured.clear()
     monkeypatch.setattr(queue_path, _queue_class(captured=captured))
     getattr(source_bootstrap, helper_name)(_FakeDatabase(), force=True, incremental=False)
     assert "incremental" not in captured["payload"]
+
+
+def test_linuxdo_bootstrap_passes_request_interval_to_extension_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openbiliclaw.sources import source_bootstrap
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setenv("OPENBILICLAW_LINUXDO_REQUEST_INTERVAL_SECONDS", "1.75")
+    monkeypatch.setattr(
+        "openbiliclaw.sources.linuxdo_tasks.LinuxdoTaskQueue",
+        _queue_class(captured=captured),
+    )
+
+    result = source_bootstrap.enqueue_linuxdo_bootstrap(_FakeDatabase(), force=True)
+
+    assert result.created is True
+    assert captured["payload"]["request_interval_seconds"] == 1.75
 
 
 def test_douyin_degraded_recent_task_is_retried(
@@ -276,6 +351,233 @@ def test_douyin_degraded_recent_task_is_retried(
     assert result.task_id == "fresh-task-id"
     assert "task_type" in captured
     assert any("仅部分完成" in message for message in messages)
+
+
+@pytest.mark.parametrize("terminal_status", ("degraded", "failed"))
+def test_linuxdo_unsuccessful_recent_terminal_is_retried(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    from openbiliclaw.sources import source_bootstrap
+    from openbiliclaw.sources.linuxdo_tasks import LinuxdoTaskQueue
+    from openbiliclaw.storage.database import Database
+
+    database = Database(tmp_path / f"linuxdo-retry-{terminal_status}.db")
+    database.initialize()
+    first = source_bootstrap.enqueue_linuxdo_bootstrap(database, force=True)
+    assert first.task_id is not None
+    queue = LinuxdoTaskQueue(database)
+    if terminal_status == "degraded":
+        queue.stage_final_result(first.task_id, terminal_status="degraded")
+        assert queue.complete_staged_result(first.task_id) is True
+    else:
+        assert queue.fail(first.task_id, error="login_required") is True
+
+    retried = source_bootstrap.enqueue_linuxdo_bootstrap(database)
+
+    assert retried.created is True
+    assert retried.reason == "created"
+    assert retried.task_id not in {None, first.task_id}
+
+
+def test_linuxdo_newer_failure_prevents_reusing_older_success(tmp_path: Path) -> None:
+    from openbiliclaw.sources import source_bootstrap
+    from openbiliclaw.sources.linuxdo_tasks import LinuxdoTaskQueue
+    from openbiliclaw.storage.database import Database
+
+    database = Database(tmp_path / "linuxdo-latest-terminal.db")
+    database.initialize()
+    queue = LinuxdoTaskQueue(database)
+    successful = queue.enqueue_with_id("bootstrap_events", {}, daily_budget=0)
+    assert successful is not None
+    queue.stage_final_result(successful, terminal_status="ok")
+    assert queue.complete_staged_result(successful) is True
+    failed = queue.enqueue_with_id("bootstrap_events", {}, daily_budget=0)
+    assert failed is not None
+    assert queue.fail(failed, error="extension_disconnected") is True
+    database.conn.execute(
+        "UPDATE linuxdo_tasks SET created_at = datetime('now', '-2 minutes') WHERE id = ?",
+        (successful,),
+    )
+    database.conn.execute(
+        "UPDATE linuxdo_tasks SET created_at = datetime('now', '-1 minute') WHERE id = ?",
+        (failed,),
+    )
+    database.conn.commit()
+
+    retried = source_bootstrap.enqueue_linuxdo_bootstrap(database)
+
+    assert retried.created is True
+    assert retried.task_id not in {None, successful, failed}
+
+
+def test_v2ex_bootstrap_registry_enqueues_the_v2ex_tasks_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openbiliclaw.sources import source_bootstrap
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "openbiliclaw.sources.v2ex_tasks.V2EXTaskQueue",
+        _queue_class(captured=captured),
+    )
+
+    result = source_bootstrap.enqueue_v2ex_bootstrap(
+        _FakeDatabase(),
+        username="alice",
+        force=True,
+    )
+
+    assert result.created is True
+    assert captured["task_type"] == "bootstrap_profile"
+    assert captured["payload"]["username"] == "alice"
+    assert captured["payload"]["scopes"] == [
+        "public_topics",
+        "public_replies",
+        "favorite_topics",
+        "favorite_nodes",
+    ]
+    assert "v2ex_tasks" in "openbiliclaw.sources.v2ex_tasks.V2EXTaskQueue"
+
+
+def test_v2ex_bootstrap_uses_config_owned_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openbiliclaw.sources import source_bootstrap
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "openbiliclaw.sources.v2ex_tasks.V2EXTaskQueue",
+        _queue_class(captured=captured),
+    )
+    config = SimpleNamespace(
+        bootstrap_topics_limit=17,
+        bootstrap_replies_limit=29,
+        bootstrap_favorites_limit=31,
+        bootstrap_max_pages_per_scope=7,
+    )
+
+    result = source_bootstrap.enqueue_v2ex_bootstrap(
+        _FakeDatabase(),
+        username="alice",
+        config=config,
+        force=True,
+    )
+
+    assert result.created is True
+    assert captured["payload"] | {"scopes": []} == {
+        "scopes": [],
+        "username": "alice",
+        "max_topics": 17,
+        "max_replies": 29,
+        "max_favorite_topics": 31,
+        "max_pages_per_scope": 7,
+        "profile_update": False,
+        "smoke_only": False,
+        "profile_rebuild": False,
+    }
+
+
+def test_v2ex_recent_task_is_not_reused_across_identity_or_limit_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openbiliclaw.sources import source_bootstrap
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "openbiliclaw.sources.v2ex_tasks.V2EXTaskQueue",
+        _queue_class(
+            recent={
+                "id": "alice-task",
+                "status": "completed",
+                "payload_json": json.dumps(
+                    {
+                        "username": "alice",
+                        "max_topics": 100,
+                        "max_replies": 300,
+                        "max_favorite_topics": 300,
+                        "max_pages_per_scope": 20,
+                    }
+                ),
+            },
+            captured=captured,
+        ),
+    )
+
+    result = source_bootstrap.enqueue_v2ex_bootstrap(_FakeDatabase(), username="bob")
+
+    assert result.created is True
+    assert result.task_id == "fresh-task-id"
+    assert captured["payload"]["username"] == "bob"
+
+
+def test_v2ex_recent_task_is_not_reused_across_projection_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openbiliclaw.sources import source_bootstrap
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "openbiliclaw.sources.v2ex_tasks.V2EXTaskQueue",
+        _queue_class(
+            recent={
+                "id": "smoke-task",
+                "status": "completed",
+                "payload_json": json.dumps(
+                    {
+                        "username": "alice",
+                        "max_topics": 100,
+                        "max_replies": 300,
+                        "max_favorite_topics": 300,
+                        "max_pages_per_scope": 20,
+                        "smoke_only": True,
+                    }
+                ),
+            },
+            captured=captured,
+        ),
+    )
+
+    result = source_bootstrap.enqueue_v2ex_bootstrap(
+        _FakeDatabase(),
+        username="alice",
+        profile_rebuild=True,
+    )
+
+    assert result.created is True
+    assert captured["payload"]["smoke_only"] is False
+    assert captured["payload"]["profile_rebuild"] is True
+
+
+def test_v2ex_partial_recent_task_remains_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openbiliclaw.sources import source_bootstrap
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "openbiliclaw.sources.v2ex_tasks.V2EXTaskQueue",
+        _queue_class(
+            recent={
+                "id": "partial-task",
+                "status": "completed",
+                "payload_json": json.dumps(
+                    {
+                        "username": "alice",
+                        "max_topics": 100,
+                        "max_replies": 300,
+                        "max_favorite_topics": 300,
+                        "max_pages_per_scope": 20,
+                    }
+                ),
+                "result_json": json.dumps({"_openbiliclaw_terminal_status": "partial"}),
+            },
+            captured=captured,
+        ),
+    )
+
+    result = source_bootstrap.enqueue_v2ex_bootstrap(_FakeDatabase(), username="alice")
+
+    assert result.created is True
+    assert result.task_id == "fresh-task-id"
 
 
 @pytest.mark.parametrize(
@@ -330,6 +632,26 @@ def test_force_does_not_bypass_cross_source_active_work(tmp_path: Path) -> None:
         reason="active_task",
     )
     assert database.conn.execute("SELECT COUNT(*) FROM dy_tasks").fetchone()[0] == 1
+    assert database.conn.execute("SELECT COUNT(*) FROM xhs_tasks").fetchone()[0] == 0
+
+
+def test_linuxdo_bootstrap_participates_in_the_global_active_gate(tmp_path: Path) -> None:
+    from openbiliclaw.sources import source_bootstrap
+    from openbiliclaw.storage.database import Database
+
+    database = Database(tmp_path / "linuxdo-active-bootstrap.db")
+    database.initialize()
+
+    first = source_bootstrap.enqueue_linuxdo_bootstrap(database, force=True)
+    blocked = source_bootstrap.enqueue_xhs_bootstrap(database, force=True)
+
+    assert first.created is True
+    assert blocked == source_bootstrap.BootstrapEnqueueResult(
+        task_id=None,
+        created=False,
+        reason="active_task",
+    )
+    assert database.conn.execute("SELECT COUNT(*) FROM linuxdo_tasks").fetchone()[0] == 1
     assert database.conn.execute("SELECT COUNT(*) FROM xhs_tasks").fetchone()[0] == 0
 
 
@@ -489,7 +811,7 @@ def test_guided_init_seeds_only_ok_for_ambiguous_empty_sources(source: str) -> N
     from openbiliclaw.sources.source_bootstrap import seed_guided_init_attempts
 
     memory = _SeedMemory()
-    statuses = {key: "skipped" for key in ("xhs", "dy", "yt", "zhihu", "reddit")}
+    statuses = {key: "skipped" for key in ("xhs", "dy", "yt", "zhihu", "reddit", "linuxdo")}
     statuses[source] = "empty"
     assert seed_guided_init_attempts(memory, statuses) == ()
     assert memory.update_calls == 0
@@ -497,20 +819,25 @@ def test_guided_init_seeds_only_ok_for_ambiguous_empty_sources(source: str) -> N
     statuses[source] = "ok"
     assert seed_guided_init_attempts(memory, statuses) == (source,)
     assert source in memory.state["source_incremental"]["last_attempt_at"]
+    assert source in memory.state["source_incremental"]["last_success_at"]
 
 
+@pytest.mark.parametrize("source", ("reddit", "linuxdo"))
 @pytest.mark.parametrize("status", ("ok", "empty"))
-def test_reddit_empty_is_seeded_because_login_is_resolved_before_bootstrap(status: str) -> None:
+def test_evidence_backed_empty_is_seeded_after_account_resolution(
+    source: str,
+    status: str,
+) -> None:
     from openbiliclaw.sources.source_bootstrap import seed_guided_init_attempts
 
-    # Reddit's bootstrap resolves /api/me first and maps an unauthenticated
-    # response to login_required, so an empty authenticated result is real
-    # evidence of a completed pull. Other sources do not make that claim.
+    # Reddit and Linux.do resolve the current account before any scope request
+    # and map an unauthenticated response to login_required, so an empty result
+    # is evidence of a completed authenticated pull.
     memory = _SeedMemory()
-    statuses = {key: "skipped" for key in ("xhs", "dy", "yt", "zhihu", "reddit")}
-    statuses["reddit"] = status
+    statuses = {key: "skipped" for key in ("xhs", "dy", "yt", "zhihu", "reddit", "linuxdo")}
+    statuses[source] = status
 
-    assert seed_guided_init_attempts(memory, statuses) == ("reddit",)
+    assert seed_guided_init_attempts(memory, statuses) == (source,)
     assert memory.update_calls == 1
 
 
@@ -518,8 +845,9 @@ def test_guided_init_seeds_all_eligible_sources_with_one_atomic_update() -> None
     from openbiliclaw.sources.source_bootstrap import seed_guided_init_attempts
 
     memory = _SeedMemory()
-    statuses = {key: "ok" for key in ("xhs", "dy", "yt", "zhihu", "reddit")}
+    statuses = {key: "ok" for key in ("xhs", "dy", "yt", "zhihu", "reddit", "linuxdo")}
     statuses["reddit"] = "empty"
+    statuses["linuxdo"] = "empty"
 
     assert seed_guided_init_attempts(memory, statuses) == (
         "xhs",
@@ -527,18 +855,37 @@ def test_guided_init_seeds_all_eligible_sources_with_one_atomic_update() -> None
         "yt",
         "zhihu",
         "reddit",
+        "linuxdo",
     )
     assert memory.update_calls == 1
     assert set(memory.state["source_incremental"]["last_attempt_at"]) == set(statuses)  # type: ignore[index]
+    assert set(memory.state["source_incremental"]["last_success_at"]) == set(statuses)  # type: ignore[index]
 
 
-@pytest.mark.parametrize("source", ("xhs", "dy", "yt", "zhihu", "reddit"))
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    (("ok", True), ("empty", True), ("partial", False)),
+)
+def test_v2ex_guided_init_only_seeds_authoritative_completion(
+    status: str,
+    expected: bool,
+) -> None:
+    from openbiliclaw.sources.source_bootstrap import seed_guided_init_attempts
+
+    memory = _SeedMemory()
+    seeded = seed_guided_init_attempts(memory, {"v2ex": status})
+
+    assert seeded == (("v2ex",) if expected else ())
+    assert memory.update_calls == (1 if expected else 0)
+
+
+@pytest.mark.parametrize("source", ("xhs", "dy", "yt", "zhihu", "reddit", "linuxdo"))
 @pytest.mark.parametrize("status", ("degraded", "failed", "login_required", "timeout", "skipped"))
 def test_guided_init_does_not_seed_non_success_statuses(source: str, status: str) -> None:
     from openbiliclaw.sources.source_bootstrap import seed_guided_init_attempts
 
     memory = _SeedMemory()
-    statuses = {key: "skipped" for key in ("xhs", "dy", "yt", "zhihu", "reddit")}
+    statuses = {key: "skipped" for key in ("xhs", "dy", "yt", "zhihu", "reddit", "linuxdo")}
     statuses[source] = status
     assert seed_guided_init_attempts(memory, statuses) == ()
     assert memory.update_calls == 0

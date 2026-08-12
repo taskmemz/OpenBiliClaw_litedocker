@@ -45,9 +45,9 @@ def test_recommendation_click_tracking_uses_click_and_auxclick_without_window_op
 def test_saved_message_and_delight_content_opens_use_anchor_semantics() -> None:
     app_js = APP_JS.read_text(encoding="utf-8")
 
-    assert '<a class="cover"' in app_js
+    assert '<a class="cover${savedCoverClass}"' in app_js
     saved_anchor = (
-        '<a class="cover" data-platform='
+        '<a class="cover${savedCoverClass}" data-platform='
         '"${escapeHtml(item.source_platform || item.platform || "bilibili")}"'
     )
     assert saved_anchor in app_js

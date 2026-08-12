@@ -17,6 +17,8 @@ import {
   fetchHealth,
   fetchProfileSummary,
   fetchSourceShareSuggestion,
+  fetchV2exIdentity,
+  acceptV2exBrowserIdentity,
   fetchUpdateStatus,
   fetchWatchLater,
   probeConfigService,
@@ -32,6 +34,23 @@ import {
 import { __resetBackendEndpointForTests } from "../popup/popup-backend-config.js";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+
+test("V2EX identity helpers use the dedicated read and acceptance endpoints", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, async json() { return { status: "resolved", username: "alice" }; } };
+  };
+
+  await fetchV2exIdentity();
+  await acceptV2exBrowserIdentity(" alice ");
+
+  assert.match(calls[0].url, /\/api\/sources\/v2ex\/identity$/);
+  assert.equal(calls[0].options.method, "GET");
+  assert.match(calls[1].url, /\/api\/sources\/v2ex\/identity$/);
+  assert.equal(calls[1].options.method, "POST");
+  assert.deepEqual(JSON.parse(calls[1].options.body), { username: "alice", accept: true });
+});
 
 test("guided init API calls all have finite request deadlines", () => {
   const source = readFileSync(resolve("popup/popup-api.js"), "utf8");
@@ -160,6 +179,41 @@ test("startInit omits the token when none is supplied (keep configured)", async 
     sources: ["bangumi"],
     source_options: { bangumi: { username: "sai" } },
   });
+});
+
+test("startInit force:true sends the re-init payload", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, async json() { return { run_id: "run-reinit" }; } };
+  };
+
+  await startInit({ force: true });
+
+  assert.deepEqual(JSON.parse(calls[0].options.body), { force: true });
+  assert.equal(calls[0].options.method, "POST");
+});
+
+test("popup settings re-init calls POST /api/init with force:true after confirm", () => {
+  const source = readFileSync(resolve("popup/popup.js"), "utf8");
+  const html = readFileSync(resolve("popup/popup.html"), "utf8");
+
+  // The settings overlay owns the re-init entry (gui-init §4 entry convergence).
+  assert.match(html, /id="cfgReinitBtn"/);
+  assert.match(html, /id="cfgReinitStatus"/);
+  // A confirm dialog guards the destructive re-pull, then force:true is sent.
+  assert.match(source, /window\.confirm\(/);
+  assert.match(source, /const payload = \{ force: true \};/);
+  // Optional awareness/insight reset checkbox feeds reset_cognition.
+  assert.match(html, /id="cfgReinitResetCognition"/);
+  assert.match(html, /data-settings-ignore-dirty/);
+  assert.match(source, /payload\.reset_cognition = true/);
+  assert.match(source, /startInit\(payload\)/);
+  // After a successful start the popup switches to the recommend tab so the
+  // existing init progress panel becomes visible.
+  assert.match(source, /setActiveTab\("recommend"\)/);
+  assert.match(source, /renderInitProgress\(\{ running: true/);
+  assert.match(source, /_startInitProgressPoll\(\)/);
 });
 
 test("popup resolves the Bangumi username omit-vs-clear before sending guided init", () => {
@@ -357,6 +411,7 @@ test("reshuffleRecommendations posts to reshuffle endpoint", async () => {
         view_count: 0,
         like_count: 0,
         comment_count: 0,
+        share_count: 0,
         favorite_count: 0,
         danmaku_count: 0,
         rating_score: 0,
@@ -421,6 +476,7 @@ test("appendRecommendations posts excluded bvids to append endpoint", async () =
         view_count: 0,
         like_count: 0,
         comment_count: 0,
+        share_count: 0,
         favorite_count: 0,
         danmaku_count: 0,
         rating_score: 0,
@@ -500,6 +556,7 @@ test("fetchRecommendations normalizes cover urls from the recommend endpoint", a
       view_count: 0,
       like_count: 0,
       comment_count: 0,
+      share_count: 0,
       favorite_count: 0,
       danmaku_count: 0,
       rating_score: 0,

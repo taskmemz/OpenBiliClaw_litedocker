@@ -4,12 +4,20 @@ function normalizeBvid(bvid) {
 
 function inferSavedPlatform(value, contentUrl) {
   const explicit = String(value || "").trim().toLowerCase();
-  if (explicit) return explicit;
+  const aliases = {
+    bili: "bilibili", xhs: "xiaohongshu", dy: "douyin", yt: "youtube",
+    x: "twitter", zh: "zhihu", rd: "reddit", bgm: "bangumi",
+    wb: "weibo", "微博": "weibo",
+  };
+  if (explicit) return aliases[explicit] || explicit;
   try {
     const host = new URL(String(contentUrl || "").trim()).hostname.toLowerCase();
     if (host === "youtu.be" || host.endsWith(".youtube.com")) return "youtube";
     if (host === "x.com" || host.endsWith(".x.com") || host.endsWith(".twitter.com")) return "twitter";
     if (host.endsWith(".zhihu.com")) return "zhihu";
+    if (["weibo.com", "weibo.cn", "sinaimg.cn", "sinaimg.com"].some(
+      (domain) => host === domain || host.endsWith(`.${domain}`),
+    )) return "weibo";
     if (host.endsWith(".bilibili.com") || host === "b23.tv") return "bilibili";
     return "web";
   } catch {
@@ -98,6 +106,9 @@ const PLATFORM_LABELS = {
   zhihu: "知乎",
   reddit: "Reddit",
   bangumi: "Bangumi",
+  linuxdo: "Linux.do",
+  weibo: "微博",
+  v2ex: "V2EX",
 };
 
 function safeSyncText(value, maxLength = 240) {
@@ -136,7 +147,8 @@ export function getSavedSyncPresentation(
   const presentation = { ...(SYNC_PRESENTATIONS[normalizedStatus] || SYNC_PRESENTATIONS.failed) };
   presentation.busy = normalizedStatus === "syncing"
     || (normalizedStatus === "pending" && Boolean(safeSyncText(syncTaskId, 64)));
-  presentation.localOnly = normalizedStatus === "unsupported" && code === "unsupported_content_type";
+  presentation.localOnly = normalizedStatus === "unsupported"
+    && ["unsupported_content_type", "local_only_source"].includes(code);
   if (normalizedStatus === "unsupported" && code === "unsupported_adapter_missing") {
     presentation.label = "待升级重试";
     presentation.tone = "warning";
@@ -153,7 +165,9 @@ export function getSavedSyncPresentation(
     ? "同步中…"
     : (presentation.retryable ? "重试同步" : "同步");
   if (presentation.localOnly) {
-    presentation.detail = "此内容类型暂不支持平台同步，仅保存在本地。";
+    presentation.detail = code === "local_only_source"
+      ? "此来源仅支持本地收藏，不会向平台创建同步任务。"
+      : "此内容类型暂不支持平台同步，仅保存在本地。";
   } else if (normalizedStatus === "unsupported" && code === "unsupported_adapter_missing") {
     presentation.detail = "同步能力可能正在滚动升级，请更新后端与插件后重试。";
   } else if (normalizedStatus === "unsupported") {
@@ -177,6 +191,7 @@ export function isSavedSyncEligibleStatus(status, errorCode = "", syncTaskId = "
 
 export function updateSavedBatchButtonState(button, pendingCount) {
   const disabled = pendingCount <= 0;
+  button.hidden = disabled;
   button.disabled = disabled;
   button.setAttribute("aria-disabled", String(disabled));
   button.removeAttribute("aria-busy");

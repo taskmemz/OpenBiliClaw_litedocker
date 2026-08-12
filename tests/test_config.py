@@ -180,6 +180,9 @@ class TestConfigDefaults:
             "zhihu": 1,
             "reddit": 1,
             "bangumi": 1,
+            "linuxdo": 1,
+            "weibo": 1,
+            "v2ex": 1,
         }
 
     def test_bilibili_source_enabled_defaults_true(self) -> None:
@@ -206,29 +209,48 @@ class TestConfigDefaults:
 
     def test_scheduler_source_incremental_defaults(self) -> None:
         config = Config()
+        loaded_without_override = _build_config({"scheduler": {}})
 
+        assert config.scheduler.source_incremental_enabled is False
+        assert loaded_without_override.scheduler.source_incremental_enabled is False
         assert config.scheduler.source_incremental_hours == 24
         assert config.scheduler.xhs_incremental_hours is None
-        assert config.scheduler.douyin_incremental_hours is None
+        assert config.scheduler.douyin_incremental_hours == 0
+        assert loaded_without_override.scheduler.douyin_incremental_hours == 0
         assert config.scheduler.youtube_incremental_hours is None
         assert config.scheduler.zhihu_incremental_hours is None
         assert config.scheduler.reddit_incremental_hours is None
 
-    def test_example_config_keeps_per_source_incremental_intervals_inherited(self) -> None:
+    def test_example_config_disables_all_periodic_source_sync_by_default(self) -> None:
         example_path = Path(__file__).parents[1] / "config.example.toml"
 
         with example_path.open("rb") as handle:
             scheduler = tomllib.load(handle)["scheduler"]
 
+        assert scheduler["source_incremental_enabled"] is False
         assert scheduler["source_incremental_hours"] == 24
         assert "xhs_incremental_hours" not in scheduler
-        assert "douyin_incremental_hours" not in scheduler
+        assert scheduler["douyin_incremental_hours"] == 0
         assert "youtube_incremental_hours" not in scheduler
         assert "zhihu_incremental_hours" not in scheduler
         assert "reddit_incremental_hours" not in scheduler
 
+    def test_default_config_persists_periodic_source_sync_disabled(self, tmp_path: Path) -> None:
+        target = tmp_path / "config.toml"
+
+        save_config(Config(), target)
+
+        rendered = target.read_text(encoding="utf-8")
+        loaded = load_config(target)
+
+        assert "source_incremental_enabled = false" in rendered
+        assert "douyin_incremental_hours = 0" in rendered
+        assert loaded.scheduler.source_incremental_enabled is False
+        assert loaded.scheduler.douyin_incremental_hours == 0
+
     def test_scheduler_source_incremental_config_round_trip(self, tmp_path: Path) -> None:
         config = Config()
+        config.scheduler.source_incremental_enabled = True
         config.scheduler.source_incremental_hours = 37
         config.scheduler.xhs_incremental_hours = 0
         config.scheduler.douyin_incremental_hours = 168
@@ -241,6 +263,7 @@ class TestConfigDefaults:
         rendered = target.read_text(encoding="utf-8")
         loaded = load_config(target)
 
+        assert loaded.scheduler.source_incremental_enabled is True
         assert loaded.scheduler.source_incremental_hours == 37
         assert loaded.scheduler.xhs_incremental_hours == 0
         assert loaded.scheduler.douyin_incremental_hours == 168
@@ -258,6 +281,7 @@ class TestConfigDefaults:
         target = tmp_path / "config.toml"
         target.write_text("[scheduler]\n", encoding="utf-8")
         values = {
+            "OPENBILICLAW_SCHEDULER_SOURCE_INCREMENTAL_ENABLED": "true",
             "OPENBILICLAW_SCHEDULER_SOURCE_INCREMENTAL_HOURS": "1",
             "OPENBILICLAW_SCHEDULER_XHS_INCREMENTAL_HOURS": "2",
             "OPENBILICLAW_SCHEDULER_DOUYIN_INCREMENTAL_HOURS": "3",
@@ -270,6 +294,7 @@ class TestConfigDefaults:
 
         loaded = load_config(target)
 
+        assert loaded.scheduler.source_incremental_enabled is True
         assert loaded.scheduler.source_incremental_hours == 1
         assert loaded.scheduler.xhs_incremental_hours == 2
         assert loaded.scheduler.douyin_incremental_hours == 3
@@ -286,12 +311,14 @@ class TestConfigDefaults:
                 "scheduler": {
                     "source_incremental_hours": value,
                     "xhs_incremental_hours": value,
+                    "douyin_incremental_hours": value,
                 }
             }
         )
 
         assert config.scheduler.source_incremental_hours == 24
         assert config.scheduler.xhs_incremental_hours is None
+        assert config.scheduler.douyin_incremental_hours == 0
 
     def test_scheduler_source_incremental_save_rejects_invalid_direct_dataclass_values(
         self, tmp_path: Path
@@ -1336,6 +1363,9 @@ youtube = 3
         "zhihu": 1,
         "reddit": 1,
         "bangumi": 1,
+        "linuxdo": 1,
+        "weibo": 1,
+        "v2ex": 1,
     }
 
 
@@ -1357,6 +1387,7 @@ twitter = 1
 
     assert config.scheduler.pool_source_shares["zhihu"] == 1
     assert config.scheduler.pool_source_shares["reddit"] == 1
+    assert config.scheduler.pool_source_shares["linuxdo"] == 1
 
 
 def test_build_config_supports_sources_browser_cdp_url() -> None:
@@ -1443,6 +1474,126 @@ def test_sources_bangumi_defaults() -> None:
     assert config.sources.bangumi.request_interval_seconds == 1
     assert config.sources.bangumi.min_interval_minutes == 3
     assert config.sources.bangumi.bootstrap_limit == 300
+
+
+def test_load_config_clamps_linuxdo_browser_task_limits(tmp_path: Path) -> None:
+    config_path = tmp_path / "linuxdo-limits.toml"
+    config_path.write_text(
+        """
+[sources.linuxdo]
+request_interval_seconds = 31
+bootstrap_limit = 500
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.sources.linuxdo.request_interval_seconds == 30
+    assert config.sources.linuxdo.bootstrap_limit == 300
+
+
+def test_sources_v2ex_defaults() -> None:
+    config = Config()
+
+    assert config.sources.v2ex.enabled is False
+    assert config.sources.v2ex.username == ""
+    assert config.sources.v2ex.access_token == ""
+    assert config.sources.v2ex.token_env == "OPENBILICLAW_V2EX_TOKEN"
+    assert config.sources.v2ex.source_modes == ("search", "node", "tab", "hot", "latest")
+    assert config.sources.v2ex.tab_modes == ("tech", "creative", "qna")
+    assert config.sources.v2ex.node_blocklist == ("sandbox",)
+    assert config.sources.v2ex.daily_search_budget == 120
+    assert config.sources.v2ex.daily_node_budget == 180
+    assert config.sources.v2ex.request_interval_seconds == 2
+    assert config.sources.v2ex.min_interval_minutes == 5
+
+
+def test_save_config_round_trips_sources_v2ex(tmp_path: Path) -> None:
+    config = Config()
+    config.sources.v2ex.enabled = True
+    config.sources.v2ex.username = "alice"
+    config.sources.v2ex.access_token = "pat-123"
+    config.sources.v2ex.token_env = "V2EX_TOKEN_TEST"
+    config.sources.v2ex.source_modes = ("search", "node", "hot")
+    config.sources.v2ex.tab_modes = ("tech",)
+    config.sources.v2ex.node_allowlist = ("programmer", "python")
+    config.sources.v2ex.node_blocklist = ("sandbox", "deals")
+    config.sources.v2ex.daily_search_budget = 42
+    config.sources.v2ex.request_interval_seconds = 4
+    config.sources.v2ex.min_interval_minutes = 20
+    config.scheduler.pool_source_shares["v2ex"] = 2
+
+    target = tmp_path / "config.toml"
+    save_config(config, target)
+    loaded = load_config(target)
+
+    assert loaded.sources.v2ex == config.sources.v2ex
+    assert loaded.scheduler.pool_source_shares["v2ex"] == 2
+
+
+def test_save_config_rejects_invalid_v2ex_credentials(tmp_path: Path) -> None:
+    from openbiliclaw.config import _collect_config_issues
+
+    config = Config()
+    config.sources.v2ex.username = "bad/name"
+    config.sources.v2ex.access_token = "bad token\nwith newline"
+    target = tmp_path / "config.toml"
+
+    issues = _collect_config_issues(config)
+    assert any(
+        issue.field == "sources.v2ex.username" and issue.severity == "blocking" for issue in issues
+    )
+    assert any(
+        issue.field == "sources.v2ex.access_token" and issue.severity == "blocking"
+        for issue in issues
+    )
+    with pytest.raises(ValueError, match="unsupported"):
+        save_config(config, target)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("node_allowlist", ("programmer", "../private")),
+        ("max_topic_chars", 20_001),
+        ("bootstrap_max_pages_per_scope", 101),
+    ),
+)
+def test_save_config_rejects_unsafe_v2ex_bounds(
+    tmp_path: Path,
+    field_name: str,
+    value: object,
+) -> None:
+    config = Config()
+    setattr(config.sources.v2ex, field_name, value)
+    target = tmp_path / "config.toml"
+
+    with pytest.raises(ValueError, match=field_name):
+        save_config(config, target)
+
+    assert not target.exists()
+
+
+def test_legacy_v2ex_config_is_bounded_and_normalized() -> None:
+    from openbiliclaw.config import V2EXSourceConfig, normalize_v2ex_source_config
+
+    source = V2EXSourceConfig(
+        source_modes=("SEARCH", "unknown", "search"),
+        tab_modes=("Tech",),
+        node_allowlist=("Programmer", "../private", "programmer"),
+        max_topic_chars=999_999,
+        bootstrap_max_pages_per_scope=0,
+    )
+
+    normalize_v2ex_source_config(source, strict=False)
+
+    assert source.source_modes == ("search",)
+    assert source.tab_modes == ("tech",)
+    assert source.node_allowlist == ("programmer",)
+    assert source.max_topic_chars == 20_000
+    assert source.bootstrap_max_pages_per_scope == 1
 
 
 def test_save_config_round_trips_sources_bangumi(tmp_path: Path) -> None:
@@ -1683,6 +1834,17 @@ def test_save_config_round_trips_bilibili_source_enabled(tmp_path: Path) -> None
     assert loaded.sources.bilibili.enabled is False
 
 
+def test_load_config_repairs_weibo_creator_only_mode(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config = Config()
+    config.sources.weibo.source_modes = ("creator",)
+
+    save_config(config, config_path)
+    loaded = load_config(config_path)
+
+    assert loaded.sources.weibo.source_modes == ("search", "creator")
+
+
 def test_save_config_round_trips_pool_source_shares(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     config = Config()
@@ -1695,6 +1857,9 @@ def test_save_config_round_trips_pool_source_shares(tmp_path: Path) -> None:
         "zhihu": 1,
         "reddit": 2,
         "bangumi": 1,
+        "linuxdo": 1,
+        "weibo": 1,
+        "v2ex": 1,
     }
 
     save_config(config, config_path)
@@ -1709,6 +1874,9 @@ def test_save_config_round_trips_pool_source_shares(tmp_path: Path) -> None:
         "zhihu": 1,
         "reddit": 2,
         "bangumi": 1,
+        "linuxdo": 1,
+        "weibo": 1,
+        "v2ex": 1,
     }
 
 

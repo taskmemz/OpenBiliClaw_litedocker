@@ -8,17 +8,23 @@ than derived.
 from __future__ import annotations
 
 from openbiliclaw.api.source_auth.contract import (
+    CapabilityAuthMode,
+    CapabilityReadinessState,
     Credential,
     CredentialOrigin,
     SourceAuthContract,
+    SourceCapabilityAuth,
     Verification,
     VerifyMethod,
 )
 from openbiliclaw.api.source_auth.legacy import check_legacy_consistency
 
 __all__ = [
+    "CapabilityAuthMode",
+    "CapabilityReadinessState",
     "Credential",
     "CredentialOrigin",
+    "SourceCapabilityAuth",
     "SourceAuthContract",
     "Verification",
     "VerifyMethod",

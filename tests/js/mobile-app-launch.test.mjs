@@ -82,6 +82,10 @@ test("buildAppDeepLink maps douyin / youtube / twitter / zhihu", () => {
 
 test("buildAppDeepLink returns empty for unknown or malformed URLs", () => {
   assert.equal(buildAppDeepLink("https://www.reddit.com/r/foo/comments/abc/"), "");
+  // Weibo has no verified mobile-app deep-link contract. Keep navigation on
+  // its canonical HTTPS URL even though init can use the browser task bridge.
+  assert.equal(buildAppDeepLink("https://m.weibo.cn/detail/5023456789012345"), "");
+  assert.equal(buildAppDeepLink("https://weibo.com/1234567890/P9Example"), "");
   assert.equal(buildAppDeepLink("https://example.com/whatever"), "");
   assert.equal(buildAppDeepLink(""), "");
   assert.equal(buildAppDeepLink(null), "");

@@ -83,6 +83,7 @@
       --platform-zhihu: #0f88eb;
       --platform-reddit: #ff4500;
       --platform-bangumi: #6950a1;
+      --platform-weibo: #e6162d;
       --platform-bilibili: #fb7299;
       --platform-xiaohongshu: #ff2442;
       --source-pending: #3898ec;
@@ -187,6 +188,7 @@
       --platform-zhihu: #70bdfb;
       --platform-reddit: #ff8a5c;
       --platform-bangumi: #a99ad5;
+      --platform-weibo: #ff7384;
       --platform-bilibili: #fc9eb9;
       --platform-xiaohongshu: #ff6b7f;
       --source-pending: #70bdfb;
@@ -240,6 +242,7 @@
         --platform-zhihu: #70bdfb;
         --platform-reddit: #ff8a5c;
         --platform-bangumi: #a99ad5;
+        --platform-weibo: #ff7384;
         --platform-bilibili: #fc9eb9;
         --platform-xiaohongshu: #ff6b7f;
         --source-pending: #70bdfb;
@@ -609,6 +612,7 @@
     .delight .thumb.is-text-media[data-platform="zhihu"] { background: color-mix(in oklab, var(--surface), var(--platform-zhihu) 8%); }
     .delight .thumb.is-text-media[data-platform="bilibili"] { background: color-mix(in oklab, var(--surface), var(--platform-bilibili) 8%); }
     .delight .thumb.is-text-media[data-platform="reddit"] { background: color-mix(in oklab, var(--surface), var(--platform-reddit) 8%); }
+    .delight .thumb.is-text-media[data-platform="weibo"] { background: color-mix(in oklab, var(--surface), var(--platform-weibo) 8%); }
     .delight .thumb.is-text-media::before { inset: 0; border: 0; border-radius: inherit; background: color-mix(in oklab, var(--surface), transparent 8%); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
     .delight-text-media-copy { position: relative; z-index: 1; margin: 0; padding-right: 70px; color: var(--fg); font-size: var(--text-sm); line-height: 1.65; font-weight: 600; text-align: left; white-space: pre-wrap; word-break: break-word; display: -webkit-box; -webkit-line-clamp: 7; -webkit-box-orient: vertical; overflow: hidden; }
     .thumb.has-image::before { display: none; }
@@ -698,6 +702,7 @@
     .cover:focus-visible { outline: none; box-shadow: var(--focus-ring); }
     .cover[data-platform="youtube"] { background: linear-gradient(135deg, var(--surface-warm), color-mix(in oklab, var(--danger), var(--fg) 30%)); }
     .cover[data-platform="douyin"] { background: linear-gradient(135deg, var(--fg), var(--accent-strong)); }
+    .cover[data-platform="weibo"] { background: linear-gradient(135deg, var(--surface), color-mix(in oklab, var(--platform-weibo), var(--surface-warm) 62%)); }
     .cover[data-platform="xiaohongshu"] { background: linear-gradient(135deg, var(--surface-warm), color-mix(in oklab, var(--platform-xiaohongshu), var(--surface) 30%)); }
     .cover[data-platform="twitter"] { background: linear-gradient(135deg, var(--surface), color-mix(in oklab, var(--fg), var(--surface) 82%)); }
     .cover[data-platform="zhihu"] { background: linear-gradient(135deg, var(--surface), color-mix(in oklab, var(--platform-zhihu), var(--surface-warm) 62%)); }
@@ -716,6 +721,7 @@
     @keyframes skeleton-sweep { to { transform: translateX(100%); } }
     @media (prefers-reduced-motion: reduce) { .skeleton-shimmer::after { animation: none; } }
     .cover.is-text-card { display: flex; align-items: flex-start; justify-content: flex-start; min-height: 132px; padding: var(--space-3) calc(var(--space-3) + 76px) var(--space-3) var(--space-3); text-align: left; }
+    .cover.is-text-card.is-coverless { aspect-ratio: auto; min-height: 96px; max-height: 124px; }
     /* issue #79 §2: glassmorphism backdrop for text cards that carry a cover —
        the blurred image unifies the look with photo cards, and a translucent
        scrim keeps the excerpt legible on top of any image. */
@@ -724,6 +730,7 @@
     .cover.is-text-card.has-backdrop::before { content: ""; position: absolute; inset: 0; z-index: -1; background: color-mix(in oklab, var(--surface), transparent 22%); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
     .cover.is-text-card.has-backdrop .cover-text { color: var(--fg); font-weight: 600; text-shadow: 0 1px 2px color-mix(in oklab, var(--surface), transparent 40%); }
     .cover-text { margin: 0; color: var(--fg-2); font-size: var(--text-sm); line-height: 1.55; font-weight: 550; white-space: pre-wrap; word-break: break-word; display: -webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; overflow: hidden; }
+    .cover.is-coverless .cover-text { -webkit-line-clamp: 4; }
     .cover.is-text-card:not(.has-backdrop) { background: var(--surface); border: 1px solid var(--border-soft); color: var(--fg); }
     .cover.is-text-card:not(.has-backdrop) .cover-text { color: var(--fg); text-shadow: none; }
     .platform { position: absolute; right: var(--space-2); top: var(--space-2); border-radius: var(--radius-pill); background: color-mix(in oklab, var(--fg), transparent 8%); color: var(--surface); padding: 4px 9px; font-size: 12px; }
@@ -731,6 +738,7 @@
     .platform[data-platform="zhihu"] { background: var(--platform-zhihu); color: var(--accent-on); }
     .platform[data-platform="xiaohongshu"] { background: var(--platform-xiaohongshu); color: var(--accent-on); }
     .platform[data-platform="reddit"] { background: var(--platform-reddit); color: var(--accent-on); }
+    .platform[data-platform="weibo"] { background: var(--platform-weibo); color: #fff; }
     .platform[data-platform="bangumi"] { background: var(--platform-bangumi); color: #fff; }
     .platform[data-platform="youtube"] { background: var(--danger); color: var(--accent-on); }
     .platform[data-platform="douyin"] { background: var(--fg); color: var(--surface); }
@@ -1259,6 +1267,16 @@
     .settings-migration-status[data-tone="pending"] { color: var(--accent-strong); }
     .settings-migration-status[data-tone="success"] { color: var(--success); }
     .settings-migration-status[data-tone="error"] { color: var(--danger); }
+    .settings-reinit-card { grid-column: 1 / -1; display: grid; gap: var(--space-4); min-width: 0; padding: clamp(18px, 2.4vw, 28px); border: 1px solid color-mix(in oklab, var(--warn), var(--border) 72%); border-radius: var(--radius-lg); background: linear-gradient(145deg, color-mix(in oklab, var(--surface), var(--warn) 7%), color-mix(in oklab, var(--surface), var(--bg) 34%)); box-shadow: var(--elev-ring); }
+    .settings-reinit-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4); min-width: 0; }
+    .settings-reinit-head h3 { margin: 0; color: var(--fg); font-size: clamp(20px, 2vw, 25px); line-height: 1.25; }
+    .settings-reinit-badge { flex: 0 0 auto; display: inline-flex; align-items: center; min-height: 28px; padding: 3px 10px; border: 1px solid color-mix(in oklab, var(--warn), var(--border-soft) 55%); border-radius: var(--radius-pill); background: color-mix(in oklab, var(--surface), var(--warn) 10%); color: var(--warn-fg); font-size: 12px; font-weight: 750; white-space: nowrap; }
+    .settings-reinit-badge[data-tone="running"] { color: var(--accent-strong); border-color: color-mix(in oklab, var(--accent), var(--border-soft) 55%); background: color-mix(in oklab, var(--surface), var(--accent) 10%); }
+    .settings-reinit-copy { margin: 0; color: var(--fg-2); line-height: 1.65; overflow-wrap: anywhere; }
+    .settings-reinit-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); }
+    .settings-reinit-actions button:disabled { opacity: 0.55; cursor: wait; }
+    .settings-reinit-option { display: inline-flex; align-items: center; gap: 6px; color: var(--fg-2); font-size: var(--text-sm); cursor: pointer; }
+    .settings-reinit-option input { accent-color: var(--accent); }
     /* Verification answers in three, not two. "Could not tell" — a dead proxy, a
        closed browser, a throttled platform, YouTube needing no login at all — is
        not a failure, and painting it red sends users off to delete a cookie that
@@ -1365,6 +1383,7 @@
     .source-card-logo[data-source-logo="bilibili"] { background: #fb7299; }
     .source-card-logo[data-source-logo="xiaohongshu"] { background: #ff2442; }
     .source-card-logo[data-source-logo="douyin"] { background: #161823; }
+    .source-card-logo[data-source-logo="weibo"] { background: #e6162d; }
     .source-card-logo[data-source-logo="youtube"] { background: #ff0033; }
     .source-card-logo[data-source-logo="twitter"] { background: #0f1419; }
     .source-card-logo[data-source-logo="zhihu"] { background: #0084ff; }
@@ -1397,7 +1416,7 @@
     .source-cred-box .source-credential-value { font-family: var(--font-mono); font-size: 12px; }
     .source-cred-box .source-credential-value[hidden] { display: none; }
     .source-card[data-available="true"] .source-credential-summary { color: color-mix(in oklab, var(--success), var(--fg) 36%); }
-    /* 分支表：分支开关和它的每日预算并排，8 个来源共用同一骨架 */
+    /* 分支表：分支开关和它的每日预算并排，9 个来源共用同一骨架 */
     .branch-table { border: 1px solid var(--border-soft); border-radius: var(--radius-md); overflow: hidden; }
     .branch-head, .branch-row { display: grid; align-items: center; gap: var(--space-3); padding: 9px var(--space-3); }
     .branch-table[data-branch-toggles="on"] .branch-head, .branch-table[data-branch-toggles="on"] .branch-row { grid-template-columns: 22px minmax(72px, 1fr) 116px minmax(0, 1.4fr); }
@@ -1422,6 +1441,7 @@
     .share-overview-bar i[data-source-key="bilibili"], .share-overview-legend em[data-source-key="bilibili"] { background: #fb7299; }
     .share-overview-bar i[data-source-key="xiaohongshu"], .share-overview-legend em[data-source-key="xiaohongshu"] { background: #ff2442; }
     .share-overview-bar i[data-source-key="douyin"], .share-overview-legend em[data-source-key="douyin"] { background: #161823; }
+    .share-overview-bar i[data-source-key="weibo"], .share-overview-legend em[data-source-key="weibo"] { background: #e6162d; }
     .share-overview-bar i[data-source-key="youtube"], .share-overview-legend em[data-source-key="youtube"] { background: #ff0033; }
     .share-overview-bar i[data-source-key="twitter"], .share-overview-legend em[data-source-key="twitter"] { background: #0f1419; }
     .share-overview-bar i[data-source-key="zhihu"], .share-overview-legend em[data-source-key="zhihu"] { background: #0084ff; }

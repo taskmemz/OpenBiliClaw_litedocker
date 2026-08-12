@@ -22,7 +22,7 @@ test("popup exposes the shared count formatter + stats builder", () => {
   assert.ok(popupJs.includes("万"), "missing 万 unit");
 
   // Every engagement segment, gated on > 0, joined with " · ".
-  for (const marker of ["▶ ", "👍 ", "💬 ", "⭐ ", "弹幕 "]) {
+  for (const marker of ["▶ ", "👍 ", "💬 ", "🔁 ", "⭐ ", "弹幕 "]) {
     assert.ok(popupJs.includes(marker), `missing stats segment ${marker}`);
   }
   assert.ok(popupJs.includes('segments.join(" · ")'), "segments must join with ' · '");
@@ -69,6 +69,7 @@ test("delight normalizer threads the raw count fields through", () => {
     "view_count",
     "like_count",
     "comment_count",
+    "share_count",
     "favorite_count",
     "danmaku_count",
     "rating_score",
@@ -91,12 +92,14 @@ test("normalizeRecommendation keeps the engagement counts (else the card row is 
     view_count: 69000,
     like_count: 3200,
     comment_count: 880,
+    share_count: 77,
     favorite_count: 455, // XHS 收藏 folded into favorite_count backend-side
     danmaku_count: 150,
   });
   assert.equal(rec.view_count, 69000);
   assert.equal(rec.like_count, 3200);
   assert.equal(rec.comment_count, 880);
+  assert.equal(rec.share_count, 77);
   assert.equal(rec.favorite_count, 455);
   assert.equal(rec.danmaku_count, 150);
 });

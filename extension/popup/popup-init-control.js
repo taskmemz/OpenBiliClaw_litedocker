@@ -245,9 +245,10 @@ export function getEnabledPlatforms(status) {
 // selectable like every other source (v0.3.118+): default checked
 // (recommended) but no longer forced — at least one source must stay checked.
 //
-// WHICH sources exist comes from the shared roster (shared/source-status.js,
+// WHICH sources can seed a profile comes from the shared capability roster
+// (shared/source-status.js,
 // published on globalThis before this module evaluates in the side panel), the
-// same list the desktop page and the setup wizard build their pickers from —
+// same projection the desktop page and the setup wizard build their pickers from —
 // a hardcoded copy here is what let the three surfaces drift. Labels come from
 // the shared module too, with a local fallback map so an unrecognised key still
 // renders; defaultChecked stays local first-run policy.
@@ -260,11 +261,12 @@ const INIT_SOURCE_LABEL_FALLBACK = {
   zhihu: "知乎",
   reddit: "Reddit",
   bangumi: "Bangumi",
+  v2ex: "V2EX",
 };
 const INIT_SOURCE_DEFAULT_CHECKED = new Set(["bilibili"]);
 const _initSourceStatus = globalThis.OpenBiliClawSourceStatus || null;
-const INIT_SOURCE_KEYS = _initSourceStatus?.SOURCE_KEYS
-  ? [..._initSourceStatus.SOURCE_KEYS]
+const INIT_SOURCE_KEYS = (_initSourceStatus?.INIT_SOURCE_KEYS || _initSourceStatus?.SOURCE_KEYS)
+  ? [...(_initSourceStatus.INIT_SOURCE_KEYS || _initSourceStatus.SOURCE_KEYS)]
   : Object.keys(INIT_SOURCE_LABEL_FALLBACK);
 export const INIT_SOURCE_OPTIONS = INIT_SOURCE_KEYS.map((key) => ({
   key,

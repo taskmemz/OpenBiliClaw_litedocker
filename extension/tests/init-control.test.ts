@@ -427,25 +427,31 @@ test("init source options: bilibili is default-checked but deselectable, others 
   assert.deepEqual(optional, [
     "xiaohongshu",
     "douyin",
+    "weibo",
     "youtube",
     "twitter",
     "zhihu",
     "reddit",
     "bangumi",
+    "linuxdo",
+    "v2ex",
   ]);
   // The login reminder copy mentions logging in on this browser.
   assert.ok(INIT_SOURCE_LOGIN_HINT.includes("登录"));
 });
 
-test("init source roster derives from the shared SourceStatus.SOURCE_KEYS (drift lock)", () => {
+test("init source roster derives from shared capability-aware INIT_SOURCE_KEYS (drift lock)", () => {
   const shared = (globalThis as Record<string, any>).OpenBiliClawSourceStatus;
   assert.ok(shared, "shared source-status module must be loaded for this test");
-  // Same keys, same order — the picker is a projection of the shared roster,
+  // Same keys, same order — the picker is the shared capability projection,
   // not a parallel hardcoded list that can drift when a platform is added.
   assert.deepEqual(
     INIT_SOURCE_OPTIONS.map((o) => o.key),
-    [...shared.SOURCE_KEYS],
+    [...shared.INIT_SOURCE_KEYS],
   );
+  assert.ok(shared.SOURCE_KEYS.includes("weibo"));
+  assert.ok(shared.INIT_SOURCE_KEYS.includes("weibo"));
+  assert.ok(INIT_SOURCE_OPTIONS.some((o) => o.key === "weibo"));
   // Labels come from the shared module too.
   for (const opt of INIT_SOURCE_OPTIONS) {
     assert.equal(opt.label, shared.sourceLabel(opt.key));
@@ -481,6 +487,13 @@ test("init source options: Bangumi is anonymous and opt-in", () => {
   assert.ok(INIT_SOURCE_LOGIN_HINT.includes("无需登录"));
 });
 
+test("init source options: Linux.do is public, optional-login and opt-in", () => {
+  const linuxdo = INIT_SOURCE_OPTIONS.find((o) => o.key === "linuxdo");
+  assert.ok(linuxdo, "linuxdo option must exist");
+  assert.ok(!linuxdo?.defaultChecked);
+  assert.equal(linuxdo?.label, "Linux.do");
+});
+
 test("start button allows Reddit as the only profile signal source", () => {
   const state = initStartButtonState(
     statusWith({
@@ -502,13 +515,14 @@ test("start button allows Reddit as the only profile signal source", () => {
 });
 
 test("initSourceLabels maps known keys and passes unknowns through", () => {
-  assert.deepEqual(initSourceLabels(["bilibili", "xiaohongshu", "zhihu", "reddit", "bangumi", "weibo"]), [
+  assert.deepEqual(initSourceLabels(["bilibili", "xiaohongshu", "zhihu", "reddit", "bangumi", "linuxdo", "weibo"]), [
     "B 站",
     "小红书",
     "知乎",
     "Reddit",
     "Bangumi",
-    "weibo",
+    "Linux.do",
+    "微博",
   ]);
   assert.deepEqual(initSourceLabels(undefined as unknown as string[]), []);
 });

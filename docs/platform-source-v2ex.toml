@@ -1,0 +1,196 @@
+schema_version = 1
+canonical_slug = "v2ex"
+display_name = "V2EX"
+integration_level = "full"
+aliases = ["v2"]
+hosts = ["v2ex.com"]
+content_types = ["topic", "node"]
+
+[transport]
+kind = "hybrid"
+owner = "shared"
+entrypoints = [
+  "src/openbiliclaw/sources/v2ex_client.py",
+  "src/openbiliclaw/sources/v2ex.py",
+  "src/openbiliclaw/sources/v2ex_tasks.py",
+  "extension/src/background/v2ex-task-dispatcher.ts",
+  "extension/src/content/v2ex/task-executor.ts",
+]
+route_aliases = []
+fallback_owner = "none"
+requires_overseas_network = false
+routed_by_network_mode = false
+network_policy = "Backend V2EX clients are CN-direct with trust_env=false; browser bootstrap follows the user's browser network and never receives PAT values."
+
+[transport.capability_routes]
+discover = "backend:official-api:anonymous-or-optional-token"
+profile = "extension:browser-task:rendered-read-only-pages"
+bootstrap = "extension:browser-task:rendered-read-only-pages"
+incremental = "extension:browser-task:rendered-read-only-pages"
+cookie-sync = "extension:browser-callback:boolean-login-state-only"
+
+[identity]
+item_id = "V2EX Topic id, stored as namespaced item key v2ex:<topic_id>; Node signals use canonical node slug"
+url = "Canonical https://www.v2ex.com/t/<topic_id> Topic URL or https://www.v2ex.com/go/<node> Node URL"
+dedupe = "Canonical source family plus Topic id; Replies aggregate by Topic and never become recommendation items"
+account_scope = "Verified PAT username > fresh browser-observed username > configured username > accepted username; conflict pauses account projections"
+
+[auth]
+mode = "capability-specific"
+credential_kinds = ["token"]
+verify_action = "live_probe"
+write_path = "config-only"
+account_resolution = "Verified PAT /api/v2/member > fresh browser observation > explicit/configured username > last accepted username"
+identity_evidence = "PAT username is verified only by a fresh live probe; browser username is observed from the authenticated navigation; config/accepted remain accepted evidence"
+login_cookie_names = ["A2"]
+login_state_path = "callback"
+
+[auth.capability_modes]
+discover = "optional-credential"
+profile = "login-required"
+bootstrap = "login-required"
+incremental = "login-required"
+cookie-sync = "login-required"
+
+[auth.capability_required]
+discover = true
+profile = true
+bootstrap = true
+incremental = true
+cookie-sync = false
+
+[upstream]
+success_content_types = [
+  "application/json",
+  "application/feed+json",
+  "application/rss+xml",
+  "application/atom+xml",
+]
+pagination = "API 2.0 page numbers and rendered V2EX pager; final rendered page/current link is authoritative when the requested URL is clamped"
+terminal_evidence = "A valid decoded API/feed envelope or a scope-specific recognized page with explicit empty-state/pager evidence; a generic page shell is insufficient"
+terminal_policy = "Challenge HTML, login walls, hidden profiles, missing selectors, malformed data, timeout and rate limit are never valid-empty"
+partial_policy = "Retain accepted rows but do not advance scope completeness, cursor or missing-item inference after page caps, parse errors, login failures or rate limits"
+publication_time_policy = "Use V2EX created epoch or feed publication timestamp normalized to UTC; never substitute discovery or task time"
+
+[discover]
+modes = ["search", "node", "tab", "hot", "latest"]
+search_generation = "Merged KeywordPlanner and inspiration-axis generation both allocate V2EX queries; producer claims transactionally and propagates source_keyword_id"
+budget = "Independent daily per-mode budgets charged only to globally deduplicated candidates retained after filtering and final limit"
+cursor = "Persistent per-node/tab rotation with a bounded reset when a page is exhausted or an upstream total shrinks"
+
+[profile]
+signals = true
+incremental = true
+refresh_mode = "incremental"
+
+[extension]
+task = "browser-task"
+hosts = ["v2ex.com"]
+task_marker = true
+background = true
+early_response = false
+cookie_sync = true
+
+[surfaces]
+cli = true
+setup = true
+desktop = true
+mobile = true
+extension_popup = true
+source_status = true
+credentials = true
+recommendation = true
+
+[engagement]
+view = "unavailable"
+like = "unavailable"
+favorite = "unavailable"
+comment = "unavailable"
+share = "unavailable"
+danmaku = "unavailable"
+
+[media]
+image = "none"
+image_hosts = []
+deep_link = "browser-fallback"
+native_save = false
+
+[e2e]
+safe_actions = [
+  "read-identity",
+  "read-public-profile",
+  "read-public-collection",
+  "search",
+  "feed",
+  "hot",
+  "latest",
+]
+mutating_actions = []
+
+[e2e.safe_assertions]
+read-identity = "upstream-state-unchanged"
+read-public-profile = "upstream-state-unchanged"
+read-public-collection = "upstream-state-unchanged"
+search = "upstream-state-unchanged"
+feed = "upstream-state-unchanged"
+hot = "upstream-state-unchanged"
+latest = "upstream-state-unchanged"
+
+[e2e.safe_postconditions]
+read-identity = "Only public username and boolean login readiness are observed; no Cookie value or upstream account state is transmitted or changed."
+read-public-profile = "Only the user's public Topic/Reply pages are read and normalized; no upstream write occurs."
+read-public-collection = "Favorite Topic/Node pages are rendered read-only and normalized locally; no upstream write occurs."
+search = "Only official public latest/hot/feed/API reads or configured read-only search retrieval occur."
+feed = "Only official JSON/RSS/Atom feeds are fetched with GET."
+hot = "Only the official public Hot endpoint is fetched with GET."
+latest = "Only the official public Latest endpoint is fetched with GET."
+
+[events]
+strategy_prefixes = ["v2ex-", "v2ex_"]
+mappings = "Topic publication maps to publish, per-Topic Reply aggregates map to discussion_reply with unknown satisfaction, favorite Topic maps to favorite, favorite Node maps to follow, and confirmed removals map to retraction"
+scope_caps = "Backend resolves identity and freezes four-scope item/page caps in the leased task; the extension may only reduce remaining capacity and cannot expand it"
+
+[task]
+lease = "Backend atomic lease blocks a second active V2EX task across extension instances; stale reclaim replays the first staged payload"
+idle_deadline = "Durable idle deadline advances only on accepted item/page progress and expires independently of worker heartbeat"
+absolute_deadline = "Durable absolute deadline bounds the whole task across MV3 restarts"
+retry = "The exact canonical task-result payload is persisted before POST and retried with bounded backoff until a 2xx ACK; backend first-final-wins remains authoritative"
+buffer = "Task id, tab id, scope/page progress, accepted items, deadlines and pending result payload are kept in extension session storage and recovered before new claims"
+
+[smoke]
+storage_scope = "isolated-only"
+
+[smoke.sinks]
+task = "allowed"
+task_result = "allowed"
+seen = "forbidden"
+affinity = "forbidden"
+snapshot = "forbidden"
+schedule = "forbidden"
+event_ingress = "forbidden"
+memory = "forbidden"
+profile = "forbidden"
+
+[exclusions]
+"extension.early-response" = "V2EX bootstrap reads stable server-rendered account pages after navigation complete and does not depend on an early network response tap."
+"engagement.view" = "Selected official V2EX Topic/feed paths do not expose a stable cross-path view count."
+"engagement.like" = "Selected official V2EX paths do not expose a canonical Topic like count."
+"engagement.favorite" = "Selected official V2EX paths do not expose a canonical per-Topic favorite count; user favorite membership is a profile event, not engagement metadata."
+"engagement.comment" = "V2EX exposes Reply count, which maps to reply_count rather than the canonical comment_count field."
+"engagement.share" = "Selected official V2EX paths do not expose a canonical share count."
+"engagement.danmaku" = "V2EX has no Bilibili-style danmaku metric."
+"media.image" = "V2EX Topic is intentionally rendered as a no-cover text card; no image fetch or proxy path is claimed."
+"media.deep-link" = "No native V2EX URL scheme is claimed; mobile opens the canonical HTTPS Topic URL."
+"media.native-save" = "V2EX integration is strictly read-only and local collection never mutates V2EX favorites or follows."
+
+[exclusion_tests]
+"extension.early-response" = ["tests/test_v2ex_contract.py::test_v2ex_browser_task_does_not_install_an_early_response_tap"]
+"engagement.view" = ["tests/test_v2ex_source.py::test_topic_normalization_uses_shared_topic_contract"]
+"engagement.like" = ["tests/test_v2ex_source.py::test_topic_normalization_uses_shared_topic_contract"]
+"engagement.favorite" = ["tests/test_v2ex_source.py::test_topic_normalization_uses_shared_topic_contract"]
+"engagement.comment" = ["tests/test_v2ex_source.py::test_topic_normalization_uses_shared_topic_contract"]
+"engagement.share" = ["tests/test_v2ex_source.py::test_topic_normalization_uses_shared_topic_contract"]
+"engagement.danmaku" = ["tests/test_v2ex_source.py::test_topic_normalization_uses_shared_topic_contract"]
+"media.image" = ["tests/test_v2ex_contract.py::test_v2ex_recommendations_are_intentional_text_cards"]
+"media.deep-link" = ["tests/test_v2ex_contract.py::test_v2ex_mobile_uses_https_without_a_native_scheme"]
+"media.native-save" = ["tests/test_v2ex_contract.py::test_v2ex_has_no_native_save_or_upstream_write_adapter"]

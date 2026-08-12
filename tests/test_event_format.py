@@ -13,6 +13,7 @@ from openbiliclaw.cli import _history_item_to_event
 from openbiliclaw.sources.event_format import (
     COMMENT_TEXT_MAX_CHARS,
     SOURCE_BILIBILI,
+    SOURCE_WEIBO,
     SOURCE_XIAOHONGSHU,
     build_event,
     default_signal_strength_for_event,
@@ -44,6 +45,16 @@ def test_format_context_xiaohongshu_like_with_author() -> None:
         author="豆子老师",
     )
     assert text == "在小红书点赞了《手冲咖啡入门》,作者:豆子老师"
+
+
+def test_format_context_weibo_share_with_author() -> None:
+    text = format_event_context(
+        event_type="share",
+        source_platform=SOURCE_WEIBO,
+        title="开源项目进展",
+        author="项目作者",
+    )
+    assert text == "在微博分享了《开源项目进展》,作者:项目作者"
 
 
 def test_format_context_unknown_event_type_falls_back() -> None:

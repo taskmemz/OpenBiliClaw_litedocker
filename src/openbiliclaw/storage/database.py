@@ -4347,6 +4347,7 @@ class Database:
         limit: int = 100,
         satisfaction_modes: frozenset[str] | None = None,
         after_event_id: int | None = None,
+        include_profile_inactive: bool = False,
     ) -> list[dict[str, Any]]:
         """Query events with optional filters.
 
@@ -4362,6 +4363,16 @@ class Database:
         sql = "SELECT * FROM events"
         clauses: list[str] = []
         params: list[Any] = []
+
+        # Account-scoped source imports remain durable evidence when a user
+        # switches accounts, but they must stop feeding cognition/profile
+        # rebuilds.  Explicit diagnostics can opt back in; normal consumers
+        # fail closed over rows marked inactive by the identity activator.
+        if not include_profile_inactive:
+            clauses.append(
+                "(metadata IS NULL OR json_valid(metadata) = 0 "
+                "OR COALESCE(json_extract(metadata, '$.profile_inactive'), 0) <> 1)"
+            )
 
         if event_types:
             placeholders = ", ".join("?" for _ in event_types)
@@ -4531,7 +4542,7 @@ class Database:
                 discovered_at AS created_at
             FROM content_cache
             WHERE ({where})
-              AND COALESCE(pool_status, '') NOT IN ('purged_by_dislike')
+              AND COALESCE(pool_status, '') NOT IN ('purged_by_dislike', 'purged_by_reinit')
               AND datetime(COALESCE(NULLIF(discovered_at, ''), '1970-01-01'))
                   >= datetime('now', ?)
             ORDER BY discovered_at DESC
@@ -8880,6 +8891,29 @@ class Database:
         )
         return cursor.rowcount
 
+    def mark_pool_purged_by_reinit(self) -> int:
+        """Retire every active pool row after a forced re-init.
+
+        A force re-init rebuilds the profile, so rows scored / copy-written
+        under the previous profile must stop being served immediately —
+        otherwise old recommendations linger and (because the backfill only
+        tops up to a small target, ``_INIT_POOL_TARGET_COUNT``) crowd out
+        fresh ones. Follows the ``purged_by_dislike`` precedent: rows stay in
+        ``content_cache`` for audit / dedup but are excluded from the
+        available-pool gate (which requires ``pool_status = 'fresh'``) and
+        from serve / recall paths.
+
+        Returns the number of rows retired.
+        """
+        cursor = self._execute_write(
+            """
+            UPDATE content_cache
+            SET pool_status = 'purged_by_reinit'
+            WHERE COALESCE(pool_status, 'fresh') IN ('fresh', 'shown', 'suppressed')
+            """
+        )
+        return cursor.rowcount
+
     def get_pool_candidates_needing_evaluation(
         self, limit: int = 20, *, xhs_self_nickname: str = ""
     ) -> list[dict[str, Any]]:
@@ -9341,6 +9375,7 @@ class Database:
                 COALESCE(c.danmaku_count, 0) AS danmaku_count,
                 COALESCE(c.favorite_count, 0) AS favorite_count,
                 COALESCE(c.comment_count, 0) AS comment_count,
+                COALESCE(c.share_count, 0) AS share_count,
                 COALESCE(c.rating_score, 0.0) AS rating_score,
                 COALESCE(c.rating_count, 0) AS rating_count,
                 COALESCE(c.source_rank, 0) AS source_rank,
@@ -16734,6 +16769,397 @@ class Database:
             state_key="zhihu_login_state",
             timestamp_key="zhihu_login_state_at",
         )
+
+    def set_linuxdo_login_state(self, logged_in: bool, when_iso: str | None = None) -> None:
+        """Persist whether the extension observed Linux.do's real ``_t`` session."""
+        if not isinstance(logged_in, bool):
+            raise TypeError("logged_in must be bool")
+        if when_iso is None:
+            from datetime import UTC, datetime
+
+            when_iso = datetime.now(UTC).isoformat()
+        self._set_browser_login_state(
+            state_key="linuxdo_login_state",
+            timestamp_key="linuxdo_login_state_at",
+            logged_in=logged_in,
+            when_iso=str(when_iso),
+        )
+
+    def set_v2ex_login_state(self, logged_in: bool, when_iso: str | None = None) -> None:
+        """Persist the privacy-preserving V2EX browser login heartbeat."""
+        if not isinstance(logged_in, bool):
+            raise TypeError("logged_in must be bool")
+        if when_iso is None:
+            from datetime import UTC, datetime
+
+            when_iso = datetime.now(UTC).isoformat()
+        self._set_browser_login_state(
+            state_key="v2ex_login_state",
+            timestamp_key="v2ex_login_state_at",
+            logged_in=logged_in,
+            when_iso=str(when_iso),
+        )
+
+    def get_linuxdo_login_state(self) -> tuple[bool, str]:
+        """Return ``(logged_in, iso_timestamp)`` for Linux.do, or ``(False, "")``."""
+        return self._get_browser_login_state(
+            state_key="linuxdo_login_state",
+            timestamp_key="linuxdo_login_state_at",
+        )
+
+    def get_v2ex_login_state(self) -> tuple[bool, str]:
+        """Return ``(logged_in, iso_timestamp)`` for V2EX."""
+        return self._get_browser_login_state(
+            state_key="v2ex_login_state",
+            timestamp_key="v2ex_login_state_at",
+        )
+
+    def set_weibo_login_state(self, logged_in: bool, when_iso: str | None = None) -> None:
+        """Persist only the browser-observed Weibo login boolean.
+
+        The extension never sends a Weibo Cookie or visitor ``SUB`` value;
+        the actual account request runs inside the logged-in browser tab.
+        """
+        if not isinstance(logged_in, bool):
+            raise TypeError("logged_in must be bool")
+        if when_iso is None:
+            from datetime import UTC, datetime
+
+            when_iso = datetime.now(UTC).isoformat()
+        self._set_browser_login_state(
+            state_key="weibo_login_state",
+            timestamp_key="weibo_login_state_at",
+            logged_in=logged_in,
+            when_iso=str(when_iso),
+        )
+
+    def get_weibo_login_state(self) -> tuple[bool, str]:
+        """Return ``(logged_in, iso_timestamp)`` for Weibo."""
+        return self._get_browser_login_state(
+            state_key="weibo_login_state",
+            timestamp_key="weibo_login_state_at",
+        )
+
+    def set_v2ex_browser_identity(
+        self,
+        username: str,
+        *,
+        evidence: str = "observed",
+        when_iso: str | None = None,
+    ) -> None:
+        """Persist an observed V2EX username without claiming verification."""
+        normalized = str(username or "").strip()
+        if not normalized or len(normalized) > 128 or any(ord(c) < 32 for c in normalized):
+            raise ValueError("V2EX username is invalid")
+        if when_iso is None:
+            from datetime import UTC, datetime
+
+            when_iso = datetime.now(UTC).isoformat()
+        conn = self.open_connection()
+        try:
+            conn.executemany(
+                "INSERT OR REPLACE INTO auth_state (key, value) VALUES (?, ?)",
+                [
+                    ("v2ex_browser_username", normalized),
+                    ("v2ex_browser_identity_evidence", str(evidence or "observed")),
+                    ("v2ex_browser_identity_at", str(when_iso)),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_v2ex_browser_identity(self) -> tuple[str, str, str]:
+        """Return ``(username, evidence, observed_at)`` for V2EX."""
+        conn = self.open_connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT key, value FROM auth_state
+                WHERE key IN (
+                    'v2ex_browser_username',
+                    'v2ex_browser_identity_evidence',
+                    'v2ex_browser_identity_at'
+                )
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+        values = {str(row["key"]): str(row["value"]) for row in rows}
+        return (
+            values.get("v2ex_browser_username", "").strip(),
+            values.get("v2ex_browser_identity_evidence", "").strip() or "observed",
+            values.get("v2ex_browser_identity_at", "").strip(),
+        )
+
+    def clear_v2ex_browser_identity(self) -> None:
+        """Forget an observed browser account after an explicit logout heartbeat."""
+        conn = self.open_connection()
+        try:
+            conn.execute(
+                """
+                DELETE FROM auth_state
+                WHERE key IN (
+                    'v2ex_browser_username',
+                    'v2ex_browser_identity_evidence',
+                    'v2ex_browser_identity_at'
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def set_v2ex_pat_identity(
+        self,
+        username: str,
+        *,
+        credential_fingerprint: str,
+        when_iso: str | None = None,
+    ) -> None:
+        """Persist only the account claim proven by the current PAT.
+
+        The token itself is never stored here. Its one-way credential
+        fingerprint binds this public username to the exact configured PAT so
+        changing or removing the token makes the old claim ineligible.
+        """
+        normalized = str(username or "").strip()
+        fingerprint = str(credential_fingerprint or "").strip()
+        if not normalized or len(normalized) > 128 or any(ord(c) < 32 for c in normalized):
+            raise ValueError("V2EX username is invalid")
+        if not fingerprint or len(fingerprint) > 256:
+            raise ValueError("V2EX credential fingerprint is invalid")
+        if when_iso is None:
+            from datetime import UTC, datetime
+
+            when_iso = datetime.now(UTC).isoformat()
+        conn = self.open_connection()
+        try:
+            conn.executemany(
+                "INSERT OR REPLACE INTO auth_state (key, value) VALUES (?, ?)",
+                [
+                    ("v2ex_pat_username", normalized),
+                    ("v2ex_pat_credential_fingerprint", fingerprint),
+                    ("v2ex_pat_identity_at", str(when_iso)),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_v2ex_pat_identity(self) -> tuple[str, str, str]:
+        """Return ``(username, credential_fingerprint, verified_at)``."""
+        conn = self.open_connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT key, value FROM auth_state
+                WHERE key IN (
+                    'v2ex_pat_username',
+                    'v2ex_pat_credential_fingerprint',
+                    'v2ex_pat_identity_at'
+                )
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+        values = {str(row["key"]): str(row["value"]) for row in rows}
+        return (
+            values.get("v2ex_pat_username", "").strip(),
+            values.get("v2ex_pat_credential_fingerprint", "").strip(),
+            values.get("v2ex_pat_identity_at", "").strip(),
+        )
+
+    def clear_v2ex_pat_identity(self, *, credential_fingerprint: str = "") -> bool:
+        """Forget the PAT account claim, optionally only for one exact PAT digest."""
+        expected = str(credential_fingerprint or "").strip()
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if expected:
+                row = conn.execute(
+                    "SELECT value FROM auth_state WHERE key='v2ex_pat_credential_fingerprint'"
+                ).fetchone()
+                current = str(row[0] if row is not None else "").strip()
+                if current != expected:
+                    conn.commit()
+                    return False
+            cursor = conn.execute(
+                """
+                DELETE FROM auth_state
+                WHERE key IN (
+                    'v2ex_pat_username',
+                    'v2ex_pat_credential_fingerprint',
+                    'v2ex_pat_identity_at'
+                )
+                """
+            )
+            conn.commit()
+            return int(cursor.rowcount) > 0
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def set_v2ex_accepted_identity(self, username: str, when_iso: str | None = None) -> None:
+        """Persist a username the user explicitly selected during conflict resolution."""
+        normalized = str(username or "").strip()
+        if not normalized or len(normalized) > 128 or any(ord(c) < 32 for c in normalized):
+            raise ValueError("V2EX username is invalid")
+        if when_iso is None:
+            from datetime import UTC, datetime
+
+            when_iso = datetime.now(UTC).isoformat()
+        conn = self.open_connection()
+        try:
+            conn.executemany(
+                "INSERT OR REPLACE INTO auth_state (key, value) VALUES (?, ?)",
+                [
+                    ("v2ex_accepted_username", normalized),
+                    ("v2ex_accepted_identity_at", str(when_iso)),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_v2ex_accepted_identity(self) -> tuple[str, str]:
+        """Return ``(username, accepted_at)`` for an explicit user choice."""
+        conn = self.open_connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT key, value FROM auth_state
+                WHERE key IN ('v2ex_accepted_username', 'v2ex_accepted_identity_at')
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+        values = {str(row["key"]): str(row["value"]) for row in rows}
+        return (
+            values.get("v2ex_accepted_username", "").strip(),
+            values.get("v2ex_accepted_identity_at", "").strip(),
+        )
+
+    def get_v2ex_profile_identity(self) -> tuple[str, str]:
+        """Return the account whose V2EX evidence currently owns the profile."""
+
+        conn = self.open_connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT key, value FROM auth_state
+                WHERE key IN ('v2ex_profile_username', 'v2ex_profile_identity_at')
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+        values = {str(row["key"]): str(row["value"]) for row in rows}
+        return (
+            values.get("v2ex_profile_username", "").strip(),
+            values.get("v2ex_profile_identity_at", "").strip(),
+        )
+
+    def activate_v2ex_profile_identity(
+        self,
+        username: str,
+        *,
+        when_iso: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically activate one V2EX account and isolate every other one.
+
+        Historical rows are retained for audit/export.  Their generic profile
+        owner marker is removed and ``profile_inactive`` is set, so a future
+        cursor recovery or profile rebuild cannot silently merge two accounts.
+        Re-selecting an older account makes its rows readable again; guided init
+        is still responsible for rebuilding the current Soul before this method
+        is called during an account switch.
+        """
+
+        normalized = str(username or "").strip()
+        if not normalized or len(normalized) > 128 or any(ord(c) < 32 for c in normalized):
+            raise ValueError("V2EX username is invalid")
+        if when_iso is None:
+            from datetime import UTC, datetime
+
+            when_iso = datetime.now(UTC).isoformat()
+        identity_key = normalized.casefold()
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            previous_row = conn.execute(
+                "SELECT value FROM auth_state WHERE key='v2ex_profile_username'"
+            ).fetchone()
+            previous = str(previous_row[0] if previous_row is not None else "").strip()
+            rows = conn.execute(
+                "SELECT id, metadata FROM events WHERE metadata LIKE '%v2ex%'"
+            ).fetchall()
+            activated = 0
+            deactivated = 0
+            for row in rows:
+                try:
+                    metadata = json.loads(str(row["metadata"] or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if (
+                    not isinstance(metadata, dict)
+                    or str(metadata.get("source_platform") or "").casefold() != "v2ex"
+                ):
+                    continue
+                row_identity = str(metadata.get("source_identity") or "").strip()
+                # Passive dwell/local-feedback rows are deliberately not tied
+                # to a V2EX account. They remain valid local evidence when the
+                # browser account changes and must never be hidden as if they
+                # belonged to the previous account bootstrap.
+                if not row_identity:
+                    continue
+                is_active = row_identity.casefold() == identity_key
+                changed = False
+                if is_active:
+                    if metadata.pop("profile_inactive", None) is not None:
+                        changed = True
+                    if metadata.pop("identity_deactivated_at", None) is not None:
+                        changed = True
+                    if changed:
+                        activated += 1
+                else:
+                    if metadata.get("profile_inactive") is not True:
+                        metadata["profile_inactive"] = True
+                        changed = True
+                    if metadata.get("identity_deactivated_at") != str(when_iso):
+                        metadata["identity_deactivated_at"] = str(when_iso)
+                        changed = True
+                    if metadata.pop("profile_update_owner", None) is not None:
+                        changed = True
+                    if changed:
+                        deactivated += 1
+                if changed:
+                    conn.execute(
+                        "UPDATE events SET metadata=? WHERE id=?",
+                        (json.dumps(metadata, ensure_ascii=False), int(row["id"])),
+                    )
+            conn.executemany(
+                "INSERT OR REPLACE INTO auth_state (key, value) VALUES (?, ?)",
+                [
+                    ("v2ex_profile_username", normalized),
+                    ("v2ex_profile_identity_at", str(when_iso)),
+                ],
+            )
+            conn.commit()
+            return {
+                "previous_username": previous,
+                "username": normalized,
+                "activated_events": activated,
+                "deactivated_events": deactivated,
+            }
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def bump_auth_epoch(self) -> int:
         """Atomically increment and return the revocation epoch.

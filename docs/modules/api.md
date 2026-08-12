@@ -17,6 +17,13 @@ Discovery 配置响应与更新白名单同时公开 `keyword_digest_grace_hours
 `0..168`。`PUT /api/config` 拒绝布尔值、非整数和越界值；合法值进入同一次 TOML 持久化与
 runtime apply。`0` 是只关闭跨 digest 关键词复用的回滚值，不会关闭统一 planner 或删除历史行。
 
+账号增量配置中的 `scheduler.source_incremental_enabled` 默认返回 `false`。旧配置没有该字段时
+也按关闭处理；只有通过 `PUT /api/config` 或 TOML 显式设为 `true`，runtime 才会按
+`source_incremental_hours` 和逐源覆盖自动创建扩展账号任务。关闭态在 presence 检查前返回，
+不会打开或切换平台标签页；领取端还会把升级前残留的周期任务标记失败，手动任务不受影响。
+`scheduler.douyin_incremental_hours` 仍额外默认 `0`，省略或发送
+`null` 都保持抖音关闭。总开关与周期字段都不控制手动初始化、手动 `fetch-*` 或正常 discovery。
+
 ## 配置保存与后台应用
 
 `PUT /api/config` 把“持久化成功”和“运行时已经切换”分成两个明确阶段。请求仍在 `_CONFIG_SAVE_LOCK` 内完成校验、`config.toml.bak` 快照、`config.toml` 写入和凭据存储，然后统一立即返回 `202 apply_state="queued"`、`apply_revision` 与已脱敏配置快照；运行时 lane 由 app-owned latest-wins 队列在后台安全应用，前端通过 `GET /api/config/apply-status` 或 runtime event 观察终态，不把 202 当作失败。
@@ -55,6 +62,36 @@ guided init 不与待应用配置并行：队列为 `queued/applying` 时 `POST 
 导入完整校验 manifest、成员类型 / 路径 / 大小、SHA-256、配置和 SQLite 后，才把内容发布到项目根下的私有暂存区。`request_id` 是上传结果的关联 / 对账 ID，不是服务端自动去重键；收到不确定结果时应先 `GET /api/migration/status`，不要盲目重复上传。匹配同一 `request_id` 的 `processing` 表示后端仍在上传或校验，不是失败；断连后的单次瞬时 `idle` 也不能单独作为本次请求的终局。桌面端最多强制查询 3 次，遇到 `idle/cancelled` 会间隔 500ms 再确认，匹配 request ID 的 `processing/staged` 则立即收口；每次打开「通用」还会绕过本地已加载标记重新查询。
 
 配置、SQLite、画像、白名单 UI 偏好和其它数据都要等下一次 `openbiliclaw start`、`openbiliclaw serve-api` 或桌面包启动取得 migration runtime lock 并成功 apply 后才生效；status 的 staged / applied 响应都只可能携带白名单 `frontend`，桌面端会忽略 staged 值。`state="applied"` 后，每个浏览器会把 `migration_id` 记为本地一次性交接回执，只应用该迁移的偏好一次；之后用户修改主题或滚动设置，即使旧 applied status 仍持久存在也不会再次覆盖。详见[存储层的可移植数据迁移](storage.md#可移植数据迁移)。再次提交合法迁移包会替换尚未应用的暂存包，也可在重启前调用 `DELETE /api/migration/pending` 取消。
+## V2EX 配置与来源状态
+
+`GET /api/config` 的 `sources.v2ex` 返回启用状态、公开用户名、PAT 是否已配置、五个
+discovery 分支、Node/Tab 过滤和预算；`access_token` 永远不回传明文。`PUT /api/config` 支持
+保存这些字段，非空 PAT 会先以只读 `GET /api/v2/member` 校验，环境变量
+`OPENBILICLAW_V2EX_TOKEN`（或 `token_env` 指定的变量）优先于配置文件。
+
+`GET /api/sources/status` 通过统一 source-auth provider 返回 V2EX 的匿名 / PAT 状态；无 PAT
+是 `auth_required=false` 的 `no_auth`，有 PAT 时可为 `unverified`、`verified`、`failed` 或
+`rate_limited`。浏览器登录态是独立的布尔心跳和 observed identity，不会被 PAT 状态替代。
+V2EX 任务桥提供 `POST /api/sources/v2ex/login-state`、`GET|POST /identity`、
+`GET /next-task`、`POST /task-result` 和 `POST /kick`；任务结果先合并为 canonical staged
+result，再经过后端身份门禁转换统一事件和账号分区 Node affinity。PAT verified、浏览器 observed、
+配置 / accepted 证据不一致时账号投影暂停但公开 discovery 不停。端点不接收或保存 Cookie 值、
+页面 HTML、私信或 CSRF 字段。
+
+## V2EX 浏览器任务桥
+
+| 方法与路径 | 状态 | 契约 |
+|---|---|---|
+| `POST /api/sources/v2ex/login-state` | ✅ | 只接收 `logged_in` 布尔心跳；扩展本地检查登录 Cookie，但不上传 Cookie 值 |
+| `POST /api/sources/v2ex/identity` | ✅ | 默认接收页面观察到的公开用户名（`observed`）；只有显式 `accept=true` 才保存用户接受的身份（`accepted`），不会伪造 `verified` |
+| `GET /api/sources/v2ex/identity` | ✅ | 本地只读解析 PAT / 浏览器 / 配置 / accepted 身份证据，返回 `resolved / identity_mismatch / unknown`、账号 bootstrap 门禁与私有 scope 可用性；不出网、不返回 token |
+| `GET /api/sources/v2ex/next-task` | ✅ | 从 `v2ex_tasks` 原子领取 `bootstrap_profile`，支持四个只读 scope |
+| `POST /api/sources/v2ex/task-result` | ✅ | 冻结首份 `ok / partial / empty` canonical 结果；服务端净化 DOM 字段、聚合 Reply、执行 identity gate，并只对 `scope_complete=true` 的收藏集合推进双快照 / durable retraction outbox；事件、账号 affinity 和 effect ack 完成后才终结任务 |
+| `POST /api/sources/v2ex/kick` | ✅ | 请求来源任务调度；仍受来源开关、扩展在线状态和全局 bootstrap 串行准入约束 |
+
+四个 scope 是 `public_topics`、`public_replies`、`favorite_topics` 和 `favorite_nodes`。首次完整 guided 收藏 scope 会种下账号基线；之后第一次完整快照缺失只增加 missing streak，连续第二次完整快照仍缺失才生成 `retraction(favorite|follow)`；错误 route、条目 / 页数截断、登录 / 网络 / 解析失败和身份冲突都不会推进。PAT verified identity 最多信任 6 小时，浏览器 observed identity 最多信任 72 小时；明确 PAT 拒绝与浏览器登出分别清理匹配证据。桌面设置页与 popup 会读取 `GET /identity` 展示冲突 claims，并允许用户显式接受当前浏览器账号；账号切换任务只暂存新账号证据，guided init 的 Soul Profile 提交成功后才激活该账号，旧账号事件 / Node Affinity / 收藏快照不会混入。
+
+普通 `POST /api/events` 中，V2EX Topic 的 `content_page_exit` 只有可见阅读时间达到 30 秒、canonical HTTPS Topic URL / Topic ID / Node slug 全部一致且当前 observed 浏览器账号不与 active profile 冲突时，才按 distinct Topic 幂等增加账号分区的 `engaged_view_count`。事件先获得 durable receipt，投影失败时请求失败并由同一 `event_id` 重试修复，不会重复计数。
 
 ## 公开项目统计
 
@@ -116,9 +153,21 @@ ID 字段是严格 JSON string，不接受数字、布尔或其它类型的自�
 
 ## 来源任务结果的两阶段完成
 
-`POST /api/sources/{xhs,dy,yt,zhihu,reddit}/task-result` 的最终回调不再先把任务写成 `completed`。后端先在 `BEGIN IMMEDIATE` 中合并并冻结第一份 canonical result（含 XHS `self_info` 私有快照），任务仍保持非终态；随后只从这份持久结果重放来源事件、seen-key 和来源专属投影，全部成功后才执行不替换 `result_json` 的 terminal flip。若进程分别退出在 canonical merge→event ingress、event ingress→seen-key 或 seen-key→terminal 三个窗口，后续 callback 会忽略变化后的 body，用第一份结果补齐缺口。队列把 staged marker 视为业务 mutation 的逻辑终态：并发/迟到的 partial、final、fail、rate-limit 都不能改写它；但它继续遵守普通 claim lease，丢失非 2xx 响应后会在 15 分钟 lease 过期时由 dispatcher 重新领取，从而自动触发修复。seen-key 通过 `update_source_bootstrap_state()` 原子、严格落盘并按源保留最新 5,000 个身份键，失败会阻止 terminal flip；事件稳定键不含 task ID，因此 ingress 已提交但 marker 未写时的重放只返回 duplicate receipt。Reddit post/comment/subreddit/user 使用各自稳定身份，comment URL fallback 只接受含 comment id 的完整 permalink，不能把 post id 或标题误作 comment key。
+`POST /api/sources/{xhs,dy,yt,zhihu,reddit,linuxdo}/task-result` 的最终回调不再先把任务写成 `completed`。后端先在 `BEGIN IMMEDIATE` 中合并并冻结第一份 canonical result（含 XHS `self_info` 私有快照），任务仍保持非终态；随后只从这份持久结果重放来源事件、seen-key 和来源专属投影，全部成功后才执行不替换 `result_json` 的 terminal flip。若进程分别退出在 canonical merge→event ingress、event ingress→seen-key 或 seen-key→terminal 三个窗口，后续 callback 会忽略变化后的 body，用第一份结果补齐缺口。队列把 staged marker 视为业务 mutation 的逻辑终态：并发/迟到的 partial、final、fail、rate-limit 都不能改写它；但它继续遵守各源 claim lease，丢失非 2xx 响应后由 lease reclaim 自动触发修复（Linux.do 长任务为约 35 分钟）。seen-key 通过 `update_source_bootstrap_state()` 原子、严格落盘并按源保留最新 5,000 个身份键，失败会阻止 terminal flip；事件稳定键不含 task ID，因此 ingress 已提交但 marker 未写时的重放只返回 duplicate receipt。Reddit post/comment/subreddit/user 使用各自稳定身份，comment URL fallback 只接受含 comment id 的完整 permalink，不能把 post id 或标题误作 comment key；Linux.do 使用正整数 topic ID，canonical `content_id="topic:<id>"`。
 
-周期任务 payload 带 `incremental=true`；五源 handler 在 guided init 外给 durable event 标记 `profile_update_owner="generic"`，在 init-owned 回调中只落事实、由阶段 2/3 统一建模。事件 ingress 成功或 duplicate receipt 后才按响应顺序 checkpoint seen key，再翻 terminal；没有 handler 直接调用画像 pipeline。扩展离线时 runtime 不创建任务，也不推进调度时间。
+周期任务 payload 带 `incremental=true`；六源 handler 在 guided init 外给 durable event 标记 `profile_update_owner="generic"`，在 init-owned 回调中只落事实、由阶段 2/3 统一建模。事件 ingress 成功或 duplicate receipt 后才按响应顺序 checkpoint seen key，再翻 terminal；没有 handler 直接调用画像 pipeline。扩展离线时 runtime 不创建任务，也不推进调度时间。
+
+### Linux.do 任务与登录态端点
+
+| 方法与路径 | 状态 | 契约 |
+|---|---|---|
+| `GET /api/sources/linuxdo/next-task` | ✅ | 使用 authenticated extension 请求原子领取最早的 pending Linux.do 任务；无任务返回 bodyless 204。约 35 分钟未完成的 claim 才可重领，init active 时只暴露本轮拥有的 task ID。 |
+| `POST /api/sources/linuxdo/task-result` | ✅ | 接受 `task_id/status/items/scope_counts/debug`；discovery 结果只供 waiting producer，明确带 `profile_update` 或 `incremental` 的 `bootstrap_events` 才进入 durable event ingress。部分 bootstrap scope 或 discovery 分页 / 输入失败可用 `degraded` 保留已得 items；零有效 item 的失败才是 `failed`。Cookie 和原始 Linux.do 响应不属于 payload。 |
+| `POST /api/sources/linuxdo/kick` | ✅ | 经 runtime-stream 广播 `linuxdo_task_available`，让在线扩展立即 poll；不直接访问 Linux.do。 |
+| `POST /api/sources/linuxdo/login-state` | ✅（兼容端点） | 只接受 strict boolean `logged_in`，持久化扩展对 `_t` 存在性的观察；不接受 Cookie 字符串。公开 discovery 的 `auth_required` 仍为 false。 |
+
+Linux.do 站点访问全部发生在真实 `linux.do` task tab 内，且只允许同源 JSON `GET`。个人 bootstrap 先以 `/session/current.json` 正面确认 username；`_t=true` 只是 source-auth 心跳，不能替代任务内身份确认。结构化错误只包含 code/status/path，不把 challenge HTML、JSON body、Cookie 或 CSRF 字段带进回调。dispatcher 在执行前把 task/tab/deadline 写入扩展 session storage；MV3 service worker 重启时先恢复 runner，仍存活的任务 tab 可把结果交给恢复后的 handler 重试后端回传，不会重跑上游 GET。完整契约见 [Linux.do 来源文档](linuxdo.md)。
+周期任务 payload 带 `incremental=true`；六源 handler（含 V2EX）在 guided init 外给 durable event 标记 `profile_update_owner="generic"`，在 init-owned 回调中只落事实、由阶段 2/3 统一建模。事件 ingress 成功或 duplicate receipt 后才按响应顺序 checkpoint seen key，再翻 terminal；没有 handler 直接调用画像 pipeline。扩展离线时 runtime 不创建任务，也不推进调度时间。
 
 ## B 站与抖音浏览器任务边界
 
@@ -133,7 +182,7 @@ ID 字段是严格 JSON string，不接受数字、布尔或其它类型的自�
 
 `GET /api/image-proxy?url=...` 先在线程中读取本地 `data/image-cache/`；命中不占网络槽并返回原始图片类型、`Cache-Control`、`nosniff` 与 `X-Image-Cache: hit`。未命中进入 app-owned `ImageFetchCoordinator`：API 前台请求和 `ContinuousRefreshController` 后台预取共用总上限 4，后台最多 3，队列有前台请求时优先放行；同一 `image_cache_key(url)` 只产生一个 upstream task。单个 HTTP waiter 取消不会取消共享抓取，>=500 失败仍会在线程中做一次“并发写入已落盘”的 cache race fallback。成功响应保留 `X-Image-Cache: miss`。
 
-抓取继续复用统一 SSRF 边界：域名白名单、每次 redirect 重验、`image/*`、10MB 上限，以及国内 CDN 直连 / 境外 CDN 继承代理。磁盘写入使用同目录临时文件 `flush + fsync + os.replace`，失败只保留旧文件或无文件，不暴露半写结果。日志只记录 host、cache hash 前缀和错误类别，不记录签名路径/query；`GET /api/runtime-status` 公开 `image_fetch_active/waiting/inflight_keys` 与 `upstream_started/singleflight_joins/peak_active/peak_background`，这些字段只含整数，不含 URL 或 token。协调器不随 `RuntimeContext` 热重载替换；新 controller 在后台任务恢复前重绑同一实例，shutdown 先停 refresh producer 再取消协调器持有的 active/queued upstream task。
+抓取继续复用统一 SSRF 边界：域名白名单、每次 redirect 重验、`image/*`、10MB 上限，以及国内 CDN 直连 / 境外 CDN 继承代理。微博封面只允许域名边界匹配的 `sinaimg.cn` / `*.sinaimg.cn`，并归入国内直连；形如 `evilsinaimg.cn` 的后缀伪装仍被拒绝。真实新浪图床在共享浏览器 UA 下要求防盗链头，因此当前 redirect 目标属于 `sinaimg.cn` 时附 `Referer: https://weibo.com/`，跳到其它白名单 CDN 后立即移除。磁盘写入使用同目录临时文件 `flush + fsync + os.replace`，失败只保留旧文件或无文件，不暴露半写结果。日志只记录 host、cache hash 前缀和错误类别，不记录签名路径/query；`GET /api/runtime-status` 公开 `image_fetch_active/waiting/inflight_keys` 与 `upstream_started/singleflight_joins/peak_active/peak_background`，这些字段只含整数，不含 URL 或 token。协调器不随 `RuntimeContext` 热重载替换；新 controller 在后台任务恢复前重绑同一实例，shutdown 先停 refresh producer 再取消协调器持有的 active/queued upstream task。
 
 ## 降级配置恢复
 

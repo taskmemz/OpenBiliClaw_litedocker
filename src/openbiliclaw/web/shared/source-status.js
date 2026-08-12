@@ -63,14 +63,26 @@
 
   /** Platform slugs the contract covers, in settings-page display order. */
   const SOURCE_KEYS = Object.freeze([
-    "bilibili", "xiaohongshu", "douyin", "youtube", "twitter", "zhihu", "reddit",
-    // Not on the auth contract yet: the backend sends `auth: null` for it and
-    // the legacy-`state` fallback below renders it. It belongs in the roster
-    // regardless — the roster answers "which sources exist", not "which sources
-    // have a contract", and leaving it out would hide the platform from all
-    // three settings surfaces at once.
-    "bangumi",
+    "bilibili", "xiaohongshu", "douyin", "weibo", "youtube", "twitter", "zhihu", "reddit",
+    "bangumi", "linuxdo", "v2ex",
   ]);
+
+  const SOURCE_CAPABILITIES = Object.freeze({
+    bilibili: Object.freeze({ guidedInit: true }),
+    xiaohongshu: Object.freeze({ guidedInit: true }),
+    douyin: Object.freeze({ guidedInit: true }),
+    weibo: Object.freeze({ guidedInit: true }),
+    youtube: Object.freeze({ guidedInit: true }),
+    twitter: Object.freeze({ guidedInit: true }),
+    zhihu: Object.freeze({ guidedInit: true }),
+    reddit: Object.freeze({ guidedInit: true }),
+    bangumi: Object.freeze({ guidedInit: true }),
+    linuxdo: Object.freeze({ guidedInit: true }),
+    v2ex: Object.freeze({ guidedInit: true }),
+  });
+  const INIT_SOURCE_KEYS = Object.freeze(
+    SOURCE_KEYS.filter((key) => SOURCE_CAPABILITIES[key]?.guidedInit === true),
+  );
 
   /**
    * Display names for the source *settings* surfaces.
@@ -83,11 +95,14 @@
     bilibili: "B 站",
     xiaohongshu: "小红书",
     douyin: "抖音",
+    weibo: "微博",
     youtube: "YouTube",
     twitter: "X",
     zhihu: "知乎",
     reddit: "Reddit",
     bangumi: "Bangumi",
+    linuxdo: "Linux.do",
+    v2ex: "V2EX",
   });
 
   function sourceLabel(key) {
@@ -169,6 +184,13 @@
    */
   const ACCESS_TOKEN_REJECTED = Object.freeze({ tone: "danger", label: "令牌已失效" });
 
+  /** Orthogonal discovery-health states that require user-visible attention. */
+  const DISCOVERY_HEALTH_ISSUES = Object.freeze({
+    partial: { tone: "warning", label: "发现部分异常" },
+    error: { tone: "danger", label: "发现失败" },
+    rate_limited: { tone: "warning", label: "发现已暂停" },
+  });
+
   // ── the orthogonal contract's presentation ─────────────────────────────
   //
   // Everything above this line reads `item.state`, the single string that packs
@@ -218,6 +240,24 @@
    * panel paint it the same grey as "we have no idea" (spec D6).
    */
   const ACCESS_NO_AUTH = Object.freeze({ tone: "public", label: "无需登录" });
+
+  /** Public discovery works, while an optional browser identity adds signals. */
+  const ACCESS_OPTIONAL_AUTH = Object.freeze({ tone: "public", label: "公开发现可用" });
+  const CAPABILITY_AUTH_MODES = Object.freeze({
+    anonymous: "匿名可用",
+    "optional-credential": "匿名可用，可选凭据增强",
+    "login-required": "需要浏览器登录",
+  });
+
+  const CAPABILITY_READINESS = Object.freeze({
+    ready: { tone: "ready", label: "已就绪" },
+    login_required: { tone: "warning", label: "需要登录" },
+    identity_required: { tone: "warning", label: "等待识别账号" },
+    identity_mismatch: { tone: "danger", label: "账号冲突" },
+    identity_switch_required: { tone: "warning", label: "需要重新初始化" },
+    stale: { tone: "warning", label: "登录态已过期" },
+    unavailable: { tone: "muted", label: "当前不可用" },
+  });
 
   /**
    * A source needing no login can still carry a verifiable credential.
@@ -388,6 +428,13 @@
     // carries a verifiable token (Bangumi) falls through to its verification,
     // so a confirmed token reads as 已验证 rather than a flat 无需登录.
     if (auth.auth_required === false && !hasVerifiableCredential(auth)) return ACCESS_NO_AUTH;
+    // Some public sources also expose optional account signals. A missing
+    // browser identity must not turn the whole source into「需要登录」: discovery
+    // remains available, while the backend-owned detail explains what signing
+    // in would add. Keep this contract-driven rather than naming a platform.
+    if (auth.auth_required === false && text(auth.credential) === "none") {
+      return ACCESS_OPTIONAL_AUTH;
+    }
     return SOURCE_ACCESS_CREDENTIAL[text(auth.credential)]
       || SOURCE_ACCESS_VERIFICATION[text(auth.verification)]
       || UNKNOWN_ACCESS;
@@ -507,6 +554,51 @@
   }
 
   /**
+   * Fail-closed descriptor for one entry in ``auth.capabilities``.
+   *
+   * A capability is ready only when the backend sends both ``ready=true`` and
+   * ``state=ready``.  This deliberately refuses to infer private readiness from
+   * a source-wide anonymous verdict.
+   */
+  function describeCapabilityReadiness(value) {
+    if (!value || typeof value !== "object") {
+      return {
+        known: false,
+        ready: false,
+        required: true,
+        mode: "",
+        state: "unavailable",
+        tone: "muted",
+        label: "后端未提供能力状态",
+        detail: "当前后端无法判断这项能力是否可用。",
+      };
+    }
+    const mode = text(value.mode);
+    const state = text(value.state);
+    const spec = CAPABILITY_READINESS[state] || CAPABILITY_READINESS.unavailable;
+    const known = Boolean(CAPABILITY_AUTH_MODES[mode] && CAPABILITY_READINESS[state]);
+    const ready = known && value.ready === true && state === "ready";
+    return {
+      known,
+      ready,
+      required: value.required !== false,
+      mode,
+      state,
+      tone: ready ? "ready" : spec.tone,
+      label: ready ? CAPABILITY_READINESS.ready.label : spec.label,
+      detail: text(value.detail),
+    };
+  }
+
+  function describeSourceCapability(item, capability) {
+    const auth = authContract(item);
+    const capabilities = auth && typeof auth.capabilities === "object"
+      ? auth.capabilities
+      : null;
+    return describeCapabilityReadiness(capabilities && capabilities[text(capability)]);
+  }
+
+  /**
    * Return an actionable problem for an enabled source, or ``null``.
    *
    * This is deliberately narrower than ``describeAccess``: ``unverified`` and
@@ -523,14 +615,20 @@
     if (!item || typeof item !== "object" || item.enabled === false) return null;
     const access = describeAccess(item, options);
     const verification = text(item.auth && item.auth.verification);
+    const discoveryState = text(item.discovery_state);
+    const discoveryIssue = DISCOVERY_HEALTH_ISSUES[discoveryState] || null;
+    const pausedFallback = item.feed_paused === true && !discoveryIssue
+      ? { tone: "warning", label: "发现已暂停" }
+      : null;
+    const healthIssue = discoveryIssue || pausedFallback;
     const actionablePending = verification === "rate_limited";
     const actionableTone = access.tone === "warning" || access.tone === "danger";
     const unknownEnabledState = !access.known;
-    if (!actionablePending && !actionableTone && !unknownEnabledState) return null;
+    if (!healthIssue && !actionablePending && !actionableTone && !unknownEnabledState) return null;
     return {
-      tone: access.tone === "danger" ? "danger" : "warning",
-      label: access.label,
-      detail: access.detail || access.label,
+      tone: access.tone === "danger" || healthIssue?.tone === "danger" ? "danger" : "warning",
+      label: healthIssue?.label || access.label,
+      detail: access.detail || healthIssue?.label || access.label,
     };
   }
 
@@ -706,13 +804,19 @@
 
   const api = {
     ACCESS_NO_AUTH,
+    ACCESS_OPTIONAL_AUTH,
+    CAPABILITY_AUTH_MODES,
+    CAPABILITY_READINESS,
+    DISCOVERY_HEALTH_ISSUES,
     EVIDENCE_ABSENT,
     EVIDENCE_HINTS,
     OFFLINE_DETAIL,
     SOURCE_ACCESS_CREDENTIAL,
     SOURCE_ACCESS_STATE,
     SOURCE_ACCESS_VERIFICATION,
+    SOURCE_CAPABILITIES,
     SOURCE_KEYS,
+    INIT_SOURCE_KEYS,
     SOURCE_LABELS,
     TONE_COLORS,
     UNKNOWN_ACCESS,
@@ -721,8 +825,10 @@
     VERIFY_TONES,
     WRITABLE_FORM_KINDS,
     describeAccess,
+    describeCapabilityReadiness,
     describeCredential,
     describeSourceIssue,
+    describeSourceCapability,
     describeVerifiedAt,
     describeVerifyError,
     describeVerifyResult,

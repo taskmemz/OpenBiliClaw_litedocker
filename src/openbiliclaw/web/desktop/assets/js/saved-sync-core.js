@@ -13,6 +13,7 @@
     x: "twitter",
     zh: "zhihu",
     rd: "reddit",
+    wb: "weibo",
   });
 
   function text(value) {
@@ -44,6 +45,9 @@
       if (host === "youtu.be" || host.endsWith(".youtube.com")) return "youtube";
       if (host === "x.com" || host.endsWith(".x.com") || host.endsWith(".twitter.com")) return "twitter";
       if (host.endsWith(".zhihu.com")) return "zhihu";
+      if (["weibo.com", "weibo.cn", "sinaimg.cn", "sinaimg.com"].some(
+        (domain) => host === domain || host.endsWith(`.${domain}`),
+      )) return "weibo";
       if (host.endsWith(".bilibili.com") || host === "b23.tv") return "bilibili";
       if (["bgm.tv", "bangumi.tv"].some((domain) => host === domain || host.endsWith(`.${domain}`))) return "bangumi";
       return "web";
@@ -150,7 +154,8 @@
     }[status] || ["同步失败", "error", true];
     let [label, tone, retryable] = base;
     const busy = status === "syncing" || (status === "pending" && Boolean(text(item.sync_task_id)));
-    const localOnly = status === "unsupported" && errorCode === "unsupported_content_type";
+    const localOnly = status === "unsupported"
+      && (errorCode === "unsupported_content_type" || errorCode === "local_only_source");
     if (status === "unsupported" && errorCode === "unsupported_adapter_missing") {
       label = "待升级重试";
       tone = "warning";
@@ -162,7 +167,11 @@
     }
     const actionable = !busy && !["synced", "already_synced"].includes(status) && !localOnly;
     let detail;
-    if (localOnly) detail = "此内容类型暂不支持平台同步，仅保存在本地。";
+    if (localOnly) {
+      detail = errorCode === "local_only_source"
+        ? "此来源仅支持本地收藏，不会向平台创建同步任务。"
+        : "此内容类型暂不支持平台同步，仅保存在本地。";
+    }
     else if (status === "unsupported" && errorCode === "unsupported_adapter_missing") {
       detail = "同步能力可能正在滚动升级，请更新后端与插件后重试。";
     } else if (status === "unsupported") detail = errorMessage || "当前同步能力暂不可用，请更新后重试。";
@@ -194,6 +203,7 @@
 
   function updateSavedBatchButtonState(button, pendingCount) {
     const disabled = pendingCount <= 0;
+    button.hidden = disabled;
     button.disabled = disabled;
     button.setAttribute("aria-disabled", String(disabled));
     button.removeAttribute("aria-busy");

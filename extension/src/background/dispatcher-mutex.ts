@@ -31,10 +31,11 @@ function mutexGlobals(): DispatcherMutexGlobals {
   return globalThis as DispatcherMutexGlobals;
 }
 
-const STALE_HOLD_TIMEOUT_MS = 6 * 60 * 1000; // 6 minutes — longer than
-// the longest plausible bootstrap (4 scopes × ~25s = 100s + slack).
-// If something holds the mutex past this window we assume the holder
-// crashed and forcibly release.
+const STALE_HOLD_TIMEOUT_MS = 36 * 60 * 1000;
+// Linux.do can legitimately hold the browser slot for up to ~29 minutes when
+// three personal scopes are paced conservatively. Keep stale eviction beyond
+// that task budget and its result grace; the durable source-task lease remains
+// the authority for replay after an actual crash.
 
 /**
  * Try to acquire the cross-source mutex for ``ownerLabel`` (e.g.

@@ -64,6 +64,9 @@ _PLATFORM_SOURCE_FIELDS = (
     "zhihu",
     "reddit",
     "bangumi",
+    "linuxdo",
+    "v2ex",
+    "weibo",
 )
 
 
@@ -406,3 +409,39 @@ class InitPrereqs:
             for name in _PLATFORM_SOURCE_FIELDS
             if getattr(getattr(sources, name, None), "enabled", False)
         ]
+
+    def source_capability_readiness(self, slug: str, capability: str) -> str:
+        """Return machine auth readiness for a guided-init capability.
+
+        The provider is pure/local, so setup and init can share the same
+        capability decision as ``GET /api/sources/status`` without adding a
+        network probe to a polling path. Older providers without a capability
+        map retain their source-wide contract semantics.
+        """
+
+        from openbiliclaw.api.source_auth.providers import (
+            SOURCE_AUTH_PROVIDERS,
+            SourceAuthContext,
+        )
+
+        provider = SOURCE_AUTH_PROVIDERS.get(str(slug).strip().lower())
+        database = getattr(self._ctx, "database", None)
+        config = getattr(self._ctx, "config", None)
+        if provider is None or database is None or config is None:
+            return "unverified"
+        contract = provider(SourceAuthContext(cfg=config, database=database))
+        state = contract.capabilities.get(str(capability).strip())
+        if state is not None:
+            if state.readiness is not None:
+                return state.readiness
+            if state.ready:
+                return "ready"
+            if state.state in {"login_required", "stale"}:
+                return state.state
+            return "unverified"
+        return "ready" if contract.capability_ready(capability) else "login_required"
+
+    def source_capability_ready(self, slug: str, capability: str) -> bool:
+        """Whether *slug* is currently admissible for *capability*."""
+
+        return self.source_capability_readiness(slug, capability) == "ready"

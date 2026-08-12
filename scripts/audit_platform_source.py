@@ -2722,16 +2722,67 @@ class Inventory:
         results = [provider, verify, write]
         if self.contract.auth.mode == "capability-specific":
             results.append(
-                AuditResult(
+                self._pass_or_missing(
                     "source-auth.capability-readiness",
                     "per-capability backend/status/setup/init readiness",
-                    "MISSING",
-                    True,
-                    (
-                        "the current shared SourceAuthContract still exposes one source-wide "
-                        "auth_required boolean; extend the runtime contract and teach this audit "
-                        "the new concrete registry before implementing a mixed-auth source"
-                    ),
+                    [
+                        (
+                            "shared SourceCapabilityAuth model",
+                            self._first_regex(
+                                ("src/openbiliclaw/api/source_auth/contract.py",),
+                                r"class\s+SourceCapabilityAuth\s*\(",
+                            ),
+                        ),
+                        (
+                            "SourceAuthContract capabilities field",
+                            self._first_regex(
+                                ("src/openbiliclaw/api/source_auth/contract.py",),
+                                r"capabilities\s*:\s*dict\[str,\s*SourceCapabilityAuth\]",
+                            ),
+                        ),
+                        (
+                            "source-specific capability mode registry",
+                            self._first_regex(
+                                ("src/openbiliclaw/api/source_auth/providers.py",),
+                                rf"{re.escape(slug.upper())}_CAPABILITY_AUTH_MODES",
+                            ),
+                        ),
+                        (
+                            "status provider capability projection",
+                            self._first_regex(
+                                ("src/openbiliclaw/api/source_auth/providers.py",),
+                                r"capabilities=capabilities",
+                            ),
+                        ),
+                        (
+                            "guided-init source_capabilities projection",
+                            self._first_regex(
+                                ("src/openbiliclaw/api/models.py",),
+                                r"source_capabilities\s*:\s*dict",
+                            ),
+                        ),
+                        (
+                            "backend bootstrap capability gate",
+                            self._first_regex(
+                                ("src/openbiliclaw/api/app.py",),
+                                rf"{re.escape(slug)}_capability_readiness",
+                            ),
+                        ),
+                        (
+                            "shared frontend capability renderer",
+                            self._first_regex(
+                                ("src/openbiliclaw/web/shared/source-status.js",),
+                                r"describeCapabilityReadiness",
+                            ),
+                        ),
+                        (
+                            "setup capability admission gate",
+                            self._first_regex(
+                                ("src/openbiliclaw/web/setup/index.html",),
+                                r"source_capabilities",
+                            ),
+                        ),
+                    ],
                 )
             )
         return results

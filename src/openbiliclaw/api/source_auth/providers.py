@@ -1,9 +1,9 @@
 """Per-platform source-auth providers.
 
 ``GET /api/sources/status`` used to be a 424-line if/elif chain that flattened
-seven heterogeneous platforms by hand (spec D8). Adding a platform meant editing
+heterogeneous platforms by hand (spec D8). Adding a platform meant editing
 that one function, and nothing forced the new branch to answer the same
-questions as the previous seven — which is how the same ``state="ready"`` came
+questions as the previous providers — which is how the same ``state="ready"`` came
 to mean "we counted three cookie field names" for B站 and "a file exists on
 disk" for Reddit.
 
@@ -47,7 +47,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from openbiliclaw.api.source_auth.contract import SourceAuthContract
+from openbiliclaw.api.source_auth.contract import (
+    CapabilityReadiness,
+    SourceAuthContract,
+    SourceCapabilityAuth,
+)
 from openbiliclaw.api.source_auth.probe_cache import (
     LIVE_PROBES,
     PROBE_FAIL_TTL_SECONDS,
@@ -59,6 +63,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from openbiliclaw.api.source_auth.contract import (
+        CapabilityReadinessState,
         Credential,
         CredentialOrigin,
         Verification,
@@ -72,6 +77,15 @@ if TYPE_CHECKING:
 # on 2026-07-18: 71h -> ready, 73h -> stale (spec D2).
 _XHS_LOGIN_FRESH_HOURS = 72
 _ZHIHU_LOGIN_FRESH_HOURS = 72
+_WEIBO_LOGIN_FRESH_HOURS = 72
+_WEIBO_CAPABILITY_AUTH_MODES = {
+    "discover": "anonymous",
+    "profile": "login-required",
+    "bootstrap": "login-required",
+    "cookie-sync": "optional-credential",
+}
+_V2EX_LOGIN_FRESH_HOURS = 72
+_LINUXDO_LOGIN_FRESH_HOURS = 72
 _HEARTBEAT_TTL_SECONDS = 72 * 3600
 
 # Live-probe verdict windows. Imported rather than redeclared: ``probe_cache``
@@ -196,7 +210,7 @@ _BILIBILI_READY_DETAIL: dict[str, str] = {
 #
 # Note this is the contract's own ``detail``; the settings chip renders the
 # discovery-health ``detail`` that ``_bangumi_status_item`` keeps (Bangumi
-# carries a discovery-health axis the seven cookie/heartbeat platforms do not).
+# carries a discovery-health axis the other providers do not).
 _BANGUMI_TOKEN_DETAIL: dict[str, str] = {
     "verified": "个人令牌有效，已识别 Bangumi 账号，可读取你的私密收藏。",
     "failed": (
@@ -209,6 +223,14 @@ _BANGUMI_TOKEN_DETAIL: dict[str, str] = {
 
 # Contract-side ``detail`` for Bangumi with no token — the anonymous default.
 _BANGUMI_ANONYMOUS_DETAIL = "公开源 · 无需登录；可选填个人令牌以识别账号或读取私密收藏。"
+
+_V2EX_TOKEN_DETAIL: dict[str, str] = {
+    "verified": "个人令牌有效，已识别 V2EX 账号，可使用 API 2.0 增强发现。",
+    "failed": "V2EX 个人令牌被拒绝（可能过期或无效）；公开发现不受影响。",
+    "stale": "V2EX 个人令牌上次联网确认已超出有效期，可点「测试连接」重新确认。",
+    "unverified": "已保存 V2EX 个人令牌，尚未联网确认；可点「测试连接」验证。",
+}
+_V2EX_ANONYMOUS_DETAIL = "公开源 · 无需登录；可选填 PAT 以识别账号并增强 Node / Topic API。"
 
 
 @dataclass
@@ -366,6 +388,20 @@ def _json_dict(raw: Any) -> dict[str, Any]:
         if isinstance(parsed, dict):
             parsed_dict = parsed
     return parsed_dict
+
+
+def _utc_timestamp(value: object) -> datetime | None:
+    """Parse a SQLite/ISO timestamp for evidence ordering."""
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    with suppress(ValueError, TypeError):
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    return None
 
 
 # ── bilibili ─────────────────────────────────────────────────────────
@@ -595,11 +631,11 @@ def auth_douyin(ctx: SourceAuthContext) -> SourceAuthContract:
 
 
 def auth_youtube(ctx: SourceAuthContext) -> SourceAuthContract:
-    """YouTube: public source, the one platform legitimately needing no login.
+    """YouTube: a public source that legitimately needs no login.
 
     ``verify_method`` must stay ``none`` here — not because verification is
     hard, but because there is nothing to verify. That is the only honest use
-    of ``none`` in the whole table (invariant I3).
+    of ``none`` for a source with no credential to verify (invariant I3).
     """
     return SourceAuthContract(
         auth_required=False,
@@ -613,6 +649,99 @@ def auth_youtube(ctx: SourceAuthContext) -> SourceAuthContract:
         legacy_state="no_auth",
         legacy_logged_in=True,
     )
+
+
+# ── Weibo ───────────────────────────────────────────────────────────
+
+
+def auth_weibo(ctx: SourceAuthContext) -> SourceAuthContract:
+    """Weibo: anonymous public discovery plus browser-backed bootstrap."""
+
+    stored, when, fresh = _login_heartbeat(
+        ctx.database,
+        getter="get_weibo_login_state",
+        fresh_hours=_WEIBO_LOGIN_FRESH_HOURS,
+    )
+    capabilities = _weibo_capabilities(
+        "ready" if stored and fresh else "stale" if stored and when else "login_required"
+    )
+    # An absent heartbeat means there is no browser credential to verify yet.
+    # Keep the legacy contract honest (I3): ``browser_heartbeat`` is only
+    # reported once the extension has actually recorded a login-state check.
+    verify_method = "browser_heartbeat" if stored else "none"
+    heartbeat: dict[str, Any] = {
+        "auth_required": False,
+        "verify_method": verify_method,
+        "verify_ttl_seconds": _HEARTBEAT_TTL_SECONDS if stored else None,
+        "can_verify_now": bool(stored),
+        "capabilities": capabilities,
+        "legacy_state": "no_auth",
+        "legacy_logged_in": True,
+    }
+    if stored and fresh:
+        return SourceAuthContract(
+            **heartbeat,
+            credential="present",
+            credential_origin="extension",
+            verification="verified",
+            verified_at=str(when),
+            detail="微博公开发现可匿名；浏览器已登录，可导入本人只读事件。",
+        )
+    if stored and when:
+        return SourceAuthContract(
+            **heartbeat,
+            credential="present",
+            credential_origin="extension",
+            verification="stale",
+            verified_at=str(when),
+            detail="微博公开发现可匿名；浏览器登录态已过期，请连接插件刷新。",
+        )
+    return SourceAuthContract(
+        **heartbeat,
+        credential="none",
+        credential_origin="none",
+        verification="unverified",
+        detail="微博公开发现可匿名；初始化本人收藏、关注和互动需要登录微博并连接插件。",
+    )
+
+
+def _weibo_capabilities(
+    personal_readiness: CapabilityReadiness,
+) -> dict[str, SourceCapabilityAuth]:
+    """Return Weibo's anonymous-discover/private-bootstrap matrix."""
+
+    return {
+        "discover": SourceCapabilityAuth(
+            mode="anonymous",
+            required=True,
+            readiness="ready",
+            detail="搜索、热搜和公开作者时间线无需登录。",
+        ),
+        "profile": SourceCapabilityAuth(
+            mode="login-required",
+            required=True,
+            readiness=personal_readiness,
+            detail="初始化本人收藏、关注和互动需要微博浏览器登录态。",
+        ),
+        "bootstrap": SourceCapabilityAuth(
+            mode="login-required",
+            required=True,
+            readiness=personal_readiness,
+            detail="个人事件只在微博同源浏览器任务中读取，后端不接收 Cookie。",
+        ),
+        "cookie-sync": SourceCapabilityAuth(
+            mode="optional-credential",
+            required=False,
+            readiness=personal_readiness,
+            detail="插件仅上报布尔登录状态；游客 SUB 不算登录凭据。",
+        ),
+    }
+
+
+def weibo_capability_readiness(ctx: SourceAuthContext) -> dict[str, SourceCapabilityAuth]:
+    """Public readiness helper used by guided init and source status."""
+
+    return auth_weibo(ctx).capabilities
 
 
 # ── X (Twitter) ──────────────────────────────────────────────────────
@@ -1152,6 +1281,643 @@ def auth_bangumi(ctx: SourceAuthContext) -> SourceAuthContract:
     )
 
 
+V2EX_CAPABILITY_AUTH_MODES: dict[str, tuple[str, bool]] = {
+    "discover": ("optional-credential", True),
+    "profile": ("login-required", True),
+    "bootstrap": ("login-required", True),
+    "incremental": ("login-required", True),
+    "cookie-sync": ("login-required", False),
+}
+
+
+def _v2ex_capability_state(
+    ctx: SourceAuthContext,
+    *,
+    configured_username: object | None = None,
+) -> tuple[dict[str, SourceCapabilityAuth], Any, str]:
+    """Return V2EX capability readiness without performing network I/O."""
+
+    from openbiliclaw.sources.v2ex_identity import (
+        resolve_v2ex_identity_state,
+    )
+
+    browser_logged_in, browser_when, browser_fresh = _login_heartbeat(
+        ctx.database,
+        getter="get_v2ex_login_state",
+        fresh_hours=_V2EX_LOGIN_FRESH_HOURS,
+    )
+    resolution = resolve_v2ex_identity_state(
+        cfg=ctx.cfg,
+        database=ctx.database,
+        probes=ctx.probes,
+        configured_username=configured_username,
+    )
+    browser_detail = ""
+    if browser_logged_in and browser_fresh:
+        browser_detail = "浏览器已登录"
+        browser_username = resolution.claims.get("browser", "")
+        if browser_username:
+            browser_detail += f" · {browser_username}"
+    elif browser_when and not browser_fresh:
+        browser_detail = "浏览器登录态已过期"
+
+    discover = SourceCapabilityAuth(
+        mode="optional-credential",
+        required=True,
+        ready=True,
+        state="ready",
+        detail="公开 API 与 Feed 可匿名发现；PAT 仅用于增强。",
+    )
+    private_state: CapabilityReadinessState
+    if resolution.status == "identity_mismatch":
+        private_state = "identity_mismatch"
+        private_detail = "账号证据冲突；请先确认要使用的 V2EX 账号。"
+    elif not browser_logged_in:
+        private_state = "login_required"
+        private_detail = "浏览器尚未登录 V2EX；公开发现仍可使用。"
+    elif not browser_fresh:
+        private_state = "stale"
+        private_detail = "浏览器登录心跳已过期；请打开 V2EX 后让扩展重新同步。"
+    elif not resolution.claims.get("browser"):
+        private_state = "identity_required"
+        private_detail = "已检测到登录态，但尚未可靠识别当前 V2EX 用户。"
+    elif not resolution.private_bootstrap_available:
+        private_state = "identity_required"
+        private_detail = "浏览器账号尚未通过后端身份解析，账号初始化暂停。"
+    else:
+        private_state = "ready"
+        private_detail = f"浏览器账号 {resolution.username} 已就绪，可只读初始化。"
+
+    private_ready = private_state == "ready"
+    active_profile_username = ""
+    if hasattr(ctx.database, "get_v2ex_profile_identity"):
+        try:
+            active_profile_username = str(ctx.database.get_v2ex_profile_identity()[0] or "").strip()
+        except Exception:  # pragma: no cover - defensive storage fallback
+            active_profile_username = ""
+    incremental_switch_required = bool(
+        private_ready
+        and active_profile_username
+        and active_profile_username.casefold() != resolution.username.casefold()
+    )
+    incremental_state: CapabilityReadinessState = (
+        "identity_switch_required" if incremental_switch_required else private_state
+    )
+    incremental_detail = (
+        f"当前画像属于 V2EX 账号 {active_profile_username}；"
+        f"请用账号 {resolution.username} 完整重新初始化后再恢复增量同步。"
+        if incremental_switch_required
+        else private_detail
+    )
+    capabilities = {
+        "discover": discover,
+        "profile": SourceCapabilityAuth(
+            mode="login-required",
+            required=True,
+            ready=private_ready,
+            state=private_state,
+            detail=private_detail,
+        ),
+        "bootstrap": SourceCapabilityAuth(
+            mode="login-required",
+            required=True,
+            ready=private_ready,
+            state=private_state,
+            detail=private_detail,
+        ),
+        "incremental": SourceCapabilityAuth(
+            mode="login-required",
+            required=True,
+            ready=private_ready and not incremental_switch_required,
+            state=incremental_state,
+            detail=incremental_detail,
+        ),
+        "cookie-sync": SourceCapabilityAuth(
+            mode="login-required",
+            required=False,
+            ready=bool(browser_logged_in and browser_fresh),
+            state=(
+                "ready"
+                if browser_logged_in and browser_fresh
+                else "stale"
+                if browser_when and not browser_fresh
+                else "login_required"
+            ),
+            detail=(
+                "浏览器登录状态心跳正常。"
+                if browser_logged_in and browser_fresh
+                else "等待浏览器扩展上报 V2EX 登录状态。"
+            ),
+        ),
+    }
+    return capabilities, resolution, browser_detail
+
+
+def v2ex_capability_readiness(
+    ctx: SourceAuthContext,
+    *,
+    configured_username: object | None = None,
+) -> dict[str, SourceCapabilityAuth]:
+    """Public backend-owned readiness registry used by status and guided init."""
+
+    capabilities, _, _ = _v2ex_capability_state(
+        ctx,
+        configured_username=configured_username,
+    )
+    return capabilities
+
+
+def auth_v2ex(ctx: SourceAuthContext) -> SourceAuthContract:
+    """V2EX: anonymous-public, optional PAT, and separate browser heartbeat."""
+
+    from openbiliclaw.sources.v2ex_identity import v2ex_identity_detail
+
+    cfg = ctx.source_cfg("v2ex")
+    token_env = str(getattr(cfg, "token_env", "OPENBILICLAW_V2EX_TOKEN") or "").strip()
+    env_token = str(os.environ.get(token_env, "") or "").strip() if token_env else ""
+    config_token = str(getattr(cfg, "access_token", "") or "").strip()
+    token = env_token or config_token
+    capabilities, resolution, browser_detail = _v2ex_capability_state(ctx)
+    identity_detail = v2ex_identity_detail(resolution)
+    if not token:
+        detail = _V2EX_ANONYMOUS_DETAIL
+        if browser_detail:
+            detail += f" · {browser_detail}"
+        if identity_detail:
+            detail += f" · {identity_detail}"
+        return SourceAuthContract(
+            auth_required=False,
+            credential="none",
+            credential_origin="none",
+            verification="unverified",
+            verify_method="none",
+            verify_ttl_seconds=None,
+            can_verify_now=False,
+            detail=detail,
+            capabilities=capabilities,
+            legacy_state="no_auth",
+            legacy_logged_in=True,
+        )
+    verification, verified_at = _probe_verdict(
+        ctx,
+        "v2ex",
+        credential="present",
+        cookie=token,
+    )
+    detail = _V2EX_TOKEN_DETAIL.get(verification, _V2EX_TOKEN_DETAIL["unverified"])
+    if browser_detail:
+        detail += f" · {browser_detail}"
+    if identity_detail:
+        detail += f" · {identity_detail}"
+    return SourceAuthContract(
+        auth_required=False,
+        credential="present",
+        credential_origin="env" if env_token else "config",
+        verification=verification,
+        verify_method="live_probe",
+        verified_at=verified_at,
+        verify_ttl_seconds=_probe_ttl(verification),
+        can_verify_now=True,
+        detail=detail,
+        capabilities=capabilities,
+        legacy_state="no_auth",
+        legacy_logged_in=True,
+    )
+
+
+def _linuxdo_capabilities(
+    personal_readiness: CapabilityReadiness,
+    *,
+    heartbeat_readiness: CapabilityReadiness | None = None,
+) -> dict[str, SourceCapabilityAuth]:
+    """Return the frozen Linux.do per-capability auth matrix."""
+
+    personal = personal_readiness  # keep construction below compact/readable
+    return {
+        "discover": SourceCapabilityAuth(
+            mode="anonymous",
+            required=True,
+            readiness="ready",
+            detail="公开 search/hot/feed/creator/related 无需个人账号凭据。",
+        ),
+        "profile": SourceCapabilityAuth(
+            mode="login-required",
+            required=True,
+            readiness=personal,
+            detail="画像信号需要浏览器会话，并由 /session/current.json 正面确认账号。",
+        ),
+        "bootstrap": SourceCapabilityAuth(
+            mode="login-required",
+            required=True,
+            readiness=personal,
+            detail="收藏、点赞和阅读记录需要已登录的 Linux.do 浏览器会话。",
+        ),
+        "incremental": SourceCapabilityAuth(
+            mode="login-required",
+            required=True,
+            readiness=personal,
+            detail="周期个人信号同步需要已登录的 Linux.do 浏览器会话。",
+        ),
+        "cookie-sync": SourceCapabilityAuth(
+            mode="optional-credential",
+            required=False,
+            readiness=(heartbeat_readiness or personal),
+            detail="Cookie 心跳只是观察证据，不等同于账号身份已验证。",
+        ),
+    }
+
+
+LINUXDO_CAPABILITY_AUTH_MODES: dict[str, tuple[str, bool]] = {
+    "discover": ("anonymous", True),
+    "profile": ("login-required", True),
+    "bootstrap": ("login-required", True),
+    "incremental": ("login-required", True),
+    "cookie-sync": ("optional-credential", False),
+}
+
+
+def _linuxdo_login_required_payload(payload: dict[str, Any]) -> bool:
+    error_code = str(payload.get("error", "") or "").strip()
+    debug = payload.get("debug")
+    codes = [error_code]
+    if isinstance(debug, dict):
+        codes.append(str(debug.get("code", "") or "").strip())
+        for key in ("scope_errors", "input_errors"):
+            errors = debug.get(key)
+            if isinstance(errors, dict):
+                codes.extend(str(value or "").strip() for value in errors.values())
+    return bool(isinstance(debug, dict) and debug.get("login_required")) or any(
+        code in {"linuxdo_login_required", "login_required", "not_logged_in"} for code in codes
+    )
+
+
+def _linuxdo_task_evidence_fresh(value: object) -> bool:
+    """Whether a personal task still describes a plausibly live browser session."""
+
+    timestamp = _utc_timestamp(value)
+    if timestamp is None:
+        return False
+    age = datetime.now(UTC) - timestamp
+    return -timedelta(minutes=5) <= age <= timedelta(hours=_LINUXDO_LOGIN_FRESH_HOURS)
+
+
+def auth_linuxdo(ctx: SourceAuthContext) -> SourceAuthContract:
+    """Linux.do public discovery plus login-required personal capabilities.
+
+    A heartbeat admits a browser task but never verifies identity. A newer
+    bootstrap outcome from ``/session/current.json`` is authoritative and may
+    therefore override an older positive cookie observation.
+    """
+    stored, when, fresh = _login_heartbeat(
+        ctx.database,
+        getter="get_linuxdo_login_state",
+        fresh_hours=_LINUXDO_LOGIN_FRESH_HOURS,
+    )
+    # A real /session/current.json result is stronger than cookie presence.
+    # Read the latest personal task separately so a newer public discovery row
+    # cannot hide an authoritative login failure.
+    auth_row = None
+    db_conn = getattr(ctx.database, "conn", None)
+    if db_conn is not None and hasattr(db_conn, "execute"):
+        with suppress(Exception):
+            auth_row = db_conn.execute(
+                """
+                SELECT status, result_json,
+                       COALESCE(completed_at, claimed_at, created_at)
+                FROM linuxdo_tasks
+                WHERE type = 'bootstrap_events'
+                  AND status IN ('pending', 'in_progress', 'completed', 'failed')
+                ORDER BY CASE WHEN status IN ('completed', 'failed') THEN 0 ELSE 1 END,
+                         COALESCE(completed_at, claimed_at, created_at) DESC,
+                         created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+    heartbeat_at = _utc_timestamp(when)
+    if auth_row is not None:
+        auth_status = str(_row_value(auth_row, "status", 0) or "").strip()
+        auth_payload = _json_dict(_row_value(auth_row, "result_json", 1))
+        auth_at = str(auth_row[2] or "")
+        auth_timestamp = _utc_timestamp(auth_at)
+        auth_is_fresh = _linuxdo_task_evidence_fresh(auth_at)
+        auth_is_newer = bool(
+            auth_timestamp is not None and (heartbeat_at is None or auth_timestamp >= heartbeat_at)
+        )
+        auth_terminal = str(auth_payload.get("_openbiliclaw_terminal_status", "") or "").strip()
+        auth_completed = auth_status == "completed" or auth_terminal in {
+            "ok",
+            "empty",
+            "degraded",
+            "completed",
+        }
+        if (
+            auth_status == "failed"
+            and auth_is_fresh
+            and _linuxdo_login_required_payload(auth_payload)
+        ):
+            # A real `/session/current.json` rejection is authoritative until
+            # a later personal task positively verifies another session.  A
+            # newer `_t`-presence heartbeat is only an observation and must
+            # never turn that rejection back into `ready` on its own.
+            return SourceAuthContract(
+                auth_required=False,
+                credential="none",
+                credential_origin="none",
+                verification="failed",
+                verify_method="task_history",
+                verified_at=auth_at,
+                verify_ttl_seconds=None,
+                can_verify_now=True,
+                detail=(
+                    "Linux.do 公开发现仍可用；最近任务提示需要登录，"
+                    "请在当前浏览器登录 Linux.do 后重试个人信号同步。"
+                ),
+                capabilities=_linuxdo_capabilities(
+                    "login_required",
+                    heartbeat_readiness=("ready" if stored and fresh else None),
+                ),
+                legacy_state="no_auth",
+                legacy_logged_in=True,
+            )
+        if auth_is_newer and auth_is_fresh and auth_completed:
+            items = auth_payload.get("items")
+            item_count = len(items) if isinstance(items, list) else 0
+            outcome = {
+                "ok": "成功",
+                "empty": "空结果",
+                "degraded": "降级完成",
+                "completed": "完成",
+                "": "完成",
+            }.get(auth_terminal, "完成")
+            return SourceAuthContract(
+                auth_required=False,
+                credential="present",
+                credential_origin="extension",
+                verification="verified",
+                verify_method="task_history",
+                verified_at=auth_at,
+                verify_ttl_seconds=_HEARTBEAT_TTL_SECONDS,
+                can_verify_now=True,
+                detail=(
+                    f"Linux.do 公开发现可用；最近个人信号同步{outcome}"
+                    f"（{item_count} 条），浏览器会话可用于收藏、点赞和阅读记录。"
+                ),
+                capabilities=_linuxdo_capabilities(
+                    "ready",
+                    heartbeat_readiness=("ready" if stored and fresh else None),
+                ),
+                legacy_state="no_auth",
+                legacy_logged_in=True,
+            )
+    if when and stored and fresh:
+        return SourceAuthContract(
+            auth_required=False,
+            credential="present",
+            credential_origin="extension",
+            verification="unverified",
+            verify_method="browser_heartbeat",
+            verified_at=str(when),
+            verify_ttl_seconds=_HEARTBEAT_TTL_SECONDS,
+            can_verify_now=True,
+            detail=("Linux.do 公开发现可用；浏览器登录态已连接，可同步个人收藏、点赞和阅读记录。"),
+            capabilities=_linuxdo_capabilities("ready", heartbeat_readiness="ready"),
+            legacy_state="no_auth",
+            legacy_logged_in=True,
+        )
+    if when and stored:
+        return SourceAuthContract(
+            auth_required=False,
+            credential="present",
+            credential_origin="extension",
+            verification="stale",
+            verify_method="browser_heartbeat",
+            verified_at=str(when),
+            verify_ttl_seconds=_HEARTBEAT_TTL_SECONDS,
+            can_verify_now=True,
+            detail="Linux.do 公开发现仍可用；个人登录态已过期，请连接插件刷新。",
+            capabilities=_linuxdo_capabilities("stale", heartbeat_readiness="stale"),
+            legacy_state="no_auth",
+            legacy_logged_in=True,
+        )
+    if when:
+        return SourceAuthContract(
+            auth_required=False,
+            credential="none",
+            credential_origin="none",
+            verification="failed",
+            verify_method="browser_heartbeat",
+            verified_at=str(when),
+            verify_ttl_seconds=_HEARTBEAT_TTL_SECONDS,
+            can_verify_now=True,
+            detail="Linux.do 公开发现可用；浏览器当前未登录，个人信号同步暂不可用。",
+            capabilities=_linuxdo_capabilities(
+                "login_required", heartbeat_readiness="login_required"
+            ),
+            legacy_state="no_auth",
+            legacy_logged_in=True,
+        )
+
+    row = None
+    db_conn = getattr(ctx.database, "conn", None)
+    if db_conn is not None and hasattr(db_conn, "execute"):
+        with suppress(Exception):
+            row = db_conn.execute(
+                """
+                SELECT type, status, result_json,
+                       COALESCE(completed_at, claimed_at, created_at)
+                FROM linuxdo_tasks
+                WHERE type IN ('bootstrap_events', 'search', 'hot', 'feed', 'creator', 'related')
+                  AND status IN ('pending', 'in_progress', 'completed', 'failed')
+                ORDER BY COALESCE(completed_at, claimed_at, created_at) DESC,
+                         created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+
+    if row is not None:
+        task_type = str(_row_value(row, "type", 0) or "").strip()
+        status = str(_row_value(row, "status", 1) or "").strip()
+        payload = _json_dict(_row_value(row, "result_json", 2))
+        at = ""
+        with suppress(Exception):
+            # The COALESCE expression has no stable sqlite row name.
+            at = str(row[3] or "")
+
+        items = payload.get("items")
+        item_count = len(items) if isinstance(items, list) else 0
+        error_code = str(payload.get("error", "") or "").strip()
+        debug = payload.get("debug")
+        debug_codes: list[str] = []
+        if isinstance(debug, dict):
+            debug_codes.append(str(debug.get("code", "") or "").strip())
+            for key in ("scope_errors", "input_errors"):
+                errors = debug.get(key)
+                if isinstance(errors, dict):
+                    debug_codes.extend(str(value or "").strip() for value in errors.values())
+        login_required = bool(isinstance(debug, dict) and debug.get("login_required")) or any(
+            code in {"linuxdo_login_required", "login_required", "not_logged_in"}
+            for code in (error_code, *debug_codes)
+        )
+        terminal_status = (
+            str(payload.get("_openbiliclaw_terminal_status", "") or "").strip().lower()
+        )
+        positive_terminal = terminal_status in {"ok", "empty", "degraded", "completed"}
+        completed = (status == "completed" and not terminal_status) or positive_terminal
+        history: dict[str, Any] = {
+            "auth_required": False,
+            "verify_method": "task_history",
+            "verify_ttl_seconds": _HEARTBEAT_TTL_SECONDS,
+            # The explicit verify action still asks the extension for a fresh
+            # heartbeat; history describes only the standing verdict.
+            "can_verify_now": True,
+            "legacy_state": "no_auth",
+            "legacy_logged_in": True,
+        }
+
+        task_evidence_fresh = _linuxdo_task_evidence_fresh(at)
+        if completed and task_type == "bootstrap_events" and not task_evidence_fresh:
+            return SourceAuthContract(
+                **history,
+                credential="present",
+                credential_origin="extension",
+                verification="stale",
+                verified_at=at,
+                detail=(
+                    "Linux.do 公开发现可用；最近个人信号任务已超过登录证据有效期，"
+                    "请连接插件刷新后再同步收藏、点赞和阅读记录。"
+                ),
+                capabilities=_linuxdo_capabilities("stale"),
+            )
+
+        if completed and task_type == "bootstrap_events":
+            outcome = {
+                "ok": "成功",
+                "empty": "空结果",
+                "degraded": "降级完成",
+                "completed": "完成",
+                "": "完成",
+            }.get(terminal_status, "完成")
+            return SourceAuthContract(
+                **history,
+                credential="present",
+                credential_origin="extension",
+                verification="verified",
+                verified_at=at,
+                detail=(
+                    f"Linux.do 公开发现可用；最近个人信号同步{outcome}"
+                    f"（{item_count} 条），浏览器会话可用于收藏、点赞和阅读记录。"
+                ),
+                capabilities=_linuxdo_capabilities("ready"),
+            )
+
+        if completed:
+            outcome = "降级完成" if terminal_status == "degraded" else "完成"
+            return SourceAuthContract(
+                **history,
+                credential="none",
+                credential_origin="none",
+                verification="unverified",
+                detail=(
+                    f"Linux.do 公开发现最近任务{outcome}（{task_type}，{item_count} 条）；"
+                    "公开任务不证明浏览器已登录，个人信号仍需登录态。"
+                ),
+                capabilities=_linuxdo_capabilities("unverified"),
+            )
+
+        if status == "failed" and login_required and task_evidence_fresh:
+            return SourceAuthContract(
+                **history,
+                credential="none",
+                credential_origin="none",
+                verification="failed",
+                verified_at=at,
+                detail=(
+                    "Linux.do 公开发现仍可用；最近任务提示需要登录，"
+                    "请在当前浏览器登录 Linux.do 后重试个人信号同步。"
+                ),
+                capabilities=_linuxdo_capabilities("login_required"),
+            )
+
+        if status == "failed" and login_required:
+            return SourceAuthContract(
+                **history,
+                credential="none",
+                credential_origin="none",
+                verification="unverified",
+                verified_at=at,
+                detail=(
+                    "Linux.do 公开发现仍可用；历史任务曾提示需要登录，但该证据已过期，"
+                    "请连接插件重新确认后再同步个人信号。"
+                ),
+                capabilities=_linuxdo_capabilities("unverified"),
+            )
+
+        if status == "completed":
+            return SourceAuthContract(
+                **history,
+                credential="none",
+                credential_origin="none",
+                verification="unverified",
+                detail=(
+                    f"Linux.do 最近任务已结束（{task_type}），但结果状态无法识别；"
+                    "公开发现仍可用，个人登录态尚未确认。"
+                ),
+                capabilities=_linuxdo_capabilities("unverified"),
+            )
+
+        if status == "failed":
+            suffix = f"：{error_code}" if error_code else ""
+            return SourceAuthContract(
+                **history,
+                credential="none",
+                credential_origin="none",
+                verification="unverified",
+                detail=(
+                    f"Linux.do 最近任务失败（{task_type}）{suffix}；"
+                    "公开发现仍可用，该运行错误无法判断个人登录态。"
+                ),
+                capabilities=_linuxdo_capabilities("unverified"),
+            )
+
+        if status in {"pending", "in_progress"}:
+            return SourceAuthContract(
+                **history,
+                credential="none",
+                credential_origin="none",
+                verification="unverified",
+                detail=(
+                    f"Linux.do 任务正在等待插件执行（{task_type} / {status}）；公开发现无需登录。"
+                ),
+                capabilities=_linuxdo_capabilities("unverified"),
+            )
+
+    return SourceAuthContract(
+        auth_required=False,
+        credential="none",
+        credential_origin="none",
+        verification="unverified",
+        verify_method="none",
+        verify_ttl_seconds=None,
+        can_verify_now=True,
+        detail="Linux.do 公开发现无需登录；连接已登录插件后可同步个人收藏、点赞和阅读记录。",
+        capabilities=_linuxdo_capabilities("unverified"),
+        legacy_state="no_auth",
+        legacy_logged_in=True,
+    )
+
+
+def linuxdo_capability_readiness(ctx: SourceAuthContext) -> dict[str, SourceCapabilityAuth]:
+    """Return Linux.do's public/private capability admission matrix."""
+
+    return auth_linuxdo(ctx).capabilities
+
+
+# ── registry ─────────────────────────────────────────────────────────
+
+#: Slug -> provider. Keys and order define the ``SourcesStatusResponse`` fields,
+#: so adding a platform means adding one entry and one provider here rather than
+#: editing the endpoint.
+
 # ── registry ─────────────────────────────────────────────────────────
 
 #: Slug -> provider. Keys and order define the ``SourcesStatusResponse`` fields,
@@ -1166,6 +1932,9 @@ SOURCE_AUTH_PROVIDERS: dict[str, Callable[[SourceAuthContext], SourceAuthContrac
     "zhihu": auth_zhihu,
     "reddit": auth_reddit,
     "bangumi": auth_bangumi,
+    "linuxdo": auth_linuxdo,
+    "v2ex": auth_v2ex,
+    "weibo": auth_weibo,
 }
 
 

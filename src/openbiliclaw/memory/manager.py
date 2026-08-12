@@ -34,6 +34,8 @@ SUPPORTED_EVENT_TYPES = frozenset(
         "like",
         "coin",
         "comment",
+        "discussion_reply",
+        "publish",
         "click",
         "scroll",
         "hover",
@@ -1108,6 +1110,7 @@ class MemoryManager:
         limit: int = 100,
         satisfaction_modes: frozenset[str] | None = None,
         after_event_id: int | None = None,
+        include_profile_inactive: bool = False,
     ) -> list[dict[str, Any]]:
         """Query persisted events from the SQLite-backed event layer."""
         return self._database.query_events(
@@ -1118,6 +1121,7 @@ class MemoryManager:
             limit=limit,
             satisfaction_modes=satisfaction_modes,
             after_event_id=after_event_id,
+            include_profile_inactive=include_profile_inactive,
         )
 
     def query_events_since(

@@ -158,11 +158,32 @@ def check_legacy_consistency(platform: str, contract: SourceAuthContract) -> lis
     # its personal token — genuinely can verify that credential, and saying so is
     # honest, not an overclaim. The gate is credential presence, not
     # ``auth_required`` alone: a method only needs backing when there is a
-    # credential it could be about.
+    # credential it could be about. One narrow exception is a browser
+    # heartbeat that positively reports an optional session is logged out:
+    # that is real negative evidence about the personal tier even though the
+    # public source itself remains anonymous and stores no credential.
+    optional_login_evidence_without_credential = (
+        not contract.auth_required
+        and contract.credential == "none"
+        and (
+            (contract.verify_method == "browser_heartbeat" and contract.verification == "failed")
+            # Linux.do discovery is anonymous-public, so task history can
+            # truthfully report an explicit login rejection or an operational
+            # result without inventing a stored credential. Keep this exception
+            # platform-specific: no other optional-auth source currently has
+            # an extension task-history channel with this meaning.
+            or (
+                platform == "linuxdo"
+                and contract.verify_method == "task_history"
+                and contract.verification in {"failed", "unverified"}
+            )
+        )
+    )
     if (
         contract.verify_method != "none"
         and not contract.auth_required
         and contract.credential == "none"
+        and not optional_login_evidence_without_credential
     ):
         problems.append(
             f"{platform}: auth_required=False with credential='none' should not carry "

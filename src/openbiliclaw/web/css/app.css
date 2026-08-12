@@ -365,7 +365,9 @@ body.chat-view-active .back-to-top {
   display: flex;
   align-items: flex-start;
   aspect-ratio: auto;
-  min-height: 96px;
+  box-sizing: border-box;
+  min-height: 88px;
+  max-height: 116px;
   padding: 12px 114px 12px 14px;
   background: var(--surface-soft);
 }
@@ -379,7 +381,7 @@ body.chat-view-active .back-to-top {
   white-space: pre-wrap;
   word-break: break-word;
   display: -webkit-box;
-  -webkit-line-clamp: 6;
+  -webkit-line-clamp: 4;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
@@ -439,11 +441,13 @@ body.chat-view-active .back-to-top {
 .card-source[data-source="bilibili"] { background: var(--brand-soft); color: var(--brand); }
 .card-source[data-source="xiaohongshu"] { background: rgba(255, 45, 85, 0.1); color: #ff2d55; }
 .card-source[data-source="douyin"] { background: rgba(0, 0, 0, 0.06); color: #161823; }
+.card-source[data-source="weibo"] { background: rgba(230, 22, 45, 0.1); color: #e6162d; }
 .card-source[data-source="youtube"] { background: rgba(255, 0, 0, 0.08); color: #ff0000; }
 .card-source[data-source="twitter"] { background: rgba(15, 23, 42, 0.08); color: #0f172a; }
 .card-source[data-source="zhihu"] { background: rgba(15, 136, 235, 0.1); color: #0f88eb; }
 .card-source[data-source="reddit"] { background: rgba(255, 69, 0, 0.1); color: #d93f00; }
 .card-source[data-source="bangumi"] { background: rgba(105, 80, 161, 0.12); color: #6950a1; }
+.card-source[data-source="v2ex"] { background: rgba(0, 160, 160, 0.12); color: #087f83; }
 
 .card-expression {
   margin-top: 8px;
@@ -680,7 +684,7 @@ body.chat-view-active .back-to-top {
 }
 
 .delight-thumb::before {
-  content: "荐";
+  content: none;
   position: absolute;
   top: 5px;
   left: 5px;
@@ -708,6 +712,27 @@ body.chat-view-active .back-to-top {
 
 .delight-thumb.is-fallback::after {
   display: none;
+}
+
+.delight-thumb.is-text-card {
+  aspect-ratio: auto;
+  min-height: 92px;
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: 10px;
+}
+
+.delight-thumb-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .delight-thumb img {

@@ -276,7 +276,7 @@
   <header>
     <h1>Soul 模块架构全景</h1>
     <p class="subtitle">这张图按当前源码梳理 Soul 的真实写回口：哪些输入会进入 ProfileUpdatePipeline，哪些后台 loop 会定时触发，哪些路径会完整 rebuild，哪些只是局部写回或读时覆盖。</p>
-    <p class="stamp">docs/diagrams/soul-architecture.html · updated 2026-06-17 · source-aligned architecture map</p>
+    <p class="stamp">docs/diagrams/soul-architecture.html · updated 2026-08-09 · source-aligned architecture map</p>
     <div class="legend" aria-label="图例">
       <span><i class="dot" style="background:var(--blue)"></i>外部输入</span>
       <span><i class="dot" style="background:var(--green)"></i>局部写回</span>
@@ -294,15 +294,18 @@
           <div class="lane-title">输入来源</div>
           <div class="lane-body">
             <article class="card blue">
-              <h3>五源扩展账号 bootstrap</h3>
-              <p>初始化或扩展在线周期回拉复用既有任务；五源全局串行，回传先经 staged durable ingress 和原子有界 seen-key，再由画像 owner 消费。</p>
+              <h3>六源扩展账号 bootstrap</h3>
+              <p>初始化或扩展在线周期回拉复用既有任务；六源全局串行，回传先经 staged durable ingress 和原子有界 seen-key，再由画像 owner 消费。</p>
               <ul>
                 <li>XHS: saved / liked / history</li>
                 <li>Douyin: post / collect / like / follow</li>
                 <li>YouTube: history / subscriptions / likes</li>
                 <li>Zhihu: history / collection / activity</li>
                 <li>Reddit: saved / upvoted / subscribed</li>
+                <li>Linux.do: bookmarks / likes / read history（同源 GET；Cookie 不上传）</li>
+                <li>V2EX: topics / replies / favorite topics / favorite nodes</li>
               </ul>
+              <p>V2EX 先按 PAT / 浏览器 / 用户接受身份做账号隔离；身份冲突暂停画像写入。收藏 scope 仅以完整快照推进缺失计数，连续两次确认后经持久 outbox 生成 retraction，重新出现则恢复。</p>
             </article>
             <article class="card blue">
               <h3>推荐点击</h3>

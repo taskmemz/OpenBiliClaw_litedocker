@@ -3,7 +3,7 @@
 **Why the status endpoint reads a cache instead of probing.**
 
 ``GET /api/sources/status`` is polled by every open settings page (desktop Web,
-extension popup) on a ~30s timer. Two of the seven platforms can be verified by
+extension popup) on a ~30s timer. Some credential-backed platforms can be verified by
 an outbound request — B站's nav endpoint and 抖音's
 ``/aweme/v1/web/user/profile/self/`` (spec D11) — and the naive wiring would
 fire that request from the status handler. That is exactly the shape that gets

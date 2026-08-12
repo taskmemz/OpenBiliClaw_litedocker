@@ -3,7 +3,8 @@
 生效日期：2026-05-31
 更新日期：2026-08-09
 
-OpenBiliClaw 是一个本地优先的跨平台内容发现 AI Agent。浏览器插件的单一用途是：在用户访问 Bilibili、小红书、抖音、YouTube 等受支持内容平台时，采集用户授权范围内的浏览、互动和内容信号，发送到用户自己配置的 OpenBiliClaw 后端，用于构建个人兴趣画像、改进内容推荐、同步收藏 / 稍后再看状态和展示本地通知。
+OpenBiliClaw 是一个本地优先的跨平台内容发现 AI Agent。浏览器插件的单一用途是：在用户访问 Bilibili、小红书、抖音、YouTube、X、知乎、Reddit、Linux.do 等受支持内容平台时，采集用户授权范围内的浏览、互动和内容信号，发送到用户自己配置的 OpenBiliClaw 后端，用于构建个人兴趣画像、改进内容推荐、同步收藏 / 稍后再看状态和展示本地通知。
+OpenBiliClaw 是一个本地优先的跨平台内容发现 AI Agent。浏览器插件的单一用途是：在用户访问 Bilibili、小红书、抖音、YouTube、V2EX 等受支持内容平台时，采集用户授权范围内的浏览、互动和内容信号，发送到用户自己配置的 OpenBiliClaw 后端，用于构建个人兴趣画像、改进内容推荐、同步收藏 / 稍后再看状态和展示本地通知。
 
 本政策说明 OpenBiliClaw 浏览器插件与本地后端如何处理数据。插件不会把数据发送到 OpenBiliClaw 开发者运营的服务器；Chrome Web Store / AMO 发布包默认只声明本机后端权限，数据流向通常是用户本机运行的 OpenBiliClaw 后端。
 
@@ -13,11 +14,12 @@ OpenBiliClaw 是一个本地优先的跨平台内容发现 AI Agent。浏览器�
 
 | 类型 | 示例 | 用途 |
 |------|------|------|
-| 账号与身份相关信息 | 平台用户 ID、昵称、头像、Bilibili / 抖音等站点 cookie 或会话字段 | 让本地后端以用户已登录身份读取用户授权可见的数据，完成初始化画像、历史 / 收藏 / 点赞同步和内容任务 |
-| 身份验证信息 | 受支持站点的登录 cookie、CSRF token 或页面内请求所需 token | 仅用于用户配置的本地后端访问对应平台，不用于 OpenBiliClaw 开发者服务器 |
+| 账号与身份相关信息 | 平台用户 ID、昵称、头像、Bilibili / 抖音等站点 cookie 或会话字段；Linux.do 只单独上报登录布尔，`/session/current.json` 确认的当前用户名只在任务 tab 内用于构造个人只读路径 | 让本地后端以用户已登录身份读取用户授权可见的数据，完成初始化画像、历史 / 收藏 / 点赞同步和内容任务 |
+| 身份验证信息 | 受支持站点的登录 cookie、CSRF token 或页面内请求所需 token；Linux.do `_t` 只在浏览器内转换成布尔，其值不上传 | 仅用于用户配置的本地后端访问对应平台，不用于 OpenBiliClaw 开发者服务器 |
 | 网络记录 | 受支持平台的页面 URL、页面标题、访问时间、视频 / 笔记 / 页面 ID | 识别用户正在浏览的内容，生成行为事件和推荐上下文 |
 | 用户活动 | 点击、搜索、滚动、停留时长、观看时长、喜欢 / 不喜欢、收藏、稍后再看、关注等行为 | 构建和更新兴趣画像，改进推荐排序，过滤不感兴趣内容 |
 | 网站内容 | 页面上可见的文字、封面图 URL、视频 / 笔记标题、作者、标签、描述、链接、统计信息等元数据 | 理解内容主题、生成候选池、去重和解释推荐理由 |
+| V2EX 只读任务字段 | Topic / Node 的公开 ID、标题、URL、作者、Node、时间、回复摘录，以及布尔登录状态 | 执行用户主动触发的四个 bootstrap scope、聚合讨论事件和生成 Node 偏好；不用于站内写操作 |
 | 个人通讯 | 用户在 OpenBiliClaw 插件侧边栏聊天框中主动输入的消息；以及用户在受支持平台上**成功提交**的评论正文与 B 站弹幕正文（提交成功后经网络层采集，仅送本机后端） | 与用户配置的本地后端聊天接口交互，帮助查看画像、推荐和设置；用户亲手写的评论 / 弹幕是最强的兴趣表达之一，用于更准确地构建兴趣画像 |
 | 本地配置与 UI 状态 | 后端地址、已关闭提示、插件设置、缓存的后端配置、任务状态 | 保持插件连接、本地偏好和界面状态 |
 | 用户主动创建的迁移包 | 文件配置中的模型 / 来源 API Key 与 token、平台 Cookie、本地 SQLite、画像 / 记忆、历史、图片缓存和白名单桌面偏好；不包含源机整段 API auth（密码 / hash、session secret、设备 key 等） | 仅在用户从本机桌面配置页明确选择导出时，生成供用户自行搬到另一台机器的 `.obcbackup` |
@@ -76,12 +78,13 @@ OpenBiliClaw 插件本身不会把数据发送到 OpenBiliClaw 开发者拥有�
 |------|------|
 | `activeTab` | 在用户当前打开的受支持平台页面中识别内容并执行必要的页面动作 |
 | `alarms` | 定时重试 cookie 同步、后端连接检查和任务轮询 |
-| `cookies` | 读取用户已登录站点的必要 cookie，并同步给用户配置的本地后端用于授权访问 |
+| `cookies` | 读取用户已登录站点的必要 cookie，并按各来源最小化契约使用；Linux.do 只判断 `_t` 是否存在并上报布尔值，不同步任何 Cookie 值 |
 | `notifications` | 显示来自本地后端的推荐、任务或状态通知 |
 | `scripting` | 在受支持平台页面注入内容脚本，采集页面内容和行为信号 |
 | `sidePanel` | 提供 OpenBiliClaw 侧边栏界面 |
 | `storage` | 保存插件设置、本地 UI 状态和后端连接信息 |
-| 主机权限 | 限定在 Bilibili、小红书、抖音、YouTube 以及本机 OpenBiliClaw 后端之间读写必要数据 |
+| 主机权限 | 限定在 Bilibili、小红书、抖音、YouTube、X、知乎、Reddit、Linux.do、Bangumi 以及本机 OpenBiliClaw 后端之间处理必要数据 |
+| 主机权限 | 限定在 Bilibili、小红书、抖音、YouTube、V2EX 以及本机 OpenBiliClaw 后端之间读写必要数据 |
 
 `http://127.0.0.1/*` 和 `http://localhost/*` 用于连接用户自己的本机 OpenBiliClaw 后端。内容采集脚本只声明在受支持内容平台上运行；发布包不声明 `http://*/*`、`https://*/*` 或 `<all_urls>` 这类所有网站权限。
 
@@ -89,7 +92,11 @@ OpenBiliClaw 插件本身不会把数据发送到 OpenBiliClaw 开发者拥有�
 
 小红书 discover 搜索任务会在后台标签页运行。由于小红书在隐藏标签中可能不挂载搜索结果列表，插件的同页 MAIN world 桥会观察页面自身发出的搜索接口响应，只归一化最多 20 条与页面卡片等价的公开字段（笔记 ID / 链接、标题、作者、封面 URL、发布时间与互动计数）以及既有的内容访问 token，并把这些字段交给该标签页的 isolated task executor；不会修改请求、转发原始响应、读取 Cookie 值或采集搜索结果正文。归一化结果只用于完成用户本地后端下发的 discover 任务，发送目标仍是用户配置的 OpenBiliClaw 后端；DOM 卡片提取保留为接口结构变化时的兜底。
 
+`https://linux.do/*` 主机权限有两个限定用途：在普通页面运行统一行为 adapter；以及在扩展自己创建、带任务标记的隔离 tab 内执行 Linux.do 同源只读任务。任务只允许 GET，支持公开 search / hot / feed / creator / related discovery，以及已登录账号的 bookmarks / likes / read history bootstrap；不会发帖、点赞、收藏、关注、编辑或执行任何其他站内状态变更。个人任务先通过 `GET /session/current.json` 正面确认当前账号，`_t` Cookie 只用于判断“是否可能已登录”，插件发送给后端的始终只是 `logged_in: true|false`。Cookie 值、其他 Cookie、CSRF 数据、原始 JSON/HTML、挑战页正文均不会上传；任务结果只包含归一化后的 topic ID、标题、URL、作者、分类、tags、发布时间、互动统计、scope 计数或结构化错误。为从 MV3 worker 回收或开发热重载中恢复，扩展会在 `chrome.storage.local` 临时保存无凭据的 task payload、runner tab ID 与绝对截止时间；其中可能包含搜索词或公开 topic / creator URL，但不含 Cookie、账号 token 或站点原始响应，并会在任务终态、超时或无效恢复时删除。普通行为采集与任务 executor 互斥：任务 tab 不产生普通浏览事件。
+
 `*://*.bgm.tv/*` 和 `*://*.bangumi.tv/*` 的主机权限仅用于**账号身份识别**：读取页面公开的用户 uid（`CHOBITS_UID`）与导航栏用户名，实现零配置识别你的 Bangumi 账号，供画像初始化时读取你的公开收藏。在这两个站点上插件不读取 Cookie、不采集浏览行为、也不上传任何个人令牌；Bangumi 内容本身由本地后端通过官方匿名只读 API 获取。
+
+`*://*.v2ex.com/*` 的主机权限用于 V2EX 普通页面的只读 Topic / Node 阅读事件，以及用户主动触发的 `bootstrap_profile` / 增量任务。任务页只读取渲染后的公开 DOM：`/member/<username>` 的本人主题、`/member/<username>/replies` 的本人回复、`/my/topics` 的收藏主题和 `/my/nodes` 的收藏 Node。插件会在本地检查 V2EX 的 A2 Cookie 是否存在，但只向用户配置的后端发送 `logged_in` 布尔值，不发送 Cookie 值；可见页面中的用户名作为 `observed` 身份证据单独上报，登出心跳会清除旧 observed username，浏览器证据最多保留 72 小时。V2EX 任务结果只包含经过限制的公开字段（Topic/Node 标识、标题、URL、作者、Node、时间和最多三条代表性回复摘录），不包含页面 HTML、请求头、CSRF/once、私信、密码或浏览器完整历史。扩展只有在确认 route、页面壳和 scope 完整翻页时才上报 complete；本地后端对收藏 Topic / Node 采用连续两次完整快照缺失确认，生成的取消收藏 / 取消关注只作为本地 `retraction` 画像事件，不会向 V2EX 发请求。PAT 验证身份只保存公开 username 与当前 PAT 的单向 fingerprint，最多信任 6 小时；匹配 PAT 被明确拒绝时清除该声明，网络失败不清除。身份冲突时暂停账号数据合并；PAT 原文仍只存在于用户选择的环境变量 / 配置凭据位置。OpenBiliClaw 对 V2EX 严格只读，不发帖、不回复、不感谢、不收藏、不取消收藏、不关注 Node。
 
 ## 远程代码
 

@@ -90,6 +90,8 @@ _CANONICAL_STORAGE_KEY_PLATFORMS = frozenset(
         "twitter",
         "zhihu",
         "reddit",
+        "bangumi",
+        "v2ex",
         "web",
     }
 )
@@ -607,6 +609,10 @@ class DiscoveredContent:
     reply_count: int = 0
     retweet_count: int = 0
     bookmark_count: int = 0
+    # Metrics listed here were actually present in the upstream envelope.
+    # A zero count without this evidence means structurally unavailable, not
+    # an observed aggregate of zero.
+    engagement_available: list[str] = field(default_factory=list)
     # Catalog metrics (Bangumi and future catalog-style sources). These are
     # deliberately separate from engagement counts: a 1–10 rating is not a
     # like, and rating participants are not comments.

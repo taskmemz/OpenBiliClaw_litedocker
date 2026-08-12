@@ -410,6 +410,19 @@ export async function fetchSourcesStatus() {
   return requestJson("/sources/status", { method: "GET" });
 }
 
+export async function fetchV2exIdentity() {
+  return requestJson("/sources/v2ex/identity", { method: "GET", timeoutMs: 12_000 });
+}
+
+export async function acceptV2exBrowserIdentity(username) {
+  return requestJson("/sources/v2ex/identity", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: String(username || "").trim(), accept: true }),
+    timeoutMs: 12_000,
+  });
+}
+
 // The counterpart to fetchSourcesStatus: that one is polled and never goes out,
 // this one is an explicit user action and is the only place a platform gets
 // probed. Generous timeout because it really can reach the network — a B站 nav

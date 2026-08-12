@@ -126,6 +126,8 @@ import {
   fetchRuntimeStatus,
   fetchSourceShareSuggestion,
   fetchSourcesStatus,
+  fetchV2exIdentity,
+  acceptV2exBrowserIdentity,
   markDelightSent,
   openPendingConfirmation,
   probeConfigService,
@@ -360,6 +362,107 @@ const elements = {
   messagesBack: document.getElementById("messagesBack"),
   messagesList: document.getElementById("messagesList"),
 };
+
+const POPUP_OVERLAY_FOCUS_SELECTOR = [
+  'button:not([disabled]):not([tabindex="-1"])',
+  'a[href]:not([tabindex="-1"])',
+  'input:not([disabled]):not([tabindex="-1"])',
+  'select:not([disabled]):not([tabindex="-1"])',
+  'textarea:not([disabled]):not([tabindex="-1"])',
+  '[tabindex="0"]',
+].join(",");
+const popupOverlayReturnFocus = new WeakMap();
+const popupOverlayBackgroundState = new Map();
+let activePopupOverlay = null;
+
+function popupOverlayFocusableElements(overlay) {
+  if (!(overlay instanceof HTMLElement)) return [];
+  return Array.from(overlay.querySelectorAll(POPUP_OVERLAY_FOCUS_SELECTOR))
+    .filter((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
+}
+
+function restorePopupOverlayBackground() {
+  for (const [element, previous] of popupOverlayBackgroundState) {
+    element.inert = previous.inert;
+    if (previous.inertAttribute === null) element.removeAttribute("inert");
+    else element.setAttribute("inert", previous.inertAttribute);
+    if (previous.ariaHidden === null) element.removeAttribute("aria-hidden");
+    else element.setAttribute("aria-hidden", previous.ariaHidden);
+  }
+  popupOverlayBackgroundState.clear();
+}
+
+function openPopupOverlay(overlay, { trigger = null, initialFocus = null } = {}) {
+  if (!(overlay instanceof HTMLElement)) return;
+  if (activePopupOverlay && activePopupOverlay !== overlay) {
+    activePopupOverlay.hidden = true;
+    restorePopupOverlayBackground();
+  }
+  const focusReturnTarget = trigger instanceof HTMLElement
+    ? trigger
+    : document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+  if (focusReturnTarget) popupOverlayReturnFocus.set(overlay, focusReturnTarget);
+  overlay.hidden = false;
+  const shell = overlay.parentElement;
+  if (shell) {
+    for (const child of shell.children) {
+      if (!(child instanceof HTMLElement) || child === overlay) continue;
+      popupOverlayBackgroundState.set(child, {
+        inert: child.inert,
+        inertAttribute: child.getAttribute("inert"),
+        ariaHidden: child.getAttribute("aria-hidden"),
+      });
+      child.inert = true;
+      child.setAttribute("inert", "");
+      child.setAttribute("aria-hidden", "true");
+    }
+  }
+  activePopupOverlay = overlay;
+  const focusTarget = initialFocus instanceof HTMLElement
+    ? initialFocus
+    : popupOverlayFocusableElements(overlay)[0];
+  focusTarget?.focus({ preventScroll: true });
+}
+
+function closePopupOverlay(overlay) {
+  if (!(overlay instanceof HTMLElement)) return;
+  overlay.hidden = true;
+  if (activePopupOverlay === overlay) {
+    restorePopupOverlayBackground();
+    activePopupOverlay = null;
+  }
+  const returnFocus = popupOverlayReturnFocus.get(overlay);
+  popupOverlayReturnFocus.delete(overlay);
+  if (returnFocus instanceof HTMLElement && returnFocus.isConnected && !returnFocus.inert) {
+    returnFocus.focus({ preventScroll: true });
+  }
+}
+
+function bindPopupOverlayKeyboard(overlay, close) {
+  if (!(overlay instanceof HTMLElement)) return;
+  overlay.addEventListener("keydown", (event) => {
+    if (event.defaultPrevented) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = popupOverlayFocusableElements(overlay);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+}
 
 async function setProxyImageSrc(image, coverUrl) {
   const path = buildImageProxyPath(coverUrl);
@@ -1154,6 +1257,10 @@ function buildSavedCard(listKind, item, { list, empty, toggles }) {
   const title = document.createElement("p");
   title.className = "saved-card-title";
   title.textContent = item.title || item.content_id;
+  const platform = document.createElement("span");
+  platform.className = "saved-card-platform";
+  platform.dataset.source = item.source_platform || "bilibili";
+  platform.textContent = platformDisplayName(item.source_platform || "bilibili");
   const up = document.createElement("p");
   up.className = "saved-card-up";
   up.textContent = item.author_name || item.up_name || "";
@@ -1174,7 +1281,7 @@ function buildSavedCard(listKind, item, { list, empty, toggles }) {
   target.className = "saved-sync-target";
   target.textContent = savedSyncDetail(item);
   syncLine.append(chip, target);
-  copy.append(title, up, syncLine);
+  copy.append(platform, title, up, syncLine);
   body.append(copy);
   body.prepend(media);
   body.addEventListener("click", () => {
@@ -2014,7 +2121,10 @@ function _renderInitSources() {
   });
   const hint = document.createElement("p");
   hint.className = "init-sources-hint";
-  hint.textContent = INIT_SOURCE_LOGIN_HINT;
+  hint.textContent = INIT_SOURCE_LOGIN_HINT.replace(
+    "Bangumi 使用公开 API，无需登录。",
+    "Bangumi 与 Linux.do 的公开发现无需登录；Linux.do 浏览器登录可增强个人信号。",
+  );
   elements.initSources.append(hint);
   elements.initSources.hidden = false;
 }
@@ -3377,7 +3487,10 @@ function updateMessageBadge() {
 async function openMessagesPanel() {
   const overlay = elements.messagesOverlay;
   if (!(overlay instanceof HTMLElement)) return;
-  overlay.hidden = false;
+  openPopupOverlay(overlay, {
+    trigger: elements.messagesButton,
+    initialFocus: elements.messagesBack,
+  });
   // Render whatever we have synchronously so the panel doesn't open
   // empty while we refetch.
   renderMessagesList();
@@ -3397,7 +3510,7 @@ async function openMessagesPanel() {
 
 function closeMessagesPanel() {
   const overlay = elements.messagesOverlay;
-  if (overlay instanceof HTMLElement) overlay.hidden = true;
+  closePopupOverlay(overlay);
 }
 
 // ── Mobile QR panel ───────────────────────────────────────────
@@ -3564,13 +3677,15 @@ async function renderMobileQrPanel() {
 async function openMobileQrPanel() {
   const overlay = elements.mobileQrOverlay;
   if (!(overlay instanceof HTMLElement)) return;
-  overlay.hidden = false;
+  openPopupOverlay(overlay, {
+    trigger: elements.mobileQrButton,
+    initialFocus: elements.mobileQrBack,
+  });
   await renderMobileQrPanel();
 }
 
 function closeMobileQrPanel() {
-  const overlay = elements.mobileQrOverlay;
-  if (overlay instanceof HTMLElement) overlay.hidden = true;
+  closePopupOverlay(elements.mobileQrOverlay);
 }
 
 function bindOpenWeb() {
@@ -3600,6 +3715,7 @@ function bindMobileQr() {
   if (elements.mobileQrBack instanceof HTMLElement) {
     elements.mobileQrBack.addEventListener("click", closeMobileQrPanel);
   }
+  bindPopupOverlayKeyboard(elements.mobileQrOverlay, closeMobileQrPanel);
   if (elements.mobileQrCopy instanceof HTMLButtonElement) {
     elements.mobileQrCopy.addEventListener("click", async () => {
       if (!currentMobileWebUrl) await renderMobileQrPanel();
@@ -3788,6 +3904,7 @@ function recommendationStats(item) {
   if (item?.view_count > 0) segments.push(`▶ ${formatCountCn(item.view_count)}`);
   if (item?.like_count > 0) segments.push(`👍 ${formatCountCn(item.like_count)}`);
   if (item?.comment_count > 0) segments.push(`💬 ${formatCountCn(item.comment_count)}`);
+  if (item?.share_count > 0) segments.push(`🔁 ${formatCountCn(item.share_count)}`);
   if (item?.favorite_count > 0) segments.push(`⭐ ${formatCountCn(item.favorite_count)}`);
   if (item?.danmaku_count > 0) segments.push(`弹幕 ${formatCountCn(item.danmaku_count)}`);
   if (item?.rating_score > 0) segments.push(`评分 ${Number(item.rating_score).toFixed(1)}`);
@@ -4339,6 +4456,7 @@ function bindMessages() {
   if (elements.messagesBack instanceof HTMLElement) {
     elements.messagesBack.addEventListener("click", closeMessagesPanel);
   }
+  bindPopupOverlayKeyboard(elements.messagesOverlay, closeMessagesPanel);
 }
 
 function renderActiveInsights(container, items) {
@@ -6147,31 +6265,36 @@ function renderDelightSlot() {
   banner.dataset.state = delight.state || "pending";
 
   // ── Row (always visible) ────────────────────────────────────────
-  const row = document.createElement("button");
-  row.type = "button";
+  const row = document.createElement("div");
   row.className = "delight-banner-row";
-  row.setAttribute("aria-expanded", isExpanded ? "true" : "false");
-  row.addEventListener("click", () => {
+  const toggleExpanded = () => {
     updateDelightHead({ expanded: !isExpanded });
     renderDelightSlot();
-  });
+  };
+  row.addEventListener("click", toggleExpanded);
 
   // Thumbnail (left)
   const thumb = document.createElement("span");
   thumb.className = "delight-banner-thumb";
+  const renderTextThumb = () => {
+    thumb.replaceChildren();
+    thumb.classList.add("is-fallback", "is-text-card");
+    const excerpt = document.createElement("span");
+    excerpt.className = "delight-banner-thumb-text";
+    excerpt.textContent = delight.body_text || delight.title || "一条文字推荐";
+    thumb.append(excerpt);
+  };
   if (delight.cover_url) {
     const image = document.createElement("img");
     void setProxyImageSrc(image, delight.cover_url);
     image.alt = "";
     image.addEventListener("error", () => {
       image.remove();
-      thumb.classList.add("is-fallback");
-      thumb.textContent = "✨";
+      renderTextThumb();
     });
     thumb.append(image);
   } else {
-    thumb.classList.add("is-fallback");
-    thumb.textContent = "✨";
+    renderTextThumb();
   }
 
   // Text column
@@ -6227,9 +6350,16 @@ function renderDelightSlot() {
 
   textCol.append(kickerLine, titleText);
 
-  const chevron = document.createElement("span");
+  const chevron = document.createElement("button");
+  chevron.type = "button";
   chevron.className = "delight-banner-chevron";
+  chevron.setAttribute("aria-label", isExpanded ? "收起惊喜推荐" : "展开惊喜推荐");
+  chevron.setAttribute("aria-expanded", isExpanded ? "true" : "false");
   chevron.textContent = isExpanded ? "▾" : "▸";
+  chevron.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleExpanded();
+  });
 
   row.append(thumb, textCol, chevron);
 
@@ -6752,7 +6882,9 @@ function renderRecommendations(items, { append = false } = {}) {
     } else {
       // No-cover text card (X tweet/thread or empty cover): show the
       // body text instead of a thumbnail — never an <img> node.
-      cover.classList.add("is-fallback", "is-text-card");
+      card.classList.add("is-text-only");
+      preview.classList.add("is-text-only");
+      cover.classList.add("is-text-card");
       const textNode = document.createElement("p");
       textNode.className = "recommendation-cover-text";
       textNode.textContent = cardMedia.text || "先看标题也行";
@@ -6777,7 +6909,7 @@ function renderRecommendations(items, { append = false } = {}) {
     }
     const platformKey = (item.source_platform || "bilibili").toLowerCase();
     const platformLabel =
-      { bilibili: "B 站", xiaohongshu: "小红书", douyin: "抖音", youtube: "YouTube", twitter: "X", zhihu: "知乎", reddit: "Reddit", bangumi: "Bangumi" }[
+      { bilibili: "B 站", xiaohongshu: "小红书", douyin: "抖音", weibo: "微博", youtube: "YouTube", twitter: "X", zhihu: "知乎", reddit: "Reddit", bangumi: "Bangumi", linuxdo: "Linux.do", v2ex: "V2EX" }[
         platformKey
       ] || item.source_platform;
     const sourceCorner = document.createElement("span");
@@ -8296,12 +8428,31 @@ function bindSettings() {
     ["ranked", "cfgBangumiModeRanked"],
     ["latest", "cfgBangumiModeLatest"],
   ];
+  const LINUXDO_SOURCE_MODE_FIELDS = [
+    ["search", "cfgLinuxdoModeSearch"],
+    ["hot", "cfgLinuxdoModeHot"],
+    ["feed", "cfgLinuxdoModeFeed"],
+    ["creator", "cfgLinuxdoModeCreator"],
+    ["related", "cfgLinuxdoModeRelated"],
+  ];
+  const WEIBO_SOURCE_MODE_FIELDS = [
+    ["search", "cfgWeiboModeSearch"],
+    ["hot", "cfgWeiboModeHot"],
+    ["creator", "cfgWeiboModeCreator"],
+  ];
   const BANGUMI_SUBJECT_TYPE_FIELDS = [
     ["anime", "cfgBangumiTypeAnime"],
     ["book", "cfgBangumiTypeBook"],
     ["game", "cfgBangumiTypeGame"],
     ["music", "cfgBangumiTypeMusic"],
     ["real", "cfgBangumiTypeReal"],
+  ];
+  const V2EX_SOURCE_MODE_FIELDS = [
+    ["search", "cfgV2exModeSearch"],
+    ["node", "cfgV2exModeNode"],
+    ["tab", "cfgV2exModeTab"],
+    ["hot", "cfgV2exModeHot"],
+    ["latest", "cfgV2exModeLatest"],
   ];
 
   function setCheckedValues(fields, rawValues) {
@@ -8320,6 +8471,24 @@ function bindSettings() {
   function collectCheckedValues(fields, fallback) {
     const selected = fields.filter(([, id]) => checked(id)).map(([value]) => value);
     return selected.length > 0 ? selected : fallback;
+  }
+
+  function setWeiboSourceModes(rawValues) {
+    const selected = Array.isArray(rawValues) ? [...rawValues] : rawValues;
+    if (Array.isArray(selected) && selected.length === 1 && selected[0] === "creator") {
+      selected.unshift("search");
+    }
+    setCheckedValues(WEIBO_SOURCE_MODE_FIELDS, selected);
+  }
+
+  function collectWeiboSourceModes() {
+    const selected = collectCheckedValues(WEIBO_SOURCE_MODE_FIELDS, ["search"]);
+    if (selected.length === 1 && selected[0] === "creator") {
+      const search = document.getElementById("cfgWeiboModeSearch");
+      if (search) search.checked = true;
+      return ["search", "creator"];
+    }
+    return selected;
   }
 
   // Unified per-source login / cookie status from GET /api/sources/status,
@@ -8391,6 +8560,74 @@ function bindSettings() {
       if (dot) dot.style.color = access.color;
       applySourceNetworkHint(row, access.present ? item.network_hint : "", access.enabled);
       row.style.opacity = access.present && !access.enabled ? "0.6" : "1";
+    }
+    await renderV2exIdentity();
+  }
+
+  const V2EX_IDENTITY_ORIGIN_LABELS = {
+    pat: "PAT",
+    browser: "浏览器",
+    configured: "配置",
+    accepted: "已选择",
+  };
+
+  function renderV2exIdentityResult(identity) {
+    const statusEl = document.getElementById("cfgV2exIdentityStatus");
+    const acceptButton = document.getElementById("cfgV2exAcceptBrowserIdentity");
+    if (!statusEl || !acceptButton) return;
+    const claims = identity?.claims && typeof identity.claims === "object" ? identity.claims : {};
+    const browser = String(claims.browser || "").trim();
+    const active = String(identity?.active_profile_identity?.username || "").trim();
+    acceptButton.dataset.username = browser;
+    acceptButton.hidden = !(browser && identity?.status === "identity_mismatch");
+    if (!identity) {
+      setProbeStatus(statusEl, "muted", "后端不可达，暂时无法读取身份状态。");
+      return;
+    }
+    if (identity.status === "identity_mismatch") {
+      const detail = Object.entries(claims)
+        .map(([origin, username]) => `${V2EX_IDENTITY_ORIGIN_LABELS[origin] || origin}=${username}`)
+        .join(" · ");
+      setProbeStatus(statusEl, "error", `身份冲突：${detail}。账号初始化已暂停，公开发现仍可用。`);
+      return;
+    }
+    if (identity.identity_switch_required) {
+      setProbeStatus(
+        statusEl,
+        "warning",
+        `当前浏览器账号 ${browser || identity.username}，画像仍属于 ${active}；增量同步已暂停，请运行一次 V2EX 完整初始化完成切换。`,
+      );
+      return;
+    }
+    if (identity.status === "resolved") {
+      const suffix = identity.private_bootstrap_available ? "，浏览器四 Scope 初始化可用。" : "；公开发现可用。";
+      setProbeStatus(statusEl, "success", `当前账号 ${identity.username}${suffix}`);
+      return;
+    }
+    setProbeStatus(statusEl, "muted", "尚未识别账号；匿名公开发现仍可用。");
+  }
+
+  async function renderV2exIdentity() {
+    try {
+      renderV2exIdentityResult(await fetchV2exIdentity());
+    } catch {
+      renderV2exIdentityResult(null);
+    }
+  }
+
+  async function acceptCurrentV2exBrowserIdentity(button) {
+    const username = String(button?.dataset?.username || "").trim();
+    const statusEl = document.getElementById("cfgV2exIdentityStatus");
+    if (!username || button.disabled) return;
+    button.disabled = true;
+    setProbeStatus(statusEl, "pending", `正在采用浏览器账号 ${username}…`);
+    try {
+      await acceptV2exBrowserIdentity(username);
+      await renderV2exIdentity();
+    } catch (error) {
+      setProbeStatus(statusEl, "error", error?.message || "身份选择失败。");
+    } finally {
+      button.disabled = false;
     }
   }
 
@@ -9196,6 +9433,14 @@ function bindSettings() {
     setVal("cfgDouyinDailyFeedBudget", cfg.sources?.douyin?.daily_feed_budget);
     setVal("cfgDouyinRequestInterval", cfg.sources?.douyin?.request_interval_seconds);
     setVal("cfgDouyinMinInterval", cfg.sources?.douyin?.min_interval_minutes);
+    const weiboEnabled = document.getElementById("cfgWeiboEnabled");
+    if (weiboEnabled) weiboEnabled.checked = cfg.sources?.weibo?.enabled === true;
+    setWeiboSourceModes(cfg.sources?.weibo?.source_modes);
+    setVal("cfgWeiboDailySearchBudget", cfg.sources?.weibo?.daily_search_budget);
+    setVal("cfgWeiboDailyHotBudget", cfg.sources?.weibo?.daily_hot_budget);
+    setVal("cfgWeiboDailyCreatorBudget", cfg.sources?.weibo?.daily_creator_budget);
+    setVal("cfgWeiboRequestInterval", cfg.sources?.weibo?.request_interval_seconds);
+    setVal("cfgWeiboMinInterval", cfg.sources?.weibo?.min_interval_minutes);
     const youtubeEnabled = document.getElementById("cfgYoutubeEnabled");
     if (youtubeEnabled) youtubeEnabled.checked = cfg.sources?.youtube?.enabled === true;
     setVal("cfgYoutubeDailySearchBudget", cfg.sources?.youtube?.daily_search_budget);
@@ -9262,6 +9507,42 @@ function bindSettings() {
     setVal("cfgBangumiRequestInterval", cfg.sources?.bangumi?.request_interval_seconds);
     setVal("cfgBangumiMinInterval", cfg.sources?.bangumi?.min_interval_minutes);
     setVal("cfgBangumiBootstrapLimit", cfg.sources?.bangumi?.bootstrap_limit);
+    const linuxdoEnabled = document.getElementById("cfgLinuxdoEnabled");
+    if (linuxdoEnabled) linuxdoEnabled.checked = cfg.sources?.linuxdo?.enabled === true;
+    setCheckedValues(LINUXDO_SOURCE_MODE_FIELDS, cfg.sources?.linuxdo?.source_modes);
+    setVal("cfgLinuxdoDailySearchBudget", cfg.sources?.linuxdo?.daily_search_budget);
+    setVal("cfgLinuxdoDailyHotBudget", cfg.sources?.linuxdo?.daily_hot_budget);
+    setVal("cfgLinuxdoDailyFeedBudget", cfg.sources?.linuxdo?.daily_feed_budget);
+    setVal("cfgLinuxdoDailyCreatorBudget", cfg.sources?.linuxdo?.daily_creator_budget);
+    setVal("cfgLinuxdoDailyRelatedBudget", cfg.sources?.linuxdo?.daily_related_budget);
+    setVal("cfgLinuxdoRequestInterval", cfg.sources?.linuxdo?.request_interval_seconds);
+    setVal("cfgLinuxdoMinInterval", cfg.sources?.linuxdo?.min_interval_minutes);
+    setVal("cfgLinuxdoBootstrapLimit", cfg.sources?.linuxdo?.bootstrap_limit);
+    const v2exEnabled = document.getElementById("cfgV2exEnabled");
+    if (v2exEnabled) v2exEnabled.checked = cfg.sources?.v2ex?.enabled === true;
+    setVal("cfgV2exUsername", cfg.sources?.v2ex?.username);
+    {
+      const v2exToken = document.getElementById("cfgV2exAccessToken");
+      if (v2exToken) {
+        v2exToken.value = "";
+        v2exToken.placeholder = cfg.sources?.v2ex?.access_token_set
+          ? "已配置（留空保持不变；填写新 PAT 以替换）"
+          : "可留空；匿名公开发现可直接使用";
+      }
+      const v2exClearToken = document.getElementById("cfgV2exClearToken");
+      if (v2exClearToken) {
+        v2exClearToken.checked = false;
+        v2exClearToken.disabled = cfg.sources?.v2ex?.access_token_set !== true;
+      }
+    }
+    setCheckedValues(V2EX_SOURCE_MODE_FIELDS, cfg.sources?.v2ex?.source_modes);
+    setVal("cfgV2exDailySearchBudget", cfg.sources?.v2ex?.daily_search_budget);
+    setVal("cfgV2exDailyNodeBudget", cfg.sources?.v2ex?.daily_node_budget);
+    setVal("cfgV2exDailyTabBudget", cfg.sources?.v2ex?.daily_tab_budget);
+    setVal("cfgV2exDailyHotBudget", cfg.sources?.v2ex?.daily_hot_budget);
+    setVal("cfgV2exDailyLatestBudget", cfg.sources?.v2ex?.daily_latest_budget);
+    setVal("cfgV2exRequestInterval", cfg.sources?.v2ex?.request_interval_seconds);
+    setVal("cfgV2exMinInterval", cfg.sources?.v2ex?.min_interval_minutes);
     void renderSourcesStatus();
 
     // General
@@ -9328,6 +9609,8 @@ function bindSettings() {
     setVal("cfgPoolShareZhihu", cfg.scheduler?.pool_source_shares?.zhihu);
     setVal("cfgPoolShareReddit", cfg.scheduler?.pool_source_shares?.reddit);
     setVal("cfgPoolShareBangumi", cfg.scheduler?.pool_source_shares?.bangumi);
+    setVal("cfgPoolShareLinuxdo", cfg.scheduler?.pool_source_shares?.linuxdo);
+    setVal("cfgPoolShareV2ex", cfg.scheduler?.pool_source_shares?.v2ex);
     setVal("cfgSpeculationInterval", cfg.scheduler?.speculation_interval_minutes);
     setVal("cfgSpeculationTtl", cfg.scheduler?.speculation_ttl_days);
     setVal("cfgSpeculationCooldown", cfg.scheduler?.speculation_cooldown_days);
@@ -9430,6 +9713,15 @@ function bindSettings() {
           request_interval_seconds: getInt("cfgDouyinRequestInterval", 2),
           min_interval_minutes: getInt("cfgDouyinMinInterval", 3),
         },
+        weibo: {
+          enabled: checked("cfgWeiboEnabled"),
+          source_modes: collectWeiboSourceModes(),
+          daily_search_budget: getInt("cfgWeiboDailySearchBudget", 60),
+          daily_hot_budget: getInt("cfgWeiboDailyHotBudget", 10),
+          daily_creator_budget: getInt("cfgWeiboDailyCreatorBudget", 30),
+          request_interval_seconds: getInt("cfgWeiboRequestInterval", 3),
+          min_interval_minutes: getInt("cfgWeiboMinInterval", 10),
+        },
         youtube: {
           enabled: checked("cfgYoutubeEnabled"),
           daily_search_budget: getInt("cfgYoutubeDailySearchBudget", 0),
@@ -9494,6 +9786,35 @@ function bindSettings() {
           min_interval_minutes: getInt("cfgBangumiMinInterval", 3),
           bootstrap_limit: getInt("cfgBangumiBootstrapLimit", 300),
         },
+        linuxdo: {
+          enabled: checked("cfgLinuxdoEnabled"),
+          source_modes: collectCheckedValues(LINUXDO_SOURCE_MODE_FIELDS, ["search"]),
+          daily_search_budget: getInt("cfgLinuxdoDailySearchBudget", 0),
+          daily_hot_budget: getInt("cfgLinuxdoDailyHotBudget", 0),
+          daily_feed_budget: getInt("cfgLinuxdoDailyFeedBudget", 0),
+          daily_creator_budget: getInt("cfgLinuxdoDailyCreatorBudget", 0),
+          daily_related_budget: getInt("cfgLinuxdoDailyRelatedBudget", 0),
+          request_interval_seconds: getInt("cfgLinuxdoRequestInterval", 3),
+          min_interval_minutes: getInt("cfgLinuxdoMinInterval", 3),
+          bootstrap_limit: getInt("cfgLinuxdoBootstrapLimit", 300),
+        },
+        v2ex: {
+          enabled: checked("cfgV2exEnabled"),
+          username: getVal("cfgV2exUsername"),
+          ...(checked("cfgV2exClearToken")
+            ? { access_token: "" }
+            : (getVal("cfgV2exAccessToken") || "") !== ""
+              ? { access_token: getVal("cfgV2exAccessToken") }
+              : {}),
+          source_modes: collectCheckedValues(V2EX_SOURCE_MODE_FIELDS, ["search"]),
+          daily_search_budget: getInt("cfgV2exDailySearchBudget", 120),
+          daily_node_budget: getInt("cfgV2exDailyNodeBudget", 180),
+          daily_tab_budget: getInt("cfgV2exDailyTabBudget", 80),
+          daily_hot_budget: getInt("cfgV2exDailyHotBudget", 40),
+          daily_latest_budget: getInt("cfgV2exDailyLatestBudget", 40),
+          request_interval_seconds: getInt("cfgV2exRequestInterval", 2),
+          min_interval_minutes: getInt("cfgV2exMinInterval", 5),
+        },
       },
       discovery: {
         ...(state.runtimeConfig?.discovery || {}),
@@ -9535,6 +9856,8 @@ function bindSettings() {
           zhihu: getInt("cfgPoolShareZhihu", 1),
           reddit: getInt("cfgPoolShareReddit", 1),
           bangumi: getInt("cfgPoolShareBangumi", 1),
+          linuxdo: getInt("cfgPoolShareLinuxdo", 1),
+          v2ex: getInt("cfgPoolShareV2ex", 1),
         },
         speculation_interval_minutes: getInt("cfgSpeculationInterval", 10),
         speculation_ttl_days: getInt("cfgSpeculationTtl", 3),
@@ -9618,11 +9941,14 @@ function bindSettings() {
     bilibili: "cfgBilibiliEnabled",
     xiaohongshu: "cfgXhsEnabled",
     douyin: "cfgDouyinEnabled",
+    weibo: "cfgWeiboEnabled",
     youtube: "cfgYoutubeEnabled",
     twitter: "cfgTwitterEnabled",
     zhihu: "cfgZhihuEnabled",
     reddit: "cfgRedditEnabled",
-    bangumi: "cfgBangumiEnabled"
+    bangumi: "cfgBangumiEnabled",
+    linuxdo: "cfgLinuxdoEnabled",
+    v2ex: "cfgV2exEnabled",
   };
 
   function setSourceCardOpen(card, open) {
@@ -9639,7 +9965,12 @@ function bindSettings() {
       if (!card) return;
       const input = document.getElementById(inputId);
       const on = input ? input.checked : true;
+      const face = card.querySelector(".source-card-face");
       card.dataset.sourceOff = on ? "false" : "true";
+      if (face instanceof HTMLElement) {
+        face.tabIndex = on ? 0 : -1;
+        face.setAttribute("aria-disabled", on ? "false" : "true");
+      }
       if (!on) setSourceCardOpen(card, false);
     });
   }
@@ -9710,6 +10041,7 @@ function bindSettings() {
         if (!(el instanceof Element)) return;
         if (!el.closest(".settings-panel")) return;
         if (el.hasAttribute("readonly")) return;
+        if (el.hasAttribute("data-settings-ignore-dirty")) return;
         markSettingsDirty(el);
       });
     });
@@ -9748,6 +10080,15 @@ function bindSettings() {
   }
 
   document.getElementById("settingsPanelSources")?.addEventListener("click", (event) => {
+    const identityButton = event.target?.closest?.("#cfgV2exAcceptBrowserIdentity");
+    if (identityButton instanceof HTMLButtonElement) {
+      void acceptCurrentV2exBrowserIdentity(identityButton);
+      return;
+    }
+    if (event.target?.closest?.("#cfgV2exRefreshIdentity")) {
+      void renderV2exIdentity();
+      return;
+    }
     const button = event.target?.closest?.(".source-verify-btn");
     if (!(button instanceof HTMLButtonElement) || button.disabled) return;
     void runSourceVerify(button);
@@ -10016,7 +10357,7 @@ function bindSettings() {
 
   gearBtn.addEventListener("click", async () => {
     closeLlmInstanceDialog();
-    overlay.hidden = false;
+    openPopupOverlay(overlay, { trigger: gearBtn, initialFocus: backBtn });
     toast.hidden = true;
     issuesContainer.innerHTML = "";
     hideConfigBanners();
@@ -10029,6 +10370,7 @@ function bindSettings() {
     void loadBackendUpdateStatus();
     void authControl.reload();
     void autostartControl.reload();
+    void refreshReinitStatus();
     try {
       const cfg = await fetchConfig();
       populateForm(cfg);
@@ -10056,8 +10398,9 @@ function bindSettings() {
 
   backBtn.addEventListener("click", () => {
     closeLlmInstanceDialog();
-    overlay.hidden = true;
+    closePopupOverlay(overlay);
   });
+  bindPopupOverlayKeyboard(overlay, () => backBtn.click());
 
   const suggestBtn = document.getElementById("cfgSuggestPoolShares");
   if (suggestBtn) {
@@ -10070,38 +10413,122 @@ function bindSettings() {
             bilibili: checked("cfgBilibiliEnabled", true),
             xiaohongshu: checked("cfgXhsEnabled"),
             douyin: checked("cfgDouyinEnabled"),
+            weibo: checked("cfgWeiboEnabled"),
             youtube: checked("cfgYoutubeEnabled"),
             twitter: checked("cfgTwitterEnabled"),
             zhihu: checked("cfgZhihuEnabled"),
             reddit: checked("cfgRedditEnabled"),
             bangumi: checked("cfgBangumiEnabled"),
+            linuxdo: checked("cfgLinuxdoEnabled"),
+            v2ex: checked("cfgV2exEnabled"),
           },
           configured_shares: {
             bilibili: getInt("cfgPoolShareBilibili", 5),
             xiaohongshu: getInt("cfgPoolShareXhs", 1),
             douyin: getInt("cfgPoolShareDouyin", 1),
+            weibo: getInt("cfgPoolShareWeibo", 1),
             youtube: getInt("cfgPoolShareYoutube", 1),
             twitter: getInt("cfgPoolShareTwitter", 1),
             zhihu: getInt("cfgPoolShareZhihu", 1),
             reddit: getInt("cfgPoolShareReddit", 1),
             bangumi: getInt("cfgPoolShareBangumi", 1),
+            linuxdo: getInt("cfgPoolShareLinuxdo", 1),
+            v2ex: getInt("cfgPoolShareV2ex", 1),
           },
         });
         const shares = suggestion?.suggested_shares || {};
         if (shares.bilibili !== undefined) setVal("cfgPoolShareBilibili", shares.bilibili);
         if (shares.xiaohongshu !== undefined) setVal("cfgPoolShareXhs", shares.xiaohongshu);
         if (shares.douyin !== undefined) setVal("cfgPoolShareDouyin", shares.douyin);
+        if (shares.weibo !== undefined) setVal("cfgPoolShareWeibo", shares.weibo);
         if (shares.youtube !== undefined) setVal("cfgPoolShareYoutube", shares.youtube);
         if (shares.twitter !== undefined) setVal("cfgPoolShareTwitter", shares.twitter);
         if (shares.zhihu !== undefined) setVal("cfgPoolShareZhihu", shares.zhihu);
         if (shares.reddit !== undefined) setVal("cfgPoolShareReddit", shares.reddit);
         if (shares.bangumi !== undefined) setVal("cfgPoolShareBangumi", shares.bangumi);
+        if (shares.linuxdo !== undefined) setVal("cfgPoolShareLinuxdo", shares.linuxdo);
+        if (shares.v2ex !== undefined) setVal("cfgPoolShareV2ex", shares.v2ex);
         markSettingsDirty(suggestBtn);
         showToast("已按已有信号填入建议比例，保存后生效。", "success");
       } catch (err) {
         showToast(`生成建议失败: ${err.message}`, "error");
       } finally {
         suggestBtn.disabled = false;
+      }
+    });
+  }
+
+  // ── 重新初始化 / 重建画像 (gui-init §4) ─────────────────────────
+  // The recommend-tab CTA is first-run-only; once initialized the only
+  // re-init entry lives in settings and calls POST /api/init {force:true}.
+  const reinitBtn = document.getElementById("cfgReinitBtn");
+  const reinitStatusEl = document.getElementById("cfgReinitStatus");
+
+  async function refreshReinitStatus() {
+    let status = null;
+    try {
+      status = await fetchInitStatus();
+    } catch {
+      if (reinitStatusEl) reinitStatusEl.textContent = "无法读取初始化状态（后端不可达）。";
+      if (reinitBtn) reinitBtn.disabled = false;
+      return;
+    }
+    if (reinitBtn) reinitBtn.disabled = Boolean(status?.running);
+    if (!reinitStatusEl) return;
+    if (status?.running) {
+      reinitStatusEl.textContent =
+        `初始化进行中（阶段 ${status.current_stage || "?"}/${status.total_stages || 4}）。` +
+        "请等待本轮完成后再重新初始化。";
+    } else if (status?.initialized) {
+      reinitStatusEl.textContent = "系统已初始化。重新初始化会重新拉取数据并重建画像，现有事件与收藏保留。";
+    } else {
+      reinitStatusEl.textContent = "系统尚未初始化完成；正常流程请到「推荐」页点击开始初始化。";
+    }
+  }
+
+  if (reinitBtn) {
+    reinitBtn.addEventListener("click", async () => {
+      let status = null;
+      try {
+        status = await fetchInitStatus();
+      } catch {
+        if (reinitStatusEl) reinitStatusEl.textContent = "无法读取初始化状态（后端不可达）。";
+        return;
+      }
+      if (status?.running) {
+        if (reinitStatusEl) reinitStatusEl.textContent = "初始化正在进行中，请等待完成后再重新初始化。";
+        return;
+      }
+      if (!status?.initialized) {
+        if (reinitStatusEl) reinitStatusEl.textContent = "系统尚未初始化完成；请先到「推荐」页完成初始化。";
+        return;
+      }
+      const resetCognition = document.getElementById("cfgReinitResetCognition")?.checked === true;
+      if (!window.confirm(
+        "将重新拉取所选平台的数据、重建完整画像并补足首轮发现池。现有推荐池会按新画像清空重建；现有事件、收藏、对话历史与手动编辑保留。重新初始化前会自动创建备份（数据库 + 画像/认知层）到 data/backups/。并消耗较多 AI 调用。继续吗？" +
+        (resetCognition
+          ? "\n\n已勾选「同时清空旧认知观察与洞察」：旧的 LLM 观察笔记与洞察将被删除（已包含在自动备份中），本轮重新生成。"
+          : "")
+      )) {
+        return;
+      }
+      reinitBtn.disabled = true;
+      if (reinitStatusEl) reinitStatusEl.textContent = "正在启动重新初始化…";
+      try {
+        const payload = { force: true };
+        if (resetCognition) payload.reset_cognition = true;
+        await startInit(payload);
+        showToast("重新初始化已开始，正在重新拉取数据并重建画像", "success");
+        closePopupOverlay(overlay);
+        setActiveTab("recommend");
+        renderInitProgress({ running: true, current_stage: 1, total_stages: 4, stages: [] });
+        _startInitProgressPoll();
+      } catch (err) {
+        if (reinitStatusEl) {
+          reinitStatusEl.textContent =
+            describeInitStartError(err) || err?.message || "重新初始化没能启动，请稍后重试。";
+        }
+        reinitBtn.disabled = false;
       }
     });
   }

@@ -473,9 +473,10 @@ function renderDelightTray() {
   tray.className = "delight-tray";
 
   const cover = getCoverImageAttrs(d.cover_url);
+  const textFallback = esc(d.body_text || d.title || "一条文字推荐");
   const coverHtml = cover
     ? `<span class="delight-thumb"><img src="${esc(cover.src)}" alt="" loading="lazy" onerror="this.parentElement.classList.add('is-fallback');this.remove()"></span>`
-    : `<span class="delight-thumb is-fallback">\u2728</span>`;
+    : `<span class="delight-thumb is-fallback is-text-card"><span class="delight-thumb-text">${textFallback}</span></span>`;
   const reasonText = d.delight_reason || d.delight_hook || "";
   const statsText = recommendationStats(d);
   const publishedHtml = publishedTimeHtml(d);
@@ -1176,6 +1177,7 @@ function renderCard(rawItem, index = 0) {
   card.className = "card";
   const url = buildContentUrl(item);
   const cardMedia = getRecommendationCardKind(item);
+  if (cardMedia.kind === "text") card.classList.add("is-text-only");
   const imageAttrs = getRecommendationImageLoadingAttrs(index);
   const publishedHtml = publishedTimeHtml(item);
 

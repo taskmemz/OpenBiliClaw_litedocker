@@ -56,6 +56,15 @@ test("settings page exposes advanced config fields from backend schema", () => {
     "cfgDouyinDailyHotBudget",
     "cfgDouyinDailyFeedBudget",
     "cfgDouyinRequestInterval",
+    "cfgWeiboEnabled",
+    "cfgWeiboModeSearch",
+    "cfgWeiboModeHot",
+    "cfgWeiboModeCreator",
+    "cfgWeiboDailySearchBudget",
+    "cfgWeiboDailyHotBudget",
+    "cfgWeiboDailyCreatorBudget",
+    "cfgWeiboRequestInterval",
+    "cfgWeiboMinInterval",
     "cfgYoutubeEnabled",
     "cfgYoutubeDailySearchBudget",
     "cfgYoutubeDailyTrendingBudget",
@@ -108,6 +117,7 @@ test("settings page exposes advanced config fields from backend schema", () => {
     "cfgPoolShareBilibili",
     "cfgPoolShareXhs",
     "cfgPoolShareDouyin",
+    "cfgPoolShareWeibo",
     "cfgPoolShareYoutube",
     "cfgPoolShareReddit",
     "cfgSuggestPoolShares",
@@ -159,11 +169,13 @@ test("settings source tab separates every platform into its own block", () => {
     "bilibili",
     "xiaohongshu",
     "douyin",
+    "weibo",
     "youtube",
     "twitter",
     "zhihu",
     "reddit",
     "bangumi",
+    "linuxdo",
     "browser",
     "pool",
   ]) {
@@ -176,6 +188,23 @@ test("settings source tab separates every platform into its own block", () => {
   assert.match(sourcesPanel, /id="cfgBilibiliEnabled"/);
   assert.match(sourcesPanel, />启用 Bilibili discovery</);
   assert.match(sourcesPanel, />调试：B 站登录时显示浏览器窗口</);
+
+  // Keep the Linux.do card closed before the V2EX card starts. If either
+  // wrapper is left open, the browser nests every later settings panel under
+  // the hidden sources panel and tabs such as 通用 render as a blank page.
+  const linuxdoStart = popupHtml.indexOf('data-source-card="linuxdo"');
+  const v2exStart = popupHtml.indexOf(
+    '<div class="settings-section settings-source-card" data-source-card="v2ex"',
+  );
+  assert.ok(linuxdoStart >= 0 && v2exStart > linuxdoStart);
+  const linuxdoBlock = popupHtml.slice(linuxdoStart, v2exStart);
+  assert.match(
+    linuxdoBlock,
+    /id="cfgLinuxdoBootstrapLimit"[\s\S]*?\n\s*<\/div>\s*\n\s*<\/div>\s*$/,
+    "Linux.do source body and card must close before V2EX starts",
+  );
+  assert.match(popupJs, /face\.tabIndex = on \? 0 : -1/);
+  assert.match(popupJs, /face\.setAttribute\("aria-disabled", on \? "false" : "true"\)/);
   assert.match(popupJs, /bilibiliEnabled\.checked = cfg\.sources\?\.bilibili\?\.enabled !== false/);
   assert.match(popupJs, /xhsEnabled\.checked = cfg\.sources\?\.xiaohongshu\?\.enabled === true/);
   assert.match(popupJs, /bilibili:\s*\{\s*enabled: checked\("cfgBilibiliEnabled", true\)/);
@@ -189,6 +218,31 @@ test("settings source tab separates every platform into its own block", () => {
   assert.match(sourcesPanel, /id="cfgXhsDailySearchBudget"[^>]*placeholder="默认 20"/);
   assert.match(sourcesPanel, /id="cfgXhsTaskInterval"[^>]*placeholder="1200"/);
   assert.match(sourcesPanel, /id="cfgXhsMinInterval"[^>]*placeholder="20"/);
+  assert.match(sourcesPanel, /id="cfgWeiboEnabled" type="checkbox"/);
+  assert.match(sourcesPanel, /无需用户 Cookie/);
+  assert.match(sourcesPanel, /guided init/);
+  assert.match(sourcesPanel, /并非官方稳定 API/);
+  assert.doesNotMatch(sourcesPanel, /id="cfgWeiboCookie"/);
+  assert.match(popupJs, /weiboEnabled\.checked = cfg\.sources\?\.weibo\?\.enabled === true/);
+  assert.match(popupJs, /weibo:\s*\{\s*enabled: checked\("cfgWeiboEnabled"\)/);
+  assert.match(popupJs, /setWeiboSourceModes\(cfg\.sources\?\.weibo\?\.source_modes\)/);
+  assert.match(popupJs, /source_modes: collectWeiboSourceModes\(\)/);
+  assert.match(sourcesPanel, /作者（需同时启用搜索或热榜）/);
+  assert.match(popupJs, /daily_search_budget: getInt\("cfgWeiboDailySearchBudget", 60\)/);
+  assert.match(popupJs, /daily_hot_budget: getInt\("cfgWeiboDailyHotBudget", 10\)/);
+  assert.match(popupJs, /daily_creator_budget: getInt\("cfgWeiboDailyCreatorBudget", 30\)/);
+  assert.match(popupJs, /request_interval_seconds: getInt\("cfgWeiboRequestInterval", 3\)/);
+  assert.match(popupJs, /min_interval_minutes: getInt\("cfgWeiboMinInterval", 10\)/);
+});
+
+test("Weibo init bridge is read-only and never syncs cookies or native writes", () => {
+  const manifest = JSON.parse(readFileSync(resolve("manifest.json"), "utf8"));
+  const manifestText = JSON.stringify(manifest);
+  const popupJs = readFileSync(resolve("popup", "popup.js"), "utf8");
+
+  assert.match(manifestText, /weibo\.com/);
+  assert.match(manifestText, /weibo\.cn/);
+  assert.doesNotMatch(popupJs, /weibo_cookie_synced|cfgWeiboCookie|syncWeibo/i);
 });
 
 test("settings logging tab edits a single full log path", () => {
@@ -440,6 +494,44 @@ test("settings page round-trips Bangumi discovery config", () => {
   assert.match(popupJs, /bangumi: getInt\("cfgPoolShareBangumi", 1\)/);
   assert.match(popupJs, /bangumi: checked\("cfgBangumiEnabled"\)/);
   assert.match(popupJs, /if \(shares\.bangumi !== undefined\) setVal\("cfgPoolShareBangumi", shares\.bangumi\)/);
+});
+
+test("settings page round-trips Linux.do config without a cookie field", () => {
+  const popupHtml = readFileSync(resolve("popup", "popup.html"), "utf8");
+  const popupJs = readFileSync(resolve("popup", "popup.js"), "utf8");
+
+  for (const id of [
+    "cfgLinuxdoEnabled",
+    "cfgLinuxdoModeSearch",
+    "cfgLinuxdoModeHot",
+    "cfgLinuxdoModeFeed",
+    "cfgLinuxdoModeCreator",
+    "cfgLinuxdoModeRelated",
+    "cfgLinuxdoDailySearchBudget",
+    "cfgLinuxdoDailyHotBudget",
+    "cfgLinuxdoDailyFeedBudget",
+    "cfgLinuxdoDailyCreatorBudget",
+    "cfgLinuxdoDailyRelatedBudget",
+    "cfgLinuxdoRequestInterval",
+    "cfgLinuxdoMinInterval",
+    "cfgLinuxdoBootstrapLimit",
+    "cfgPoolShareLinuxdo",
+  ]) {
+    assert.match(popupHtml, new RegExp(`id="${id}"`), `${id} should exist`);
+    assert.match(popupJs, new RegExp(`"${id}"`), `${id} should be wired in popup.js`);
+  }
+
+  const card = popupHtml.match(/data-source-card="linuxdo"[\s\S]*?data-source-card="pool"/)?.[0] ?? "";
+  assert.doesNotMatch(card, /id="cfgLinuxdoCookie"|<textarea/);
+  assert.match(card, /公开发现无需登录/);
+  assert.match(card, /浏览器插件后，可增强收藏、点赞和阅读记录/);
+  assert.match(popupJs, /setCheckedValues\(LINUXDO_SOURCE_MODE_FIELDS, cfg\.sources\?\.linuxdo\?\.source_modes\)/);
+  assert.match(popupJs, /source_modes: collectCheckedValues\(LINUXDO_SOURCE_MODE_FIELDS, \["search"\]\)/);
+  assert.match(popupJs, /daily_search_budget: getInt\("cfgLinuxdoDailySearchBudget", 0\)/);
+  assert.match(popupJs, /bootstrap_limit: getInt\("cfgLinuxdoBootstrapLimit", 300\)/);
+  assert.match(popupJs, /linuxdo: getInt\("cfgPoolShareLinuxdo", 1\)/);
+  assert.match(popupJs, /linuxdo: checked\("cfgLinuxdoEnabled"\)/);
+  assert.match(popupJs, /if \(shares\.linuxdo !== undefined\) setVal\("cfgPoolShareLinuxdo", shares\.linuxdo\)/);
 });
 
 test("settings page exposes Bangumi clear-token control and rejected status", () => {
@@ -924,7 +1016,7 @@ test("settings page shows the budget-semantics hint for every per-source budget 
     "预算 = 每日任务次数上限；搜索默认每天 20 次，显式填 0 = 不限；创作者预算 0 或留空 = 不限。";
 
   // Every source card that has a daily budget input must carry a note.
-  const budgetCards = ["xiaohongshu", "douyin", "youtube", "twitter", "zhihu", "reddit"];
+  const budgetCards = ["xiaohongshu", "douyin", "youtube", "twitter", "zhihu", "reddit", "linuxdo"];
   for (const card of budgetCards) {
     const start = popupHtml.indexOf(`data-source-card="${card}"`);
     assert.ok(start >= 0, `source card ${card} should exist`);

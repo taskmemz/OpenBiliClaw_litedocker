@@ -358,6 +358,64 @@ request_interval_seconds = 1
 min_interval_minutes = 3
 bootstrap_limit = 300
 
+# ── Linux.do（浏览器插件同源只读）──
+# 公开 search/hot/feed/creator/related 无需登录；登录后还可读取本人收藏、点赞和
+# 最近阅读，用于画像初始化与周期增量。Cookie 始终留在浏览器内。
+[sources.linuxdo]
+enabled = false
+source_modes = ["search", "hot", "feed", "creator", "related"]
+daily_search_budget = 0
+daily_hot_budget = 0
+daily_feed_budget = 0
+daily_creator_budget = 0
+daily_related_budget = 0
+request_interval_seconds = 3
+min_interval_minutes = 3
+bootstrap_limit = 300
+# ── V2EX 公开发现（只读）──
+# Anonymous hot/latest, node and official feed discovery work without login.
+# An optional PAT enables API 2.0 member/node/topic calls; it is never used for
+# writes. Browser-login bootstrap/favorites are not part of this backend phase.
+[sources.v2ex]
+enabled = false
+username = ""
+access_token = ""
+token_env = "OPENBILICLAW_V2EX_TOKEN"
+source_modes = ["search", "node", "tab", "hot", "latest"]
+tab_modes = ["tech", "creative", "qna"]
+node_allowlist = []
+node_blocklist = ["sandbox"]
+node_downweight = ["promotions", "jobs", "deals"]
+daily_search_budget = 120
+daily_node_budget = 180
+daily_tab_budget = 80
+daily_hot_budget = 40
+daily_latest_budget = 40
+request_interval_seconds = 2
+min_interval_minutes = 5
+detail_fetch_limit = 15
+reply_enrichment_limit = 10
+max_topic_chars = 6000
+max_reply_digest_chars = 1200
+max_profile_nodes = 12
+bootstrap_topics_limit = 100
+bootstrap_replies_limit = 300
+bootstrap_favorites_limit = 300
+bootstrap_max_pages_per_scope = 20
+
+# ── 微博公开发现 + 登录态初始化（只读）──
+# 后端公开 search / hot / creator 只在内存中申请短期访客会话，不读取、上传或保存用户登录 Cookie。
+# 若在 guided init 中选择微博，浏览器插件会在已登录的 m.weibo.cn 同源任务页读取收藏、关注和 mentions，
+# 只回传归一化事件；后端只保存布尔登录心跳和账号绑定，不保存微博 Cookie。个人事件目前为 init-only，不做定时增量。
+[sources.weibo]
+enabled = false
+source_modes = ["search", "hot", "creator"]
+daily_search_budget = 60
+daily_hot_budget = 10
+daily_creator_budget = 30
+request_interval_seconds = 3
+min_interval_minutes = 10
+
 [scheduler]
 # Enable scheduled content discovery
 enabled = true
@@ -381,18 +439,24 @@ pool_target_count = 300
 copy_ready_target_count = 90
 # Low-frequency account sync interval for history / favorites / following
 account_sync_interval_hours = 6
-# Extension-online periodic account bootstrap refresh. This only runs while
-# the OpenBiliClaw browser extension runtime-stream is connected; it does not
-# perform browser-free/private-account synchronization. 0 disables all five
-# sources. Allowed values: integer 0..168 hours.
+# Extension-online periodic account bootstrap refresh is globally disabled by
+# default because browser-backed tasks may foreground a tab and steal focus.
+# Set this to true only when that behavior is acceptable. The interval below
+# takes effect only after this explicit opt-in.
+source_incremental_enabled = false
+# 0 also disables all sources after opt-in. Allowed values: 0..168 hours.
 source_incremental_hours = 24
 # Per-source overrides: omit (or set through the API to null) to inherit the
-# global interval; 0 disables only that source. Allowed values: 0..168.
+# global interval; 0 disables only that source. Douyin is the exception: its
+# foreground account bootstrap is default-off; set 1..168 to opt in.
+# Allowed values: 0..168.
 # xhs_incremental_hours = 12
-# douyin_incremental_hours = 24
+douyin_incremental_hours = 0
 # youtube_incremental_hours = 24
 # zhihu_incremental_hours = 24
 # reddit_incremental_hours = 24
+# linuxdo_incremental_hours = 24
+# v2ex_incremental_hours = 24
 # --- Runtime refresh tuning ---
 refresh_check_interval_seconds = 60      # Main loop poll interval; values <15 fallback
 # eval_min_batch_size = 15               # Coalesce trickle candidates into fuller eval batches; 1..90
@@ -457,6 +521,9 @@ twitter = 1
 zhihu = 1
 reddit = 1
 bangumi = 1
+linuxdo = 1
+v2ex = 1
+weibo = 1
 
 # ── 统一关键词规划器 / Discover 背压 (P1) ──
 # 把"每平台各自定时调 LLM 生成搜索词"换成缺口拉动的双缓冲背压模型：一个关键词

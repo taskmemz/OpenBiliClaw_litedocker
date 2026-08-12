@@ -271,7 +271,9 @@ def test_setup_exposes_anonymous_bangumi_bootstrap() -> None:
     # SOURCE_KEYS, which is the point — one roster, not one per surface. So
     # assert the derivation is wired *and* that it actually yields Bangumi,
     # rather than pinning the test to a literal that duplication would restore.
-    assert "SourceStatus.SOURCE_KEYS.map(" in html, "init roster must derive from the shared roster"
+    assert "SourceStatus.INIT_SOURCE_KEYS.map(" in html, (
+        "init roster must derive from the shared capability roster"
+    )
     assert '"bangumi"' in shared_source_status_js(), "shared roster must carry Bangumi"
     assert 'bangumiInput.id = "initBangumiUsername"' in html
     assert "Bangumi \u4f7f\u7528\u516c\u5f00 API，\u4e0d\u9700\u767b\u5f55" in html

@@ -2517,6 +2517,28 @@ class TestBackendAPI:
         assert isinstance(ctx.runtime_controller.reddit_producer, RedditDiscoveryProducer)
         assert ctx.runtime_controller.pool_source_shares["reddit"] == 2
 
+    def test_runtime_context_wires_linuxdo_producer_when_enabled(self, tmp_path: Path) -> None:
+        from openbiliclaw.api.runtime_context import build_runtime_context
+        from openbiliclaw.config import Config
+        from openbiliclaw.runtime.linuxdo_producer import LinuxdoDiscoveryProducer
+
+        config = Config(data_dir=str(tmp_path / "data"))
+        config.llm.default_provider = "ollama"
+        config.llm.ollama.model = "llama3"
+        config.sources.linuxdo.enabled = True
+        config.sources.linuxdo.request_interval_seconds = 7
+        config.scheduler.pool_source_shares["linuxdo"] = 2
+
+        ctx = build_runtime_context(config)
+
+        producer = ctx.runtime_controller.linuxdo_producer
+        assert isinstance(producer, LinuxdoDiscoveryProducer)
+        assert producer.candidate_pipeline is ctx.runtime_controller.discovery_candidate_pipeline
+        assert producer.keyword_fetch is ctx.runtime_controller.keyword_fetch
+        assert producer.candidate_evaluation_owned_by_coordinator is True
+        assert producer.poll_interval_seconds == 7
+        assert ctx.runtime_controller.pool_source_shares["linuxdo"] == 2
+
     def test_runtime_context_delegates_runtime_producer_evaluation_to_shared_coordinator(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -2908,6 +2930,8 @@ class TestBackendAPI:
             "yt": False,
             "zhihu": False,
             "reddit": False,
+            "linuxdo": False,
+            "v2ex": False,
         }
         assert captured["runtime_controller_kwargs"]["bilibili_producer"] is not None
         assert (
@@ -3111,6 +3135,8 @@ class TestBackendAPI:
             "zhihu",
             "reddit",
             "bangumi",
+            "linuxdo",
+            "weibo",
         ):
             assert key in body, f"{key} missing from sources status"
             item = body[key]
@@ -3136,6 +3162,12 @@ class TestBackendAPI:
         assert body["bangumi"]["logged_in"] is True
         assert body["bangumi"]["auth"] is not None
         assert body["bangumi"]["auth"]["auth_required"] is False
+        assert body["linuxdo"]["state"] == "no_auth"
+        assert body["linuxdo"]["logged_in"] is True
+        assert body["linuxdo"]["auth"]["auth_required"] is False
+        assert body["weibo"]["state"] == "no_auth"
+        assert body["weibo"]["logged_in"] is True
+        assert body["weibo"]["auth"]["auth_required"] is False
 
     def test_bangumi_status_is_no_auth_with_discovery_health_in_detail(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -4735,6 +4767,61 @@ class TestBackendAPI:
         ev = memory.events[0]
         assert ev["metadata"]["watch_seconds"] == 600
         assert ev["metadata"]["video_duration_seconds"] == 700
+
+    def test_events_endpoint_projects_v2ex_engaged_topic_once_for_active_identity(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        from openbiliclaw.memory.manager import MemoryManager
+        from openbiliclaw.sources.v2ex_affinity import V2EXNodeAffinityStore
+        from openbiliclaw.storage.database import Database
+
+        database = Database(tmp_path / "v2ex-dwell.db")
+        database.initialize()
+        database.activate_v2ex_profile_identity("alice")
+        database.set_v2ex_browser_identity("alice")
+        memory = MemoryManager(tmp_path / "v2ex-dwell", database=database)
+        app = create_app(
+            memory_manager=memory,
+            database=database,
+            soul_engine=_ReadySoulEngine(),
+        )
+        client = TestClient(app)
+        payload = {
+            "events": [
+                {
+                    "event_id": "v2ex-engaged-topic-42",
+                    "type": "click",
+                    "url": "https://www.v2ex.com/t/42",
+                    "title": "Local-first agents",
+                    "timestamp": 1786310400000,
+                    "source_platform": "v2ex",
+                    "context": {"pageType": "topic"},
+                    "metadata": {
+                        "content_id": "42",
+                        "topic_id": "42",
+                        "node_name": "programmer",
+                        "node_title": "程序员",
+                        "dwell_source": "content_page_exit",
+                        "watch_seconds": 45,
+                    },
+                }
+            ]
+        }
+
+        first = client.post("/api/events", json=payload)
+        second = client.post("/api/events", json=payload)
+
+        assert first.status_code == 200, first.text
+        assert first.json()["receipts"][0]["inserted"] is True
+        assert second.status_code == 200, second.text
+        assert second.json()["receipts"][0]["duplicate"] is True
+        scores = V2EXNodeAffinityStore(database).scores(username="alice")
+        assert scores[0]["engaged_view_count"] == 1
+        assert scores[0]["score"] == 0.3
+        assert database.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
 
     def test_events_endpoint_normalizes_dislike_to_feedback(self) -> None:
         from fastapi.testclient import TestClient
@@ -6928,6 +7015,7 @@ class TestBackendAPI:
                     "danmaku_count": 890,
                     "favorite_count": 0,
                     "comment_count": 0,
+                    "share_count": 0,
                     "rating_score": 0.0,
                     "rating_count": 0,
                     "source_rank": 0,
@@ -6957,6 +7045,7 @@ class TestBackendAPI:
                     "danmaku_count": 0,
                     "favorite_count": 0,
                     "comment_count": 0,
+                    "share_count": 0,
                     "rating_score": 0.0,
                     "rating_count": 0,
                     "source_rank": 0,
@@ -7255,6 +7344,7 @@ class TestBackendAPI:
                     "danmaku_count": 0,
                     "favorite_count": 0,
                     "comment_count": 0,
+                    "share_count": 0,
                     "rating_score": 0.0,
                     "rating_count": 0,
                     "source_rank": 0,
@@ -11196,6 +11286,27 @@ class TestBackendAPI:
             == "https://bgm.tv/subject/326"
         )
 
+    def test_recommendation_click_builds_only_numeric_linuxdo_fallback_url(self) -> None:
+        """Linux.do topic identities map to canonical topic URLs, never Bilibili."""
+        from openbiliclaw.api.app import _fallback_recommendation_click_url
+
+        assert (
+            _fallback_recommendation_click_url(
+                source_platform="linuxdo",
+                content_id="topic:326",
+                bvid="topic:326",
+            )
+            == "https://linux.do/t/326"
+        )
+        assert (
+            _fallback_recommendation_click_url(
+                source_platform="linuxdo",
+                content_id="topic:not-numeric",
+                bvid="topic:not-numeric",
+            )
+            == ""
+        )
+
     def test_recommendation_click_endpoint_persists_dwell_fields(self) -> None:
         """When the extension reports dwell on the click-through, those
         fields flow into the persisted click event so storage can classify
@@ -11763,6 +11874,7 @@ class TestBackendAPI:
                         "delight_score": 0.95,
                         "published_at": "2026-07-08T06:30:00Z",
                         "published_label": "3 days ago",
+                        "share_count": 321,
                     }
                 ]
 
@@ -11787,6 +11899,7 @@ class TestBackendAPI:
 
         assert response.status_code == 200
         assert_publication(event_hub.events[0])
+        assert event_hub.events[0]["share_count"] == 321
 
     def test_delight_pending_batch_surfaces_body_text_and_content_type(self) -> None:
         """The delight card derives a readable title for legacy answer_<id> rows
@@ -12376,6 +12489,70 @@ class TestBackendAPI:
         )
         assert invalid_mode.status_code == 400
         assert "source_modes" in invalid_mode.json()["detail"]
+
+    def test_put_config_bounds_and_normalizes_v2ex_source(self, monkeypatch, tmp_path) -> None:
+        from fastapi.testclient import TestClient
+
+        from openbiliclaw.config import Config, LLMConfig, LLMProviderConfig, save_config
+
+        cfg = Config(
+            llm=LLMConfig(
+                default_provider="ollama",
+                ollama=LLMProviderConfig(model="llama3", base_url="http://localhost:11434"),
+            )
+        )
+        config_path = tmp_path / "config.toml"
+        save_config(cfg, config_path)
+        monkeypatch.setenv("OPENBILICLAW_PROJECT_ROOT", str(tmp_path))
+        monkeypatch.setattr("openbiliclaw.config.load_config", lambda *_a, **_kw: cfg)
+        monkeypatch.setattr(
+            "openbiliclaw.config.save_config",
+            lambda c, path=None: save_config(c, config_path),
+        )
+        app = create_app(memory_manager=object(), database=object(), soul_engine=object())
+        client = TestClient(app)
+
+        unsafe_slug = client.put(
+            "/api/config",
+            json={"sources": {"v2ex": {"node_allowlist": ["programmer", "../private"]}}},
+        )
+        assert unsafe_slug.status_code == 400
+        assert "node_allowlist" in unsafe_slug.json()["detail"]
+
+        oversized = client.put(
+            "/api/config",
+            json={"sources": {"v2ex": {"max_topic_chars": 20_001}}},
+        )
+        assert oversized.status_code == 400
+        assert "max_topic_chars" in oversized.json()["detail"]
+
+        unknown = client.put(
+            "/api/config",
+            json={"sources": {"v2ex": {"max_pages": 20}}},
+        )
+        assert unknown.status_code == 400
+        assert "max_pages" in unknown.json()["detail"]
+
+        valid = client.put(
+            "/api/config",
+            json={
+                "sources": {
+                    "v2ex": {
+                        "enabled": True,
+                        "source_modes": ["SEARCH", "node", "search"],
+                        "tab_modes": ["Tech", "QNA"],
+                        "node_allowlist": ["Programmer", "programmer"],
+                        "max_topic_chars": 20_000,
+                    }
+                }
+            },
+        )
+        assert valid.status_code == 202, valid.text
+        source = valid.json()["config"]["sources"]["v2ex"]
+        assert source["source_modes"] == ["search", "node"]
+        assert source["tab_modes"] == ["tech", "qna"]
+        assert source["node_allowlist"] == ["programmer"]
+        assert source["max_topic_chars"] == 20_000
 
     def _bangumi_token_put_app(self, monkeypatch, tmp_path):
         from fastapi.testclient import TestClient
@@ -14904,6 +15081,9 @@ class TestEmbeddingAndCompatProviderE2E:
             "zhihu": 1,
             "reddit": 1,
             "bangumi": 4,
+            "linuxdo": 1,
+            "weibo": 1,
+            "v2ex": 1,
         }
         assert data["scheduler"]["account_sync_interval_hours"] == 9
         assert data["scheduler"]["refresh_check_interval_seconds"] == 75
@@ -15127,6 +15307,7 @@ class TestEmbeddingAndCompatProviderE2E:
         from openbiliclaw.config import Config, LLMConfig, LLMProviderConfig
 
         cfg = Config(llm=LLMConfig(openai=LLMProviderConfig(api_key="sk-openai")))
+        cfg.scheduler.source_incremental_enabled = False
         cfg.scheduler.source_incremental_hours = 36
         cfg.scheduler.xhs_incremental_hours = 0
         cfg.scheduler.douyin_incremental_hours = 168
@@ -15134,6 +15315,7 @@ class TestEmbeddingAndCompatProviderE2E:
 
         initial = client.get("/api/config")
         assert initial.status_code == 200
+        assert initial.json()["scheduler"]["source_incremental_enabled"] is False
         assert initial.json()["scheduler"]["source_incremental_hours"] == 36
         assert initial.json()["scheduler"]["xhs_incremental_hours"] == 0
         assert initial.json()["scheduler"]["douyin_incremental_hours"] == 168
@@ -15143,6 +15325,7 @@ class TestEmbeddingAndCompatProviderE2E:
             "/api/config",
             json={
                 "scheduler": {
+                    "source_incremental_enabled": True,
                     "source_incremental_hours": 48,
                     "xhs_incremental_hours": None,
                     "douyin_incremental_hours": 12,
@@ -15154,6 +15337,7 @@ class TestEmbeddingAndCompatProviderE2E:
         )
 
         assert updated.status_code == 202
+        assert cfg.scheduler.source_incremental_enabled is True
         assert cfg.scheduler.source_incremental_hours == 48
         assert cfg.scheduler.xhs_incremental_hours is None
         assert cfg.scheduler.douyin_incremental_hours == 12
@@ -15161,6 +15345,14 @@ class TestEmbeddingAndCompatProviderE2E:
         assert cfg.scheduler.zhihu_incremental_hours == 7
         assert cfg.scheduler.reddit_incremental_hours == 168
         assert updated.json()["config"]["scheduler"]["xhs_incremental_hours"] is None
+
+        reset_douyin = client.put(
+            "/api/config",
+            json={"scheduler": {"douyin_incremental_hours": None}},
+        )
+        assert reset_douyin.status_code == 202
+        assert cfg.scheduler.douyin_incremental_hours == 0
+        assert reset_douyin.json()["config"]["scheduler"]["douyin_incremental_hours"] == 0
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -15458,6 +15650,9 @@ class TestEmbeddingAndCompatProviderE2E:
             "zhihu": 1,
             "reddit": 1,
             "bangumi": 1,
+            "linuxdo": 1,
+            "weibo": 1,
+            "v2ex": 1,
         }
         assert cfg.scheduler.refresh_check_interval_seconds == 75
         assert cfg.scheduler.eval_min_batch_size == 23
@@ -15603,7 +15798,10 @@ class TestEmbeddingAndCompatProviderE2E:
                 "twitter": 0,
                 "zhihu": 0,
                 "reddit": 225,
+                "weibo": 0,
+                "v2ex": 0,
                 "bangumi": 0,
+                "linuxdo": 0,
             },
             "enabled_sources": {
                 "bilibili": True,
@@ -15614,6 +15812,9 @@ class TestEmbeddingAndCompatProviderE2E:
                 "zhihu": False,
                 "reddit": False,
                 "bangumi": False,
+                "linuxdo": False,
+                "weibo": False,
+                "v2ex": False,
             },
             "suggested_shares": {
                 "bilibili": 8,
@@ -15691,7 +15892,10 @@ class TestEmbeddingAndCompatProviderE2E:
                 "twitter": 0,
                 "zhihu": 0,
                 "reddit": 225,
+                "weibo": 0,
+                "v2ex": 0,
                 "bangumi": 0,
+                "linuxdo": 0,
             },
             "enabled_sources": {
                 "bilibili": True,
@@ -15702,6 +15906,9 @@ class TestEmbeddingAndCompatProviderE2E:
                 "zhihu": False,
                 "reddit": True,
                 "bangumi": False,
+                "linuxdo": False,
+                "weibo": False,
+                "v2ex": False,
             },
             "suggested_shares": {
                 "bilibili": 6,
@@ -16092,11 +16299,13 @@ class _FakeInitPrereqs:
         chat: bool = True,
         platforms=None,
         chat_detail: str = "",
+        capability_readiness: dict[tuple[str, str], str] | None = None,
     ) -> None:
         self._bili = bili
         self._chat = chat
         self._chat_detail = chat_detail
         self._platforms = list(platforms or [])
+        self._capability_readiness = dict(capability_readiness or {})
         self.bilibili_check_calls = 0
         self.chat_ready_calls = 0
 
@@ -16125,6 +16334,9 @@ class _FakeInitPrereqs:
 
     def enabled_platforms(self) -> list[str]:
         return list(self._platforms)
+
+    def source_capability_readiness(self, slug: str, capability: str) -> str:
+        return self._capability_readiness.get((slug, capability), "ready")
 
 
 def test_init_crash_detail_summarizes_exception() -> None:
@@ -16262,6 +16474,43 @@ class TestGuidedInitEndpoints:
         assert resp.status_code == 409
         assert resp.json()["error"] == "already_initialized"
         assert db.get_latest_init_run() is None
+
+    def test_init_force_bypasses_already_initialized_guard(self, tmp_path: Path) -> None:
+        """``force:true`` must pass the already-initialized guard (re-init entry).
+
+        A later prerequisite failure (here: B 站登录) proves the request actually
+        advanced past the initialized guard instead of being short-circuited by
+        it — the re-init path keeps the normal prerequisite checks.
+        """
+        from fastapi.testclient import TestClient
+
+        prereqs = _FakeInitPrereqs(bili="failed", chat=True, platforms=["bilibili"])
+        app, db = self._make_app(tmp_path, profile_ready=True, prereqs=prereqs)
+        with TestClient(app) as client:
+            resp = client.post("/api/init", json={"force": True})
+        assert resp.status_code == 409
+        assert resp.json()["error"] == "bilibili_not_logged_in"
+        # Guard bypassed: the failure is a later prerequisite, not
+        # already_initialized, and the run was rolled back cleanly.
+        assert resp.json()["error"] != "already_initialized"
+        run = db.get_latest_init_run()
+        assert run["status"] == "idle"
+        assert app.state.runtime_context.init_coordinator.init_active() is False
+
+    def test_init_force_starts_reinit_when_prerequisites_pass(self, tmp_path: Path) -> None:
+        """``force:true`` with healthy prerequisites reserves a real re-init run."""
+        from fastapi.testclient import TestClient
+
+        prereqs = _FakeInitPrereqs(bili="ok", chat=True, platforms=["bilibili"])
+        app, db = self._make_app(tmp_path, profile_ready=True, prereqs=prereqs)
+        with TestClient(app) as client:
+            resp = client.post("/api/init", json={"force": True, "reset_cognition": True})
+            assert resp.status_code == 202, resp.text
+            body = resp.json()
+            assert body["run_id"]
+            assert body["status"] in {"starting", "running"}
+            # Clean up the background run so the test exits without a live task.
+            client.post("/api/init/cancel", json={})
 
     def test_init_already_running_returns_409(self, tmp_path: Path) -> None:
         from fastapi.testclient import TestClient
@@ -16413,6 +16662,42 @@ class TestGuidedInitEndpoints:
         assert captured["include_bili"] is False
         assert captured["include_xhs"] is True
 
+    def test_init_force_wires_pool_purge_and_cognition_reset(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Force re-init must inject the pool-purge callback + reset_cognition.
+
+        Regression: the purge used to be forwarded via backfill signature
+        sniffing, and the API wrapper's backfill silently omitted the flag —
+        force re-init on the API path never retired the old pool (field report
+        2026-08-12, caught by real E2E). The pipeline now receives a callback
+        unconditionally and runs it at stage-4 start.
+        """
+        from fastapi.testclient import TestClient
+
+        prereqs = _FakeInitPrereqs(bili="ok", chat=True, platforms=["bilibili"])
+        app, _ = self._make_app(tmp_path, profile_ready=True, prereqs=prereqs)
+        captured = self._capture_run_guided_init(monkeypatch)
+        with TestClient(app) as client:
+            resp = client.post("/api/init", json={"force": True, "reset_cognition": True})
+            assert resp.status_code == 202
+            self._drive_until(client, captured)
+        assert captured["purge_pool_callback"] is not None
+        assert captured["reset_cognition"] is True
+
+    def test_init_first_run_does_not_inject_pool_purge(self, tmp_path: Path, monkeypatch) -> None:
+        """A first (non-force) init has no pool to purge and must not inject."""
+        from fastapi.testclient import TestClient
+
+        prereqs = _FakeInitPrereqs(bili="ok", chat=True, platforms=["bilibili"])
+        app, _ = self._make_app(tmp_path, prereqs=prereqs)
+        captured = self._capture_run_guided_init(monkeypatch)
+        with TestClient(app) as client:
+            resp = client.post("/api/init", json={})
+            assert resp.status_code == 202
+            self._drive_until(client, captured)
+        assert captured["purge_pool_callback"] is None
+
     def test_init_rejects_empty_source_selection(self, tmp_path: Path) -> None:
         from fastapi.testclient import TestClient
 
@@ -16440,6 +16725,51 @@ class TestGuidedInitEndpoints:
         assert captured["include_bili"] is False
         assert captured["include_reddit"] is True
         assert db.get_latest_init_run() is not None
+
+    def test_init_accepts_linuxdo_as_only_profile_signal_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        prereqs = _FakeInitPrereqs(bili="ok", chat=True, platforms=["linuxdo"])
+        app, db = self._make_app(tmp_path, prereqs=prereqs)
+        captured = self._capture_run_guided_init(monkeypatch)
+        with TestClient(app) as client:
+            response = client.post("/api/init", json={"sources": ["linuxdo"]})
+            assert response.status_code == 202
+            self._drive_until(client, captured, key="include_linuxdo")
+
+        assert captured["include_bili"] is False
+        assert captured["include_linuxdo"] is True
+        assert db.get_latest_init_run() is not None
+
+    def test_init_rejects_linuxdo_only_when_profile_capability_is_signed_out(
+        self, tmp_path: Path
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        prereqs = _FakeInitPrereqs(
+            bili="ok",
+            chat=True,
+            platforms=["linuxdo"],
+            capability_readiness={("linuxdo", "profile"): "login_required"},
+        )
+        app, db = self._make_app(tmp_path, prereqs=prereqs)
+
+        with TestClient(app) as client:
+            response = client.post("/api/init", json={"sources": ["linuxdo"]})
+
+        assert response.status_code == 409
+        assert response.json() == {
+            "error": "no_profile_signal_sources",
+            "detail": (
+                "Linux.do 公开发现无需登录，但初始化所需的收藏、点赞和阅读记录"
+                "需要已登录的浏览器会话。请先在当前浏览器登录 Linux.do 并连接插件。"
+            ),
+            "capability": "profile",
+            "readiness": "login_required",
+        }
+        assert db.get_latest_init_run() is None
 
     def test_init_records_douyin_degraded_as_partial_success(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -20318,17 +20648,17 @@ def test_reshuffle_and_append_forward_canonical_source_platform() -> None:
 
     reshuffle = client.post(
         "/api/recommendations/reshuffle",
-        json={"excluded_bvids": ["BV1"], "source_platform": "zhihu"},
+        json={"excluded_bvids": ["BV1"], "source_platform": "weibo"},
     )
     append = client.post(
         "/api/recommendations/append",
-        json={"excluded_bvids": ["BV1"], "source_platform": "zhihu"},
+        json={"excluded_bvids": ["BV1"], "source_platform": "weibo"},
     )
 
     assert reshuffle.status_code == 200
     assert append.status_code == 200
-    assert engine.reshuffle_kwargs[0]["source_platform"] == "zhihu"
-    assert engine.append_kwargs[0]["source_platform"] == "zhihu"
+    assert engine.reshuffle_kwargs[0]["source_platform"] == "weibo"
+    assert engine.append_kwargs[0]["source_platform"] == "weibo"
 
 
 def test_recommendation_requests_normalize_platform_aliases() -> None:
@@ -20377,7 +20707,7 @@ def test_recommendation_requests_reject_unknown_platform() -> None:
     client = TestClient(_scoped_app(engine, _ScopedFakeRuntimeController()))
 
     for path in ("/api/recommendations/reshuffle", "/api/recommendations/append"):
-        for bogus in ("weibo", "'; DROP TABLE content_cache; --", "bilibili2"):
+        for bogus in ("'; DROP TABLE content_cache; --", "bilibili2"):
             response = client.post(path, json={"excluded_bvids": [], "source_platform": bogus})
             assert response.status_code == 422, (path, bogus)
 

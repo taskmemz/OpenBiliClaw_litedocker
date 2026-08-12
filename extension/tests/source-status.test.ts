@@ -15,12 +15,8 @@ const SourceStatus = (globalThis as Record<string, any>).OpenBiliClawSourceStatu
 test("the shared module publishes itself for classic-script consumers", () => {
   assert.ok(SourceStatus, "source-status.js did not define OpenBiliClawSourceStatus");
   assert.deepEqual([...SourceStatus.SOURCE_KEYS], [
-    // Bangumi is in the roster without being on the auth contract: the roster
-    // answers "which sources exist", and omitting it would drop the platform
-    // from all three settings surfaces at once. It renders off the legacy
-    // `state` fallback until it gets a provider — see the test below.
-    "bilibili", "xiaohongshu", "douyin", "youtube", "twitter", "zhihu", "reddit",
-    "bangumi",
+    "bilibili", "xiaohongshu", "douyin", "weibo", "youtube", "twitter", "zhihu", "reddit",
+    "bangumi", "linuxdo", "v2ex",
   ]);
 });
 
@@ -213,6 +209,38 @@ test("auth_required=false is its own tier, not a shade of verified", () => {
   assert.notEqual(youtube.label, "需要登录");
 });
 
+test("optional browser login never hides Linux.do public discovery", () => {
+  const detail =
+    "Linux.do 公开发现可用；浏览器当前未登录，个人信号同步暂不可用。";
+  const loggedOut = {
+    state: "ready",
+    enabled: true,
+    detail,
+    auth: {
+      auth_required: false,
+      credential: "none",
+      verification: "failed",
+      verify_method: "browser_heartbeat",
+      verified_at: "2026-07-18T09:57:00+00:00",
+    },
+  };
+  const access = SourceStatus.describeAccess(loggedOut, { now: NOW });
+
+  assert.equal(SourceStatus.sourceLabel("linuxdo"), "Linux.do");
+  assert.equal(access.label, "公开发现可用");
+  assert.equal(access.tone, "public");
+  assert.equal(access.detail, detail);
+  assert.ok(access.evidence.text.includes("插件心跳"));
+  assert.equal(SourceStatus.describeSourceIssue(loggedOut), null);
+
+  const credential = SourceStatus.describeCredential({
+    available: false,
+    detail: "连接已登录插件后可同步个人收藏、点赞和阅读记录。",
+    form: { kind: "extension_only", label: "Linux.do 登录态（可选）" },
+  });
+  assert.equal(credential.form.writable, false);
+});
+
 test("a capability is not a result: unverified says so, whatever the method", () => {
   const view = SourceStatus.describeAccess({
     state: "unverified",
@@ -332,6 +360,59 @@ test("dashboard issue classification covers every enabled source without flaggin
   ]) {
     assert.equal(SourceStatus.describeSourceIssue({ enabled: true, ...item }), null, item.state);
   }
+});
+
+test("anonymous Weibo discovery health remains actionable independently of auth", () => {
+  const base = {
+    state: "no_auth",
+    enabled: true,
+    auth: {
+      auth_required: false,
+      credential: "none",
+      verification: "unverified",
+      verify_method: "none",
+    },
+  };
+
+  const failed = SourceStatus.describeSourceIssue({
+    ...base,
+    discovery_state: "error",
+    detail: "微博公开发现最近失败，将按节流策略自动重试。",
+  });
+  assert.deepEqual(failed, {
+    tone: "danger",
+    label: "发现失败",
+    detail: "微博公开发现最近失败，将按节流策略自动重试。",
+  });
+
+  const limited = SourceStatus.describeSourceIssue({
+    ...base,
+    discovery_state: "rate_limited",
+    feed_paused: true,
+    detail: "微博公开接口正在退避冷却，到期后自动重试。",
+  });
+  assert.equal(limited?.tone, "warning");
+  assert.equal(limited?.label, "发现已暂停");
+
+  assert.equal(SourceStatus.describeSourceIssue({
+    ...base,
+    discovery_state: "ready",
+    detail: "微博公开发现正常。",
+  }), null);
+});
+
+test("feed_paused remains an actionable fallback for older health payloads", () => {
+  const issue = SourceStatus.describeSourceIssue({
+    state: "no_auth",
+    enabled: true,
+    feed_paused: true,
+    detail: "后台发现暂时暂停。",
+    auth: { auth_required: false, credential: "none", verification: "unverified" },
+  });
+
+  assert.equal(issue?.tone, "warning");
+  assert.equal(issue?.label, "发现已暂停");
+  assert.equal(issue?.detail, "后台发现暂时暂停。");
 });
 
 // A side panel installed from the store can be pointed at a self-hosted backend

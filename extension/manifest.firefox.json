@@ -37,6 +37,10 @@
         "*://*.zhihu.com/*",
         "*://*.reddit.com/*",
         "*://*.redd.it/*",
+        "https://linux.do/*",
+        "*://*.v2ex.com/*",
+        "*://*.weibo.com/*",
+        "*://*.weibo.cn/*",
         "*://*.x.com/*",
         "*://*.twitter.com/*",
         "*://*.bgm.tv/*",
@@ -133,11 +137,39 @@
         },
         {
             "matches": [
+                "*://*.weibo.com/*",
+                "*://*.weibo.cn/*"
+            ],
+            "js": [
+                "content/weibo.js"
+            ],
+            "run_at": "document_idle"
+        },
+        {
+            "matches": [
                 "*://*.reddit.com/*",
                 "*://*.redd.it/*"
             ],
             "js": [
                 "content/reddit.js"
+            ],
+            "run_at": "document_idle"
+        },
+        {
+            "matches": [
+                "https://linux.do/*"
+            ],
+            "js": [
+                "content/linuxdo.js"
+            ],
+            "run_at": "document_idle"
+        },
+        {
+            "matches": [
+                "*://*.v2ex.com/*"
+            ],
+            "js": [
+                "content/v2ex.js"
             ],
             "run_at": "document_idle"
         },

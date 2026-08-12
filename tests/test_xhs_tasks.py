@@ -820,6 +820,36 @@ class TestXhsTaskApi:
         resp = api_client.get("/api/sources/xhs/next-task")
         assert resp.status_code == 204
 
+    def test_default_off_cancels_queued_incremental_task_before_claim(
+        self,
+        api_client: TestClient,
+    ) -> None:
+        ctx = api_client.app.state.runtime_context
+        queue = XhsTaskQueue(ctx.database)
+        scheduled_id = queue.enqueue_with_id(
+            "bootstrap_profile",
+            {"incremental": True, "incremental_owner": "scheduler"},
+            daily_budget=0,
+        )
+        assert scheduled_id is not None
+
+        blocked = api_client.get("/api/sources/xhs/next-task")
+
+        assert blocked.status_code == 204
+        stored = queue.get(scheduled_id)
+        assert stored is not None
+        assert stored["status"] == "failed"
+
+        manual_id = queue.enqueue_with_id(
+            "bootstrap_profile",
+            {"incremental": True, "scopes": ["saved"]},
+            daily_budget=0,
+        )
+        assert manual_id is not None
+        claimed = api_client.get("/api/sources/xhs/next-task")
+        assert claimed.status_code == 200
+        assert claimed.json()["id"] == manual_id
+
     def test_disabled_source_does_not_claim_queued_discovery_task(
         self,
         api_client: TestClient,

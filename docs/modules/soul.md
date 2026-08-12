@@ -96,7 +96,7 @@
 | 小红书初始化画像信号 | ✅ | `openbiliclaw init` 会把插件解析到的小红书 `saved/liked/xhs_history` 转成 `favorite/like/view` 事件，并与 B 站历史、收藏、关注一起进入 `analyze_events()` 和初始画像 history |
 | 抖音初始化画像信号 | ✅ | `openbiliclaw init --yes-douyin` 会把插件解析到的抖音 `dy_post/dy_collect/dy_like/dy_follow` 转成 `view/favorite/like/follow` 事件，并进入偏好分析和初始画像 history |
 | Durable 行为事件增量画像 | ✅ | profile 已存在时，`POST /api/events`、推荐点击与带画像语义的 source task 只经 `EventIngressService` 提交 durable event 并 wake。app-owned scheduler 的 `profile_events` generic consumer 与 `content_feedback` consumer 按显式 owner、各自 cursor 扫描，使用 event-row 稳定 signal ID，通过 `checkpointed_enqueue_batch()` 原子发布 buffer+cursor，再调用 `tick_if_buffered()`；独立周期维护才调用完整 `tick()`，HTTP 不直调 pipeline/LLM。retraction 投影在 generic cursor 前完成；hypothesis/import feedback 由其它 owner 处理或只越过 feedback cursor；rejected/not_initialized 不入 pipeline。 |
-| 小红书 / 抖音 / YouTube / 知乎 / Reddit 增量画像事件 | ✅ | profile 已存在时，带画像更新语义的 bootstrap task-result 新增事件会经 durable ingress 后进入 generic profile-update owner，参与后续分层画像更新；知乎 / Reddit 普通 fetch smoke 仍需 `profile_update=true`，周期任务则由后端 `incremental=true` 标记放行 |
+| 小红书 / 抖音 / YouTube / 知乎 / Reddit / Linux.do 增量画像事件 | ✅ | profile 已存在时，带画像更新语义的 bootstrap task-result 新增事件会经 durable ingress 后进入 generic profile-update owner，参与后续分层画像更新；知乎 / Reddit / Linux.do 普通 fetch smoke 默认不进入画像，周期任务则由后端 `incremental=true` 标记放行；Linux.do 只接收插件归一化后的事件，不接收 Cookie 或原始响应 |
 | Retraction 确定性折价（双面） | ✅ | 用户撤销的正向行为（unlike/unbookmark/unfollow/undo-retweet）不再以满强度留在画像证据里。**内存面**：`ProfileUpdatePipeline.ingest_batch()` 开头新增原子折价预处理，早于任何阈值消费（`_update_layer`）——同批 / 既有缓冲中同 identity key、事件类型 == `retracted_action`、且事件时间早于 retraction 时间的正向信号被折价（`metadata.retracted=true`、`signal_strength=min(现值,0.2)`）；乱序到达用内存 tombstone `(identity_key, action) → retraction 事件时间`（TTL 24h / cap 500 逐出最旧）处理，`like→retract→like` 的重新点赞（事件时间晚于 retraction）不折，事件时间缺失保守不折。**离线重读面**：`Database.mark_positive_events_retracted()` 由 generic durable event consumer 在推进 cursor 前严格投影，并被 `openbiliclaw init` 全量重建 / 12h 认知整理等重读路径复用；旧 `apply_retraction_db_marks()` 只保留 deprecated embedder 兼容，不再由 HTTP ingress 直调。迟到正向事件（account_sync 回填旧 like）在 MemoryManager 规范化落库时对账已存 retraction 行。identity key 复用共享 `sources/identity_keys.py`（tweet_id / bvid / mid / xhs note_id）。`retracted_action` 白名单 `{like,favorite,share,follow}`，越界跳过 + WARNING。|
 | Retraction 渲染标记与回放不变性 | ✅ | `sources/event_format.render_retraction_marked_events()` 给 `metadata.retracted` 为真的事件在渲染时给 context 追加「(已撤销)」——两个重读 events 的 LLM 消费面（`build_preference_analysis_prompt` 偏好 + `build_awareness_prompt` 12h 认知觉察）共用该函数自动生效，兼容 dict 与 DB 返回的 JSON 字符串两种 metadata 形态；折后 0.2 强度经既有 preserved keys 自然进入 prompt。偏好 system prompt 追加一条静态撤销语义规则（rule 12b，仍是模块级常量，prompt-cache 调用不变性不破）。回放不变性作用域=事件渲染文本：无 retraction 标注的事件集渲染字节一致（`tests/test_event_retraction_discount.py::test_event_rendering_invariance_without_retractions` 兜底）|
 | ToneProfile | ✅ | 从 `OnionProfile`、偏好摘要和近期反馈推断 `density/warmth/playfulness/directness`，统一驱动推荐、画像和聊天语气 |
@@ -469,7 +469,7 @@ active 池会做两层多样性保护：词面 / specifics 的 novelty guard 阻
 首次初始化时，走的是 `SoulEngine.build_initial_profile(history)`：
 
 1. 先读取已有 `preference` 层。
-2. `openbiliclaw init` 已经先把 B 站历史 / 收藏 / 关注，以及显式启用的小红书 / 抖音 bootstrap signals 汇总成事件批次，调用 `analyze_events()` 更新偏好层。
+2. `openbiliclaw init` 已经先把 B 站历史 / 收藏 / 关注，以及显式启用的小红书、抖音、YouTube、知乎、Reddit、Linux.do、Bangumi bootstrap signals 汇总成事件批次，调用 `analyze_events()` 更新偏好层。
 3. 再加载历史 `awareness_notes` 和 `active_insights`。首次新装通常为空；如果第 2 步的初始化分片输出了临时 `awareness_candidates` / `insight_candidates`，`SoulEngine` 会把它们追加到本次 profile-build prompt 的 awareness / insights 输入中。
 4. `ProfileBuilder.build()` 把 `history_summary + preference_summary + awareness + insights` 一起送给 LLM。临时 chunk cognition 只参与这次 prompt，不持久化到 awareness / insight 层。
 5. LLM 返回结构化 JSON，必须包含：
@@ -500,6 +500,14 @@ active 池会做两层多样性保护：词面 / specifics 的 novelty guard 阻
 | `dy_collect` | `favorite` | 收藏/想回看信号，强度最高 |
 | `dy_like` | `like` | 中高强度偏好信号 |
 | `dy_follow` | `follow` | 对创作者长期内容的兴趣信号 |
+
+Linux.do bootstrap signals 来自扩展在真实 `linux.do` tab 中执行的同源只读 GET，不读取 Chrome 浏览器历史，也不上传 Cookie、CSRF 数据或原始响应。个人 scope 必须由 `/session/current.json` 正面确认当前用户；`_t` 只作为“可能已登录”的布尔提示。scope 映射为：
+
+| Linux.do scope | 事件类型 | 用途 |
+|----------------|----------|------|
+| `linuxdo_bookmarks` | `favorite` | 用户明确保存、希望回看的主题 |
+| `linuxdo_likes` | `like` | 中高强度偏好信号 |
+| `linuxdo_read_history` | `view` | 站点账户阅读历史的弱偏好信号 |
 
 这里有两个重要约束：
 

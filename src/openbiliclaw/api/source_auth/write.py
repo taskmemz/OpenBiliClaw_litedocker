@@ -286,6 +286,56 @@ CREDENTIAL_SPECS: dict[str, CredentialSpec] = {
             "Bangumi 校验一次。填好后可点「测试连接」用 /v0/me 复验。"
         ),
     ),
+    "linuxdo": CredentialSpec(
+        slug="linuxdo",
+        kinds=("login_state",),
+        unverified_reason=(
+            "Linux.do Cookie 保留在浏览器中，后端只接收登录布尔值；"
+            "公开发现不依赖登录，个人信号同步由插件登录态增强。"
+        ),
+        form_kind="extension_only",
+        form_label="Linux.do 登录态（可选）",
+        login_url="https://linux.do/",
+        help_text=(
+            "公开发现无需登录。要同步本人收藏、点赞和阅读记录，请在浏览器登录 Linux.do；"
+            "插件只上报登录状态，不上传 Cookie。"
+        ),
+    ),
+    "v2ex": CredentialSpec(
+        slug="v2ex",
+        # PATs remain config-owned.  The only value accepted here is the
+        # privacy-preserving browser heartbeat: one boolean, never a cookie.
+        kinds=("login_state",),
+        opaque_credential=True,
+        unverified_reason=(
+            "V2EX 登录态只保存浏览器上报的布尔值，后端不读取 Cookie；"
+            "PAT 在 [sources.v2ex] 或环境变量中配置。"
+        ),
+        form_kind="none",
+        form_label="V2EX PAT（可选）",
+        env_var_path="sources.v2ex.token_env",
+        env_var_default="OPENBILICLAW_V2EX_TOKEN",
+        login_url="https://www.v2ex.com/help/api",
+        help_text=(
+            "V2EX 公开发现无需登录。可选 PAT 用于识别账号和增强 API 2.0，"
+            "请在设置 / config.toml 的 [sources.v2ex] 中填写，或使用 token_env 指定环境变量。"
+        ),
+    ),
+    "weibo": CredentialSpec(
+        slug="weibo",
+        kinds=("login_state",),
+        opaque_credential=True,
+        unverified_reason=(
+            "微博公开发现可匿名；个人收藏、关注和互动初始化只接受浏览器登录状态布尔值，"
+            "后端不读取或保存 Cookie。"
+        ),
+        form_kind="none",
+        form_label="微博浏览器登录态",
+        help_text=(
+            "公开发现无需登录；要在初始化时导入本人收藏、关注和互动，请登录微博并连接插件。"
+            "插件只同步是否登录，实际只读请求在微博页面内执行，不上传 Cookie。"
+        ),
+    ),
 }
 
 
@@ -689,8 +739,15 @@ def persist_credential(
     this function stays a dumb writer.
     """
     if kind == "login_state":
-        setter = f"set_{'xhs' if slug == 'xiaohongshu' else 'zhihu'}_login_state"
-        getter = f"get_{'xhs' if slug == 'xiaohongshu' else 'zhihu'}_login_state"
+        prefix = {
+            "xiaohongshu": "xhs",
+            "zhihu": "zhihu",
+            "linuxdo": "linuxdo",
+            "v2ex": "v2ex",
+            "weibo": "weibo",
+        }.get(slug, slug)
+        setter = f"set_{prefix}_login_state"
+        getter = f"get_{prefix}_login_state"
         if database is None or not hasattr(database, setter):
             return PersistResult(persisted=False)
         getattr(database, setter)(bool(value))

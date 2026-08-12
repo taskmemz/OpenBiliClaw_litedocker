@@ -1,5 +1,6 @@
 const DEFAULT_TITLE = "这条标题还没对上号";
 const DEFAULT_UP_NAME = "这位 UP 还没认出来";
+const DEFAULT_CREATOR_NAME = "这位创作者还没认出来";
 const DEFAULT_PORTRAIT = "画像还在慢慢攒，先多看一阵。";
 const DEFAULT_DELIGHT_TITLE = "这条惊喜推荐还没起好标题";
 const DEFAULT_DELIGHT_REASON = "这条可能会给你一点意外之喜。";
@@ -31,6 +32,8 @@ function normalizeSourcePlatform(value, url = "") {
     dy: "douyin",
     douyin: "douyin",
     tiktok: "douyin",
+    wb: "weibo",
+    weibo: "weibo",
     yt: "youtube",
     youtube: "youtube",
     x: "twitter",
@@ -41,6 +44,10 @@ function normalizeSourcePlatform(value, url = "") {
     reddit: "reddit",
     bgm: "bangumi",
     bangumi: "bangumi",
+    linuxdo: "linuxdo",
+    "linux.do": "linuxdo",
+    v2: "v2ex",
+    v2ex: "v2ex",
   };
   if (aliases[key]) return aliases[key];
   if (key) return key;
@@ -48,11 +55,14 @@ function normalizeSourcePlatform(value, url = "") {
   if (lowerUrl.includes("bilibili.com") || lowerUrl.includes("b23.tv")) return "bilibili";
   if (lowerUrl.includes("xiaohongshu.com") || lowerUrl.includes("xhslink.com")) return "xiaohongshu";
   if (lowerUrl.includes("douyin.com")) return "douyin";
+  if (urlHostMatches(url, ["weibo.com", "weibo.cn", "sinaimg.cn", "sinaimg.com"])) return "weibo";
   if (lowerUrl.includes("youtube.com") || lowerUrl.includes("youtu.be")) return "youtube";
   if (urlHostMatches(url, ["x.com", "twitter.com"])) return "twitter";
   if (urlHostMatches(url, ["zhihu.com", "zhuanlan.zhihu.com"])) return "zhihu";
   if (urlHostMatches(url, ["reddit.com", "redd.it"])) return "reddit";
   if (urlHostMatches(url, ["bgm.tv", "bangumi.tv"])) return "bangumi";
+  if (urlHostMatches(url, ["linux.do"])) return "linuxdo";
+  if (urlHostMatches(url, ["v2ex.com"])) return "v2ex";
   return "";
 }
 
@@ -153,6 +163,8 @@ const PLATFORM_DISPLAY_NAMES = {
   bilibili: "B 站",
   youtube: "YouTube",
   douyin: "抖音",
+  weibo: "微博",
+  wb: "微博",
   xiaohongshu: "小红书",
   xhs: "小红书",
   twitter: "X",
@@ -161,6 +173,10 @@ const PLATFORM_DISPLAY_NAMES = {
   reddit: "Reddit",
   bgm: "Bangumi",
   bangumi: "Bangumi",
+  linuxdo: "Linux.do",
+  "linux.do": "Linux.do",
+  v2: "V2EX",
+  v2ex: "V2EX",
 };
 
 export function platformDisplayName(value) {
@@ -204,7 +220,15 @@ export function buildContentUrl(item) {
   if (!vid) return "";
   if (platform === "youtube") return buildYouTubeUrl(vid);
   if (platform === "bangumi") return `https://bgm.tv/subject/${encodeURIComponent(vid)}`;
+  if (platform === "linuxdo") {
+    const topicId = vid.replace(/^(?:linuxdo:)?topic[:_]/i, "");
+    return /^[1-9]\d*$/.test(topicId)
+      ? `https://linux.do/t/${encodeURIComponent(topicId)}`
+      : "";
+  }
   if (platform === "zhihu" || platform === "reddit") return "";
+  if (platform === "v2ex") return `https://www.v2ex.com/t/${encodeURIComponent(vid)}`;
+  if (platform === "zhihu" || platform === "reddit" || platform === "weibo") return "";
   return buildVideoUrl(vid);
 }
 
@@ -295,7 +319,12 @@ export function normalizeRecommendation(item) {
     id: Number(item?.id ?? 0),
     bvid,
     title: normalizeText(item?.title) || DEFAULT_TITLE,
-    up_name: normalizeText(item?.up_name) || (sourcePlatform === "bangumi" ? "" : DEFAULT_UP_NAME),
+    up_name: normalizeText(item?.up_name)
+      || (sourcePlatform === "bangumi"
+        ? ""
+        : sourcePlatform === "bilibili"
+        ? DEFAULT_UP_NAME
+        : DEFAULT_CREATOR_NAME),
     cover_url: normalizeCoverUrl(item?.cover_url),
     expression: normalizeText(item?.expression),
     topic_label: normalizeText(item?.topic_label),
@@ -314,6 +343,7 @@ export function normalizeRecommendation(item) {
     view_count: Number(item?.view_count ?? 0) || 0,
     like_count: Number(item?.like_count ?? 0) || 0,
     comment_count: Number(item?.comment_count ?? 0) || 0,
+    share_count: Number(item?.share_count ?? 0) || 0,
     favorite_count: Number(item?.favorite_count ?? 0) || 0,
     danmaku_count: Number(item?.danmaku_count ?? 0) || 0,
     rating_score: Number(item?.rating_score ?? 0) || 0,
@@ -425,6 +455,7 @@ export function normalizeDelightCandidate(item) {
     view_count: Number(item?.view_count ?? 0),
     like_count: Number(item?.like_count ?? 0),
     comment_count: Number(item?.comment_count ?? 0),
+    share_count: Number(item?.share_count ?? 0),
     favorite_count: Number(item?.favorite_count ?? 0),
     danmaku_count: Number(item?.danmaku_count ?? 0),
     rating_score: Number(item?.rating_score ?? 0),

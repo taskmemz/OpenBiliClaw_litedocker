@@ -2,7 +2,7 @@
 
 Bilibili videos carry semantics that ``title`` + ``description`` miss entirely:
 the description is often "求三连" boilerplate, and ``body_text`` is empty on
-the Bilibili path (only X / Zhihu / Reddit / Bangumi populate it). Danmaku is
+the Bilibili path (X / Zhihu / Reddit / Bangumi / Weibo populate it). Danmaku is
 what the audience is actually discussing.
 
 Selection strategy is driven by real measurement, not intuition. Sampling

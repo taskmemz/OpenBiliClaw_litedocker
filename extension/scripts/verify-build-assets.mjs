@@ -34,7 +34,6 @@ export function collectManifestBuildAssets(manifest) {
   for (const [index, script] of (manifest.background?.scripts ?? []).entries()) {
     addAsset(assets, script, `background.scripts[${index}]`);
   }
-
   for (const [entryIndex, contentScript] of (manifest.content_scripts ?? []).entries()) {
     for (const [scriptIndex, script] of (contentScript.js ?? []).entries()) {
       addAsset(

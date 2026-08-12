@@ -697,7 +697,7 @@
     .delight-banner-thumb {
       flex-shrink: 0;
       position: relative;
-      width: 160px;
+      width: clamp(108px, 32vw, 136px);
       aspect-ratio: 16 / 9;
       border-radius: 18px;
       overflow: hidden;
@@ -726,8 +726,26 @@
       display: block;
     }
     .delight-banner-thumb.is-fallback {
-      font-size: 36px;
       color: var(--brand-strong);
+    }
+    .delight-banner-thumb.is-text-card {
+      aspect-ratio: auto;
+      min-height: 88px;
+      align-items: flex-start;
+      justify-content: flex-start;
+      padding: 12px 10px 10px;
+    }
+    .delight-banner-thumb-text {
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 4;
+      overflow: hidden;
+      color: var(--text-secondary);
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
     }
     /* ✨ overlay badge — instant "this one is special" marker. */
     .delight-banner-thumb::before {
@@ -772,6 +790,8 @@
       display: flex;
       align-items: center;
       gap: 6px;
+      flex-wrap: wrap;
+      min-width: 0;
     }
 
     .delight-banner-kicker {
@@ -782,6 +802,10 @@
       border-radius: 999px;
       background: rgba(251, 114, 153, 0.1);
       letter-spacing: 0.02em;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .delight-banner-platform {
@@ -791,6 +815,8 @@
       padding: 2px 6px;
       border-radius: 999px;
       background: rgba(0, 0, 0, 0.05);
+      flex: 0 0 auto;
+      white-space: nowrap;
     }
 
     .delight-banner-counter {
@@ -800,6 +826,15 @@
       padding: 1px 5px;
       border-radius: 8px;
       background: rgba(0, 0, 0, 0.04);
+      flex: 0 0 auto;
+      white-space: nowrap;
+    }
+
+    .delight-banner-kicker-line .recommendation-published-time {
+      flex: 0 0 auto;
+      margin-left: 0;
+      white-space: nowrap;
+      color: var(--text-muted);
     }
 
     /* Nav buttons (‹ / ›). 28×28 visible target plus a transparent
@@ -820,6 +855,7 @@
       cursor: pointer;
       padding: 0;
       display: inline-flex;
+      flex: 0 0 28px;
       align-items: center;
       justify-content: center;
       transition: background 0.15s ease, transform 0.1s ease, border-color 0.15s ease;
@@ -940,9 +976,21 @@
 
     .delight-banner-chevron {
       flex-shrink: 0;
+      width: 32px;
+      height: 32px;
+      padding: 0;
+      border: 0;
+      border-radius: 10px;
+      background: transparent;
       font-size: 12px;
       color: var(--text-secondary);
+      cursor: pointer;
       transition: transform 0.2s ease;
+    }
+    .delight-banner-chevron:hover,
+    .delight-banner-chevron:focus-visible {
+      background: rgba(251, 114, 153, 0.1);
+      color: var(--brand-strong);
     }
 
     .delight-banner-dismiss {
@@ -1323,8 +1371,16 @@
     .recommendation-cover.is-text-card {
       align-items: flex-start;
       justify-content: flex-start;
+      aspect-ratio: auto;
+      box-sizing: border-box;
+      min-height: 124px;
+      max-height: 180px;
       text-align: left;
       padding: 12px 74px 34px 14px;
+    }
+
+    .recommendation-cover.is-text-card::after {
+      display: none;
     }
 
     .recommendation-cover-text {
@@ -1334,7 +1390,7 @@
       line-height: 1.55;
       color: var(--text-secondary);
       display: -webkit-box;
-      -webkit-line-clamp: 5;
+      -webkit-line-clamp: 4;
       -webkit-box-orient: vertical;
       overflow: hidden;
       white-space: pre-wrap;
@@ -1410,7 +1466,8 @@
       z-index: 2;
     }
 
-    .recommendation-cover.is-fallback .recommendation-source-corner {
+    .recommendation-cover.is-fallback .recommendation-source-corner,
+    .recommendation-cover.is-text-card .recommendation-source-corner {
       background: rgba(18, 22, 32, 0.08);
       color: var(--text-muted);
     }
@@ -1420,7 +1477,8 @@
       color: #fff;
     }
 
-    .recommendation-cover.is-fallback .recommendation-source-corner.source-platform-zhihu {
+    .recommendation-cover.is-fallback .recommendation-source-corner.source-platform-zhihu,
+    .recommendation-cover.is-text-card .recommendation-source-corner.source-platform-zhihu {
       background: rgba(15, 136, 235, 0.12);
       color: #0f88eb;
     }
@@ -1430,9 +1488,20 @@
       color: #fff;
     }
 
-    .recommendation-cover.is-fallback .recommendation-source-corner.source-platform-reddit {
+    .recommendation-cover.is-fallback .recommendation-source-corner.source-platform-reddit,
+    .recommendation-cover.is-text-card .recommendation-source-corner.source-platform-reddit {
       background: rgba(255, 69, 0, 0.12);
       color: #d93f00;
+    }
+
+    .recommendation-source-corner.source-platform-weibo {
+      background: rgba(230, 22, 45, 0.82);
+      color: #fff;
+    }
+
+    .recommendation-cover.is-fallback .recommendation-source-corner.source-platform-weibo {
+      background: rgba(230, 22, 45, 0.12);
+      color: #e6162d;
     }
 
     .recommendation-source-corner.source-platform-bangumi {
@@ -1440,9 +1509,21 @@
       color: #fff;
     }
 
-    .recommendation-cover.is-fallback .recommendation-source-corner.source-platform-bangumi {
+    .recommendation-cover.is-fallback .recommendation-source-corner.source-platform-bangumi,
+    .recommendation-cover.is-text-card .recommendation-source-corner.source-platform-bangumi {
       background: rgba(105, 80, 161, 0.12);
       color: #6950a1;
+    }
+
+    .recommendation-source-corner.source-platform-v2ex {
+      background: rgba(0, 160, 160, 0.82);
+      color: #fff;
+    }
+
+    .recommendation-cover.is-fallback .recommendation-source-corner.source-platform-v2ex,
+    .recommendation-cover.is-text-card .recommendation-source-corner.source-platform-v2ex {
+      background: rgba(0, 160, 160, 0.12);
+      color: #087f83;
     }
 
     .recommendation-title {
@@ -3737,10 +3818,6 @@
       gap: 10px;
     }
 
-    .shell:has(#viewChat:not([hidden])) .footer {
-      display: none;
-    }
-
     .footer-head {
       display: flex;
       align-items: flex-start;
@@ -3823,7 +3900,7 @@
       /* Cap the expanded history height and let it scroll internally so
          the activity feed can hold many entries (or load more pages)
          without pushing the popup body off-screen. */
-      max-height: 360px;
+      max-height: clamp(72px, calc(100dvh - 440px), 360px);
       overflow-y: auto;
       overflow-x: hidden;
       padding-right: 4px;
@@ -4954,7 +5031,7 @@
     }
 
     /* 平台源卡片：卡面常驻（标题 / 启用 / 接入状态），配置按需展开。
-       侧栏宽度有限，8 个来源全展开会让这一页长到无法浏览。 */
+       侧栏宽度有限，9 个来源全展开会让这一页长到无法浏览。 */
     .settings-source-card[data-open] {
       padding-bottom: 0;
     }
@@ -5800,7 +5877,7 @@
           <h2 data-saved-heading tabindex="-1">稍后再看</h2>
           <p class="view-subtitle">点时钟图标加入临时队列，看完可以随手移除。</p>
           <div class="saved-sync-toolbar">
-            <button id="watchLaterSyncAll" class="action-button action-secondary" data-saved-list-action="sync-all" type="button" disabled>同步未同步内容（0）</button>
+            <button id="watchLaterSyncAll" class="action-button action-secondary" data-saved-list-action="sync-all" type="button" disabled hidden>同步未同步内容（0）</button>
             <span id="watchLaterSyncStatus" class="saved-sync-status" aria-live="polite"></span>
           </div>
         </div>
@@ -5817,7 +5894,7 @@
           <h2 data-saved-heading tabindex="-1">我的收藏</h2>
           <p class="view-subtitle">点星标收藏的内容会长期留在这里，和稍后再看互相独立。</p>
           <div class="saved-sync-toolbar">
-            <button id="favoritesSyncAll" class="action-button action-secondary" data-saved-list-action="sync-all" type="button" disabled>同步未同步内容（0）</button>
+            <button id="favoritesSyncAll" class="action-button action-secondary" data-saved-list-action="sync-all" type="button" disabled hidden>同步未同步内容（0）</button>
             <span id="favoritesSyncStatus" class="saved-sync-status" aria-live="polite"></span>
           </div>
         </div>
@@ -5995,11 +6072,11 @@
     </main>
 
     <!-- ── Mobile QR overlay ── -->
-    <div id="mobileQrOverlay" class="mobile-overlay" hidden>
+    <div id="mobileQrOverlay" class="mobile-overlay" role="dialog" aria-modal="true" aria-labelledby="mobileQrTitle" hidden>
       <div class="mobile-header">
         <div>
           <p class="view-kicker">Mobile Web</p>
-          <h2>手机扫码打开</h2>
+          <h2 id="mobileQrTitle">手机扫码打开</h2>
         </div>
         <button id="mobileQrBack" class="settings-back" type="button" title="返回" aria-label="关闭移动端二维码">&larr;</button>
       </div>
@@ -6015,18 +6092,18 @@
     </div>
 
     <!-- ── Messages overlay ── -->
-    <div id="messagesOverlay" class="messages-overlay" hidden>
+    <div id="messagesOverlay" class="messages-overlay" role="dialog" aria-modal="true" aria-labelledby="messagesTitle" hidden>
       <div class="messages-header">
-        <h2>消息</h2>
+        <h2 id="messagesTitle">消息</h2>
         <button id="messagesBack" class="settings-back" type="button" title="返回" aria-label="关闭消息">&larr;</button>
       </div>
       <div id="messagesList"></div>
     </div>
 
     <!-- ── Settings overlay ── -->
-    <div id="settingsOverlay" class="settings-overlay" hidden>
+    <div id="settingsOverlay" class="settings-overlay" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
       <div class="settings-header">
-        <h2>后端设置</h2>
+        <h2 id="settingsTitle">后端设置</h2>
         <button id="settingsBack" class="settings-back" type="button" title="返回" aria-label="关闭设置">&larr;</button>
       </div>
 
@@ -6517,6 +6594,61 @@
       </div>
       </div>
 
+      <div class="settings-section settings-source-card" data-source-card="weibo" data-open="0">
+        <div class="source-card-face" role="button" tabindex="0" aria-expanded="false" aria-controls="sourceCardBody-weibo">
+        <h3><span class="section-icon">微</span> 微博</h3>
+        <div class="settings-field-row">
+          <input id="cfgWeiboEnabled" type="checkbox">
+          <label for="cfgWeiboEnabled">启用微博 discovery</label>
+        </div>
+        <p class="settings-hint source-status-row" id="cfgWeiboStatus" data-source-status="weibo"><span class="src-dot">●</span> <span class="src-detail">微博来源状态加载中…</span></p>
+          <span class="source-card-chev" aria-hidden="true">&#x25BE;</span>
+        </div>
+        <div class="source-card-body" id="sourceCardBody-weibo">
+        <div class="settings-probe-row source-verify-row">
+          <button class="settings-secondary-btn source-verify-btn" type="button">查看接入状态</button>
+          <span class="settings-probe-status source-verify-status" aria-live="polite"></span>
+        </div>
+        <p class="settings-hint">公开 search / 热榜 / 作者 discovery 使用匿名访客会话，无需用户 Cookie。显式 guided init 时，扩展会在已登录微博的同源任务页只读收藏、关注和互动，并回传规范化事件；后端不接收或保存 Cookie。网页接口并非官方稳定 API，可能随微博调整而变化。</p>
+        <div class="settings-field">
+          <label>微博 discovery 分支</label>
+          <div class="settings-field-row">
+            <input id="cfgWeiboModeSearch" type="checkbox">
+            <label for="cfgWeiboModeSearch">搜索</label>
+          </div>
+          <div class="settings-field-row">
+            <input id="cfgWeiboModeHot" type="checkbox">
+            <label for="cfgWeiboModeHot">热榜</label>
+          </div>
+          <div class="settings-field-row">
+            <input id="cfgWeiboModeCreator" type="checkbox">
+            <label for="cfgWeiboModeCreator">作者（需同时启用搜索或热榜）</label>
+          </div>
+        </div>
+        <div class="settings-field">
+          <label for="cfgWeiboDailySearchBudget">微博每日搜索候选条数</label>
+          <input id="cfgWeiboDailySearchBudget" type="number" min="0" step="1" placeholder="60">
+        </div>
+        <div class="settings-field">
+          <label for="cfgWeiboDailyHotBudget">微博每日热榜候选条数</label>
+          <input id="cfgWeiboDailyHotBudget" type="number" min="0" step="1" placeholder="10">
+        </div>
+        <div class="settings-field">
+          <label for="cfgWeiboDailyCreatorBudget">微博每日作者候选条数</label>
+          <input id="cfgWeiboDailyCreatorBudget" type="number" min="0" step="1" placeholder="30">
+        </div>
+        <p class="settings-hint" data-budget-note>预算 = 每日最终保留候选条数上限。匿名接口可能变化，建议保留默认节流并谨慎提高预算。</p>
+        <div class="settings-field">
+          <label for="cfgWeiboRequestInterval">微博请求间隔秒数</label>
+          <input id="cfgWeiboRequestInterval" type="number" min="0" step="1" placeholder="3">
+        </div>
+        <div class="settings-field">
+          <label for="cfgWeiboMinInterval">微博最小调度间隔分钟数</label>
+          <input id="cfgWeiboMinInterval" type="number" min="0" step="1" placeholder="10">
+        </div>
+      </div>
+      </div>
+
       <div class="settings-section settings-source-card" data-source-card="youtube" data-open="0">
         <div class="source-card-face" role="button" tabindex="0" aria-expanded="false" aria-controls="sourceCardBody-youtube">
         <h3><span class="section-icon">&#x25B6;</span> YouTube</h3>
@@ -6812,6 +6944,89 @@
       </div>
       </div>
 
+      <div class="settings-section settings-source-card" data-source-card="linuxdo" data-open="0">
+        <div class="source-card-face" role="button" tabindex="0" aria-expanded="false" aria-controls="sourceCardBody-linuxdo">
+        <h3><span class="section-icon">L</span> Linux.do</h3>
+        <div class="settings-field-row">
+          <input id="cfgLinuxdoEnabled" type="checkbox">
+          <label for="cfgLinuxdoEnabled">启用 Linux.do 来源</label>
+        </div>
+        <p class="settings-hint source-status-row" id="cfgLinuxdoStatus" data-source-status="linuxdo"><span class="src-dot">●</span> <span class="src-detail">Linux.do 来源状态加载中…</span></p>
+          <span class="source-card-chev" aria-hidden="true">&#x25BE;</span>
+        </div>
+        <div class="source-card-body" id="sourceCardBody-linuxdo">
+        <div class="settings-probe-row source-verify-row">
+          <button class="settings-secondary-btn source-verify-btn" type="button">测试连接</button>
+          <span class="settings-probe-status source-verify-status" aria-live="polite"></span>
+        </div>
+        <p class="settings-hint">公开发现无需登录；连接已登录 Linux.do 的浏览器插件后，可增强收藏、点赞和阅读记录等个人信号。登录态由插件同源读取，不需要也不提供 Cookie 输入。</p>
+        <div class="settings-field">
+          <label>Linux.do discovery 分支</label>
+          <div class="settings-field-row"><input id="cfgLinuxdoModeSearch" type="checkbox"><label for="cfgLinuxdoModeSearch">搜索</label></div>
+          <div class="settings-field-row"><input id="cfgLinuxdoModeHot" type="checkbox"><label for="cfgLinuxdoModeHot">热门</label></div>
+          <div class="settings-field-row"><input id="cfgLinuxdoModeFeed" type="checkbox"><label for="cfgLinuxdoModeFeed">最新</label></div>
+          <div class="settings-field-row"><input id="cfgLinuxdoModeCreator" type="checkbox"><label for="cfgLinuxdoModeCreator">作者</label></div>
+          <div class="settings-field-row"><input id="cfgLinuxdoModeRelated" type="checkbox"><label for="cfgLinuxdoModeRelated">相关</label></div>
+        </div>
+        <div class="settings-field"><label for="cfgLinuxdoDailySearchBudget">Linux.do 每日搜索任务</label><input id="cfgLinuxdoDailySearchBudget" type="number" min="0" step="1" placeholder="0 = 不限"></div>
+        <div class="settings-field"><label for="cfgLinuxdoDailyHotBudget">Linux.do 每日热门任务</label><input id="cfgLinuxdoDailyHotBudget" type="number" min="0" step="1" placeholder="0 = 不限"></div>
+        <div class="settings-field"><label for="cfgLinuxdoDailyFeedBudget">Linux.do 每日最新任务</label><input id="cfgLinuxdoDailyFeedBudget" type="number" min="0" step="1" placeholder="0 = 不限"></div>
+        <div class="settings-field"><label for="cfgLinuxdoDailyCreatorBudget">Linux.do 每日作者任务</label><input id="cfgLinuxdoDailyCreatorBudget" type="number" min="0" step="1" placeholder="0 = 不限"></div>
+        <div class="settings-field"><label for="cfgLinuxdoDailyRelatedBudget">Linux.do 每日相关任务</label><input id="cfgLinuxdoDailyRelatedBudget" type="number" min="0" step="1" placeholder="0 = 不限"></div>
+        <p class="settings-hint" data-budget-note>预算 = 每日任务次数上限，不是开关；填 1 表示每天只允许 1 次。0 或留空 = 不限。</p>
+        <div class="settings-field"><label for="cfgLinuxdoRequestInterval">请求间隔秒数</label><input id="cfgLinuxdoRequestInterval" type="number" min="0" max="30" step="1" placeholder="3"></div>
+        <div class="settings-field"><label for="cfgLinuxdoMinInterval">最小调度间隔分钟</label><input id="cfgLinuxdoMinInterval" type="number" min="0" step="1" placeholder="3"></div>
+        <div class="settings-field"><label for="cfgLinuxdoBootstrapLimit">初始化个人信号上限</label><input id="cfgLinuxdoBootstrapLimit" type="number" min="1" max="300" step="1" placeholder="300"></div>
+        </div>
+      </div>
+      <div class="settings-section settings-source-card" data-source-card="v2ex" data-open="0">
+        <div class="source-card-face" role="button" tabindex="0" aria-expanded="false" aria-controls="sourceCardBody-v2ex">
+        <h3><span class="section-icon">V2</span> V2EX</h3>
+        <div class="settings-field-row">
+          <input id="cfgV2exEnabled" type="checkbox">
+          <label for="cfgV2exEnabled">启用 V2EX discovery</label>
+        </div>
+        <p class="settings-hint source-status-row" id="cfgV2exStatus" data-source-status="v2ex"><span class="src-dot">●</span> <span class="src-detail">V2EX 来源状态加载中…</span></p>
+          <span class="source-card-chev" aria-hidden="true">&#x25BE;</span>
+        </div>
+        <div class="source-card-body" id="sourceCardBody-v2ex">
+        <div class="settings-field">
+          <label for="cfgV2exAccessToken">PAT（可留空）</label>
+          <input id="cfgV2exAccessToken" type="password" maxlength="512" autocomplete="off" placeholder="可留空；匿名公开发现可直接使用">
+          <div class="settings-field-row">
+            <input id="cfgV2exClearToken" type="checkbox">
+            <label for="cfgV2exClearToken">清除已保存的 PAT</label>
+          </div>
+          <p class="settings-hint">PAT 只用于识别账号和 API 2.0 增强读取；后端严格只读，不发帖、不回复、不收藏、不关注 Node。guided init / 增量同步可通过当前已登录浏览器只读导入本人主题、本人回复、收藏主题和收藏 Node。</p>
+        </div>
+        <div class="settings-field">
+          <label for="cfgV2exUsername">公开用户名（可选）</label>
+          <input id="cfgV2exUsername" type="text" maxlength="128" autocomplete="off" placeholder="PAT 会自动识别；也可手填作为提示">
+        </div>
+        <div class="settings-probe-row">
+          <button class="settings-secondary-btn" id="cfgV2exAcceptBrowserIdentity" type="button" hidden>采用当前浏览器账号</button>
+          <button class="settings-secondary-btn" id="cfgV2exRefreshIdentity" type="button">刷新身份</button>
+          <span class="settings-probe-status" id="cfgV2exIdentityStatus" aria-live="polite">身份状态加载中…</span>
+        </div>
+        <div class="settings-field">
+          <label>内容发现分支</label>
+          <div class="settings-field-row"><input id="cfgV2exModeSearch" type="checkbox"><label for="cfgV2exModeSearch">搜索</label></div>
+          <div class="settings-field-row"><input id="cfgV2exModeNode" type="checkbox"><label for="cfgV2exModeNode">Node</label></div>
+          <div class="settings-field-row"><input id="cfgV2exModeTab" type="checkbox"><label for="cfgV2exModeTab">Tab</label></div>
+          <div class="settings-field-row"><input id="cfgV2exModeHot" type="checkbox"><label for="cfgV2exModeHot">热门</label></div>
+          <div class="settings-field-row"><input id="cfgV2exModeLatest" type="checkbox"><label for="cfgV2exModeLatest">最新</label></div>
+        </div>
+        <div class="settings-field"><label for="cfgV2exDailySearchBudget">每日搜索条目</label><input id="cfgV2exDailySearchBudget" type="number" min="0" step="1" placeholder="120"></div>
+        <div class="settings-field"><label for="cfgV2exDailyNodeBudget">每日 Node 条目</label><input id="cfgV2exDailyNodeBudget" type="number" min="0" step="1" placeholder="180"></div>
+        <div class="settings-field"><label for="cfgV2exDailyTabBudget">每日 Tab 条目</label><input id="cfgV2exDailyTabBudget" type="number" min="0" step="1" placeholder="80"></div>
+        <div class="settings-field"><label for="cfgV2exDailyHotBudget">每日热门条目</label><input id="cfgV2exDailyHotBudget" type="number" min="0" step="1" placeholder="40"></div>
+        <div class="settings-field"><label for="cfgV2exDailyLatestBudget">每日最新条目</label><input id="cfgV2exDailyLatestBudget" type="number" min="0" step="1" placeholder="40"></div>
+        <div class="settings-field"><label for="cfgV2exRequestInterval">请求间隔秒数</label><input id="cfgV2exRequestInterval" type="number" min="0" step="1" placeholder="2"></div>
+        <div class="settings-field"><label for="cfgV2exMinInterval">最小调度间隔分钟</label><input id="cfgV2exMinInterval" type="number" min="0" step="1" placeholder="5"></div>
+        <p class="settings-hint">V2EX 使用官方公开 API / JSON Feed；匿名即可发现。搜索当前采用有界公开召回，正式候选统一进入共享评估池。</p>
+      </div>
+      </div>
+
       <div class="settings-section settings-source-card" data-source-card="pool">
         <h3><span class="section-icon">&#x1F4E6;</span> 候选池来源占比</h3>
         <div class="settings-field">
@@ -6825,6 +7040,10 @@
         <div class="settings-field">
           <label for="cfgPoolShareDouyin">候选池抖音占比</label>
           <input id="cfgPoolShareDouyin" type="number" min="1" step="1" placeholder="1">
+        </div>
+        <div class="settings-field">
+          <label for="cfgPoolShareWeibo">候选池微博占比</label>
+          <input id="cfgPoolShareWeibo" type="number" min="1" step="1" placeholder="1">
         </div>
         <div class="settings-field">
           <label for="cfgPoolShareYoutube">候选池 YouTube 占比</label>
@@ -6845,6 +7064,12 @@
         <div class="settings-field">
           <label for="cfgPoolShareBangumi">候选池 Bangumi 占比</label>
           <input id="cfgPoolShareBangumi" type="number" min="1" step="1" placeholder="1">
+        </div>
+        <div class="settings-field">
+          <label for="cfgPoolShareLinuxdo">候选池 Linux.do 占比</label>
+          <input id="cfgPoolShareLinuxdo" type="number" min="1" step="1" placeholder="1">
+          <label for="cfgPoolShareV2ex">候选池 V2EX 占比</label>
+          <input id="cfgPoolShareV2ex" type="number" min="1" step="1" placeholder="1">
         </div>
         <div class="settings-actions">
           <button id="cfgSuggestPoolShares" class="settings-save" type="button">按已有信号建议比例</button>
@@ -6911,6 +7136,18 @@
           </div>
           <p class="settings-hint">默认关闭。收藏和稍后再看始终先保存在本地；关闭时仍可在列表页手动同步。</p>
           <p id="cfgSavedAutoSyncStatus" class="settings-probe-status" aria-live="polite"></p>
+        </div>
+        <div class="settings-field" id="reinitControlField">
+          <label>重新初始化 / 重建画像</label>
+          <p class="settings-hint">重新拉取所选平台数据、重建完整画像并补足首轮发现池；现有事件、收藏与对话历史保留，<strong>旧推荐池会按新画像清空重建</strong>。适合更换平台账号或画像长期未更新，会消耗较多 AI 调用。</p>
+          <div class="settings-field-row">
+            <button id="cfgReinitBtn" type="button" class="settings-inline-btn">开始重新初始化</button>
+          </div>
+          <div class="settings-field-row">
+            <input id="cfgReinitResetCognition" type="checkbox" data-settings-ignore-dirty>
+            <label for="cfgReinitResetCognition">同时清空旧认知观察与洞察（换账号 / 大改兴趣时建议）</label>
+          </div>
+          <p id="cfgReinitStatus" class="settings-probe-status" aria-live="polite">读取初始化状态中…</p>
         </div>
         <div class="settings-field">
           <label for="cfgLanguage">语言</label>

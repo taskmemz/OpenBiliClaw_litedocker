@@ -24,9 +24,18 @@ from openbiliclaw.discovery.prefilter_audit import (
     classify_prefilter_context,
     evaluate_prefilter_gate,
     hash_prefilter_candidate_identity,
+    sanitize_prefilter_platform,
 )
 from openbiliclaw.soul.profile import InterestTag, SoulProfile
 from openbiliclaw.storage.database import Database
+
+
+def test_weibo_is_preserved_as_a_bounded_prefilter_platform_class() -> None:
+    assert sanitize_prefilter_platform("weibo") == "weibo"
+
+
+def test_weibo_hot_strategy_is_classified_as_trending_context() -> None:
+    assert classify_prefilter_context("weibo-hot", "weibo-hot") == "trending"
 
 
 def _profile() -> SoulProfile:

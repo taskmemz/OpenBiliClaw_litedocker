@@ -145,4 +145,10 @@ test("saved sync view model sanitizes task snapshots and groups platform results
     detail: "此内容类型暂不支持平台同步，仅保存在本地。",
   });
   assert.equal(summarizeSavedSyncResults(task.items), "B站 1/1 · YouTube 0/1");
+  assert.equal(
+    summarizeSavedSyncResults([
+      { item_key: "linuxdo:topic:42", status: "unsupported" },
+    ]),
+    "Linux.do 0/1",
+  );
 });

@@ -44,6 +44,7 @@ function round3(value) {
 
 const DEFAULT_TITLE = "这条标题还没对上号";
 const DEFAULT_UP_NAME = "这位 UP 还没认出来";
+const DEFAULT_CREATOR_NAME = "这位创作者还没认出来";
 const DEFAULT_PORTRAIT = "画像还在慢慢攒，先多看一阵。";
 const DEFAULT_DELIGHT_TITLE = "这条惊喜推荐还没起好标题";
 const DEFAULT_DELIGHT_REASON = "这条可能会给你一点意外之喜。";
@@ -130,11 +131,14 @@ const SOURCE_LABEL_MAP = {
   bilibili: "Bilibili",
   xiaohongshu: "Xiaohongshu",
   douyin: "Douyin",
+  weibo: "微博",
   youtube: "YouTube",
   twitter: "X (Twitter)",
   zhihu: "知乎",
   reddit: "Reddit",
   bangumi: "Bangumi",
+  linuxdo: "Linux.do",
+  v2ex: "V2EX",
   web: "Web",
 };
 
@@ -147,6 +151,8 @@ const SOURCE_ALIAS_MAP = {
   dy: "douyin",
   douyin: "douyin",
   tiktok: "douyin",
+  wb: "weibo",
+  weibo: "weibo",
   yt: "youtube",
   youtube: "youtube",
   x: "twitter",
@@ -157,6 +163,10 @@ const SOURCE_ALIAS_MAP = {
   reddit: "reddit",
   bgm: "bangumi",
   bangumi: "bangumi",
+  linuxdo: "linuxdo",
+  "linux.do": "linuxdo",
+  v2: "v2ex",
+  v2ex: "v2ex",
 };
 
 const RUNTIME_TOPIC_LABEL_MAP = {
@@ -174,6 +184,12 @@ const RUNTIME_TOPIC_LABEL_MAP = {
   "douyin-search": "抖音搜索",
   "douyin-hot": "抖音热点",
   "douyin-feed": "抖音推荐流",
+  weibo_search: "微博搜索",
+  weibo_hot: "微博热榜",
+  weibo_creator: "微博作者",
+  "weibo-search": "微博搜索",
+  "weibo-hot": "微博热榜",
+  "weibo-creator": "微博作者",
   yt_search: "YouTube 搜索",
   yt_trending: "YouTube 热榜",
   yt_channel: "YouTube 频道",
@@ -204,6 +220,21 @@ const RUNTIME_TOPIC_LABEL_MAP = {
   "bangumi-search": "Bangumi 搜索",
   "bangumi-ranked": "Bangumi 排名",
   "bangumi-latest": "Bangumi 按日期浏览",
+  linuxdo_search: "Linux.do 搜索",
+  linuxdo_hot: "Linux.do 热门",
+  linuxdo_feed: "Linux.do 最新",
+  linuxdo_creator: "Linux.do 作者",
+  linuxdo_related: "Linux.do 相关",
+  "linuxdo-search": "Linux.do 搜索",
+  "linuxdo-hot": "Linux.do 热门",
+  "linuxdo-feed": "Linux.do 最新",
+  "linuxdo-creator": "Linux.do 作者",
+  "linuxdo-related": "Linux.do 相关",
+  "v2ex-search": "V2EX 搜索",
+  "v2ex-node": "V2EX Node",
+  "v2ex-tab": "V2EX Tab",
+  "v2ex-hot": "V2EX 热门",
+  "v2ex-latest": "V2EX 最新",
 };
 
 function urlHostMatches(url, hostnames) {
@@ -227,11 +258,14 @@ export function normalizeSourcePlatform(item) {
     if (lowerUrl.includes("bilibili.com") || lowerUrl.includes("b23.tv")) return "bilibili";
     if (lowerUrl.includes("xiaohongshu.com") || lowerUrl.includes("xhslink.com")) return "xiaohongshu";
     if (lowerUrl.includes("douyin.com")) return "douyin";
+    if (urlHostMatches(url, ["weibo.com", "weibo.cn", "sinaimg.cn", "sinaimg.com"])) return "weibo";
     if (lowerUrl.includes("youtube.com") || lowerUrl.includes("youtu.be")) return "youtube";
     if (urlHostMatches(url, ["x.com", "twitter.com"])) return "twitter";
     if (urlHostMatches(url, ["zhihu.com", "zhuanlan.zhihu.com"])) return "zhihu";
     if (urlHostMatches(url, ["reddit.com", "redd.it"])) return "reddit";
     if (urlHostMatches(url, ["bgm.tv", "bangumi.tv"])) return "bangumi";
+    if (urlHostMatches(url, ["linux.do"])) return "linuxdo";
+    if (urlHostMatches(url, ["v2ex.com"])) return "v2ex";
     return "web";
   }
   if (normalizeText(item?.bvid)) return "bilibili";
@@ -267,9 +301,12 @@ function formatRuntimeTopicLabel(value) {
   if (RUNTIME_TOPIC_LABEL_MAP[key]) return RUNTIME_TOPIC_LABEL_MAP[key];
   if (key.startsWith("xhs-extension-")) return "小红书";
   if (key.startsWith("dy-plugin-") || key.startsWith("douyin-")) return "抖音";
+  if (key.startsWith("weibo-")) return "微博";
   if (key.startsWith("yt-") || key.startsWith("youtube-")) return "YouTube";
   if (key.startsWith("reddit-")) return "Reddit";
   if (key.startsWith("bangumi-")) return "Bangumi";
+  if (key.startsWith("linuxdo-")) return "Linux.do";
+  if (key.startsWith("v2ex-")) return "V2EX";
   return text;
 }
 
@@ -316,7 +353,15 @@ export function buildContentUrl(item) {
   if (platform === "youtube") return buildYouTubeUrl(vid);
   if (platform === "twitter") return buildTwitterUrl(vid);
   if (platform === "bangumi") return `https://bgm.tv/subject/${encodeURIComponent(vid)}`;
+  if (platform === "linuxdo") {
+    const topicId = vid.replace(/^(?:linuxdo:)?topic[:_]/i, "");
+    return /^[1-9]\d*$/.test(topicId)
+      ? `https://linux.do/t/${encodeURIComponent(topicId)}`
+      : "";
+  }
   if (platform === "zhihu" || platform === "reddit") return "";
+  if (platform === "v2ex") return `https://www.v2ex.com/t/${encodeURIComponent(vid)}`;
+  if (platform === "zhihu" || platform === "reddit" || platform === "weibo") return "";
   return buildVideoUrl(vid);
 }
 
@@ -346,7 +391,12 @@ export function normalizeRecommendation(item) {
     id: Number(item?.id ?? 0),
     bvid,
     title: normalizeText(item?.title) || DEFAULT_TITLE,
-    up_name: normalizeText(item?.up_name) || (sourcePlatform === "bangumi" ? "" : DEFAULT_UP_NAME),
+    up_name: normalizeText(item?.up_name)
+      || (sourcePlatform === "bangumi"
+        ? ""
+        : sourcePlatform === "bilibili"
+        ? DEFAULT_UP_NAME
+        : DEFAULT_CREATOR_NAME),
     cover_url: normalizeCoverUrl(item?.cover_url),
     expression: normalizeText(item?.expression),
     topic_label: normalizeText(item?.topic_label),
@@ -363,6 +413,7 @@ export function normalizeRecommendation(item) {
     view_count: Number(item?.view_count ?? 0),
     like_count: Number(item?.like_count ?? 0),
     comment_count: Number(item?.comment_count ?? 0),
+    share_count: Number(item?.share_count ?? 0),
     favorite_count: Number(item?.favorite_count ?? 0),
     danmaku_count: Number(item?.danmaku_count ?? 0),
     rating_score: Number(item?.rating_score ?? 0),
@@ -433,6 +484,7 @@ export function recommendationStats(item) {
   if (item?.view_count > 0) segments.push(`▶ ${formatCountCn(item.view_count)}`);
   if (item?.like_count > 0) segments.push(`👍 ${formatCountCn(item.like_count)}`);
   if (item?.comment_count > 0) segments.push(`💬 ${formatCountCn(item.comment_count)}`);
+  if (item?.share_count > 0) segments.push(`🔁 ${formatCountCn(item.share_count)}`);
   if (item?.favorite_count > 0) segments.push(`⭐ ${formatCountCn(item.favorite_count)}`);
   if (item?.danmaku_count > 0) segments.push(`弹幕 ${formatCountCn(item.danmaku_count)}`);
   if (item?.rating_score > 0) segments.push(`评分 ${Number(item.rating_score).toFixed(1)}`);
@@ -525,6 +577,7 @@ export function normalizeDelightCandidate(item) {
     view_count: Number(item?.view_count ?? 0),
     like_count: Number(item?.like_count ?? 0),
     comment_count: Number(item?.comment_count ?? 0),
+    share_count: Number(item?.share_count ?? 0),
     favorite_count: Number(item?.favorite_count ?? 0),
     danmaku_count: Number(item?.danmaku_count ?? 0),
     rating_score: Number(item?.rating_score ?? 0),

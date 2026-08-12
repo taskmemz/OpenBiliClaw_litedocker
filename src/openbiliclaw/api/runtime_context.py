@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -439,6 +440,8 @@ class RuntimeContext:
     llm_service: Any = None
     bilibili_client: Any = None
     bangumi_client: Any = None
+    v2ex_client: Any = None
+    weibo_client: Any = None
     saved_sync_service: Any = None
     soul_engine: Any = None
     dialogue: Any = None
@@ -781,6 +784,32 @@ class RuntimeContext:
                     getattr(bangumi_cfg, "request_interval_seconds", 1.0)
                 ),
             )
+        v2ex_cfg = getattr(getattr(new_config, "sources", None), "v2ex", None)
+        new_v2ex_client: Any = None
+        v2ex_access_token = ""
+        if bool(getattr(v2ex_cfg, "enabled", False)):
+            from openbiliclaw.sources.v2ex_client import V2EXClient
+
+            token_env = str(
+                getattr(v2ex_cfg, "token_env", "OPENBILICLAW_V2EX_TOKEN")
+                or "OPENBILICLAW_V2EX_TOKEN"
+            ).strip()
+            v2ex_access_token = (
+                str(os.environ.get(token_env, "") or "").strip()
+                or str(getattr(v2ex_cfg, "access_token", "") or "").strip()
+            )
+            new_v2ex_client = V2EXClient(
+                access_token=v2ex_access_token or None,
+                request_interval_seconds=float(getattr(v2ex_cfg, "request_interval_seconds", 2.0)),
+            )
+        weibo_cfg = getattr(getattr(new_config, "sources", None), "weibo", None)
+        new_weibo_client: Any = None
+        if bool(getattr(weibo_cfg, "enabled", False)):
+            from openbiliclaw.sources.weibo_client import WeiboClient
+
+            new_weibo_client = WeiboClient(
+                request_interval_seconds=float(getattr(weibo_cfg, "request_interval_seconds", 3.0))
+            )
         new_saved_sync_service = SavedSyncService(
             self.database,
             NativeSaveRouter(
@@ -1101,6 +1130,9 @@ class RuntimeContext:
         new_zhihu_producer: Any = None
         new_reddit_producer: Any = None
         new_bangumi_producer: Any = None
+        new_linuxdo_producer: Any = None
+        new_v2ex_producer: Any = None
+        new_weibo_producer: Any = None
         if hasattr(self.database, "conn"):
             from openbiliclaw.runtime.bilibili_producer import BilibiliExtensionSearchProducer
             from openbiliclaw.runtime.xhs_producer import XhsTaskProducer
@@ -1206,6 +1238,24 @@ class RuntimeContext:
                 keyword_fetch=new_keyword_fetch,
                 kick=_kick_zhihu_extension,
             )
+            from openbiliclaw.runtime.linuxdo_producer import (
+                build_linuxdo_discovery_producer,
+            )
+
+            async def _kick_linuxdo_extension() -> None:
+                publish = getattr(getattr(self, "event_hub", None), "publish", None)
+                if callable(publish):
+                    with suppress(Exception):
+                        await publish({"type": "linuxdo_task_available", "source": "task_kick"})
+
+            new_linuxdo_producer = build_linuxdo_discovery_producer(
+                config=new_config,
+                database=self.database,
+                soul_engine=new_soul_engine,
+                candidate_pipeline=new_candidate_pipeline,
+                keyword_fetch=new_keyword_fetch,
+                kick=_kick_linuxdo_extension,
+            )
             from openbiliclaw.runtime.reddit_producer import build_reddit_discovery_producer
 
             new_reddit_producer = build_reddit_discovery_producer(
@@ -1238,6 +1288,72 @@ class RuntimeContext:
                     candidate_pipeline=new_candidate_pipeline,
                     keyword_fetch=new_keyword_fetch,
                 )
+            if new_v2ex_client is not None:
+                from openbiliclaw.api.source_auth.probe_cache import LIVE_PROBES
+                from openbiliclaw.runtime.v2ex_producer import (
+                    V2EXDiscoveryProducer,
+                    build_v2ex_external_search_provider,
+                )
+                from openbiliclaw.sources.v2ex_identity import resolve_v2ex_identity_state
+
+                v2ex_identity = resolve_v2ex_identity_state(
+                    cfg=new_config,
+                    database=self.database,
+                    probes=LIVE_PROBES,
+                )
+                new_v2ex_producer = V2EXDiscoveryProducer(
+                    database=self.database,
+                    soul_engine=new_soul_engine,
+                    client=new_v2ex_client,
+                    access_token=v2ex_access_token,
+                    identity_username=(
+                        v2ex_identity.username if v2ex_identity.account_bootstrap_allowed else ""
+                    ),
+                    enabled=bool(getattr(v2ex_cfg, "enabled", False))
+                    and bool(getattr(sched_cfg, "enabled", True)),
+                    source_modes=tuple(
+                        getattr(
+                            v2ex_cfg, "source_modes", ("search", "node", "tab", "hot", "latest")
+                        )
+                    ),
+                    tab_modes=tuple(getattr(v2ex_cfg, "tab_modes", ("tech", "creative", "qna"))),
+                    node_allowlist=tuple(getattr(v2ex_cfg, "node_allowlist", ())),
+                    node_blocklist=tuple(getattr(v2ex_cfg, "node_blocklist", ("sandbox",))),
+                    node_downweight=tuple(getattr(v2ex_cfg, "node_downweight", ())),
+                    daily_search_budget=int(getattr(v2ex_cfg, "daily_search_budget", 120)),
+                    daily_node_budget=int(getattr(v2ex_cfg, "daily_node_budget", 180)),
+                    daily_tab_budget=int(getattr(v2ex_cfg, "daily_tab_budget", 80)),
+                    daily_hot_budget=int(getattr(v2ex_cfg, "daily_hot_budget", 40)),
+                    daily_latest_budget=int(getattr(v2ex_cfg, "daily_latest_budget", 40)),
+                    min_interval_minutes=int(getattr(v2ex_cfg, "min_interval_minutes", 5)),
+                    detail_fetch_limit=int(getattr(v2ex_cfg, "detail_fetch_limit", 15)),
+                    reply_enrichment_limit=int(getattr(v2ex_cfg, "reply_enrichment_limit", 10)),
+                    max_topic_chars=int(getattr(v2ex_cfg, "max_topic_chars", 6000)),
+                    max_reply_digest_chars=int(getattr(v2ex_cfg, "max_reply_digest_chars", 1200)),
+                    max_profile_nodes=int(getattr(v2ex_cfg, "max_profile_nodes", 12)),
+                    candidate_pipeline=new_candidate_pipeline,
+                    keyword_fetch=new_keyword_fetch,
+                    search_provider=build_v2ex_external_search_provider(new_config),
+                )
+            if new_weibo_client is not None:
+                from openbiliclaw.runtime.weibo_producer import WeiboDiscoveryProducer
+
+                new_weibo_producer = WeiboDiscoveryProducer(
+                    database=self.database,
+                    soul_engine=new_soul_engine,
+                    client=new_weibo_client,
+                    enabled=bool(getattr(weibo_cfg, "enabled", False))
+                    and bool(getattr(sched_cfg, "enabled", True)),
+                    source_modes=tuple(
+                        getattr(weibo_cfg, "source_modes", ("search", "hot", "creator"))
+                    ),
+                    daily_search_budget=int(getattr(weibo_cfg, "daily_search_budget", 60)),
+                    daily_hot_budget=int(getattr(weibo_cfg, "daily_hot_budget", 10)),
+                    daily_creator_budget=int(getattr(weibo_cfg, "daily_creator_budget", 30)),
+                    min_interval_minutes=int(getattr(weibo_cfg, "min_interval_minutes", 10)),
+                    candidate_pipeline=new_candidate_pipeline,
+                    keyword_fetch=new_keyword_fetch,
+                )
 
         # P1.6: unified keyword planner — deficit-pulled merged keyword
         # generation. Built as its OWN object (the controller has no
@@ -1264,6 +1380,8 @@ class RuntimeContext:
                     bilibili_client=new_bilibili_client,
                     x_client=new_x_client,
                     bangumi_client=new_bangumi_client,
+                    v2ex_client=new_v2ex_client,
+                    weibo_client=new_weibo_client,
                 ),
                 platforms_per_probe=int(inspiration_params.platforms_per_probe),
                 riskcontrolled_probe_budget=int(inspiration_params.riskcontrolled_probe_budget),
@@ -1302,10 +1420,13 @@ class RuntimeContext:
                 "yt": _source_enabled("youtube"),
                 "zhihu": _source_enabled("zhihu"),
                 "reddit": _source_enabled("reddit"),
+                "linuxdo": _source_enabled("linuxdo"),
+                "v2ex": _source_enabled("v2ex"),
             },
             scheduler_config=new_config.scheduler,
             profile_ready=lambda: bool(new_soul_engine.is_profile_ready()),
             init_active=lambda: bool(self.init_coordinator.init_active()),
+            runtime_config=new_config,
             kick=_kick_source_incremental,
         )
 
@@ -1344,6 +1465,9 @@ class RuntimeContext:
             zhihu_producer=new_zhihu_producer,
             reddit_producer=new_reddit_producer,
             bangumi_producer=new_bangumi_producer,
+            linuxdo_producer=new_linuxdo_producer,
+            v2ex_producer=new_v2ex_producer,
+            weibo_producer=new_weibo_producer,
             scheduler_config=new_config.scheduler,
             presence=self.presence,
             # gui-init D1: pause the controller's background loops while a guided
@@ -1455,6 +1579,9 @@ class RuntimeContext:
             new_youtube_producer,
             new_zhihu_producer,
             new_bangumi_producer,
+            new_linuxdo_producer,
+            new_v2ex_producer,
+            new_weibo_producer,
         ):
             if producer is not None:
                 producer.candidate_evaluation_owned_by_coordinator = True
@@ -1556,7 +1683,11 @@ class RuntimeContext:
         self.llm_service = new_llm_service
         self.bilibili_client = new_bilibili_client
         old_bangumi_client = self.bangumi_client
+        old_v2ex_client = self.v2ex_client
+        old_weibo_client = self.weibo_client
         self.bangumi_client = new_bangumi_client
+        self.v2ex_client = new_v2ex_client
+        self.weibo_client = new_weibo_client
         self.saved_sync_service = new_saved_sync_service
         self.soul_engine = new_soul_engine
         self.dialogue = new_dialogue
@@ -1571,6 +1702,16 @@ class RuntimeContext:
             if callable(close):
                 with suppress(RuntimeError):
                     self.task_registry.track("close_old_bangumi_client", close())
+        if old_v2ex_client is not None and old_v2ex_client is not new_v2ex_client:
+            close = getattr(old_v2ex_client, "aclose", None)
+            if callable(close):
+                with suppress(RuntimeError):
+                    self.task_registry.track("close_old_v2ex_client", close())
+        if old_weibo_client is not None and old_weibo_client is not new_weibo_client:
+            close = getattr(old_weibo_client, "aclose", None)
+            if callable(close):
+                with suppress(RuntimeError):
+                    self.task_registry.track("close_old_weibo_client", close())
         if new_inventory_available is not None:
             new_llm_gate.update_inventory(
                 available=new_inventory_available,

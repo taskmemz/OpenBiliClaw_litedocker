@@ -48,10 +48,19 @@ from openbiliclaw.sources.platforms import (
     PLATFORM_DOUYIN as PLATFORM_DOUYIN,
 )
 from openbiliclaw.sources.platforms import (
+    PLATFORM_LINUXDO as PLATFORM_LINUXDO,
+)
+from openbiliclaw.sources.platforms import (
     PLATFORM_REDDIT as PLATFORM_REDDIT,
 )
 from openbiliclaw.sources.platforms import (
     PLATFORM_TWITTER as PLATFORM_TWITTER,
+)
+from openbiliclaw.sources.platforms import (
+    PLATFORM_V2EX as PLATFORM_V2EX,
+)
+from openbiliclaw.sources.platforms import (
+    PLATFORM_WEIBO as PLATFORM_WEIBO,
 )
 from openbiliclaw.sources.platforms import (
     PLATFORM_XIAOHONGSHU as PLATFORM_XIAOHONGSHU,

@@ -441,11 +441,11 @@ def test_native_save_source_api_is_documented() -> None:
         "docs/modules/runtime.md": "extension_native_save_broker",
         "docs/modules/saved-sync.md": "global native ownership",
         "docs/modules/init.md": "legacy discovery/bootstrap queues",
-        "docs/modules/api-auth.md": "six state-changing GET `/next-task`",
+        "docs/modules/api-auth.md": "seven state-changing GET `/next-task`",
         "docs/architecture.md": "/api/sources/{xhs,dy,yt,x,zhihu,reddit}",
         "docs/spec.md": "native_save multiplex",
-        "README.md": "六平台 source task multiplex",
-        "README_EN.md": "six-platform source task multiplex",
+        "README.md": "七源 source task multiplex",
+        "README_EN.md": "seven-source task multiplex",
         "docs/changelog.md": "source task multiplex",
     }
     for path, marker in required.items():

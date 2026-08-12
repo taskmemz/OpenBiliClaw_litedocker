@@ -106,6 +106,9 @@ _PLANNER_PLATFORMS: tuple[str, ...] = (
     "zhihu",
     "reddit",
     "bangumi",
+    "linuxdo",
+    "v2ex",
+    "weibo",
 )
 _BILIBILI = "bilibili"
 _PLATFORM_QUERY_STYLES: dict[str, dict[str, tuple[str, ...]]] = {
@@ -264,6 +267,45 @@ _PLATFORM_QUERY_STYLES: dict[str, dict[str, tuple[str, ...]]] = {
         ),
         "examples": ("赛博朋克 动画", "独立游戏 时间循环"),
         "avoid_markers": ("爆款", "热议", "速看", "探店"),
+    },
+    "linuxdo": {
+        "native_markers": (
+            "教程",
+            "经验",
+            "分享",
+            "求助",
+            "踩坑",
+            "开源",
+            "部署",
+            "折腾",
+            "讨论",
+            "方案",
+            "自建",
+            "实测",
+            "复盘",
+        ),
+        "examples": ("本地大模型 部署 踩坑", "开源自托管 工具 分享"),
+        "avoid_markers": ("小红书", "抖音", "爆款", "种草"),
+    },
+    "v2ex": {
+        "native_markers": ("讨论", "经验", "折腾", "求助", "实测", "踩坑", "方案", "开源"),
+        "examples": ("本地运行 Agent 讨论", "家庭网络折腾 实测 踩坑"),
+        "avoid_markers": ("短视频", "种草笔记"),
+    },
+    "weibo": {
+        "native_markers": (
+            "热议",
+            "话题",
+            "观点",
+            "现场",
+            "回应",
+            "进展",
+            "讨论",
+            "争议",
+            "超话",
+        ),
+        "examples": ("AI Agent 热议", "动画制作 业内回应"),
+        "avoid_markers": ("小红书", "subreddit"),
     },
 }
 # The planner reclaims in-flight rows that leaked past the claim lease before

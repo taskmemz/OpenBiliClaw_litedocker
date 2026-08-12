@@ -94,6 +94,7 @@ test("platformDisplayName maps known platforms and passes through unknown", () =
   assert.equal(platformDisplayName("ZHIHU"), "知乎");
   assert.equal(platformDisplayName("reddit"), "Reddit");
   assert.equal(platformDisplayName("bgm"), "Bangumi");
+  assert.equal(platformDisplayName("linuxdo"), "Linux.do");
   assert.equal(platformDisplayName("newtube"), "newtube");
   assert.equal(platformDisplayName(""), "");
 });
@@ -157,7 +158,7 @@ test("buildContentUrl and click payload keep YouTube items source-aware", () => 
     title: "A YouTube deep dive",
     recommendation_id: 42,
     topic_label: "",
-    up_name: "这位 UP 还没认出来",
+    up_name: "这位创作者还没认出来",
   });
 });
 
@@ -182,7 +183,7 @@ test("normalizeRecommendation keeps Zhihu items source-aware", () => {
     title: "一个知乎回答",
     recommendation_id: 43,
     topic_label: "",
-    up_name: "这位 UP 还没认出来",
+    up_name: "这位创作者还没认出来",
   });
 });
 
@@ -222,7 +223,7 @@ test("normalizeRecommendation keeps Reddit items source-aware and text-card base
     title: "Local-first agents",
     recommendation_id: 44,
     topic_label: "",
-    up_name: "这位 UP 还没认出来",
+    up_name: "这位创作者还没认出来",
   });
 });
 
@@ -235,6 +236,74 @@ test("buildContentUrl does not fabricate Bilibili links for Reddit ids", () => {
   });
 
   assert.equal(item.source_platform, "reddit");
+  assert.equal(buildContentUrl(item), "");
+});
+
+test("Linux.do recommendations use canonical topic links and text cards", () => {
+  const item = normalizeRecommendation({
+    id: 45,
+    content_id: "topic:12345",
+    title: "Linux.do 上的一篇主题",
+    source_platform: "linux.do",
+    content_type: "post",
+    body_text: "主题正文摘要",
+    cover_url: "",
+  });
+
+  assert.equal(item.source_platform, "linuxdo");
+  assert.equal(platformDisplayName(item.source_platform), "Linux.do");
+  assert.equal(buildContentUrl(item), "https://linux.do/t/12345");
+  assert.deepEqual(getRecommendationCardKind(item), {
+    kind: "text",
+    coverUrl: "",
+    text: "主题正文摘要",
+  });
+
+  const inferred = normalizeRecommendation({
+    content_id: "topic:67890",
+    content_url: "https://linux.do/t/example/67890",
+    content_type: "post",
+  });
+  assert.equal(inferred.source_platform, "linuxdo");
+
+  const popupJs = readFileSync(resolve("popup", "popup.js"), "utf8");
+  assert.match(popupJs, /linuxdo: "Linux\.do"/);
+});
+
+test("Weibo aliases and hosts normalize to text-first post cards", () => {
+  const item = normalizeRecommendation({
+    id: 45,
+    content_id: "5023456789012345",
+    content_url: "https://m.weibo.cn/detail/5023456789012345",
+    title: "一条公开微博",
+    source_platform: "wb",
+    content_type: "post",
+    body_text: "公开微博正文。",
+    share_count: 321,
+  });
+
+  assert.equal(item.source_platform, "weibo");
+  assert.equal(platformDisplayName(item.source_platform), "微博");
+  assert.equal(buildContentUrl(item), "https://m.weibo.cn/detail/5023456789012345");
+  assert.equal(item.share_count, 321);
+  assert.deepEqual(getRecommendationCardKind(item), {
+    kind: "text",
+    coverUrl: "",
+    text: "公开微博正文。",
+  });
+
+  assert.equal(normalizeRecommendation({ content_url: "https://weibo.com/u/123" }).source_platform, "weibo");
+  assert.equal(normalizeRecommendation({ content_url: "https://wx1.sinaimg.cn/large/a.jpg" }).source_platform, "weibo");
+});
+
+test("buildContentUrl does not fabricate Bilibili links for Weibo ids", () => {
+  const item = normalizeRecommendation({
+    content_id: "5023456789012345",
+    title: "缺 URL 的微博",
+    source_platform: "weibo",
+    content_type: "post",
+  });
+
   assert.equal(buildContentUrl(item), "");
 });
 
@@ -448,15 +517,18 @@ test("getRecommendationCardKind keeps a cover card for video items with a cover"
   assert.equal(result.text, "");
 });
 
-test("popup recommendation renderer has text-card styles for X items", () => {
+test("popup recommendation renderer distinguishes text cards from image failures", () => {
   const popupJs = readFileSync(resolve("popup", "popup.js"), "utf8");
   const popupHtml = readFileSync(resolve("popup", "popup.html"), "utf8");
 
-  assert.match(popupJs, /cover\.classList\.add\("is-fallback", "is-text-card"\)/);
+  assert.match(popupJs, /cover\.classList\.add\("is-text-card"\)/);
+  assert.doesNotMatch(popupJs, /cover\.classList\.add\("is-fallback", "is-text-card"\)/);
+  assert.match(popupJs, /card\.classList\.add\("is-text-only"\)/);
   assert.match(popupJs, /textNode\.className = "recommendation-cover-text"/);
   assert.match(popupJs, /source-platform-\$\{platformKey\}/);
   assert.match(popupJs, /twitter: "X"/);
   assert.match(popupHtml, /\.recommendation-cover\.is-text-card/);
+  assert.match(popupHtml, /aspect-ratio: auto/);
   assert.match(popupHtml, /\.recommendation-cover-text/);
 });
 
@@ -648,6 +720,7 @@ test("normalizeDelightCandidate fills stable fallbacks and upgrades cover urls",
     view_count: 0,
     like_count: 0,
     comment_count: 0,
+    share_count: 0,
     favorite_count: 0,
     danmaku_count: 0,
     rating_score: 0,

@@ -14,10 +14,23 @@ EXPECTED = [
 
 def test_store_listing_names_all_supported_platforms_and_local_backend() -> None:
     text = LISTING.read_text(encoding="utf-8")
-    for label in ("B站", "小红书", "抖音", "YouTube", "X", "知乎", "Reddit"):
+    for label in (
+        "B站",
+        "小红书",
+        "抖音",
+        "YouTube",
+        "X",
+        "知乎",
+        "Reddit",
+        "Bangumi",
+        "V2EX",
+    ):
         assert label in text
     assert "本地后端" in text
     assert "数据默认保存在你的本机" in text
+    assert "只检查 A2 Cookie 是否存在" in text
+    assert "不访问、存储或发送 Cookie 值" in text
+    assert "不向 V2EX 发帖、回复、感谢、收藏、取消收藏或关注 Node" in text
 
 
 def test_store_listing_assets_have_stable_order_dimensions_and_visual_detail() -> None:

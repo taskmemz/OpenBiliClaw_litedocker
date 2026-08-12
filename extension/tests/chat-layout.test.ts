@@ -20,8 +20,6 @@ test("chat tab layout pins a compact composer below a flexible history pane", ()
   const chatShellBlock = cssBlockWith(popupHtml, ".chat-shell", /overflow:\s*hidden;/);
   const chatMessagesBlock = cssBlockWith(popupHtml, ".chat-messages", /overflow-y:\s*auto;/);
   const chatFormBlock = cssBlockWith(popupHtml, ".chat-form", /margin-top:\s*auto;/);
-  const chatFooterBlock =
-    popupHtml.match(/\.shell:has\(#viewChat:not\(\[hidden\]\)\)\s+\.footer\s*\{[\s\S]*?\}/)?.[0] ?? "";
 
   assert.match(viewBlock, /flex:\s*1;/);
   assert.match(chatShellBlock, /flex:\s*1;/);
@@ -31,7 +29,11 @@ test("chat tab layout pins a compact composer below a flexible history pane", ()
   assert.doesNotMatch(chatMessagesBlock, /max-height:/);
   assert.match(chatFormBlock, /margin-top:\s*auto;/);
   assert.match(chatFormBlock, /flex-shrink:\s*0;/);
-  assert.match(chatFooterBlock, /display:\s*none;/);
+  assert.doesNotMatch(
+    popupHtml,
+    /\.shell:has\(#viewChat:not\(\[hidden\]\)\)\s+\.footer\s*\{[\s\S]*?display:\s*none;/,
+    "the global activity footer must stay visible on the chat tab",
+  );
 });
 
 test("pending confirmations stay bounded and scroll independently from chat history", () => {

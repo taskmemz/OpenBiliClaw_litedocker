@@ -11,12 +11,14 @@ export interface ChromeMockTab {
 export interface ChromeMockState {
   createdTabs: Array<{ active?: boolean; url: string }>;
   updatedTabs: Array<{ active?: boolean; tabId: number; url?: string }>;
+  reloadedTabs: number[];
   sentMessages: Array<{ message: unknown; tabId: number }>;
   removedTabs: number[];
   executedScripts: Array<{ files?: string[]; tabId?: number; world?: string }>;
   fetchCalls: Array<{ body?: unknown; method?: string; url: string }>;
   queryResult: ChromeMockTab[];
   sessionStorage: Record<string, unknown>;
+  runtimeSessionStorage: Record<string, unknown>;
   sessionGetImpl: (key: string) => Promise<Record<string, unknown>>;
   sessionSetImpl: (items: Record<string, unknown>) => Promise<void>;
   sessionRemoveImpl: (key: string) => Promise<void>;
@@ -53,12 +55,14 @@ export function installChromeMock(): ChromeMockState {
   const state: ChromeMockState = {
     createdTabs: [],
     updatedTabs: [],
+    reloadedTabs: [],
     sentMessages: [],
     removedTabs: [],
     executedScripts: [],
     fetchCalls: [],
     queryResult: [],
     sessionStorage: {},
+    runtimeSessionStorage: {},
     sessionGetImpl: async (key) => Object.hasOwn(state.sessionStorage, key)
       ? { [key]: state.sessionStorage[key] }
       : {},
@@ -133,19 +137,43 @@ export function installChromeMock(): ChromeMockState {
   const chromeMock = {
     storage: {
       local: {
-        get(_key: string, callback: (items: Record<string, unknown>) => void) {
-          callback({});
-        },
-      },
-      session: {
-        async get(key: string) {
-          return state.sessionGetImpl(key);
+        get(key: string, callback?: (items: Record<string, unknown>) => void) {
+          const promise = state.sessionGetImpl(key);
+          if (callback) void promise.then(callback);
+          return promise;
         },
         async set(items: Record<string, unknown>) {
           await state.sessionSetImpl(items);
         },
         async remove(key: string) {
           await state.sessionRemoveImpl(key);
+        },
+      },
+      session: {
+        async get(key: string) {
+          if (key === "openbiliclaw_linuxdo_runtime_session") {
+            return Object.hasOwn(state.runtimeSessionStorage, key)
+              ? { [key]: state.runtimeSessionStorage[key] }
+              : {};
+          }
+          return state.sessionGetImpl(key);
+        },
+        async set(items: Record<string, unknown>) {
+          const runtimeSession = items.openbiliclaw_linuxdo_runtime_session;
+          if (runtimeSession !== undefined) {
+            state.runtimeSessionStorage.openbiliclaw_linuxdo_runtime_session = runtimeSession;
+          }
+          const other = Object.fromEntries(
+            Object.entries(items).filter(([key]) => key !== "openbiliclaw_linuxdo_runtime_session"),
+          );
+          if (Object.keys(other).length > 0) await state.sessionSetImpl(other);
+        },
+        async remove(key: string) {
+          if (key === "openbiliclaw_linuxdo_runtime_session") {
+            delete state.runtimeSessionStorage[key];
+          } else {
+            await state.sessionRemoveImpl(key);
+          }
         },
       },
       onChanged: {
@@ -174,6 +202,11 @@ export function installChromeMock(): ChromeMockState {
         };
         state.tabById.set(tabId, updated);
         return updated;
+      },
+      async reload(tabId: number) {
+        state.reloadedTabs.push(tabId);
+        const current = state.tabById.get(tabId) ?? { id: tabId };
+        state.tabById.set(tabId, { ...current, status: "loading" });
       },
       async sendMessage(tabId: number, message: unknown) {
         state.sentMessages.push({ tabId, message });

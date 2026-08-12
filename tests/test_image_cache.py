@@ -38,6 +38,7 @@ XHS_ROTATED = (
     "https://sns-webpic-qc.xhscdn.com/202606010130/"
     "ffffffffffffffffffffffffffffffff/spectrum/note!nc_n_webp_prv_1"
 )
+WEIBO = "https://wx1.sinaimg.cn/large/demo.jpg"
 
 
 # ── Key primitives ────────────────────────────────────────────────
@@ -217,6 +218,7 @@ class _FakeHTTPX:
         self.responses: dict[str, _FakeResp] = {}
         self.timeouts: set[str] = set()
         self.sent_urls: list[str] = []
+        self.sent_headers: list[httpx.Headers] = []
         self.client_kwargs: list[dict[str, object]] = []
 
     def add(
@@ -250,6 +252,7 @@ class _FakeHTTPX:
             async def send(self, request: httpx.Request, *, stream: bool = False) -> _FakeResp:
                 url = str(request.url)
                 fake.sent_urls.append(url)
+                fake.sent_headers.append(request.headers)
                 if url in fake.timeouts:
                     raise httpx.TimeoutException("timed out", request=request)
                 return fake.responses.get(url, _FakeResp(404))
@@ -322,6 +325,41 @@ async def test_fetch_cover_bytes_success(fake_httpx: _FakeHTTPX) -> None:
     data, content_type = await fetch_cover_bytes(XHS)
     assert data == b"webp"
     assert content_type == "image/webp"
+
+
+async def test_sinaimg_fetch_uses_weibo_referer(fake_httpx: _FakeHTTPX) -> None:
+    fake_httpx.add(
+        WEIBO,
+        status_code=200,
+        headers={"content-type": "image/jpeg"},
+        chunks=[b"jpeg"],
+    )
+
+    data, content_type = await fetch_cover_bytes(WEIBO)
+
+    assert data == b"jpeg"
+    assert content_type == "image/jpeg"
+    assert fake_httpx.sent_headers[0]["referer"] == "https://weibo.com/"
+
+
+async def test_sinaimg_referer_is_recomputed_after_redirect(fake_httpx: _FakeHTTPX) -> None:
+    redirected = "https://i1.hdslb.com/bfs/archive/redirected.jpg"
+    fake_httpx.add(
+        WEIBO,
+        status_code=302,
+        headers={"location": redirected},
+    )
+    fake_httpx.add(
+        redirected,
+        status_code=200,
+        headers={"content-type": "image/jpeg"},
+        chunks=[b"jpeg"],
+    )
+
+    await fetch_cover_bytes(WEIBO)
+
+    assert fake_httpx.sent_headers[0]["referer"] == "https://weibo.com/"
+    assert "referer" not in fake_httpx.sent_headers[1]
 
 
 async def test_network_failure_log_never_contains_signed_url(

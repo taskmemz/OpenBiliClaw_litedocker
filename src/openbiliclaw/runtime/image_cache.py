@@ -285,6 +285,7 @@ ALLOWED_IMAGE_HOST_SUFFIXES: tuple[str, ...] = (
     "ytimg.com",
     "ggpht.com",
     "lain.bgm.tv",
+    "sinaimg.cn",
 )
 # CN CDNs must be fetched DIRECT: env/system proxies (Clash & co.) route them
 # through exit IPs their risk control blocks or throttles — the same failure
@@ -301,6 +302,7 @@ _DIRECT_FETCH_HOST_SUFFIXES: tuple[str, ...] = (
     "pstatp.com",
     "douyinpic.com",
     "douyinvod.com",
+    "sinaimg.cn",
 )
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
@@ -314,6 +316,7 @@ _UPSTREAM_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
     ),
 }
+_SINAIMG_REFERER = "https://weibo.com/"
 
 
 class CoverFetchError(Exception):
@@ -339,6 +342,22 @@ def _is_direct_fetch_host(hostname: str) -> bool:
     return any(
         host == suffix or host.endswith(f".{suffix}") for suffix in _DIRECT_FETCH_HOST_SUFFIXES
     )
+
+
+def _upstream_headers_for_host(hostname: str) -> dict[str, str]:
+    """Return upstream headers scoped to the current redirect target.
+
+    Sinaimg rejects the browser-shaped user agent used by the shared image
+    proxy unless the request also carries a Weibo Referer.  Build a fresh
+    mapping for every redirect hop so that header is never forwarded to a
+    different allowlisted CDN.
+    """
+
+    headers = dict(_UPSTREAM_HEADERS)
+    host = hostname.rstrip(".").lower()
+    if host == "sinaimg.cn" or host.endswith(".sinaimg.cn"):
+        headers["Referer"] = _SINAIMG_REFERER
+    return headers
 
 
 def is_allowed_image_url(url: str) -> bool:
@@ -405,7 +424,11 @@ async def _send_with_redirects(client: httpx.AsyncClient, url: httpx.URL) -> htt
         if current_key in seen:
             raise CoverFetchError(502, "Redirect loop")
         seen.add(current_key)
-        request = client.build_request("GET", current_key, headers=_UPSTREAM_HEADERS)
+        request = client.build_request(
+            "GET",
+            current_key,
+            headers=_upstream_headers_for_host(str(current.host or "")),
+        )
         response = await client.send(request, stream=True)
         if response.status_code in _REDIRECT_STATUSES:
             location = response.headers.get("location", "").strip()

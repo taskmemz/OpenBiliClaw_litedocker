@@ -31,6 +31,53 @@ def test_profile_analysis_default_budget_scales_with_chunk_count() -> None:
     assert cli._profile_analysis_timeout_seconds(event_count=1100, requested=0) is None
 
 
+def test_v2ex_guided_identity_activates_only_after_profile_commit(tmp_path: Path) -> None:
+    import openbiliclaw.cli as cli
+    from openbiliclaw.storage.database import Database
+
+    database = Database(tmp_path / "guided-v2ex.db")
+    database.initialize()
+    alice_id = database.insert_event(
+        "publish",
+        title="Alice",
+        metadata={"source_platform": "v2ex", "source_identity": "alice"},
+    )
+    database.activate_v2ex_profile_identity("alice")
+    memory = type("Memory", (), {"_database": database})()
+    bob_event = {
+        "event_type": "publish",
+        "title": "Bob",
+        "metadata": {"source_platform": "v2ex", "source_identity": "bob"},
+    }
+
+    identity = cli._stage_guided_v2ex_profile_identity(memory, [bob_event], "ok")
+    assert identity == "bob"
+    assert bob_event["metadata"]["profile_inactive"] is True
+    bob_id = database.insert_event(
+        "publish",
+        title="Bob",
+        metadata=bob_event["metadata"],
+    )
+    assert [row["id"] for row in database.query_events(limit=10)] == [alice_id]
+
+    cli._activate_guided_v2ex_profile_identity(memory, identity)
+
+    assert database.get_v2ex_profile_identity()[0] == "bob"
+    assert [row["id"] for row in database.query_events(limit=10)] == [bob_id]
+
+
+def test_v2ex_guided_identity_rejects_mixed_account_events() -> None:
+    import openbiliclaw.cli as cli
+
+    events = [
+        {"metadata": {"source_identity": "alice"}},
+        {"metadata": {"source_identity": "bob"}},
+    ]
+
+    with pytest.raises(cli.GuidedInitError, match="唯一账号"):
+        cli._guided_v2ex_profile_identity(events, "partial")
+
+
 def test_profile_analysis_concurrency_reads_soul_llm_service() -> None:
     import openbiliclaw.cli as cli
 
@@ -72,7 +119,7 @@ def test_desktop_web_static_contract_exposes_guided_init_cta() -> None:
     # Roster drift lock: the desktop init picker derives WHICH sources exist from
     # the shared roster (/shared/source-status.js), the same list the wizard and
     # side panel build from — no third hand-kept copy that can silently drift.
-    assert "_initSourceStatus?.SOURCE_KEYS" in app_js
+    assert "_initSourceStatus?.INIT_SOURCE_KEYS" in app_js
     assert 'src="/shared/source-status.js"' in Path(
         "src/openbiliclaw/web/desktop/index.html"
     ).read_text(encoding="utf-8")
@@ -180,7 +227,7 @@ def test_setup_init_sources_are_explicit_opt_in_without_settings_enable_block() 
     # The wizard builds its checkbox list from the shared roster instead of a
     # third hand-kept copy, so it can no longer offer a platform the settings
     # pages do not know about (spec I6).
-    assert "SourceStatus.SOURCE_KEYS.map" in setup_html
+    assert "SourceStatus.INIT_SOURCE_KEYS.map" in setup_html
     assert 'src="/shared/source-status.js"' in setup_html
     for source in (
         "bilibili",
@@ -191,9 +238,11 @@ def test_setup_init_sources_are_explicit_opt_in_without_settings_enable_block() 
         "zhihu",
         "reddit",
         "bangumi",
+        "linuxdo",
     ):
         assert f'"{source}"' in shared
         assert f'key: "{source}"' in app_js
+    assert "weibo: Object.freeze({ guidedInit: true })" in shared
 
 
 def test_guided_init_web_docs_belong_to_v03110_release_block() -> None:

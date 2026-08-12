@@ -14,6 +14,7 @@ from openbiliclaw.sources.bootstrap_state import (
     default_source_bootstrap_state,
     merge_seen_keys,
     normalize_source_bootstrap_state,
+    source_bootstrap_state_key,
 )
 
 if TYPE_CHECKING:
@@ -71,6 +72,17 @@ def test_normalize_source_bootstrap_state_caps_legacy_lists() -> None:
     assert keys[-1] == f"reddit:{SOURCE_SEEN_KEY_CAP}"
 
 
+def test_linuxdo_seen_keys_have_a_canonical_state_projection() -> None:
+    assert source_bootstrap_state_key("linuxdo") == "linuxdo_seen_item_keys"
+    assert default_source_bootstrap_state()["linuxdo_seen_item_keys"] == []
+
+    state = normalize_source_bootstrap_state(
+        {"linuxdo_seen_item_keys": ["linuxdo_bookmarks:topic:42", "", "linuxdo_bookmarks:topic:42"]}
+    )
+
+    assert state["linuxdo_seen_item_keys"] == ["linuxdo_bookmarks:topic:42"]
+
+
 def test_merge_seen_keys_refreshes_recency_and_collapses_blanks() -> None:
     merged = merge_seen_keys(
         ["old", "refresh", "keep", "refresh", ""],
@@ -96,6 +108,7 @@ def test_update_source_bootstrap_state_normalizes_mutator_output(tmp_path: Path)
     assert state["source_incremental"] == {
         "cursor": "",
         "last_attempt_at": {},
+        "last_success_at": {},
         "active_task": None,
     }
     assert memory.load_source_bootstrap_state() == state

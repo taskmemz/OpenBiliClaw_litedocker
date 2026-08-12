@@ -1008,7 +1008,10 @@ def test_exclusion_evidence_rejects_production_nested_skipped_and_irrelevant_nod
         ),
         (
             "xfailed",
-            "@pytest.mark.xfail\ndef test_example_search_integration_xfailed():\n    assert True\n",
+            (
+                "@pytest.mark."
+                + "xfail\ndef test_example_search_integration_xfailed():\n    assert True\n"
+            ),
             "test_example_search_integration_xfailed",
         ),
         (

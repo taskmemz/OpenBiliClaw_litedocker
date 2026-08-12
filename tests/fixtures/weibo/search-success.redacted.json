@@ -1,0 +1,33 @@
+{
+  "_fixture": {
+    "captured_from": "https://m.weibo.cn/api/container/getIndex",
+    "captured_at": "2026-08-10",
+    "content_type": "application/json; charset=utf-8",
+    "redaction": "Public identifiers, author name, and post text replaced; envelope and field types retained"
+  },
+  "ok": 1,
+  "data": {
+    "cardlistInfo": {
+      "page": 2,
+      "total": 1
+    },
+    "cards": [
+      {
+        "card_type": 9,
+        "mblog": {
+          "id": "redacted-post-id",
+          "bid": "RedactedBid",
+          "created_at": "Sun Aug 09 13:45:29 +0800 2026",
+          "text": "<p>脱敏公开微博正文</p>",
+          "user": {
+            "id": 1000000000,
+            "screen_name": "脱敏作者"
+          },
+          "attitudes_count": 8,
+          "comments_count": 3,
+          "reposts_count": 2
+        }
+      }
+    ]
+  }
+}

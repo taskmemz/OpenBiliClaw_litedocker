@@ -355,11 +355,11 @@ keywords, present, explore_domains = parse_merged_keywords_with_presence_and_exp
 )
 ```
 
-`explore_domains_block` 是可选项；未传时 prompt 与解析仍按普通多平台关键词生成运行。传入时，模型可在平台 key 之外额外返回 `explore_domains`，每个 domain 包含 `domain / novelty_level / queries`。这些 queries 会被 runtime 写入 B 站 `discovery_keywords` query cache，因此 prompt 规则要求它们保持探索性、跨域和 B 站可直接搜索，而不是普通兴趣关键词的换皮。
+`explore_domains_block` 是可选项；未传时 prompt 与解析仍按普通多平台关键词生成运行。合法普通平台 key 包含 `weibo`：其供给说明要求面向中文实时公开讨论，优先具体人物、事件、作品和话题实体，并可搭配“热议 / 回应 / 进展”等微博语境词。微博 producer 的 hot 分支仍独立把热搜词当 query seed，不把它写成 planner 结果。传入 explore block 时，模型可在平台 key 之外额外返回 `explore_domains`，每个 domain 包含 `domain / novelty_level / queries`。这些 queries 会被 runtime 写入 B 站 `discovery_keywords` query cache，因此 prompt 规则要求它们保持探索性、跨域和 B 站可直接搜索，而不是普通兴趣关键词的换皮。
 
 ### Inspiration axis-keyword prompt
 
-`build_inspiration_axis_keyword_prompt()` 是 regular / shared inspiration stage 唯一的 LLM 调用（caller `discovery.keyword_inspiration`），一次返回 `{axes[], keywords[]}`。system prompt 是模块级静态常量 `_INSPIRATION_AXIS_KEYWORD_SYSTEM_PROMPT`，所有 per-call 数据（platform guides、已选兴趣、既有轴、fresh evidence、allocation targets）都在 user message 里按稳定→易变排序、`ensure_ascii=False, indent=2, sort_keys=True` 序列化。
+`build_inspiration_axis_keyword_prompt()` 是 regular / shared inspiration stage 唯一的 LLM 调用（caller `discovery.keyword_inspiration`），一次返回 `{axes[], keywords[]}`。system prompt 是模块级静态常量 `_INSPIRATION_AXIS_KEYWORD_SYSTEM_PROMPT`，其平台枚举包含 `weibo`；所有 per-call 数据（platform guides、已选兴趣、既有轴、fresh evidence、allocation targets）都在 user message 里按稳定→易变排序、`ensure_ascii=False, indent=2, sort_keys=True` 序列化。微博的 guide / evidence 只帮助生成搜索词，不把 inspiration preview 直接写入候选池。
 
 Phase 2.1（多平台丰富度修复 F1）在该静态 Rules 里新增一条**产出具体性规则**：`core_concept` 必须锚定 `fresh_evidence` 里的具体实体 / 事件 / 作品 / 人物 / 机制（专名、作品名、具名争议、具体机制），**不得直接复述 interest 或 axis_label**；prompt 内置正反例（反：`新游推荐` 只是话题名 → 不合格；正：`士官长 登陆PS5` / `腾讯网易 新游发布`），并保留出口——某槽位 evidence 确实没有具体锚点时**允许**退回话题级、不硬造专名。该规则是纯静态文本（无 f-string、无 per-call 变量），因此仍满足 byte-identical prompt-cache 契约，`test_prompt_builder_system_messages_are_call_invariant` 覆盖 `build_inspiration_axis_keyword_prompt` 并逐字校验跨两次不同输入的 system message 相同。装配端还有确定性 `is_specific` 排序把"产出具体候选"真正落到"选中具体候选"（见 [discovery.md](./discovery.md) 的 `materialize_platform_keywords`）。
 

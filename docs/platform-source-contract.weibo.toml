@@ -1,0 +1,181 @@
+# Weibo source contract: anonymous public discovery plus browser-backed,
+# capability-specific personal bootstrap. The backend never receives a
+# Weibo Cookie; the extension runs bounded same-origin GETs in a logged-in tab.
+# Registration audit:
+#   PYTHONPATH="$PWD/src" "$PWD/.venv/bin/python" \
+#     scripts/audit_platform_source.py \
+#     --contract docs/platform-source-contract.weibo.toml --check --json
+
+schema_version = 1
+canonical_slug = "weibo"
+display_name = "微博"
+integration_level = "full"
+aliases = ["wb", "微博"]
+hosts = ["weibo.com", "weibo.cn"]
+content_types = ["post"]
+
+[transport]
+kind = "browser-task"
+owner = "shared"
+entrypoints = [
+  "src/openbiliclaw/sources/weibo_client.py",
+  "src/openbiliclaw/sources/weibo_tasks.py",
+  "extension/src/content/weibo/task-executor.ts",
+  "extension/src/background/weibo-task-dispatcher.ts",
+]
+route_aliases = []
+fallback_owner = "none"
+requires_overseas_network = false
+routed_by_network_mode = false
+network_policy = "Public discovery uses the backend anonymous visitor client; personal bootstrap uses same-origin browser requests so the backend never handles the user's Cookie."
+
+[transport.capability_routes]
+discover = "backend:private-api:anonymous-visitor"
+profile = "extension:browser-task:session-current"
+bootstrap = "extension:browser-task:session-current"
+cookie-sync = "extension:cookie-sync:observed-login"
+
+[identity]
+item_id = "Weibo post id, persisted under the namespaced item key weibo:<post_id>"
+url = "Canonical public weibo.com/<uid>/<bid> URL when available, otherwise https://m.weibo.cn/detail/<post_id>"
+dedupe = "Canonical source family plus post id; personal bootstrap keys are partitioned by verified current-account uid and interaction scope"
+account_scope = "The task tab must positively identify the logged-in uid from same-origin response data before personal events are accepted"
+
+[auth]
+mode = "capability-specific"
+credential_kinds = ["login_state"]
+verify_action = "browser_heartbeat"
+write_path = "unified"
+account_resolution = "The extension reads the current account identity in the same-origin task tab; the backend stores only a boolean heartbeat and opaque account key in event metadata"
+identity_evidence = "A cookie heartbeat is only a readiness hint; personal events require a positive uid in the task response"
+login_cookie_names = ["SUBP", "ALF"]
+login_state_path = "callback"
+
+[auth.capability_modes]
+discover = "anonymous"
+profile = "login-required"
+bootstrap = "login-required"
+cookie-sync = "optional-credential"
+
+[auth.capability_required]
+discover = true
+profile = true
+bootstrap = true
+cookie-sync = false
+
+[upstream]
+success_content_types = ["application/json", "text/javascript", "text/html"]
+pagination = "Anonymous discovery uses bounded public H5 pagination; personal bootstrap uses bounded same-origin favorites/following/mentions pages"
+terminal_evidence = "Route-specific HTTP success, valid decoded envelope, positive login identity for personal scopes, and explicit empty collection evidence"
+terminal_policy = "Login walls, challenge HTML, malformed JSON, missing identity, 429, timeout, and unobserved responses are failed/degraded, never healthy empty"
+partial_policy = "Accepted scopes survive partial results; failed or unexecuted personal scopes remain retryable and account binding prevents cross-account mixing"
+publication_time_policy = "Parse authoritative created_at only, normalize to UTC RFC3339, and leave unknown values neutral"
+
+[discover]
+modes = ["search", "hot", "creator"]
+search_generation = "Merged KeywordPlanner and inspiration-axis generation allocate durable Weibo keyword claims; hot terms seed real post searches and creator follows same-run authors"
+budget = "Independent daily per-mode candidate budgets are charged only after global dedupe, filtering, and final retention"
+cursor = "Bounded public H5 page parameters; no durable completeness cursor is claimed"
+
+[profile]
+signals = true
+incremental = false
+refresh_mode = "init-only"
+
+[extension]
+task = "browser-task"
+hosts = ["weibo.com", "weibo.cn"]
+task_marker = true
+background = true
+early_response = false
+cookie_sync = true
+
+[surfaces]
+cli = true
+setup = true
+desktop = true
+mobile = true
+extension_popup = true
+source_status = true
+credentials = true
+recommendation = true
+
+[surface_scope]
+desktop_platform_filter = true
+mobile_platform_filter = false
+extension_popup_platform_filter = false
+platform_filter_policy = "Desktop owns the repository's platform filter and inventory counts. Mobile and extension popup expose canonical Weibo identity and login/init status; they do not claim a per-platform filter until a shared control exists."
+
+[engagement]
+view = "mapped"
+like = "mapped"
+favorite = "unavailable"
+comment = "mapped"
+share = "mapped"
+danmaku = "unavailable"
+
+[media]
+image = "proxy"
+image_hosts = ["sinaimg.cn"]
+deep_link = "browser-fallback"
+native_save = false
+
+[e2e]
+safe_actions = ["read-identity", "read-public-page", "search", "hot", "read-public-profile"]
+mutating_actions = []
+
+[e2e.safe_assertions]
+read-identity = "upstream-state-unchanged"
+read-public-page = "upstream-state-unchanged"
+search = "upstream-state-unchanged"
+hot = "upstream-state-unchanged"
+read-public-profile = "upstream-state-unchanged"
+
+[e2e.safe_postconditions]
+read-identity = "Only the same-origin login/account status endpoint is read; no platform state changes."
+read-public-page = "The logged-in task page may read favorites, following, and mentions with same-origin GETs only; no platform state changes."
+search = "Only anonymous public reads occur; normalized candidates may enter the normal acceptance database."
+hot = "Public hot terms are read as seeds for public post searches; no account state changes."
+read-public-profile = "Only a public creator timeline is read; follow, like, save, and other mutations are absent."
+
+[events]
+strategy_prefixes = ["weibo-", "weibo_"]
+mappings = "Logged-in favorites map to favorite, following to follow, and mentions to comment; account identity is retained as metadata and anonymous discovery never becomes a profile event"
+scope_caps = "Allowed scopes, account key, item counts, profile_update, and incremental authority are backend-owned task fields"
+
+[task]
+lease = "Backend atomically admits one active Weibo bootstrap task across extension instances and reclaims stale claims through the durable task row"
+idle_deadline = "The dispatcher bounds tab startup and result wait; each same-origin request has browser fetch termination"
+absolute_deadline = "A task shape cap limits three scopes to 300 rows each and the dispatcher cancels at a fixed terminal deadline"
+retry = "Task results are staged before profile/event projection; accepted scopes survive partial results and terminal retries never duplicate account-scoped keys"
+buffer = "Only normalized credential-free task/result payloads cross the extension boundary; no raw Cookie, Authorization header, or page HTML is buffered"
+
+[smoke]
+storage_scope = "isolated-only"
+
+[smoke.sinks]
+task = "allowed"
+task_result = "allowed"
+seen = "forbidden"
+affinity = "forbidden"
+snapshot = "forbidden"
+schedule = "forbidden"
+event_ingress = "forbidden"
+memory = "forbidden"
+profile = "forbidden"
+
+[exclusions]
+"profile.incremental" = "The first implementation imports logged-in personal signals during guided init; an independent periodic incremental scheduler is not claimed yet."
+"extension.early-response" = "The task tab starts explicit same-origin reads after the isolated listener receives the backend-owned task; no page response tap or replay is used."
+"engagement.favorite" = "The selected Weibo post schema does not expose a trustworthy public aggregate favorite count."
+"engagement.danmaku" = "Weibo has no Bilibili-style danmaku metric."
+"media.deep-link" = "No reliable official Weibo native-app scheme is claimed; mobile opens the canonical HTTPS URL."
+"media.native-save" = "The source is read-only; OpenBiliClaw membership remains local and no platform mutation adapter is claimed."
+
+[exclusion_tests]
+"profile.incremental" = ["tests/test_weibo_contract.py::test_weibo_profile_incremental_is_init_only"]
+"extension.early-response" = ["tests/test_weibo_contract.py::test_weibo_extension_early_response_is_explicitly_false"]
+"engagement.favorite" = ["tests/test_weibo_contract.py::test_weibo_favorite_engagement_is_unavailable"]
+"engagement.danmaku" = ["tests/test_weibo_contract.py::test_weibo_danmaku_engagement_is_unavailable"]
+"media.deep-link" = ["tests/test_weibo_contract.py::test_weibo_deep_link_uses_browser_fallback"]
+"media.native-save" = ["tests/test_weibo_contract.py::test_weibo_native_save_is_excluded"]

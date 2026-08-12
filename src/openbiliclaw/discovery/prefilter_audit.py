@@ -57,6 +57,7 @@ PREFILTER_PLATFORM_CLASSES: Final[frozenset[str]] = frozenset(
         "reddit",
         "twitter",
         "unknown",
+        "weibo",
         "web",
         "xiaohongshu",
         "youtube",
@@ -260,7 +261,7 @@ def classify_prefilter_context(source_context: object, source_strategy: object) 
         return "related"
     if "creator" in token or "up_track" in token or "follow" in token:
         return "creator"
-    if "trend" in token or "rank" in token or "popular" in token:
+    if "trend" in token or "rank" in token or "popular" in token or "hot" in token:
         return "trending"
     if "feed" in token or "timeline" in token:
         return "feed"

@@ -20,6 +20,9 @@ SOURCE_BOOTSTRAP_STATE_KEYS: dict[str, str] = {
     "zh": "zhihu_seen_item_keys",
     "reddit": "reddit_seen_item_keys",
     "rdt": "reddit_seen_item_keys",
+    "linuxdo": "linuxdo_seen_item_keys",
+    "v2ex": "v2ex_seen_item_keys",
+    "weibo": "weibo_seen_item_keys",
 }
 
 
@@ -31,10 +34,16 @@ def default_source_bootstrap_state() -> dict[str, object]:
         "yt_seen_item_keys": [],
         "zhihu_seen_item_keys": [],
         "reddit_seen_item_keys": [],
+        "linuxdo_seen_item_keys": [],
+        "linuxdo_account_key": "",
+        "v2ex_seen_item_keys": [],
+        "weibo_seen_item_keys": [],
+        "weibo_account_key": "",
         "last_source_bootstrap_sync_at": "",
         "source_incremental": {
             "cursor": "",
             "last_attempt_at": {},
+            "last_success_at": {},
             "active_task": None,
         },
     }
@@ -113,6 +122,16 @@ def _normalize_source_incremental_state(value: Any) -> dict[str, object]:
             if source:
                 last_attempt_at[source] = raw_timestamp.strip()
 
+    raw_successes = value.get("last_success_at", {})
+    last_success_at: dict[str, str] = {}
+    if isinstance(raw_successes, dict):
+        for raw_source, raw_timestamp in raw_successes.items():
+            if not isinstance(raw_source, str) or not isinstance(raw_timestamp, str):
+                continue
+            source = raw_source.strip().lower()
+            if source:
+                last_success_at[source] = raw_timestamp.strip()
+
     raw_active_task = value.get("active_task")
     active_task: dict[str, object] | None = None
     if isinstance(raw_active_task, dict):
@@ -123,6 +142,7 @@ def _normalize_source_incremental_state(value: Any) -> dict[str, object]:
     return {
         "cursor": cursor,
         "last_attempt_at": last_attempt_at,
+        "last_success_at": last_success_at,
         "active_task": active_task,
     }
 
@@ -138,6 +158,19 @@ def normalize_source_bootstrap_state(loaded: Any) -> dict[str, object]:
         "yt_seen_item_keys": merge_seen_keys(loaded.get("yt_seen_item_keys", []), []),
         "zhihu_seen_item_keys": merge_seen_keys(loaded.get("zhihu_seen_item_keys", []), []),
         "reddit_seen_item_keys": merge_seen_keys(loaded.get("reddit_seen_item_keys", []), []),
+        "linuxdo_seen_item_keys": merge_seen_keys(loaded.get("linuxdo_seen_item_keys", []), []),
+        "linuxdo_account_key": (
+            loaded.get("linuxdo_account_key", "").strip()
+            if isinstance(loaded.get("linuxdo_account_key", ""), str)
+            else ""
+        ),
+        "v2ex_seen_item_keys": merge_seen_keys(loaded.get("v2ex_seen_item_keys", []), []),
+        "weibo_seen_item_keys": merge_seen_keys(loaded.get("weibo_seen_item_keys", []), []),
+        "weibo_account_key": (
+            loaded.get("weibo_account_key", "").strip()
+            if isinstance(loaded.get("weibo_account_key", ""), str)
+            else ""
+        ),
         "last_source_bootstrap_sync_at": (
             loaded.get("last_source_bootstrap_sync_at", "").strip()
             if isinstance(loaded.get("last_source_bootstrap_sync_at", ""), str)

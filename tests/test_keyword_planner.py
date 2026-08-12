@@ -45,7 +45,18 @@ _TWITTER = "twitter"
 _ZHIHU = "zhihu"
 _REDDIT = "reddit"
 _BANGUMI = "bangumi"
-_SEARCH_PLATFORMS = (_BILI, _XHS, _DOUYIN, _YOUTUBE, _TWITTER, _ZHIHU, _REDDIT)
+_WEIBO = "weibo"
+_SEARCH_PLATFORMS = (
+    _BILI,
+    _XHS,
+    _DOUYIN,
+    _YOUTUBE,
+    _TWITTER,
+    _ZHIHU,
+    _REDDIT,
+    _BANGUMI,
+    _WEIBO,
+)
 # ── fakes ────────────────────────────────────────────────────────────────
 
 
@@ -676,6 +687,21 @@ async def test_bangumi_deficit_is_included_in_unified_keyword_generation(db: Dat
     assert len(llm.calls) == 1
     assert _BANGUMI in llm.calls[0]["user"]
     assert _pending(db, _BANGUMI, digest) == ["赛博朋克 动画", "时间循环 独立游戏"]
+
+
+async def test_weibo_deficit_is_included_in_unified_keyword_generation(db: Database) -> None:
+    profile = _profile(("AI Agent", 0.93), ("动画制作", 0.81))
+    digest = profile_kw_digest(profile)
+    llm = _FakeLLM(payload={_WEIBO: ["AI Agent 热议", "动画制作 业内回应"]})
+    deficit = _FakeDeficitSource(deficits={_WEIBO: 20})
+    planner = _make_planner(db, llm=llm, profile=profile, deficit=deficit)
+
+    ledger = await planner.run_once()
+
+    assert ledger == {_WEIBO: 2}
+    assert len(llm.calls) == 1
+    assert _WEIBO in llm.calls[0]["user"]
+    assert _pending(db, _WEIBO, digest) == ["AI Agent 热议", "动画制作 业内回应"]
 
 
 async def test_keyword_planner_uses_layered_profile_prefix(db: Database) -> None:
@@ -3170,8 +3196,8 @@ async def test_merged_ask_capped_at_gen_batch(db: Database) -> None:
 
 
 async def test_merged_max_tokens_scales_with_total_ask(db: Database) -> None:
-    # 7 due platforms × gen_batch(30) = 210 keyword ask → max_tokens sized to it
-    # (210 × 48 + 1024 = 11104), well above the 4096 floor, so the trailing
+    # 9 due platforms × gen_batch(30) = 270 keyword ask → max_tokens sized to it
+    # (270 × 48 + 1024 = 13984), well above the 4096 floor, so the trailing
     # platforms in the merged JSON are never truncated onto the fallback.
     profile = _profile(("露营", 0.9), ("和田玉", 0.7))
     plats = _SEARCH_PLATFORMS
@@ -3179,7 +3205,7 @@ async def test_merged_max_tokens_scales_with_total_ask(db: Database) -> None:
     deficit = _FakeDeficitSource(deficits=dict.fromkeys(plats, 40))
     cfg = _discovery_cfg(kw_cache_high=30, gen_batch=30)
     await _make_planner(db, llm=llm, profile=profile, deficit=deficit, discovery=cfg).run_once()
-    assert llm.max_tokens_seen[0] == 210 * 48 + 1024
+    assert llm.max_tokens_seen[0] == 270 * 48 + 1024
 
 
 # ── Phase 2 Task 3: axis backfill tick wiring + ordering regression ──────

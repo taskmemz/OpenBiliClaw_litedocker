@@ -59,11 +59,31 @@ import {
   pollZhihuTaskNow,
 } from "./zhihu-task-dispatcher.js";
 import {
+  startWeiboTaskPolling,
+  handleWeiboTaskAlarm,
+  handleWeiboTaskResult,
+  pollWeiboTaskNow,
+} from "./weibo-task-dispatcher.ts";
+import {
   startRedditTaskPolling,
   handleRedditTaskAlarm,
   handleRedditTaskResult,
   pollRedditTaskNow,
 } from "./reddit-task-dispatcher.ts";
+import {
+  startLinuxdoTaskPolling,
+  handleLinuxdoTaskAlarm,
+  handleLinuxdoTaskResult,
+  ensureLinuxdoTaskRecovery,
+  pollLinuxdoTaskNow,
+} from "./linuxdo-task-dispatcher.ts";
+import {
+  startV2EXTaskPolling,
+  handleV2EXTaskAlarm,
+  handleV2EXScopeResult,
+  ensureV2EXTaskRecovery,
+  pollV2EXTaskNow,
+} from "./v2ex-task-dispatcher.ts";
 import {
   startXTaskPolling,
   handleXTaskAlarm,
@@ -79,7 +99,10 @@ import {
 } from "./bili-task-dispatcher.js";
 import type { YtScopeResult } from "../content/yt/task-executor.js";
 import type { ZhihuTaskResult } from "../content/zhihu/task-executor.js";
+import type { WeiboTaskResult } from "../content/weibo/task-executor.ts";
 import type { RedditTaskResult } from "../content/reddit/task-executor.ts";
+import type { LinuxdoTaskResult } from "../content/linuxdo/task-executor.ts";
+import type { V2EXScopeResult } from "../content/v2ex/task-executor.ts";
 import {
   openExtensionUi,
   parseDelightBvid,
@@ -279,8 +302,20 @@ async function handleRuntimeEvent(event: Record<string, unknown>): Promise<void>
     pollZhihuTaskNow();
     return;
   }
+  if (eventType === "weibo_task_available") {
+    pollWeiboTaskNow();
+    return;
+  }
   if (eventType === "reddit_task_available") {
     await pollRedditTaskNow();
+    return;
+  }
+  if (eventType === "linuxdo_task_available") {
+    await pollLinuxdoTaskNow();
+    return;
+  }
+  if (eventType === "v2ex_task_available") {
+    pollV2EXTaskNow();
     return;
   }
   if (eventType === "x_task_available") {
@@ -559,18 +594,26 @@ function startPlatformTaskPolling(): void {
   startDyTaskPolling();
   startYtTaskPolling();
   startZhihuTaskPolling();
+  startWeiboTaskPolling();
   startRedditTaskPolling();
+  startLinuxdoTaskPolling();
+  startV2EXTaskPolling();
   startXTaskPolling();
   startBiliTaskPolling();
 }
 
 async function startServiceWorkerAfterRecovery(): Promise<void> {
-  // MV3 workers can stop between tab creation and cleanup. Session storage records
-  // only the runner-owned numeric tab ID, so recovery must finish before polling
-  // can create a new task tab and never scans or closes arbitrary Reddit/X tabs.
-  await ensureNativeSaveTaskRecovery();
+  // MV3 workers can stop between tab creation and cleanup. Source-owned recovery
+  // rows close the polling gate before a new task tab can be claimed; recovery
+  // never scans or closes arbitrary Reddit/X/Linux.do tabs.
   await ensureSession();
-  await connectRuntimeStream();
+  // Runtime-stream health must not be held hostage by a runner waiting for the
+  // shared task mutex. Every task wake still awaits its source recovery barrier.
+  const runtimeStreamReady = connectRuntimeStream();
+  await ensureLinuxdoTaskRecovery();
+  await ensureNativeSaveTaskRecovery();
+  await ensureV2EXTaskRecovery();
+  await runtimeStreamReady;
   startPlatformTaskPolling();
   startCookieSync();
 }
@@ -632,7 +675,7 @@ async function postBangumiIdentity(payload: { uid: number; username: string }): 
   }
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "BGM_IDENTITY_OBSERVED") {
     void postBangumiIdentity(message.data as { uid: number; username: string });
     return;
@@ -724,11 +767,41 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       })
       .catch((error: unknown) => {
         sendResponse({ ok: false, error: String(error) });
-    });
+      });
+    return true;
+  }
+  if (message.action === "WEIBO_TASK_RESULT") {
+    void handleWeiboTaskResult(message.data as WeiboTaskResult)
+      .then(() => {
+        sendResponse({ ok: true });
+      })
+      .catch((error: unknown) => {
+        sendResponse({ ok: false, error: String(error) });
+      });
     return true;
   }
   if (message.action === "REDDIT_TASK_RESULT") {
     void handleRedditTaskResult(message.data as RedditTaskResult)
+      .then(() => {
+        sendResponse({ ok: true });
+      })
+      .catch((error: unknown) => {
+        sendResponse({ ok: false, error: String(error) });
+      });
+    return true;
+  }
+  if (message.action === "LINUXDO_TASK_RESULT") {
+    void handleLinuxdoTaskResult(message.data as LinuxdoTaskResult, sender.tab)
+      .then(() => {
+        sendResponse({ ok: true });
+      })
+      .catch((error: unknown) => {
+        sendResponse({ ok: false, error: String(error) });
+      });
+    return true;
+  }
+  if (message.action === "V2EX_SCOPE_RESULT") {
+    void handleV2EXScopeResult(message.data as V2EXScopeResult, sender)
       .then(() => {
         sendResponse({ ok: true });
       })
@@ -765,7 +838,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   handleDyTaskAlarm(alarm.name);
   handleYtTaskAlarm(alarm.name);
   handleZhihuTaskAlarm(alarm.name);
+  handleWeiboTaskAlarm(alarm.name);
   void handleRedditTaskAlarm(alarm.name);
+  void handleLinuxdoTaskAlarm(alarm.name);
+  handleV2EXTaskAlarm(alarm.name);
   void handleXTaskAlarm(alarm.name);
   handleBiliTaskAlarm(alarm.name);
   if (handleCookieSyncAlarm(alarm.name)) {
