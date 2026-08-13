@@ -106,3 +106,6 @@ backend.err
 
 # Playwright CLI local cache (tool artifact)
 .playwright-cli/
+
+# DSH 插件：独立仓库（github.com/dsh-external/dsh-openbiliclaw），不随主仓库提交
+dsh-plugin/
