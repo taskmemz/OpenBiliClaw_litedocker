@@ -38,12 +38,13 @@ runtime 使用公开 `drain_pending_expression_copy(profile, limit<=60, max_extr
 | M119 风格多样性与快速文案增强 | ✅ | `reshuffle` 现在会同时约束 `topic_key + style_key`，并把快速 fallback 文案润色成更自然的老B友短句 |
 | M120 来源上限与硬配比 | ✅ | `reshuffle` 现在会对 `topic_key + style_key + source` 同时加硬上限，小批次优先保留不同来源，10 条一批时单一来源最多 3 条 |
 | M121 推荐自动续页 | ✅ | popup 与移动 Web 滚到底附近时会调用 `append` 从 discovery pool 再续 10 条，不再只能整组“换一批”；插件 / side panel 与移动 Web 的自动续页都需要用户向下滚动 / 翻页先触发一次意图门闩，后台和推荐消费后的 `refresh.pool_updated` 只刷新池子状态与可换提示，不会重拉 `/api/recommendations` 覆盖已 append 的历史卡片，也不会在加载更多哨兵仍可见时空转消耗候选池；底部「加载更多」按钮仍作为兜底，并会在插入追加卡片前预热封面 |
+| PC Web 后台推荐读取边界 | ✅ | 桌面 Web 已有卡片时，切回标签页、配置应用或其它后台水合只同步 runtime / 库存状态并跳过 `/api/recommendations`；该 GET 在首屏历史较薄时可能触发 `serve()` 补池并消费候选，因此只有首屏空列表或用户明确手动刷新时才读取推荐快照。关闭“滚动到底自动加载推荐”后，滚动与后台状态刷新都不会消费候选池 |
 | PC Web 自动续页滚动稳定 | ✅ | 平台 Tab 即使在用户用滚轮 / 触控板浏览到列表底部后仍持有键盘焦点，续页完成重绘 Tab 库存徽标时也只恢复焦点、不把离屏 Tab 滚回视口；推荐卡增量追加、当前 `scrollY` 与键盘可达性同时保留。 |
 | Web 空失败态恢复 | ✅ | 移动与桌面 Web 会把推荐/库存读取失败与真实空结果分开：瞬时超时进入 1/2/4/8 秒、最多四次的单飞恢复；成功空数组终止推荐重试；`refresh.pool_updated` 只在当前列表仍为空且上次推荐读取失败时触发条件恢复，已有或追加卡片不会被覆盖。库存状态可由含 `pool_available_count` 的实时快照独立恢复，不再把未知状态渲染成零库存。 |
 | M122 来源优先补齐 | ✅ | 推荐选片时会先补齐不同 `source`，再限制重复 `style`，避免 `explore` 把 `search/trending` 挤出同一批结果 |
 | 平台定向推荐（PC Web） | ✅ | `serve / reshuffle / append`（含 `*_with_result`）新增默认空的 keyword-only `source_platform`。非空时只装载该 canonical 平台的候选、跳过跨平台保底补位，其余 curator 打分、amplification guard、embedding/MMR、topic/style/broad-topic 多样性、视觉加成、持久化与 shown 提交全部复用既有实现——平台作用域只缩小候选集合，绝不是"先生成混合批次再过滤结果"。返回前经 `_enforce_platform_scope()` 校验，发现跨平台行记 ERROR 并丢弃，不让泄漏进响应。省略该参数时调用形状与行为与引入前完全一致（对签名不确定的兼容对象也只在真的带平台时才传新关键字）。**仅 PC Web 有该交互**：移动 Web、扩展 popup / side panel 与 CLI 没有平台 Tab，继续走不带平台的兼容路径，行为不变 |
 | 平台库存徽标（PC Web） | ✅ | `GET /api/recommendations/platform-availability` 返回 `{total_available, by_platform}`，来自 storage 的单次隔离快照，`total_available == sum(by_platform)` 恒成立，且与平台定向选片同一 servability 口径。读取失败返回可诊断 5xx，前端保留上一次成功快照，绝不把失败当成全零 |
-| 恢复标签页读取合并 | ✅ | `GET /api/recommendations` 使用 1 秒进程内快照与 `asyncio.Lock` single-flight，把浏览器恢复几十个旧标签页时的同形昂贵历史读取合并为一次；返回值 deep-copy，reshuffle / append / feedback 会立即失效快照。逐卡 `/api/saved/{list_kind}/status` 采用同窗口有界短缓存，并在 save/remove 时按 item 失效，不改变交互一致性。 |
+| 恢复标签页读取合并 | ✅ | `GET /api/recommendations` 使用最长 1 秒的进程内快照与 `asyncio.Lock` single-flight，把浏览器恢复几十个旧标签页时的同形昂贵历史读取合并为一次；桌面 Web 本地已有卡片时恢复水合直接跳过该 GET，仅同步 runtime / 库存，避免首屏补池副作用；空列表和明确刷新仍走读取。返回前逐行复核 temporal v2 三态，并把快照 deadline 截短到最早一条内容的 deadline 或 `next_review_at`。deadline 先锚定 monotonic clock、再读取 wall clock，两个时钟采样之间的调度延迟只会缩短缓存而不会越过 hold/expiry 边界；返回值 deep-copy，reshuffle / append / feedback 会立即失效快照。逐卡 `/api/saved/{list_kind}/status` 采用同窗口有界短缓存，并在 save/remove 时按 item 失效，不改变交互一致性。 |
 | M123 上游来源配额补货 | ✅ | discovery pool 低于目标值时，runtime 会按前端可换口径计算来源缺口，并用 raw-material headroom 限制请求量，减少推荐层长期面对“explore 过满、trending 过少”的偏池子 |
 | M124 generate 路径丰富度修正 | ✅ | `generate_recommendations()` 现在也会先对缓存候选做来源均衡，再分阶段放宽 `topic/style/source` 约束，避免高分 `related_chain` 长时间吃掉整批名额 |
 | M125 pool 预生成推荐文案 | ✅ | discovery pool 现在会异步批量预生成 `expression/topic_label`，`reshuffle/append` 只消费预生成结果，缺失时返回空而不是写统一兜底 |
@@ -73,7 +74,7 @@ runtime 使用公开 `drain_pending_expression_copy(profile, limit<=60, max_extr
 | v0.3.45 MMR embedding 提前 warm | ✅ | `warm_mmr_embeddings` 在 discovery 入池 + `classify_pool_backlog` 落库后立即并行 warm L2 SQLite embedding cache（cache key 文本由 `_mmr_embedding_text` 静态方法做 single source of truth），serve() 用 `asyncio.gather` 并行兜底,新增 `MMR embedding fetch: coverage=N/M elapsed=Xms` 埋点。换一批 P50 双峰（0.7s / 6-10s）收敛到稳定 <1s。v0.3.124+（lever 4）：冷启动伴侣 `prewarm_pool_mmr_embeddings()` 返回 `-1`＝没东西可暖(无 embedding service / 空池，良性)、`0`＝有候选但全嵌入失败(后端不可达)、`>0`＝已暖,供启动包装器区分良性冷启动与真故障 |
 | 换批默认硬去重 + 批次事件 | ✅ | 桌面 Web、移动 Web 与扩展 side panel 调用 `POST /api/recommendations/reshuffle` 时都会携带当前卡片 ID；桌面平台 Tab 还会排除该平台本会话已加载卡片。API/引擎把 `excluded_bvids` 贯穿到最终过滤，并把候选读取窗口扩大为基础窗口加排除数，避免旧卡因平台保底或 top-40 截断回流。成功换批只写一条 satisfaction-neutral、强度 `0.1` 的 `reshuffle` 批次事件，不再把整屏逐条伪装成 `dismiss`；误导性的“换一批时忽略当前”开关已移除。空响应或失败仍保留当前列表；CLI 是无持久卡片状态的单次输出，不适用列表保留语义。 |
 | issue #98 CPU 排序脱离事件循环 | ✅ | `_select_diversified_batch_async()` 与 `_build_supergroup_canonical_map_async()` 通过 `asyncio.to_thread()` 执行 MMR/多样性选择和 supergroup 两两 union-find；同步纯函数仍是唯一算法实现，异步包装保持完全相同的确定性输出。MMR 日志拆分 `selector_worker_ms` 与 `event_loop_resume_delay_ms`，不再把 worker 已完成后主协程迟迟未恢复的停顿误算成算法 CPU 时间。线程主要用于保持 asyncio 响应，不承诺绕过 Python GIL 提升吞吐。 |
-| issue #98 SQLite 换批热路径 | ✅ | `PoolServeSnapshot` 在独立 serve DB worker 的短生命周期连接、单个读事务内统一读取 readiness、候选窗口、平台补位、`seen_items` 和 curator 信号；已看身份来自持久化 canonical 账本，而不是重复解析最近事件窗口。API 不再前置重复扫描库存。推荐历史写入与 `pool_status='shown'` 在同一独立短事务中原子提交，和后台 maintenance worker/连接彻底分离；读取、维护或精确状态收敛期间 `/api/ping` / runtime stream 仍可响应。`recommendation_request_timing` 记录 profile/snapshot/embedding/selector/resume/persist/total 阶段，详细候选与 MMR 摘要只在 DEBUG 输出；`scripts/benchmark_reshuffle_latency.py` 使用独立预热的 health 连接并发验证尾延迟，避免 HTTP/1 客户端连接池串行化污染结果。 |
+| issue #98 SQLite 换批热路径 | ✅ | `PoolServeSnapshot` 在独立 serve DB worker 上先把 temporal `review_due` 的 `fresh` 行转为 `temporal_review_hold`、把 `expired` 行转为 `stale`，再用短生命周期连接、单个读事务统一读取 readiness、候选窗口、平台补位、`seen_items` 和 curator 信号；两类行都不展示、不计 canonical 库存。API 不再前置重复扫描库存。推荐历史写入与 `pool_status='shown'` 在同一独立短事务中原子提交，并在事务内对最终选中行重读完整证据组，避免 snapshot→persist 竞态把刚到复审点或刚确定过期的内容返回给用户。它和后台 maintenance worker/连接彻底分离；读取、维护或精确状态收敛期间 `/api/ping` / runtime stream 仍可响应。`recommendation_request_timing` 记录 profile/snapshot/embedding/selector/resume/persist/total 阶段，详细候选与 MMR 摘要只在 DEBUG 输出；`scripts/benchmark_reshuffle_latency.py` 使用独立预热的 health 连接并发验证尾延迟，避免 HTTP/1 客户端连接池串行化污染结果。 |
 | v0.3.57 pool gate on precomputed copy | ✅ | `get_pool_candidates` / `count_pool_candidates` SQL 加 `AND COALESCE(pool_expression, '') != '' AND COALESCE(pool_topic_label, '') != ''` —— 未 precompute 的 row 对 serve() 不可见,消除"discovery 完成→precompute 完成"60–90s 窗口内 popup 显示占位模板的旧 bug。`engine.py:320` 的 `_fallback_expression` 路径变成 race-window 安全网,触发即 `logger.warning("Pool gate leak: ...")` |
 | v0.3.66 pool gate on classification | ✅ | `get_pool_candidates` / `count_pool_candidates` 现在同样要求 `style_key` 与 `topic_group` 非空；`get_pool_candidates_needing_copy` 也只挑已分类但缺文案的候选，避免未分类跨源内容先生成 copy 后绕过 serve 分类口径 |
 | v0.3.91 servable pool count | ✅ | `count_pool_candidates()` 在读取前刷新 SQLite/WAL snapshot，并默认应用与 `get_pool_candidates()` 相同的 `max_per_topic_group=3` 候选窗口；新增 `count_pool_readiness()` 拆分 `available/raw/pending`；`serve()` 零候选 warning 会输出 `raw/servable/pending`，用于定位“池子有素材但暂不可换”的真实原因。 |
@@ -115,6 +116,8 @@ runtime 使用公开 `drain_pending_expression_copy(profile, limit<=60, max_extr
 cover bonus 仍由前者单独控制。
 
 ## 公开 API
+
+桌面 Web 的后台恢复、配置应用和状态水合在本地已有推荐卡片时只同步 runtime / 库存，跳过可能触发首屏 `serve()` 补池的 `GET /api/recommendations`；空列表首屏与用户明确手动刷新仍读取推荐快照。该边界不改变 `reshuffle` / `append` 的显式消费契约。
 
 ### RecommendationEngine
 
@@ -426,7 +429,7 @@ Content-Type: application/json
 from openbiliclaw.recommendation.curator import PoolCurator
 ```
 
-`PoolCurator` 提供推荐侧的独立评分。它从候选池读取 Evaluation Agent 已持久化的语义特征，并按照一套专属权重对每条候选打分；时效只以发布时间明确、高置信类别的正向 bonus 进入推荐排序，不改写 discovery relevance 或 admission。
+`PoolCurator` 提供推荐侧的独立评分。它从候选池读取 Evaluation Agent 已持久化的语义特征，并按照一套专属权重对每条候选打分。相关性始终保持时间中性；时效分成两层：证据驱动三态 eligibility 负责可展示、待复审与确定过期的生命周期，publication bonus 只负责合格内容之间的优先级。
 
 #### ScoringWeights
 
@@ -441,6 +444,14 @@ from openbiliclaw.recommendation.curator import PoolCurator
 `serendipity` 加分只对 `explore` 来源发放（满额 1.0）。其余任何 strategy —— 包括 `trending` —— 一律为 0.0：来源只是上下文，不能凭发现路径白拿 rec_score（issue #90）。
 
 `freshness` 现在表示 publication-time temporal bonus，不再读取 `discovered_at`。只有 `breaking/current/versioned`、有效 `published_at` 且分类置信度至少 `0.60` 的候选参与：半衰期分别为 1 / 14 / 120 天，类别权重为 0.85 / 0.60 / 0.30；置信度 `>=0.80` 使用完整权重，`>=0.60 且 <0.80` 使用半量，低于 0.60 为 0。`evergreen/historical/unknown`、缺失/无效/明显未来时间全部保持中性，不会把发现时间冒充发布时间。
+
+三态 eligibility 与 bonus 共用 `discovery.temporal` 的类别策略、置信门和发布时间解析，避免 admission、排序、serving 三套规则漂移，但两者语义独立。Agent 的 v2 证据组为 `class/confidence/reason + validity_mode/valid_until/scope/evidence/state`；代码拥有 `evaluated_at/next_review_at/policy_version/evidence_complete`。只有置信度 `>=0.80`、整组完整、`scope=core` 且 evidence 可在 Agent 实际看到的 prompt projection 中逐字 grounding 时，已过 `explicit_deadline` 或事件 `expired` / 版本 `superseded` 才返回 `expired`。deadline 证据必须明确写出日期、时刻和时区并与 `valid_until` 完全一致，终态证据必须正向明示“已结束 / 已替代”；日期-only、反向表述、`hook`、低置信、缺字段、未 grounding、无效时钟与不一致的 mode/state 均 fail-neutral，不解析 `temporal_reason` 猜截止日。
+
+年龄曲线只负责“多久再看一次”：`breaking/current/versioned` 分别在评估后 1 / 14 / 120 天进入 `review_due`，不是内容死亡线；明确 deadline 的复核点就是 deadline。旧 v1 `breaking/current` 行跨过原 3 / 60 天窗口时也只进入 `review_due`。`event_state=active` 与 `version_state=active` 会按类别继续安排复审；`evergreen/historical/unknown`、`scope=hook` 和证据不足内容不因固定年龄被挡。
+
+生命周期卡口覆盖三个时机：Evaluation 完成后、写入 `content_cache` 前先做三态 admission；`review_due` 的 discovery 行重新排队，`expired` 行终态拒绝。已经入池的 `review_due` 内容会进入可逆 `temporal_review_hold`，不能展示、不计库存，并由现有 legacy/recovery evaluator 复审；DB 用 1 / 2 / 4 / 8 / 16 / 24 小时有界租约调度重复失败，完整新证据可恢复 `fresh` 并清零租约，`expired` 才转 `stale`。每次 `PoolServeSnapshot` 前动态收敛状态，最终 recommendation + shown 写事务再复核。Engine 只返回真正原子提交成功的条目，因此内容不会因为“排序低但一直刷”最终漏出。
+
+展示快路径也使用同一资格判断：`GET /api/recommendations` / OpenClaw 读取尚未处理的 recommendation history、未读计数和主动通知候选时，会在最终 `limit` 前排除后来进入 `review_due/expired` 的条目；完整历史查询仍保留这些记录，供行为回顾与审计使用。legacy `content_cache` 补分类会原子持久化完整 temporal 证据组并立即收敛 hold/stale 状态；discovery cached-backfill 只读取仍为 `fresh` 且 disposition 为 `eligible` 的行，并完整往返 temporal 元数据，不能把旧证据洗回 `unknown`。普通 raw 重抓同样不能恢复 hold 或 stale；只有完整的新一轮复审结果能恢复。
 
 每次 Curator 评分还会 best-effort 生成 `temporal-ranking-shadow-v1` 聚合审计：把当前含 bonus 排序与“精确减掉本次 bonus”的 no-bonus 反事实比较，记录 Top 10 / 50 / 100 的 overlap、Jaccard、同位置数，以及按时效类别、来源和年龄桶的进入/退出分布。审计发生在 MMR/多样性选择之前，不改变分数、准入或 serving；写入失败只记 WARNING。持久化内容不含 BVID、内容 ID、标题、作者、URL、query 或画像文本，保留上限为 30 天 / 5,000 轮。
 
@@ -508,7 +519,7 @@ curator.record_temporal_ranking_shadow_audit(candidates, scores, context)
 report: PoolHealthReport = curator.check_pool_health()
 ```
 
-`score_candidates()` 以叠加覆盖层的形式返回新的分数映射，不会修改传入的候选对象。`PoolCurator` 的所有方法均不修改输入数据。shadow 的年龄桶固定为 `<=1d / 1-7d / 7-30d / 30-180d / >180d / unknown`，用于与 2026-08 历史回放口径连续比较；它只回答“bonus 改了谁的相对位置”，不自动开启硬 stale gate。
+`score_candidates()` 以叠加覆盖层的形式返回新的分数映射，不会修改传入的候选对象。`PoolCurator` 的所有方法均不修改输入数据。shadow 的年龄桶固定为 `<=1d / 1-7d / 7-30d / 30-180d / >180d / unknown`，用于与 2026-08 历史回放口径连续比较；它只回答“bonus 改了谁的相对位置”，本身不改变 eligibility 或自动调整硬期限。
 
 ## 示例：记忆如何影响推荐结果
 

@@ -47,6 +47,7 @@ $env:MODE="docker"; [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePo
 
 > The leading `[Net.ServicePointManager]...Tls12` line is **required on PowerShell 5.1** (the default that ships with Windows 10/11). PS 5.1 defaults to TLS 1.0/1.1, but GitHub.com only accepts TLS 1.2+. Without the prefix, `iwr` fails with "underlying connection was closed" and the user blames the installer. Users on PowerShell 7+ can omit the prefix. Compatible from v0.3.9 forward — the script itself also re-applies the same setting once it starts running, so any subsequent HTTPS calls (git, pip, uv) inside the script are also covered.
 > v0.3.71+ also sets `NO_PROXY/no_proxy=localhost,127.0.0.1,::1` in `install.sh`, `install.ps1`, and `agent_bootstrap.py` before local health checks. This keeps corporate/VPN proxies from intercepting `http://127.0.0.1:<port>/api/health` on native Windows.
+> `install.ps1` captures `git clone`'s stderr before checking its exit code. Windows PowerShell 5.1 can otherwise treat Git's normal progress output as a terminating error when `$ErrorActionPreference=Stop`, leaving a complete clone with no bootstrap. A real clone failure still prints Git's captured diagnostics (issue #177).
 
 Either command:
 
@@ -276,7 +277,7 @@ questions, then re-run bootstrap with those flags.
 
 v0.3.95+ embedding safety net (`should_auto_wire_embedding`): when
 `[llm.embedding].provider` would otherwise stay empty — e.g. the chat
-provider is Claude / DeepSeek / OpenRouter (which can't embed) and you
+provider is Claude / DeepSeek / OpenRouter / OrcaRouter (which can't embed) and you
 never passed `--embedding-provider` — bootstrap auto-writes
 `provider=ollama, model=bge-m3` and pulls the model, so semantic dedup
 isn't silently disabled (the symptom is recommendations repeating
@@ -308,11 +309,16 @@ user chooses an OpenAI-compatible gateway / preset path.
 | 4. **Gemini 官方** | `gemini-2.5-flash`(稳定;可选 gemini-3-flash-preview / gemini-3.1-pro-preview 旗舰 Public Preview 需付费项目) | Google AI Studio 申请 Key | ✅ 需要 | 免费档每天 1500 次 |
 | 5. **Claude 官方** | `claude-sonnet-4-6`(1M ctx;可选 claude-haiku-4-5 便宜 / claude-opus-4-7 旗舰) | Anthropic console | ✅ 需要 | $3-$75/M,按 token,质量高 |
 | 6. **OpenRouter** | `openai/gpt-5-nano`(格式 `<vendor>/<model>`) | 一个 Key 跑多家 | ✅ 需要 | 按调用计费 |
-| 7. **本地 Ollama**（完全免费 / 离线 / 不要 Key） | `qwen2.5:7b`(中文好;可选 llama3.2 / gemma2 / mistral / deepseek-r1) | 16GB+ 内存,能接受 1–3 分钟首次响应 | ❌ 不需要 | ✅ 免费 / ⚠️ CPU 推理慢 |
+| 7. **OrcaRouter** | `openai/gpt-4o`(格式 `<vendor>/<model>`) | 一个 Key 跑 150+ 模型 / 网关级零信任安全 | ✅ 需要 | 按调用计费 |
+
+> **本地 Ollama 不在聊天 provider 菜单里**（v0.3.176+）：随装的 Ollama 只带
+> embedding 模型 `bge-m3`，小体积本地聊天模型达不到内容管线质量线。需要本地
+> 聊天模型时到桌面设置页手动配置，或显式 `--provider ollama --llm-model qwen2.5:7b`
+> 走完全离线路径（见下方「Hardware caveat for local Ollama」）。
 
 > ⚠️ **不要把选项 3 (OpenAI 官方) 和选项 2 (协议兼容) 混淆**:走 OpenAI API 官方端点选 3;走任何"OpenAI 协议兼容"的第三方 / 自建服务选 2。
 
-**AI agent 决策建议**: **默认引导 #1 DeepSeek**(几毛钱搞定);用户明确说"我有中转站 Key / OneAPI / 通义 / 智谱 / Kimi / MiniMax / Yi / Azure / vLLM 等任何 OpenAI 兼容服务"→ 引导 #2(进子菜单后再细分);用户明确说"用 OpenAI / Gemini / Claude 官方"才走 #3-5;Ollama 仅在用户明确要求"本地 / 离线"时引导。
+**AI agent 决策建议**: **默认引导 #1 DeepSeek**(几毛钱搞定);用户明确说"我有中转站 Key / OneAPI / 通义 / 智谱 / Kimi / MiniMax / Yi / Azure / vLLM 等任何 OpenAI 兼容服务"→ 引导 #2(进子菜单后再细分);用户明确说"用 OpenAI / Gemini / Claude 官方"才走 #3-5;用户提到"OrcaRouter / 一个 Key 跑多家模型 + 安全网关"→ 引导 #7;Ollama 仅在用户明确要求"本地 / 离线"时用显式 `--provider ollama` 走离线路径。
 
 **选项 2 的核心场景:你买了第三方中转站 / OneAPI 的 Key**,想用人民币付钱跑 OpenAI / Claude / 国产模型 —— 这是国内绝大多数用户用这个选项的真正原因。子菜单 9 个 preset 中,**第 1 个就是中转站(默认)**:
 
@@ -380,7 +386,7 @@ under ¥1 for most users. That's the actual zero-friction path. Ollama
 remains a first-class option for people who genuinely want offline /
 no-key setups, but should not be sold as "新手友好".
 
-**Hardware caveat for option 7 (Ollama)**: tell the user upfront —
+**Hardware caveat for local Ollama**: tell the user upfront —
 "本地模型的首次响应会比较慢（CPU 推理），内存建议 16GB 以上。如果你介意等待，
 选 1 或 2 更顺。" Don't wave them into Ollama if they have a 4-core
 Windows laptop with 8 GB.
@@ -426,7 +432,7 @@ flags from Step 3. DeepSeek has no embeddings endpoint, so recommend
 local Ollama bge-m3 unless the user explicitly wants Gemini / OpenAI
 embedding. `--embedding-provider ""` now means "do not enable embedding".
 
-#### Options 3-6 (OpenAI 官方 / Gemini / Claude / OpenRouter):
+#### Options 3-7 (OpenAI 官方 / Gemini / Claude / OpenRouter / OrcaRouter):
 
 Substitute the right vendor name and Key URL:
 
@@ -434,13 +440,14 @@ Substitute the right vendor name and Key URL:
 - Gemini: https://aistudio.google.com/apikey
 - Claude: https://console.anthropic.com/ → Settings → API Keys
 - OpenRouter: https://openrouter.ai/keys
+- OrcaRouter: https://www.orcarouter.ai/keys
 
 Run with `--provider <name> --llm-api-key <KEY>` plus the Step 3
 embedding flags. Don't ask for Base URL. Embedding is independent from
 the primary LLM; if the user wants embedding, pass an explicit
 `--embedding-provider` and its model/key fields.
 
-#### Option 3 (Ollama, fully offline / no key):
+#### Ollama (fully offline / no key, via `--provider ollama`):
 
 **You don't need to ask the user to install Ollama themselves.** Since
 v0.3.10, `agent_bootstrap.py` auto-installs Ollama (macOS via `brew`,

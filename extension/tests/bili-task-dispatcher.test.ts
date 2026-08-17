@@ -113,6 +113,7 @@ interface ChromeMock {
   tabs: {
     create: (opts: { url: string; active?: boolean }) => Promise<{ id: number }>;
     get: (tabId: number) => Promise<{ id: number; status?: string }>;
+    update: (tabId: number, opts: { muted?: boolean }) => Promise<void>;
     remove: (tabId: number) => Promise<void>;
     sendMessage: (tabId: number, message: unknown) => Promise<void>;
     onUpdated: {
@@ -131,6 +132,7 @@ interface MockState {
   sendMessageImpl: (tabId: number, message: unknown) => Promise<void>;
   fetchCalls: { url: string; body?: unknown }[];
   removedTabs: number[];
+  updatedTabs: { tabId: number; muted?: boolean }[];
   tabStatus: string;
 }
 
@@ -141,6 +143,7 @@ function installChromeMock(): MockState {
     sendMessageImpl: async () => {},
     fetchCalls: [],
     removedTabs: [],
+    updatedTabs: [],
     tabStatus: "loading",
   };
 
@@ -152,6 +155,9 @@ function installChromeMock(): MockState {
         return { id: 42 };
       },
       get: async (tabId) => ({ id: tabId, status: state.tabStatus }),
+      update: async (tabId, opts) => {
+        state.updatedTabs.push({ tabId, ...opts });
+      },
       remove: async (tabId) => {
         state.removedTabs.push(tabId);
       },
@@ -209,6 +215,8 @@ test("executeTask retries Bili sendMessage until the content script listener is 
 
   const task: BiliTask = { id: "bili-retry", type: "search", query: "机械键盘 声音" };
   await executeTask(task);
+
+  assert.deepEqual(state.updatedTabs, [{ tabId: 42, muted: true }], "task tab is muted before execution");
 
   state.tabStatus = "complete";
   chrome.tabs.onUpdated._emit(42, { status: "complete" });

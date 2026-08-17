@@ -1345,6 +1345,39 @@ def test_visual_enrichment_provenance_requeues_old_namespace_and_sampling(
     db.close()
 
 
+def test_visual_enrichment_filters_temporal_staleness_before_limit(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    common = {
+        "cover_url": "",
+        "source": "search",
+        "source_platform": "bilibili",
+        "pool_expression": "表达",
+        "pool_topic_label": "主题",
+        "topic_group": "组",
+        "style_key": "tutorial",
+    }
+    db.cache_content(
+        bvid="BVEXPIRED",
+        title="已经过期的突发视频",
+        relevance_score=0.99,
+        published_at="2000-01-01T00:00:00+00:00",
+        temporal_class="breaking",
+        temporal_confidence=0.95,
+        temporal_reason="价值依赖即时状态",
+        **common,
+    )
+    db.cache_content(
+        bvid="BVELIGIBLE",
+        title="仍可处理的视频",
+        relevance_score=0.70,
+        **common,
+    )
+
+    assert [row["bvid"] for row in db.get_candidates_needing_keyframes(limit=1)] == ["BVELIGIBLE"]
+    assert [row["bvid"] for row in db.get_candidates_needing_danmaku(limit=1)] == ["BVELIGIBLE"]
+    db.close()
+
+
 def test_visual_enrichment_ignores_history_and_keeps_confirmed_empty_idempotent(
     tmp_path: Path,
 ) -> None:

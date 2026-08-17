@@ -8,7 +8,6 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Release](https://img.shields.io/github/v/release/whiteguo233/OpenBiliClaw?filter=openbiliclaw-v*&style=flat-square&label=Release&color=success)](https://github.com/whiteguo233/OpenBiliClaw/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/whiteguo233/OpenBiliClaw/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/whiteguo233/OpenBiliClaw/actions/workflows/ci.yml)
-[![LINUX DO](https://img.shields.io/badge/LINUX_DO-Community-black?style=flat-square&logo=linux)](https://linux.do/)
 [![Discussion](https://img.shields.io/badge/LINUX_DO-Discussion-orange?style=flat-square&logo=discourse)](https://linux.do/t/topic/1978894)
 [![Chrome Web Store](https://img.shields.io/chrome-web-store/v/cdfjfkdjjhdaccbldipkjhpibnfbiamg?style=flat-square&label=Chrome%20Web%20Store&logo=googlechrome&logoColor=white&color=4285F4)](https://chromewebstore.google.com/detail/cdfjfkdjjhdaccbldipkjhpibnfbiamg)
 [![Gitee Mirror](https://img.shields.io/badge/Gitee-Mirror-C71D23?style=flat-square&logo=gitee&logoColor=white)](https://gitee.com/whiteguo233/OpenBiliClaw)
@@ -28,6 +27,12 @@
 > - Cookie-sync endpoints are allowed through while the backend is in degraded (LLM-unavailable) mode
 >
 > Features and API behavior may differ from the official version; this repo's code is authoritative. Upstream: [github.com/whiteguo233/OpenBiliClaw](https://github.com/whiteguo233/OpenBiliClaw).
+>
+> ### 🆕 Big update: OpenBiliClaw now runs inside DeepSeek Harness
+>
+> New **DSH client plugin** — install OpenBiliClaw into [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness): a persistent fourth column (Recommendations / Library / Chat / Profile / Settings) in the DSH web GUI, plus 22 Agent Bridge tools so agents can read recommendations, answer probes, and close the learning loop — browse cross-platform personalized content while you work in DSH. → [`github.com/whiteguo233/dsh-openbiliclaw`](https://github.com/whiteguo233/dsh-openbiliclaw)
+>
+> 📱 Want a native app? The Flutter mobile client (Android / iOS / Web / desktop) lives in the separate repo [`OpenBiliClaw-mobile`](https://github.com/whiteguo233/OpenBiliClaw-mobile): recommendations, chat, profile, favorites / watch-later / 30-day history — all talking to the same local backend.
 
 ## OpenBiliClaw in 10 Seconds
 
@@ -98,7 +103,7 @@ Core behavior, recommendation, and dialogue data lives in SQLite on your disk; c
 
 ## 📸 Feature Preview
 
-Four core surfaces: the browser extension handles in-page interaction and login sessions, the Desktop Web (`/web`) gives you a big-screen recommendation home, the Mobile Web (`/m`) is built for phones, and a native Flutter client ([OpenBiliClaw-mobile](https://github.com/whiteguo233/OpenBiliClaw-mobile), separate repo) covers Android / iOS / Web / desktop. Every non-extension surface only calls your local API — cookie sync and platform tasks still run through the extension.
+Five core surfaces: the browser extension handles in-page interaction and login sessions, the Desktop Web (`/web`) gives you a big-screen recommendation home, the Mobile Web (`/m`) is built for phones, a native Flutter client ([OpenBiliClaw-mobile](https://github.com/whiteguo233/OpenBiliClaw-mobile), separate repo) covers Android / iOS / Web / desktop, and a [DSH client plugin](https://github.com/whiteguo233/dsh-openbiliclaw) brings the same panels into the DSH web GUI as a fourth column (plus 22 Agent Bridge tools). Every non-extension surface only calls your local API — cookie sync and platform tasks still run through the extension.
 
 <table>
   <tr>
@@ -203,11 +208,12 @@ After starting the backend, open `http://127.0.0.1:8420/web` (or just `http://12
 
 ## Recent Updates
 
-📌 Latest: **v0.3.204 (2026-08-11)**
+📌 Latest: **v0.3.207 (2026-08-15)**
 
-- **Periodic account refresh is now opt-in** — upgrades no longer open platform tabs automatically; manual init, manual sync, and normal discovery are unchanged.
-- **Linux.do background discovery is more resilient** — transient content-script readiness races recover within the same task and tab instead of spawning repeated failures.
-- **V2EX Search works across all three keyword modes** — mixed, inspiration, and traditional keywords now reach formal search and the shared evaluation pipeline.
+- **Faster pool replenishment** — healthy sources keep backfilling the global pool when other source quotas stall, fixing the all-day underfill.
+- **Keyless web grounding** — new Bing RSS fallback delivers real search results without Exa / You keys.
+- **Direct Exa / You.com APIs** — set `exa_api_key` / `you_api_key` to call them straight from Python, no mcporter needed.
+- **More resilient sources** — V2EX missing-CLI and Weibo `upstream_rejected` degrade gracefully instead of spamming tracebacks.
 
 Full changelog: [docs/changelog.md](docs/changelog.md).
 
@@ -235,12 +241,12 @@ For most users, setup is four steps: install the extension, ask an AI coding age
 
 The extension is the main interface. It shows the sidebar on supported sites, records feedback, and runs bounded read-only tasks for sources including Zhihu, Reddit, Linux.do, V2EX, and Weibo. Linux.do, V2EX, and Weibo task tabs are isolated from passive behavior collection; Weibo public discovery still runs independently in the backend.
 
-Built on Manifest V3, the extension works in any Chrome-compatible browser — **Chrome, Edge, Brave, Arc, Vivaldi, Opera**, and more.
+Built on Manifest V3, the extension works in any Chrome-compatible browser — **Chrome, Edge, Brave, Arc, Vivaldi, Opera**, and more; a **Safari (macOS)** build is also provided. Releases automatically attach `openbiliclaw-extension-v*-safari.dmg` (Developer ID-signed and notarized when Apple credentials are configured, otherwise an ad-hoc experimental build that requires Safari's "Allow Unsigned Extensions"), and you can also convert the local build to an Xcode project via Apple's `safari-web-extension-converter` (see the [Safari build guide](docs/safari-extension-build.md)).
 
 **Recommended · download the latest build from the Latest Release aggregate page** (gets the newest features and fixes — the Chrome Web Store listing usually lags by a few days to a couple of weeks due to review scheduling):
 
 1. Open [OpenBiliClaw Latest Release](https://github.com/whiteguo233/OpenBiliClaw/releases/latest), the newest user-facing aggregate `openbiliclaw-v*` release
-2. Chrome / Edge / Brave users download `openbiliclaw-extension-v*.zip`; Firefox users install `openbiliclaw-extension-v*-firefox.xpi` when it is present, otherwise download `openbiliclaw-extension-v*-firefox.zip` and load it temporarily through `about:debugging`
+2. Chrome / Edge / Brave users download `openbiliclaw-extension-v*.zip`; Firefox users install `openbiliclaw-extension-v*-firefox.xpi` when it is present, otherwise download `openbiliclaw-extension-v*-firefox.zip` and load it temporarily through `about:debugging`; Safari (macOS) users download `openbiliclaw-extension-v*-safari.dmg`, launch the app once, then enable OpenBiliClaw in Safari Settings → Extensions
 3. Open the extensions page (Chrome: `chrome://extensions/` · Edge: `edge://extensions/` · Brave: `brave://extensions/`), enable "Developer mode" in the top right
 4. Chrome / Edge / Brave users drag the downloaded `.zip` file into the page to install; Firefox `.xpi` files install directly, while the temporary zip must be unzipped before loading `manifest.json`
 
@@ -248,7 +254,7 @@ Built on Manifest V3, the extension works in any Chrome-compatible browser — *
 
 > 👉 **[Install OpenBiliClaw on the Chrome Web Store](https://chromewebstore.google.com/detail/cdfjfkdjjhdaccbldipkjhpibnfbiamg)** — click "Add to Chrome".
 
-Extension updates depend on the install channel: Chrome Web Store / Edge Add-ons and the Firefox AMO listed build after approval are updated by the browser; GitHub Release Chrome zips / Firefox signed XPIs / Firefox temporary zips, developer-mode loads, and Firefox temporary installs must download the new package and reload it manually. Firefox AMO `0.3.204` has been accepted for listed review but is still `unreviewed`; until it is publicly approved, use the `*-firefox.zip` temporary package from Releases. After approval, Firefox will update the listed install natively. The backend "auto update" switch only updates the local backend source checkout, not the browser extension.
+Extension updates depend on the install channel: Chrome Web Store / Edge Add-ons and the Firefox AMO listed build after approval are updated by the browser; GitHub Release Chrome zips / Firefox signed XPIs / Firefox temporary zips / Safari DMGs, developer-mode loads, and Firefox temporary installs must download the new package and reload it manually. Firefox AMO listed review is asynchronous; until the listed version is publicly approved, use the `*-firefox.zip` temporary package from Releases. After approval, Firefox will update the listed install natively. The backend "auto update" switch only updates the local backend source checkout, not the browser extension.
 
 <details>
 <summary>Firefox users: regular install and temporary debugging (Firefox 140+)</summary>
@@ -602,7 +608,7 @@ The whole loop stays local — the agent host just calls the CLI bridge; your pr
 - 🔄 **Continuous Learning** — Socratic dialogue + behavioral analysis + instant feedback; it understands you better over time
 - ⭐ **Local-First Favorites / Watch Later** — cards save to local SQLite first and auto-sync stays off by default; desktop Web hydrates the sidebar count badges on first load; the 2026-07-14 real-account regression completed both actions across all seven platforms as `synced/already_synced`
 - 🕘 **30-Day Content History** — extension, desktop, and mobile share opened, surfaced-but-unopened, and recently removed views; covers are paged and lazy-loaded, and removed local saves can be restored
-- 🧩 **Browser Extension** — Chrome / Edge / Brave / Arc / Firefox; side-panel recommendations + cross-site behavior collection, install and go
+- 🧩 **Browser Extension** — Chrome / Edge / Brave / Arc / Firefox / Safari; side-panel recommendations + cross-site behavior collection, install and go
 - 📱 **Flutter Native Client** — separate repo [OpenBiliClaw-mobile](https://github.com/whiteguo233/OpenBiliClaw-mobile); Android / iOS / Web / Linux / macOS / Windows against the same local backend, with Bilibili covers hitting the CDN directly to skip two hops
 - 🚀 **Guided Init in the UI** — the packaged `/setup/` wizard, Desktop Web, and the extension can all initialize with one click; no terminal required
 - 📦 **Cross-Machine Migration** — export/import portable config, SQLite, profiles, cookies, and the image cache from Desktop settings; imports are validated and staged, can be inspected or cancelled, then apply on restart with rollback copies. `.obcbackup` contains plaintext secrets but excludes the source machine's API-login password, session-signing secret, and extension device keys
@@ -662,7 +668,7 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 
 ```
 ┌────────────────────────────────────────────────┐
-│       Browser Extension (Chrome / Firefox)     │
+│ Browser Extension (Chrome / Firefox / Safari)  │
 │  Behavior capture · MAIN-world taps (comment/  │
 │  danmaku, xhs strong signal) · Cookie · Tasks  │
 └──────────────────────┬─────────────────────────┘
@@ -689,7 +695,7 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 │ Legacy batch only when rollback flag=false     │
 │ Init barrier: profile commit → discover/evaluate/copy → ready │
 │ Bilibili supply: relevance search + budgeted 1×5 pubdate recent lane → shared evaluation │
-│ Evaluation: time-neutral relevance + Agent temporal class → high-confidence publication bonus │
+│ Evaluation: time-neutral relevance + grounded temporal evidence → eligible / review hold / expired + publication bonus │
 │ Temporal shadow: bonus vs no-bonus Top10/50/100 aggregates → class/source/age audit (no serving change) │
 │ Images: proxy fg + refresh prefetch → app-stable 4/3 lane → singleflight/atomic cache │
 │ Soul cognition: dual pending cooldown · one anchor · worker-only settlement · winner receipt · confusion FIFO · ledger · deep gate │
@@ -704,7 +710,7 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 │ Bangumi public API → search/ranked/date producer → shared eval │
 │ V2EX public API/Feed → bounded Topic/Reply enrichment → five modes → shared eval │
 │ V2EX identity ladder: verified PAT > observed browser > accepted user; mismatch pauses only account projection │
-│ Eval clock: published_at + exact UTC evaluated_at → hourly cache invalidation │
+│ Temporal lifecycle: verbatim evidence + code-owned review clock → serve / temporal_review_hold / expired │
 │ Evaluator prefilter stays shadow → privacy-safe decision/raw-score join → read-only gate (no auto-enforce) │
 │ Named cognition views → task gate: compact only for awareness_confusions; others legacy │
 │ Token diet: per-offset preference packing; weighted recent/judged/relevant/important insight≤40 → full merge │
@@ -714,7 +720,7 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 │ API raw-empty → wake under-share sources now → real progress resets / duplicate-only waves back off │
 │ Delight gate: formal copy/topic ready + seen_items guard → score/snapshot → UI × writes seen ledger │
 │ Inventory API/OpenClaw startup hook → recover/maintain → expose LLM │
-│ Reshuffle: current-card exclusion → PoolServeSnapshot/seen_items → short rec+shown write → one batch event │
+│ Reshuffle: current-card exclusion → hold/stale retirement + PoolServeSnapshot → final temporal recheck + atomic write │
 │ Platform scope (PC Web tabs only): source_platform → scoped candidates, no cross-platform floor → same rank/copy/persist │
 │ Platform inventory: platform-availability → same canonical servable set → total == Σ by_platform │
 │ Background maintenance: isolated worker → ≤50 rows/batch; unchanged skip / 10m sweep │
@@ -748,6 +754,7 @@ durable turn → fixed time/payload → confirmation entry (pending list/cards) 
 card action → synchronous 200 fast path | 202 processing → popup/mobile/desktop poll; CLI has no action
 
 Desktop startup: recommendation hydration │ runtime hydration │ secondary health/profile/activity/config hydration (independent)
+Desktop background resume (cards already loaded): skip the pool-filling recommendation GET │ sync runtime / inventory status only
 
 Overseas traffic: `[network].mode` → system proxy (default) / direct / custom proxy → LLM, YouTube, X/Reddit CLIs, Bangumi, updater, GitHub project stats; CN clients including V2EX remain isolated and direct
 Manual Douyin discovery: CLI discover → daemon-equivalent producer → per-keyword outcomes → extension search/hot/feed → pending-eval pool
@@ -834,7 +841,7 @@ OpenBiliClaw/
 │   ├── bilibili/              # Bilibili API layer (WBI signing · rate control)
 │   ├── llm/                   # Multi-model LLM adapters + structured JSON tolerance
 │   └── storage/               # Data storage layer
-├── extension/                 # Chrome/Firefox extension (including Linux.do/V2EX/Weibo read-only task bridges)
+├── extension/                 # Chrome/Firefox/Safari extension (including Linux.do/V2EX/Weibo read-only task bridges)
 ├── extension/                 # Chrome extension (Bilibili + XHS + Douyin + YouTube + X + Zhihu + Reddit + Weibo recovery/tasks)
 ├── skills/                    # Built-in Skill definitions
 ├── docs/                      # Documentation
@@ -849,7 +856,7 @@ OpenBiliClaw/
 |--------|-----------|
 | Backend | Python 3.11+ |
 | Browser Extension | TypeScript + Chrome Extension (Manifest V3) |
-| LLM | Multiple independent Base URL / token / model instances per provider type, with ordered global and per-module failover chains; first migration keeps a permanent legacy backup and `config-export-legacy` creates an old-version copy; built-in Gemini / DeepSeek / OpenAI / Claude / OpenRouter / Ollama; any OpenAI-compatible endpoint works; OpenAI can experimentally reuse Codex CLI OAuth |
+| LLM | Multiple independent Base URL / token / model instances per provider type, with ordered global and per-module failover chains; first migration keeps a permanent legacy backup and `config-export-legacy` creates an old-version copy; built-in Gemini / DeepSeek / OpenAI / Claude / OpenRouter / OrcaRouter / Ollama; any OpenAI-compatible endpoint works; OpenAI can experimentally reuse Codex CLI ChatGPT OAuth via the official Codex transport |
 | Bilibili API | Custom client (WBI signing · v_voucher auto-recovery · rate control) |
 | Xiaohongshu | Extension DOM/state extraction + task dispatch; search/creator run in background tabs and search uses a MAIN-world page-response bridge when hidden virtual DOM is absent; only scrolling init opens `/explore` in the foreground and clicks the profile entry; no backend crawling |
 | Douyin | Extension DOM + MAIN-world passive fetch tap + task dispatch; init imports post / favorite / like / follow signals; search / hot / feed discovery starts from the Douyin home page and uses DOM interactions to trigger loading; search/feed passively collect page responses / rendered results, and hot can use a hot-board `group_id` seed as a logged-in related fallback; no backend login crawling |
@@ -922,3 +929,12 @@ Default data flow: browser extension → your configured local OpenBiliClaw back
 ## 📄 License
 
 [MIT](LICENSE)
+
+## Friend Links
+
+<details>
+<summary>Friend Links</summary>
+
+[![LINUX DO](https://img.shields.io/badge/LINUX_DO-Friend%20Links-4D6BFE?style=flat-square&logo=discourse&logoColor=white)](https://linux.do/)
+
+</details>

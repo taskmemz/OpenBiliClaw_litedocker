@@ -20,7 +20,8 @@
 
 | 任务 | 状态 | 说明 |
 |------|------|------|
-| 2.1 Provider 实现 | ✅ | OpenAI / Claude / Gemini / DeepSeek / Ollama / OpenRouter / OpenAI-compatible，带 retry + 超时 |
+| 2.1 Provider 实现 | ✅ | OpenAI / Claude / Gemini / DeepSeek / Ollama / OpenRouter / OrcaRouter / OpenAI-compatible，带 retry + 超时 |
+| v0.3.x OrcaRouter Provider 支持 | ✅ | 新增 `OrcaRouterProvider`（OpenAI 兼容协议）：一个 Key 跑 150+ 模型，默认 `openai/gpt-4o`，默认端点 `https://api.orcarouter.ai/v1`；沿用统一超时 / 重试 / 错误归一化 / JSON mode 与 per-call model 覆盖。网关把 `reasoning_effort` 与嵌套 `reasoning` 对象都原样转发给上游路由，非推理模型会以 HTTP 400 拒绝（已对 `openai/gpt-4o` 实测），因此适配器**不发送任何推理参数**，推理模型使用自身默认档位 |
 | 2.2 Provider Registry | ✅ | 多端点实例注册 + 全局 / 模块有序链 + 实例级 cooldown + health check |
 | 2.3 Prompt 管理与 Service | ✅ | Prompt 构建器 + LLMService 门面 |
 | 画像整理裁决 prompt | ✅ | `build_profile_consolidation_prompt()` 保持静态 system + 确定性 user JSON；likes 从“仅严格同义”调整为“是否重复占用同一推荐意图”，允许合并“搞笑 / 娱乐搞笑”这类无新增选择价值的同粒度标签，同时明确保留“篮球 / NBA”“AI技术 / AI视频技术”等会改变召回范围的父子兴趣。每个簇携带 `known_distinct_pairs`，模型不得重判或合并用户回滚 / 当前策略已确认分开的 pair；代码侧仍作相同约束的强校验。dislikes 继续只合并近乎同义项并严禁向上泛化 |
@@ -39,14 +40,14 @@
 | v0.3.147+ Prompt layer cache | ✅ | `profile_prompt_layers()` 把结构化画像拆为 `profile_core` / `profile_life_context` / `profile_interests` / `profile_style_context` / `profile_recent_context`，从稳定到易变排序；`PromptLayerRenderCache` 按层 digest 复用已渲染 JSON prompt block，供 discovery eval、推荐分类 / 文案 / delight 和统一关键词 planner 共享，画像核心不变时 provider 看到的前缀保持 byte-stable |
 | v0.3.144+ 缓存前缀保护 | ✅ | `LLMService.complete_with_core_memory()` / `complete_structured_task()` / `complete_multimodal_structured_task()` 支持 `inject_core_memory=False`，供候选 eval、推荐分类 / delight、跨平台关键词生成、awareness / insight / speculation / profile build、初始化偏好分析这类已自带完整结构化上下文的路径跳过重复 memory 注入；`build_soul_profile_prompt()` 也保持静态 system，并把 tone / preference / awareness / insight 放在巨大 history 前，稳定 provider prompt-cache 前缀 |
 | v0.3.150+ DeepSeek thinking 显式关闭 | ✅ | `DeepSeekProvider.complete(..., reasoning_effort="")` 会向 DeepSeek 请求体写入 `thinking={"type":"disabled"}`。DeepSeek v4 默认开启 thinking，单纯省略字段并不会关闭 reasoning；配置页 LLM 探测和短结构化任务因此能真正避免 thinking 先耗尽输出预算后返回空 `content` |
-| 统一 reasoning effort 默认与映射 | ✅ | 支持原生档位的 provider 默认统一为 `medium`：OpenAI 官方 GPT-5/o-series 分别写入 Chat `reasoning_effort` 或 Responses `reasoning.effort`；Claude 4.6+ 写入 `output_config.effort`；Gemini 3 写入 `thinking_level`，Gemini 2.5 按当前输出上限用 50% thinking budget 近似中档；DeepSeek 将 portable `medium` 按官方规则归一为 native `high`；OpenRouter 用 `reasoning.effort` 跨厂商映射。泛 OpenAI-compatible 无法可靠推断能力：空值不发送，只有新版实例中用户明确填写的非空值才按 OpenAI 字段透传；Ollama 不发送伪参数 |
+| 统一 reasoning effort 默认与映射 | ✅ | 支持原生档位的 provider 默认统一为 `medium`：OpenAI 官方 GPT-5/o-series 分别写入 Chat `reasoning_effort` 或 Responses `reasoning.effort`；Claude 4.6+ 写入 `output_config.effort`；Gemini 3 写入 `thinking_level`，Gemini 2.5 按当前输出上限用 50% thinking budget 近似中档；DeepSeek 将 portable `medium` 按官方规则归一为 native `high`；OpenRouter 用 `reasoning.effort` 跨厂商映射。OrcaRouter 网关把推理参数原样转发给上游路由、非推理模型以 HTTP 400 拒绝，因此**不发送** `reasoning_effort` / `reasoning`（推理模型用自身默认档位）。泛 OpenAI-compatible 无法可靠推断能力：空值不发送，只有新版实例中用户明确填写的非空值才按 OpenAI 字段透传；Ollama 不发送伪参数 |
 | 渠道 caller 默认无 reasoning | ✅ | `LLMService` 将 `discovery.*` / `recommendation.*` / `sources.*` / `yt_search.*` / `runtime.bilibili_extension_search.*` 以及三类轻量 eval caller 的未指定 effort 解析为 `""`；显式 caller 参数始终优先。DeepSeek 将空值真正关闭 thinking；OpenAI / Claude / Gemini 在模型不能完全关闭时选最低安全档；OpenRouter 因未持有 per-model mandatory metadata 而省略该字段，避免向强制推理模型发送 `none` 后 400。Soul / 画像与长场景继续使用 provider 的 `medium`（或用户配置值） |
 | v0.3.150+ reasoning-only 诊断与兼容端点自愈 | ✅ | OpenAI-compatible / DeepSeek / OpenRouter / Ollama native 返回 HTTP 200 且含 `reasoning_content` / `reasoning` / `thinking`、但最终 `content` 为空时，错误会明确提示 `returned reasoning but no final content` 并带 `finish_reason`，避免和完全空响应混淆。泛 OpenAI-compatible 首请求仍保持标准兼容：空 effort 不发送非标准字段；若调用方明确传 `reasoning_effort=""`，端点却在去掉 `response_format` 后仍返回 reasoning-only，provider 才追加一次 `thinking={"type":"disabled"}` 重试，修复 SenseNova/DeepSeek relay 把输出预算全部耗在默认 thinking 的情况。 |
 | v0.3.117+ reasoning-first 探活 | ✅ | `LLMProvider.health_check()` 与配置页 LLM 测试探针统一使用 `max_tokens=4096`，避免 SenseNova 等 OpenAI-compatible reasoning-first 模型先产出 `message.reasoning`、尚未到 `message.content` 就被截断，从而误报空响应；通用 health check 同时显式传 `reasoning_effort=""`，所以 DeepSeek 不会让一次连通性探针继承 `medium/high/max`、扩成 16K/32K thinking 请求后在 init 门禁内假超时 |
 | LLM Provider 实例路由 v2 | ✅ | `[llm.instances.<id>]` 把 adapter 类型与渠道端点解耦，同类型可配置多个 Base URL / token / model；`default_chain` 是任意长度全局故障切换链，`[llm.routes.<module>]` 默认继承，也可拥有自己的有序链。模块自定义链耗尽后不会越界 spill 到全局链 |
 | 实例模型发现与可编辑选择 | ✅ | PC Web、插件与 setup 把当前未保存实例交给 `POST /api/config/discover-models`，后端精确调用该端点的 OpenAI-compatible `GET /models`，不保存配置；模型和 Effort 都是可手填的 combobox，发现失败保留原输入。该草稿端点在 active registry 无法构建的 degraded 恢复态仍精确放行，不会被旧配置造成的 503 阻断。协议只标准化模型列表，没有 effort capability 枚举，因此 Effort 选项是本地 advisory，不冒充服务端事实 |
 | v0.3.75 Per-module LLM 路由生效 | ✅ | `LLMService` 按 caller bucket 路由 soul / discovery / recommendation / evaluation；旧 `[llm.<module>] provider/model` 会无损投影为 v2 模块实例链，保留兼容但不再是推荐写法 |
-| v0.3.75 Provider per-call model | ✅ | OpenAI / Claude / Gemini / DeepSeek / Ollama / OpenRouter / OpenAI-compatible 的 `complete(..., model=...)` 支持单次模型覆盖，不修改 provider 实例默认 `_model` |
+| v0.3.75 Provider per-call model | ✅ | OpenAI / Claude / Gemini / DeepSeek / Ollama / OpenRouter / OrcaRouter / OpenAI-compatible 的 `complete(..., model=...)` 支持单次模型覆盖，不修改 provider 实例默认 `_model` |
 | 体验优化：B站动态语气 | ✅ | 推荐、画像总结和聊天 prompt 统一接入 `ToneProfile`，在“老B友”基础上按用户画像微调语气 |
 | v0.3.0 Ollama embedding 兜底 | ✅ | `OllamaProvider.embed()` 走原生 `/api/embeddings`，配合 `bge-m3` 模型可在 Mac/Win/Linux CPU 跑相似度计算，不需要额外的 embedding API Key |
 | v0.3.0 EmbeddingService 双层缓存 | ✅ | L1 内存 + L2 SQLite 持久化；`build_embedding_service` 按 provider 自动选默认 model（gemini→gemini-embedding-001 / openai→text-embedding-3-small / ollama→bge-m3） |
@@ -54,10 +55,10 @@
 | 视觉 / document embedding provenance | ✅ | dedicated `EmbeddingService` 为 openai / openai-compatible / gemini / ollama / dashscope / openrouter 及 fallback 建立稳定 provenance：逻辑 provider、去掉 query/fragment/userinfo 的规范化 endpoint、model 和实际已知 output dimension。`embedding_fingerprint` 与 L2 SQLite model namespace 同时隔离不同 endpoint；同配置跨进程稳定且不落 API key。`embed_document()` / `lookup_cached_document()` 对弹幕摘要使用完整文本 key，空向量不写缓存。关键帧 cache key 由 fingerprint + sampling signature + stable sampled-slot 隔离，避免模型、维度或采样变更复用旧向量 |
 | DashScope 多模态 embedding | ✅ | `provider = "dashscope"` → `DashScopeEmbeddingProvider`：原生 multimodal-embedding API；`embed`/`embed_image` 独立向量（不 `enable_fusion`）；默认 `qwen3-vl-embedding`；`output_dimensionality` 对 qwen3-vl 透传 `dimension`；embedding-only（`complete` 拒绝） |
 | v0.3.113 Embedding 目标维度 | ✅ | `[llm.embedding].output_dimensionality` 默认 1024，与 Ollama `bge-m3` 对齐；Gemini 传 `output_dimensionality`，`provider = "openai"` 且模型为 `text-embedding-3-*` 时传 `dimensions`，Ollama / OpenRouter / 泛 OpenAI-compatible 等未确认支持的后端不传。L2 cache 仅在 provider 确认支持目标维度时按 `model#dim=N` 签名隔离，同一文本的不同维度向量不会互相覆盖，也不会把未生效的兼容后端标成伪维度 |
-| v0.3.155 Ollama embedding 诊断 + 自修 | ✅ | `llm/ollama_diagnostics.py`：`diagnose_ollama_embedding()` 把向量模型不可用分类为 `not_running` / `model_missing` / `model_broken` / `model_path_encoding` / `disk_full` / `network` / `model_oom` / `error`（先 `/api/tags` 判定服务与模型在位，再真打一次 embed——覆盖"模型在列表里但加载失败"的 500 场景）。`model_path_encoding` 专指 Windows 非 ASCII 用户名 / mojibake 路径导致 `llama-server` 无法从 `.ollama\models` 加载模型的失败，重新拉取不会修复，需迁移模型目录或手动设置 `OLLAMA_MODELS` 到纯英文路径；`model_oom` 从旧 `model_broken` 中拆出，明确内存不足时重拉无效；`disk_full` 既识别 pull / probe 错误文本，也会在拉取前检查 `OLLAMA_MODELS` / 托管模型目录所在卷是否至少有约 2.0GB 空间；`network` 区分无法访问 registry 的下载源问题与本地模型损坏。`pull_ollama_model()` 经原生 `/api/pull` 流式拉取 / 重拉模型并回调进度；两者均 `trust_env=False` 且可注入 `httpx.MockTransport` 测试。`OllamaProvider.embed()` 失败日志附带响应体错误片段（此前只有裸状态码）。供 `/api/init-status` 的 `embedding_check`/`embedding_detail` 与 `POST /api/embedding/repair` 一键修复使用（见 [init 模块](init.md)） |
+| v0.3.155 Ollama embedding 诊断 + 自修 | ✅ | `llm/ollama_diagnostics.py`：`diagnose_ollama_embedding()` 把向量模型不可用分类为 `not_running` / `model_missing` / `model_broken` / `model_path_encoding` / `disk_full` / `network` / `model_oom` / `error`（先 `/api/tags` 判定服务与模型在位，再真打一次 embed——覆盖"模型在列表里但加载失败"的 500 场景）。`model_path_encoding` 专指 Windows 非 ASCII 用户名 / mojibake 路径导致 `llama-server` 无法从 `.ollama\models` 加载模型的失败，重新拉取不会修复，需迁移模型目录或手动设置 `OLLAMA_MODELS` 到纯英文路径；`model_oom` 从旧 `model_broken` 中拆出，明确内存不足时重拉无效；`disk_full` 既识别 pull / probe 错误文本，也会在拉取前检查 `OLLAMA_MODELS` / 托管模型目录所在卷是否至少有约 2.0GB 空间；`network` 区分无法访问 registry 的下载源问题与本地模型损坏。`pull_ollama_model()` 经原生 `/api/pull` 流式拉取 / 重拉模型并回调进度；两者均 `trust_env=False` 且可注入 `httpx.MockTransport` 测试。`OllamaProvider.embed()` 失败日志附带响应体错误片段（此前只有裸状态码）。供 `/api/init-status` 的 `embedding_check`/`embedding_detail` 与 `POST /api/embedding/repair` 一键修复使用（见 [init 模块](init.md)）。v0.3.206+：识别 Windows 访问违规崩溃（`0xc0000005` / `access violation`），在 `model_broken` 内给出「一键重拉 → 重启 → 内存/虚拟内存 → 杀软白名单 → 升级」排序清单，不再只提示「下载不完整或内存不足」 |
 | v0.3.97 EmbeddingService 实时探活 | ✅ | `EmbeddingService.probe()` 绕过 L1/L2 缓存直接打一次 provider，返回是否拿到非空向量；供 `/api/health.embedding_ready` 做**实时**就绪判定（缓存命中的旧成功不会掩盖 provider 已掉线 / 模型没拉）。`/api/health` 侧自带 TTL + single-flight，probe 不缓存结果、每次都真打 |
 | v0.3.114 配置页服务探测 | ✅ | `POST /api/config/probe-service` 对用户当前表单草稿做无写入真实探测：LLM 走临时 `LLMRegistry.complete_provider()`，embedding 走临时 `EmbeddingService.probe()`，结果供 PCWeb / 插件设置页行内展示。它属于 degraded 恢复控制面：不依赖失败的 active registry；也属于 guided init 写端门控的只读例外，初始化运行时仍可测试。真实 LLM 请求始终经过 RuntimeContext 的稳定 total gate；LLM 实例 / 链的外层 deadline 按配置 clamp 到 10–120 秒，桌面与 popup 使用 125 秒请求预算以覆盖本地 Ollama 冷启动。 |
-| v0.3.20 Embedding fallback 能力识别 | ✅ | `LLMProvider.supports_embedding` 类属性显式声明 provider 是否真的有 embeddings endpoint。Claude / DeepSeek / OpenRouter 标 `False`（前者无 API、后两者继承自 OpenAIProvider 但实际后端不路由 embeddings）；OpenAI / Gemini / Ollama 标 `True`。当前只在 `[llm.embedding].fallback_provider` 非空时尝试一个显式备选 provider |
+| v0.3.20 Embedding fallback 能力识别 | ✅ | `LLMProvider.supports_embedding` 类属性显式声明 provider 是否真的有 embeddings endpoint。Claude / DeepSeek / OpenRouter / OrcaRouter 标 `False`（前者无 API、其余继承自 OpenAIProvider 但实际后端不路由 embeddings）；OpenAI / Gemini / Ollama 标 `True`。当前只在 `[llm.embedding].fallback_provider` 非空时尝试一个显式备选 provider |
 | v0.3.89.1 OpenRouter embedding 显式路径 | ✅ | `[llm.embedding].provider = "openrouter"` 会构造独立 `OpenRouterProvider`（必须配 `model = "<vendor>/<model>"`）。它不参与 chat 实例链；embedding 自己未填凭据 / headers 时，可兼容借用首个启用的同类型 chat 实例，旧 `[llm.openrouter]` 也继续可读 |
 | v0.3.20 OpenAI Provider embed | ✅ | `OpenAIProvider.embed()` 走 `/v1/embeddings`，默认 `text-embedding-3-small`。OpenAI 用户没显式配 embedding 时不再静默返回 None。失败返回 `[]`（与 Ollama / Gemini 一致），调用方降级处理 |
 | v0.3.31 DeepSeek 空内容兜底 | ✅ | DeepSeek 返回 HTTP 200 但 `content=""` 时，provider 会重试一次；`reasoning_effort` 开启时仍先关闭 thinking 重试，普通模式则原参数重试，避免 explore / structured task 因一次空内容直接降级为空结果 |
@@ -71,7 +72,7 @@
 | v0.3.74 结构化输出共享解析 | ✅ | 新增 `llm/json_utils.py`，统一提供 `extract_llm_json_list()` / `extract_llm_json_object()` / `parse_llm_json_tolerant()`。调用方可传 item/object predicate 和 wrapper aliases，兼容 root array/object、`results/items/data/output/scores/evaluations` 等 wrapper、单行或 pretty-printed 多行 singleton dict、Markdown fenced JSON、JSONL、多 root echo 后最终结果，以及 MiMo 形态的 malformed `{ [ ... ] }` 数组包裹；`allow_singleton=True` 会显式把 root object 包成单元素列表，不再偶然依赖只支持单行的 JSONL fallback |
 | v0.3.74 Ollama embedding 空凭据静默本地默认 | ✅ | `embedding.provider="ollama"` 且 embedding `api_key/base_url` 为空时直接构造本地 Ollama provider，默认 `http://localhost:11434/v1`；如果存在启用的 Ollama chat 实例，会优先复用首个匹配实例的地址并规范化到 `/v1`，旧 `[llm.ollama].base_url` 仍作为兼容来源，且都不会触发 `_emit_embedding_compat_warning()`。远端 embedding provider 留空凭据时仍保留一次性向后兼容 WARNING |
 | v0.3.77 LM Studio JSON mode 兼容 | ✅ | `OpenAIProvider` 的 `json_mode=True` 对普通 OpenAI-compatible 后端默认使用 `json_object`，遇到 `response_format.type` 只允许 `json_schema/text` 时用通用 `json_schema` 重试；对本地 LM Studio（默认 `localhost/127.0.0.1:1234` 或 URL 含 `lmstudio` / `lm-studio`）首次请求即不发送 `response_format`，依赖 prompt 约束 JSON，避免 compat 层在 `json_object` / `json_schema` 下丢失 `message.content` 后再浪费一整次 LLM 调用 |
-| v0.3.78 Codex OAuth 实验认证 | ✅ | OpenAI 实例设置 `auth_mode="codex_oauth"` 时复用 Codex CLI 的 ChatGPT OAuth 凭据；`codex_auth.py` 负责安全导入、落盘和刷新。该路径为非官方实验集成，只允许 OpenAI 官方 `base_url`；旧 `[llm.openai]` 写法继续兼容 |
+| v0.3.78 Codex OAuth 实验认证 | ✅ | OpenAI 实例设置 `auth_mode="codex_oauth"` 时复用 Codex CLI 的 ChatGPT OAuth 凭据；`codex_auth.py` 负责安全导入、落盘和刷新，`codex_chatgpt_provider.py` 走官方 `chatgpt.com/backend-api/codex/responses` SSE 传输（issue #170）。只允许官方 Codex 域名，拒绝把 ChatGPT token 发给第三方或 Platform API；旧 `[llm.openai]` 写法继续兼容 |
 | v0.3.x LLM 限流识别 | ✅ | `is_llm_rate_limit_error()` 会沿异常链识别 `LLMRateLimitError`、cooldown、429 / quota / resource exhausted 文本；discovery / recommendation 批量调用据此跳过逐条 fallback，避免一次 provider 限流放大成 N 个必失败调用和堆栈日志 |
 | v0.3.x 余额 / 账单错误熔断 | ✅ | OpenAI-compatible provider 会把 HTTP 402、`Insufficient Balance`、`payment required`、`billing`、余额不足等 provider 余额 / 账单失败归一为 `LLMRateLimitError`，跳过 provider 内部 retry，并让 registry cooldown 与批量任务的“跳过逐条 fallback”保护生效 |
 | v0.3.x Eval-batch 负样本锚定与跨平台公平 | ✅ | `build_batch_content_evaluation_prompt` 新增可选 `negative_examples` kwarg；非空时在 user prompt `<source_context>` 与 `<content_batch>` 之间插入 `<negative_examples>` 块（`sort_keys=True` 决定性 JSON）。`None` / `[]` 退回原 user 字节形态以保留 cold-start 缓存前缀。`_BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT` 加入永久规则：按话术 / 商业意图 / 标题结构层面 pattern-match 候选与示例，不要看关键词重叠；混源 batch 中不得仅因 `source_platform` 不同而抬高或压低 preference score，只能把平台作为内容语境。规则改动一次后 system message 保持 call-invariant |
@@ -80,17 +81,21 @@
 | v0.3.x 避雷探针多样性 prompt | ✅ | `build_avoidance_generation_prompt` 会携带 `existing_avoidance_details`，让 LLM 看到已有 active 的 `source_mode`、`source_signal`、体验轴和 specifics；system prompt 要求同一 `source_mode` + 同一粗主题 / 证据源只生成一个候选，已有 AI positive_boundary 时不再输出 AI 教程 / 测评 / 趋势换皮项 |
 | v0.3.x 第三方 API 网关适配（issue #72） | ✅ | Claude 实例的 `base_url` 可指向任意 Anthropic 协议网关；OpenAI / OpenAI-compatible 实例的 `api_flavor` 可选 Chat Completions 或 Responses。每个实例独立持有渠道 URL / token / model，所以同一 adapter 的多个网关可同时注册并互为降级；非法组合由配置校验 blocking 拦截 |
 | v0.3.162+ 托管 Ollama 生命周期自愈 | ✅ | `runtime/ollama_supervisor.py` 记录托管 daemon 的完整启动规格并新增 watchdog；`with-embedding` 私有 11435 daemon 纳入一键修复与崩溃自动拉起（详见下方[托管 Ollama 生命周期](#托管-ollama-生命周期v03162)） |
-| v0.3.165 海外网络三模式 | ✅ | `OpenAIProvider` / `ClaudeProvider` / `GeminiProvider`（含 DeepSeek / OpenRouter 子类与 embedding 实例）同时接收 `proxy` 与 `trust_env`。registry 统一读取 `[network].mode`：`direct` 注入忽略环境代理的 SDK transport，`system` 保留 SDK 环境继承，`custom` 注入指定代理并强制 `trust_env=False`。**Ollama 工厂不读该策略**——本地 / CN 直连由 `tests/test_network_proxy_isolation.py` 守卫 |
+| v0.3.165 海外网络三模式 | ✅ | `OpenAIProvider` / `ClaudeProvider` / `GeminiProvider`（含 DeepSeek / OpenRouter / OrcaRouter 子类与 embedding 实例）同时接收 `proxy` 与 `trust_env`。registry 统一读取 `[network].mode`：`direct` 注入忽略环境代理的 SDK transport，`system` 保留 SDK 环境继承，`custom` 注入指定代理并强制 `trust_env=False`。**Ollama 工厂不读该策略**——本地 / CN 直连由 `tests/test_network_proxy_isolation.py` 守卫 |
 | v0.3.166 国内网关代理豁免 | ✅ | registry 按每个实例的 `base_url` 独立裁决代理，委托 `network.is_domestic_endpoint()`。国内大模型网关与 localhost / 内网自建端点即使全局为 `system` / `custom` 也强制直连；同一链里的境外实例仍走全局代理策略 |
 | Issue #113 CA 环境防护 | ✅ | `network.set_outbound_proxy(..., mode="system")` 在任何继承环境的 SDK 客户端构造前检查 `SSL_CERT_FILE` / `SSL_CERT_DIR` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE`。只移除指向不存在目标的失效覆盖，让 httpx / OpenSSL 回退到默认可信 CA store；有效私有 CA、`HTTPS_PROXY` 等代理变量和 TLS 验证均保持不变，避免 Windows 遗留 CA 路径导致所有客户端在发请求前直接 `FileNotFoundError`。 |
 | Issue #113 task-local 后台准入 bypass | ✅ | 内部 scope 通过 `ContextVar` 只影响当前异步上下文；scope 内 `LLMService.complete_with_core_memory()` 跳过库存敏感的后台 admission，但仍经过总 provider gate，退出 scope 后自动恢复。guided init 仅在阶段 2/3 使用，并行 discovery 不继承该 scope；既有公开 API 签名不变。 |
+| Issue #153 L2 缓存版本化 BLOB | ✅ | `EmbeddingCache` 改为版本化 little-endian float32 二进制存储（`encoding=1`，`OBLV` 头 + dtype/dimension 元数据），4096 维向量从约 90 KiB JSON 降到约 16 KiB。读取对 legacy JSON（`encoding=0`）、BLOB 与 mixed-format（旧版回写）内容自适应解码，单行损坏降级为 cache miss。`migrate_encoding()` 按小批次幂等迁移（中断可续跑，进度即 `encoding` 列本身），损坏行标记 `encoding=-1` 后跳过；schema 升级保留旧行并补齐 `dimension` / `created_at` / `last_accessed_at` 元数据列 |
+| Issue #153 L2 容量策略与 namespace 生命周期 | ✅ | 新增可配置磁盘预算（`[llm.embedding].cache_max_bytes`，默认 0 = 不设上限）与高低水位；超高位后按「非 active namespace（含 legacy 行）→ active namespace 最旧/最近未访问」顺序批量淘汰到低位，写路径按节奏抽样检查避免逐行开销。`last_accessed_at` 每次命中最多每分钟刷新一次。`delete_inactive()`（含 dry-run / keep_legacy）显式回收失效 namespace，`compact()` 执行 WAL checkpoint + `VACUUM INTO` + `integrity_check` + 原子替换做物理回收；`stats()` / `EmbeddingService.l2_cache_stats()` 暴露行数、逻辑载荷、主文件/WAL 大小、namespace 分布、水位与最近维护记录 |
+| Issue #153 L2 运行时准备 | ✅ | `EmbeddingService` 构造时注册自身 provenance namespace 为 active，并执行一次/进程/库的运行时准备（JSON→BLOB 迁移 + 首轮预算维护，`_PREPARED_DB_PATHS` 去重）；任何准备失败只降级为普通缓存，不影响推荐正确性。CLI `embedding-cache-stats` / `embedding-cache-clean`（默认 dry-run，`--apply` 生效，`--keep-model` / `--keep-legacy` / `--no-compact` / `--batch-size`）提供诊断与一键回收入口 |
 
 ### Embedding provenance API
 
 `EmbeddingService.embedding_fingerprint`、`embedding_model`、`embedding_provider` 和
 `embedding_dimension` 为推荐层提供当前向量命名空间；`embed_document()` 与
 `lookup_cached_document()` 保留完整文档 key，专供弹幕摘要使用。`embed()`、`embed_image()`
-和文档 embedding 在 provider 返回空向量时都不写完成缓存。
+和文档 embedding 在 provider 返回空向量时都不写完成缓存。`EmbeddingService.l2_cache` /
+`l2_cache_stats()` 把 L2 持久化缓存暴露给诊断与维护面（CLI 清理等），namespace 注册保持一致。
 
 ## 公开 API
 
@@ -104,6 +109,7 @@ from openbiliclaw.llm import (
     OllamaProvider,
     OpenAIProvider,
     OpenRouterProvider,
+    OrcaRouterProvider,
 )
 
 # 创建 provider
@@ -138,6 +144,12 @@ provider = OpenRouterProvider(
     x_title="OpenBiliClaw",
 )
 
+provider = OrcaRouterProvider(
+    api_key="sk-orca-...",
+    model="openai/gpt-4o",
+    base_url="https://api.orcarouter.ai/v1",
+)
+
 provider = GeminiProvider(
     api_key="gemini-key",
     model="gemini-2.5-flash",
@@ -152,6 +164,7 @@ from openbiliclaw.llm.codex_auth import (
     import_codex_credentials,
     load_codex_credentials,
 )
+from openbiliclaw.llm.codex_chatgpt_provider import probe_codex_llm
 
 # 导入官方 Codex CLI 登录态，默认读取 ~/.codex/auth.json，
 # 写入 ~/.openbiliclaw/codex_auth.json。
@@ -160,9 +173,15 @@ print(credentials.account_id)
 
 # Provider 运行时会调用它；临期时自动刷新。
 token = await get_valid_codex_token()
+
+# 真实能力探测：验证 ChatGPT token 能否调用官方 Codex LLM 通道。
+# 结果会持久化到凭据文件，供 CLI --status 与 /api/health 区分
+# "已导入" 与 "可调用"。
+probe = await probe_codex_llm()  # model 留空 → 自动发现账号可用的 Codex 后端模型
+print(probe.ok, probe.message)
 ```
 
-Codex OAuth 是实验路径：OpenAI 官方 API 认证仍以 Platform API key 为准；该模块只复用本机 Codex CLI 凭据，不自建 OAuth PKCE 浏览器流程，也不会把 token 打印到 CLI 输出。
+Codex OAuth 是实验路径：OpenAI 官方 API 认证仍以 Platform API key 为稳定入口；该模块只复用本机 Codex CLI 凭据，不自建 OAuth PKCE 浏览器流程，也不会把 token 打印到 CLI 输出。`auth_mode="codex_oauth"` 使用独立的 `CodexChatGPTProvider`，把请求发往 `https://chatgpt.com/backend-api/codex/responses`（官方 Codex CLI 同款通道），不再把 ChatGPT token 当作 Platform API Key 发给 `api.openai.com`。
 
 ### Registry
 
@@ -220,7 +239,7 @@ POST /api/config/discover-models
 
 该接口同样不写配置。请求携带 `instance_id` 与当前页面的 `config.llm` 草稿；后端在内存副本中应用草稿，精确使用该实例自己的 Base URL、API Key、网络策略与认证方式调用 OpenAI-compatible `GET /models`。保存过的 masked key 会按配置更新的既有规则保留真实密钥，响应只返回排序去重后的模型 ID、耗时和安全错误，不回传凭据。它与草稿探测一起列入 degraded 精确 allow-list，因此旧 active registry 坏掉时仍可用 replacement draft 找模型。
 
-- 支持 `openai` / `deepseek` / `openrouter` / `ollama` / `openai_compatible`；其他原生协议返回 `ok=false` 与继续手填的说明。
+- 支持 `openai` / `deepseek` / `openrouter` / `orcarouter` / `ollama` / `openai_compatible`；其他原生协议返回 `ok=false` 与继续手填的说明。
 - 拉取失败、端点没有实现 `/models` 或列表为空都不会覆盖页面里已经输入的模型。
 - OpenAI Models API 只提供 ID 等基础元数据，没有标准字段声明某模型支持哪些 reasoning effort。响应里的 `reasoning_efforts` 因此标记为 `local_advisory`，用于方便选择而不是服务端能力承诺，输入框始终允许手填。
 
@@ -598,12 +617,12 @@ force-quit 残留场景；收养只做记录、绝不发信号，但让 watchdog
 3. **Protocol DI**：`SupportsComplete` Protocol 解耦了调用方和具体实现，测试时可注入 Fake
 4. **Prompt 集中管理**：所有 prompt 在 `prompts.py` 中定义，不散落在各模块
 5. **统一上下文注入**：`complete_with_core_memory()` / `complete_structured_task()` 默认负责把核心记忆注入到 Soul 相关任务里；已在 `user_input` 自带完整结构化上下文的高频任务可传 `inject_core_memory=False`，或通过 `llm.task_options.without_core_memory_kwargs()` 在兼容旧 stub 的前提下关闭注入，避免动态 core memory 破坏 provider prompt-cache 前缀
-6. **OpenAI-compatible 复用**：DeepSeek、OpenRouter 这类兼容 OpenAI 协议的 provider 复用同一套重试、超时和错误归一化逻辑，只在子类中注入默认地址或额外请求头
+6. **OpenAI-compatible 复用**：DeepSeek、OpenRouter、OrcaRouter 这类兼容 OpenAI 协议的 provider 复用同一套重试、超时和错误归一化逻辑，只在子类中注入默认地址或额外请求头
 7. **Gemini 独立适配**：Gemini 走官方 `google-genai` SDK，不强行复用 OpenAI-compatible 抽象；provider 内部负责把统一 `messages` 渲染成 quickstart 风格的单文本 prompt
 8. **Gemini 可选依赖降级**：环境里缺少 `google-genai` 时，`llm` 包和 registry 仍可正常导入；只有真正实例化 Gemini provider 时才会给出明确缺依赖错误。守卫捕获的是 `ImportError` 而非仅 `ModuleNotFoundError`（issue #80）——SDK 装上了但其原生传递依赖加载失败（如 Termux/Android 下 `cryptography` 的 manylinux 轮子 dlopen 失败）同样降级而不是让 CLI 启动即崩，实例化报错会附带底层 import 失败详情
 9. **Prompt 风格集中收口**：推荐、画像和聊天的“老B友”语气由共享 `ToneProfile` 驱动，不允许各模块各自发散成不同人格
 10. **Prompt-cache 约定**：高频结构化 builder 的 system prompt 必须保持静态；user prompt 按“tone / 画像 / 长期偏好 / 来源上下文 / 本批内容或历史”从稳定到易变排序，并使用确定性 JSON。使用完整 `profile_summary` 的高频链路优先经 `profile_prompt_layers()` 分层渲染，稳定层放前、recent 层放后；调用方不得再把同一份动态画像通过 core memory 追加进 system prompt，便于 DeepSeek / Claude / OpenAI / Gemini 的 provider-side prompt cache 复用前缀
 11. **结构化输出只在 helper 处放宽**：业务模块不再各自手写 JSON 截取逻辑；容错集中在 `json_utils.py`，模块侧用 predicate 收紧语义，避免一个 provider 的异常 shape 修复污染其他任务。
 12. **分模块链不隐式改意图**：默认 `inherit=true`；显式自定义链只在链内降级，引用失效或整链失败都不会偷跑到全局链。旧模块 model override 在迁移时成为独立派生实例，避免修改共享实例或污染其他模块。
-13. **Codex OAuth 只做认证层**：`auth_mode="codex_oauth"` 不注册新 provider，而是给现有 `OpenAIProvider` 注入动态 token provider。该模式只允许 OpenAI 官方 `base_url`，防止 ChatGPT OAuth token 泄露给 OpenAI-compatible 代理。
+13. **Codex OAuth 使用独立官方传输**：`auth_mode="codex_oauth"` 不再给 `OpenAIProvider` 注入 Platform API token，而是构造 `CodexChatGPTProvider`，请求发往 `https://chatgpt.com/backend-api/codex/responses`（官方 Codex CLI 同款通道），401 时安全刷新并重试一次。该模式只允许官方 Codex 域名，防止 ChatGPT OAuth token 泄露给 OpenAI-compatible 代理或 `api.openai.com`。
 14. **失败分类先于批响应解析**：共享 classifier 保持 rate-limit / no-provider / auth / invalid-response 的特定语义优先级，并额外识别连接失败与 HTTP 500/502/503/504；调用方只把 provider transient 交给协调器退避，不把 JSON shape 错误误判成网络失败。

@@ -9,6 +9,7 @@ import {
   type SanitizedNativeSaveOutcome,
 } from "../shared/native-save.ts";
 import { releaseDispatcherMutex, tryAcquireDispatcherMutex } from "./dispatcher-mutex.ts";
+import { createTaskTab } from "./task-tab.ts";
 
 const DEFAULT_TIMEOUT_MS = 240_000;
 const DEFAULT_READINESS_RETRY_MS = 250;
@@ -273,7 +274,7 @@ async function createTabBeforeDeadline(
   url: string,
   deadline: number,
 ): Promise<chrome.tabs.Tab> {
-  const creation = chrome.tabs.create({ active: true, url });
+  const creation = createTaskTab({ active: true, url });
   try {
     return await beforeDeadline(creation, deadline);
   } catch (error) {

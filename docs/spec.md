@@ -194,10 +194,10 @@ Linux.do 同样纳入统一关键词 planner 的九平台目标与 `platform_gui
 > 评估的核心依据是**用户的 Soul（灵魂画像）和深层兴趣**，而非通用指标。
 
 - **核心评估**：这个内容是否匹配这个用户的深层兴趣和当前状态？
-- **时效性基准**：来源 `published_at` 与本轮精确 UTC `evaluated_at` 一起进入单条、批量及推荐池补分类 prompt；模型用内容主体判断 `breaking/current/versioned/evergreen/historical/unknown` 及置信度，不根据标题日期词或自身知识截止日期猜当前时间。`relevance_score` 与新旧完全解耦；发布时间缺失或无效时仍可语义分类，但推荐侧不发时间 bonus。评估缓存绑定发布时间摘要与独立小时桶，并由 v4 namespace 隔离旧评分语义。
-- **近期供给与排序观测**：B 站 API 主搜索与扩展 fallback 都只提供一个小型 recent lane；lane provenance 贯穿 `DiscoveredContent → discovery_candidates`，但不改变来源策略、准入阈值或配额。推荐侧对每个候选窗口聚合比较“含 publication bonus”与“无 bonus”Top10/50/100，按 class/source/age 记录进入退出；shadow 不含候选身份/文本，写失败 fail-open，也不会自动开启 stale 淘汰。
+- **时效性基准与三态推荐资格**：来源 `published_at` 与本轮精确 UTC `evaluated_at` 一起进入单条、批量及推荐池补分类 prompt；模型基于 prompt 可见正文原子输出 `temporal_class/confidence/reason`，以及 `validity_mode`（`none/explicit_deadline/event_state/version_state/freshness_only`）、`valid_until`、`scope`（`none/core/hook`）、逐字 `evidence` 和 `state`（`unknown/active/expired/superseded`）。代码侧统一生成 `temporal_evaluated_at/temporal_next_review_at/temporal_policy_version/temporal_evidence_complete`；`relevance_score` 与新旧完全解耦。确定性 policy 返回 `eligible/review_due/expired`：只有置信度 `>=0.80`、完整且作用于 `core` 的证据组经过逐字 grounding 后，已过 `explicit_deadline` 或结构化事件 `expired` / 版本 `superseded` 才 hard expire。deadline 必须从 Agent 实际可见文本中逐字取得日期、具体时刻和时区，并与规范化 `valid_until` 表示同一瞬间；active / 终态必须分别有正向、无条件的当前状态 / 结束替代语义，条件、假设、可能或未来态句子不能作为 state 证据。日期-only、反向证据、`hook`、低置信、缺字段、未 grounding、不一致状态和无效时间全部 fail-neutral。`breaking/current/versioned` 的 1 / 14 / 120 天是复审频率，不是死亡线；旧 v1 `breaking/current` 的 3 / 60 天窗口也仅生成 `review_due`。评估缓存绑定 prompt-visible 内容、发布时间摘要与独立小时桶，并由 v6 namespace 隔离旧契约。
+- **近期供给、排序与生命周期复核**：B 站 API 主搜索与扩展 fallback 都只提供一个小型 recent lane；lane provenance 贯穿 `DiscoveredContent → discovery_candidates`，但不改变来源策略、相关性阈值或配额。合格候选间继续使用有界 publication bonus；推荐侧对每个候选窗口聚合比较“含 bonus”与“无 bonus”Top10/50/100，按 class/source/age 记录进入退出，shadow 不含候选身份/文本，写失败 fail-open，且本身不调整三态 policy。`review_due` 的 discovery candidate 回到待评估状态，正式池条目进入可逆 `temporal_review_hold`；两边都按逐行 1 / 2 / 4 / 8 / 16 / 24 小时 not-before 租约退避，候选租约未到时不可 claim、也不计 raw / projected / 来源容量。hold 不展示、不计库存，由现有 evaluator 复审后可恢复 `fresh`。评估落库后 admission 重读 durable row，仅最终状态仍为 `evaluated` 才能入池；`expired` 则转 `rejected_temporal_stale` / `stale`。`PoolServeSnapshot`、最终 recommendation + shown 写事务以及 API 1 秒快照都会使用同一证据组复核，避免连续刷新或 snapshot 竞态绕过 hold/expiry。
 - **可选辅助指标**：播放量/点赞/弹幕质量等——由用户画像决定是否参考（有些用户在意质量指标，有些人不在意）
-- **统一待评估池与准入**：API daemon 的不同来源 raw candidates 进入 `discovery_candidates` 后，由唯一 `CandidateEvalCoordinator` tokenized claim；默认 3 个 30 条 LLM worker 并行，任一完成即补位，SQLite 完成提交与 admission 串行。pipeline 单次 enqueue callback 立即唤醒这个 owner，refresh / managed producer 不再同步 drain。raw 清空且 projected 仍低于目标时，coordinator 调用 quota-aware supply wave，即时 tick 所有欠份额 producer 并执行 B 站 refresh；同平台周期 / 即时 tick 由 per-source lock 去重。补池生产性以真实 `inserted/enqueued` 为准，全部 duplicate 即使跑过策略也进入 30/60/120/300/600 秒退避，真实入队立即清零。串行 lane 先持久化全部 token-owned 评分，再按 `target - available - admitted_pending_available` admission；`admitted_pending_available` 只统计补齐表达后能进入当前 topic 三条展示窗口的 pending-copy，超过 headroom 的达标结果保留为 `evaluated`。评估输入包含正文 / 标签 / 互动指标；`[discovery].eval_prefilter_mode` 默认 shadow 只记录 embedding would-filter，enforce 才会让明显低相似且非 explore 的候选本地低分缓存并跳过 LLM；多模态评估开启且模型支持图像时会复用运行时图片缓存。OpenClaw direct one-shot 不启动 daemon owner，`recommend(refresh_if_needed=True)` 的首轮 source supply / inline claim 固定 ≤4，并在 durable admission 后同步 drain ≤4 条 expression copy。调度 projected 固定为 `available + admitted_pending_available + evaluated_pending_admission`，普通 raw 与同 topic 深层 pending-copy 不计入；表达协调器以 `max(copy-ready 缺口, min(available 缺口, admitted_pending_available))` 接手已入池 eligible 素材。来源只影响取数方式、配额和 prompt 上下文，平台节流、raw ceiling 与准入阈值不变。
+- **统一待评估池与准入**：API daemon 的不同来源 raw candidates 进入 `discovery_candidates` 后，由唯一 `CandidateEvalCoordinator` tokenized claim；默认 3 个 30 条 LLM worker 并行，任一完成即补位，SQLite 完成提交与 admission 串行。pipeline 单次 enqueue callback 立即唤醒这个 owner，refresh / managed producer 不再同步 drain。raw 清空且 projected 仍低于目标时，coordinator 调用 quota-aware supply wave，即时 tick 所有欠份额 producer 并执行 B 站 refresh；同平台周期 / 即时 tick 由 per-source lock 去重。补池生产性以真实 `inserted/enqueued` 为准，全部 duplicate 即使跑过策略也进入 30/60/120/300/600 秒退避，真实入队立即清零。串行 lane 先原子持久化全部 token-owned 相关性与 temporal v2 证据组，再按 `target - available - admitted_pending_available` 执行相关性门和三态 eligibility；`review_due` 重新排队复审，`expired` 终态拒绝，只有 `eligible` 可 admission。raw 重抓、旧缓存或不完整评估不能局部覆盖证据组，也不能复活 hold/stale 行。`admitted_pending_available` 只统计补齐表达后能进入当前 topic 三条展示窗口的 pending-copy，超过 headroom 的达标结果保留为 `evaluated`。评估输入包含正文 / 标签 / 互动指标；`[discovery].eval_prefilter_mode` 默认 shadow 只记录 would-filter，enforce 才会让明显低相似且非 explore 的候选本地低分缓存并跳过 LLM；多模态评估开启且模型支持图像时会复用运行时图片缓存。OpenClaw direct one-shot 不启动 daemon owner，`recommend(refresh_if_needed=True)` 的首轮 source supply / inline claim 固定 ≤4，并在 durable admission 后同步 drain ≤4 条 expression copy。调度 projected 固定为 `available + admitted_pending_available + evaluated_pending_admission`，普通 raw 与同 topic 深层 pending-copy 不计入；表达协调器以 `max(copy-ready 缺口, min(available 缺口, admitted_pending_available))` 接手已入池 eligible 素材。来源只影响取数方式、配额和 prompt 上下文，平台节流、raw ceiling 与相关性阈值不变。
 - **来源定向回填**：主策略不足时，历史 `content_cache` backfill 先按本轮 strategy 的 `source_platform` 在 SQL 中过滤，再做平衡与 `LIMIT`；空 legacy 平台只归 B 站。一次 B 站 / YouTube / 抖音定向运行不能被其它平台的高分历史行补满。
 
 ---
@@ -359,8 +359,8 @@ degraded registry → provider-free ping(degraded) → static /web | /setup | /m
                   ├─ GET/PUT config → restart runtime
                   └─ skip hydration; recommendation / discovery / profile APIs stay 503
 
-reshuffle HTTP → PoolServeSnapshot → isolated serve DB worker/read transaction
-               → unchanged MMR → short atomic recommendation+shown write
+reshuffle HTTP → temporal review-hold / expiry retirement → PoolServeSnapshot → isolated serve DB worker/read transaction
+               → unchanged MMR → final temporal recheck + short atomic recommendation+shown write
                → current-card exclusions + durable seen_items are mandatory guards
                → non-empty success records one neutral reshuffle event, never N dismisses
   PC Web platform tab → optional source_platform (additive, canonical)
@@ -394,7 +394,8 @@ admission，而返回 `dialogue_busy` 让 popup/移动/桌面带等待态自动�
 dislike writeback，精确清池与后续语义精判不等待完整画像重建。provider、限流、配置、
 失败/超时与取消都会回滚临时用户历史并保持 durable `pending`，在队头原位有界退避；
 只有显式空/无效响应才持久化安全错因与 `failed / reply=""`。桌面 Web 的推荐、
-runtime 与次级 hydration 是独立分支。
+runtime 与次级 hydration 是独立分支；已有卡片的后台恢复跳过可能补池的推荐 GET，
+只同步 runtime / 库存状态，空列表或明确手动刷新才读取推荐快照。
 
 ```
 LAN clients ─ HTTP（默认）────────────→ IPv4 0.0.0.0 + IPv6 [::] listeners → one uvicorn / FastAPI app
@@ -475,6 +476,7 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  │ runtime status：available/raw/pending 库存 -> 插件/移动/桌面 │   │
 │  │ 补池：available-by-source deficit + raw-material headroom     │   │
 │  │ 推荐消费池后：ServeResult 扣减快照 -> 精确异步复读 -> 三端收敛 │   │
+│  │ 桌面已有卡片后台恢复：跳过可能补池的推荐 GET，只同步库存状态 │   │
 │  └──────────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │ 画像编辑：编辑面板 -> /api/profile/edit -> 覆盖层（插件/移动/桌面三端） │ │
@@ -500,11 +502,11 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  │     request_replenishment + 定时/手动补货 + B/XHS/DY/YT/X/Zhihu/Reddit/Bangumi/V2EX=5/1/1/1/1/1/1/1/1 │ │
 │  │     raw断供 → 欠份额 producer 即时并行唤醒 → 真实新增计数 / 无产出阶梯退避 │ │
 │  │ API CandidateEvalCoordinator: available + eligible copy-pending + evaluated -> 3×30 -> serial admit │ │
-│  │ evaluator: time-neutral relevance + temporal class/confidence/reason -> durable candidate/cache │ │
-│  │ curator: valid published_at + high-confidence temporal class -> bounded positive bonus │ │
+│  │ evaluator: time-neutral relevance + atomic grounded temporal evidence -> tri-state eligibility │ │
+│  │ temporal policy: 1/14/120d review clock; deadline/terminal evidence expires; gaps fail-neutral │ │
 │  │ OpenClaw refresh: first source/eval <=4 -> copy <=4/no split retry -> canonical subset; both hosts recover first │ │
 │  │ delight: copy/topic ready + seen_items guard -> score/snapshot -> UI × writes seen ledger │ │
-│  │ reshuffle: current IDs + seen_items -> PoolServeSnapshot/MMR -> atomic persist -> one batch event │ │
+│  │ reshuffle: current IDs + seen_items -> retire/snapshot/MMR -> final recheck+atomic persist │ │
 │  │ maintenance worker: isolated connection -> <=50 mutations/batch -> commit/yield │ │
 │  │     内容元数据：时长/互动/发布时间 -> candidates -> content_cache -> API -> 四端 │ │
 │  │     Query inspiration cache: search preview -> inspiration/expansion -> keyword provenance │ │
@@ -613,7 +615,7 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  ┌──────────────────────────┐  ┌────────────────────────┐   │
 │  │ OpenAI / Claude / Gemini │  │ EmbeddingService       │   │
 │  │ DeepSeek / Ollama /      │  │ L1 内存 + L2 SQLite    │   │
-│  │ OpenRouter + Codex OAuth │  │ Ollama bge-m3 兜底可选  │   │
+│  │ OpenRouter / OrcaRouter  │  │ Ollama bge-m3 兜底可选  │   │
 │  └──────────────────────────┘  └────────────────────────┘   │
 │  可选视觉 / 弹幕预热：质心、关键帧、完整 document embedding；endpoint provenance + stable slot retry │
 │  Desktop bundle: official Ollama.app runtime (ollama + runner dylibs/assets) │
@@ -622,7 +624,7 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │    └→ token diet: preference packing + weighted recent/judged/relevant/important insight≤40 → full merge │
 │  discovery evaluator: text + metrics + optional compressed cover image input │
 │    └→ embedding prefilter shadow → privacy-safe decision → raw score/admission join → read-only gate │
-│  OpenAI auth_mode: api_key / experimental Codex CLI OAuth      │
+│  OpenAI auth_mode: api_key / experimental Codex ChatGPT transport│
 │  结构化 JSON helper: wrapper / fenced / JSONL / schema echo / MiMo 容错 │
 ├──────────────────────────────────────────────────────────────┤
 │                    多层网状记忆存储                             │
@@ -632,12 +634,12 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  │ Soul+偏好   │ │  向量索引)   │ │  JSON)     │ │         │  │
 │  └───────────┘ └─────────────┘ └────────────┘ └─────────┘  │
 │  SQLite: events(inferred_satisfaction) / seen_items(views+saves+snapshot)   │
-│          discovery_candidates                                      │
+│          discovery_candidates → relevance + temporal eligible/review_due/expired admission │
 │          evaluator_prefilter_shadow_audit (30d / 20k bounded, no raw content) │
 │          discovery_keywords → 24h safe cross-digest pending reconcile (0=hard expiry) │
 │          admitted pending copy → bounded copy-ready watermark → serve/refill │
 │          discovery_keywords(+cohort gate) / discovery_inspiration_*│
-│          content_cache(item_key: nonblank partial unique + legacy blank repair)              │
+│          content_cache(item_key; review_due → temporal_review_hold; expired → stale) │
 │          recommendations(item_key) / chat_turns / card_settlements / avoidance_state          │
 │          saved_items/memberships/native_save_states + durable task ledger │
 └──────────────────────────────────────────────────────────────┘

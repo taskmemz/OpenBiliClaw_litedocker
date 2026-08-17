@@ -3,7 +3,12 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import test from "node:test";
 
-import { computeYtTaskTimeoutMs, isValidYtTask } from "../src/background/yt-task-dispatcher.ts";
+import {
+  computeYtTaskTimeoutMs,
+  isValidYtTask,
+  YT_TASK_SESSION_KEY,
+  YT_TASK_TIMEOUT_ALARM_NAME,
+} from "../src/background/yt-task-dispatcher.ts";
 import type { NativeSaveTask } from "../src/shared/native-save.ts";
 
 const nativeTask: NativeSaveTask = {
@@ -47,4 +52,22 @@ test("YouTube content entry installs native executor without removing legacy lis
   const source = readFileSync(resolve("src/content/youtube.ts"), "utf8");
   assert.match(source, /installYtMessageListener\(\)/);
   assert.match(source, /installNativeSaveExecutor\(["']youtube["'], saveYouTube\)/);
+});
+
+test("yt task timeout alarm persists through MV3 service-worker sleep", () => {
+  assert.equal(YT_TASK_TIMEOUT_ALARM_NAME, "openbiliclaw-yt-task-timeout");
+  assert.equal(YT_TASK_SESSION_KEY, "openbiliclaw-yt-active-task");
+  assert.equal(
+    computeYtTaskTimeoutMs({
+      id: "bootstrap",
+      type: "bootstrap_profile",
+      max_scroll_rounds: 30,
+    }),
+    300_000,
+  );
+  const source = readFileSync(resolve("src/background/yt-task-dispatcher.ts"), "utf8");
+  assert.match(source, /chrome\.alarms\.create\(YT_TASK_TIMEOUT_ALARM_NAME, \{ when: deadlineAt \}\)/);
+  assert.match(source, /chrome\.storage\?\.session/);
+  assert.match(source, /recoverInterruptedYtTask/);
+  assert.match(source, /handleYtTaskAlarm/);
 });

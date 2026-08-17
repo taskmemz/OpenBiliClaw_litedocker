@@ -6185,6 +6185,7 @@
             <option value="deepseek">DeepSeek</option>
             <option value="ollama">Ollama (本地)</option>
             <option value="openrouter">OpenRouter</option>
+            <option value="orcarouter">OrcaRouter</option>
             <option value="openai_compatible">OpenAI 协议兼容 (Groq/Together/Azure/vLLM)</option>
           </select>
         </div>
@@ -6206,6 +6207,7 @@
             <option value="deepseek">DeepSeek</option>
             <option value="ollama">Ollama (本地)</option>
             <option value="openrouter">OpenRouter</option>
+            <option value="orcarouter">OrcaRouter</option>
             <option value="openai_compatible">OpenAI 协议兼容 (Groq/Together/Azure/vLLM)</option>
           </select>
         </div>
@@ -6321,6 +6323,21 @@
             <input id="cfgOpenrouterTitle" type="text" placeholder="OpenBiliClaw">
           </div>
         </div>
+        <!-- OrcaRouter -->
+        <div class="settings-provider-fields" data-provider="orcarouter">
+          <div class="settings-field">
+            <label for="cfgOrcarouterKey">OrcaRouter API Key</label>
+            <input id="cfgOrcarouterKey" type="password" autocomplete="off" placeholder="sk-orca-...">
+          </div>
+          <div class="settings-field">
+            <label for="cfgOrcarouterModel">Model</label>
+            <input id="cfgOrcarouterModel" type="text" placeholder="openai/gpt-4o">
+          </div>
+          <div class="settings-field">
+            <label for="cfgOrcarouterBaseUrl">Base URL</label>
+            <input id="cfgOrcarouterBaseUrl" type="text" placeholder="https://api.orcarouter.ai/v1">
+          </div>
+        </div>
         <!-- OpenAI Compatible -->
         <div class="settings-provider-fields" data-provider="openai_compatible">
           <p class="settings-hint">
@@ -6407,6 +6424,7 @@
             <option value="deepseek">DeepSeek</option>
             <option value="ollama">Ollama</option>
             <option value="openrouter">OpenRouter</option>
+            <option value="orcarouter">OrcaRouter</option>
             <option value="openai_compatible">OpenAI 协议兼容</option>
           </select>
         </div>
@@ -6424,6 +6442,7 @@
             <option value="deepseek">DeepSeek</option>
             <option value="ollama">Ollama</option>
             <option value="openrouter">OpenRouter</option>
+            <option value="orcarouter">OrcaRouter</option>
             <option value="openai_compatible">OpenAI 协议兼容</option>
           </select>
         </div>
@@ -6441,6 +6460,7 @@
             <option value="deepseek">DeepSeek</option>
             <option value="ollama">Ollama</option>
             <option value="openrouter">OpenRouter</option>
+            <option value="orcarouter">OrcaRouter</option>
             <option value="openai_compatible">OpenAI 协议兼容</option>
           </select>
         </div>
@@ -6458,6 +6478,7 @@
             <option value="deepseek">DeepSeek</option>
             <option value="ollama">Ollama</option>
             <option value="openrouter">OpenRouter</option>
+            <option value="orcarouter">OrcaRouter</option>
             <option value="openai_compatible">OpenAI 协议兼容</option>
           </select>
         </div>
@@ -7485,6 +7506,7 @@
                 <option value="gemini">Gemini</option>
                 <option value="deepseek">DeepSeek</option>
                 <option value="openrouter">OpenRouter</option>
+                <option value="orcarouter">OrcaRouter</option>
                 <option value="ollama">Ollama</option>
                 <option value="openai_compatible">OpenAI-compatible</option>
               </select>

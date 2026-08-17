@@ -18,6 +18,7 @@ from .gemini_provider import GeminiProvider
 from .ollama_provider import OllamaProvider
 from .openai_provider import DeepSeekProvider, OpenAIProvider
 from .openrouter_provider import OpenRouterProvider
+from .orcarouter_provider import OrcaRouterProvider
 from .registry import (
     RegistryBuildError,
     RegistrySummary,
@@ -48,6 +49,7 @@ __all__ = [
     "OllamaProvider",
     "OpenAIProvider",
     "OpenRouterProvider",
+    "OrcaRouterProvider",
     "RegistryBuildError",
     "RegistrySummary",
     "LLMProviderExecutionError",

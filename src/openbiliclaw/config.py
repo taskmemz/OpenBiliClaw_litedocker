@@ -68,6 +68,7 @@ _SUPPORTED_CHAT_PROVIDERS = {
     "deepseek",
     "ollama",
     "openrouter",
+    "orcarouter",
     "openai_compatible",
 }
 _LLM_INSTANCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -78,6 +79,7 @@ _LLM_PROVIDER_DISPLAY_NAMES = {
     "deepseek": "DeepSeek",
     "ollama": "Ollama",
     "openrouter": "OpenRouter",
+    "orcarouter": "OrcaRouter",
     "openai_compatible": "OpenAI-compatible",
 }
 _MIN_POOL_TARGET_COUNT = 1
@@ -143,6 +145,7 @@ _DEFAULT_INSPIRATION_BREADTH = "high"
 _DEFAULT_INSPIRATION_SEARCH_BACKENDS: tuple[str, ...] = (
     "local_cache",
     "platform_sources",
+    "bing_rss",
     "exa",
     "you",
 )
@@ -202,6 +205,7 @@ _REMOTE_PROVIDER_FIELDS = {
     "gemini": "llm.gemini.api_key",
     "deepseek": "llm.deepseek.api_key",
     "openrouter": "llm.openrouter.api_key",
+    "orcarouter": "llm.orcarouter.api_key",
     # v0.3.32+ — generic OpenAI-protocol-compatible provider (Groq /
     # Together / Azure OpenAI / vLLM / self-hosted, etc.). Distinct from
     # ``openai`` so users can run both in parallel (chat = openai for
@@ -430,6 +434,14 @@ class EmbeddingConfig:
     # gemini-embedding-2 or dashscope qwen3-vl-embedding. Default off so
     # local bge-m3 / text-only paths pay zero extra cost.
     multimodal_enabled: bool = False
+    # L2 persistent cache byte budget (0 = unlimited). When set, the cache
+    # evicts inactive/legacy namespaces first, then oldest active rows, once
+    # usage crosses high_watermark, and stops at low_watermark. Vectors are
+    # stored as compact float32 blobs regardless; this bounds disk growth for
+    # long-running discovery/warmup cycles.
+    cache_max_bytes: int = 0
+    cache_high_watermark: float = 0.9
+    cache_low_watermark: float = 0.7
 
 
 @dataclass
@@ -473,6 +485,8 @@ class LLMConfig:
     # v0.3.32+ generic OpenAI-protocol-compatible provider. Always
     # requires an explicit base_url (otherwise it would just be ``openai``).
     openai_compatible: LLMProviderConfig = field(default_factory=LLMProviderConfig)
+    # OrcaRouter model-routing gateway (OpenAI-compatible, ``sk-orca-`` key).
+    orcarouter: LLMProviderConfig = field(default_factory=LLMProviderConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     # Per-module overrides (empty = use global default)
     soul: ModuleLLMConfig = field(default_factory=ModuleLLMConfig)
@@ -1054,6 +1068,12 @@ class DiscoveryConfig:
     # grounded adjacent concepts and metadata-bearing keywords.
     inspiration_search_enabled: bool = True
     inspiration_search_backends: tuple[str, ...] = _DEFAULT_INSPIRATION_SEARCH_BACKENDS
+    # Direct API credentials for the Exa / You.com inspiration backends. When
+    # present, the runtime calls the provider HTTP APIs directly instead of
+    # shelling out to the optional ``mcporter`` Node CLI. Keep empty to use the
+    # mcporter CLI fallback (or skip the backend when neither is available).
+    exa_api_key: str = ""
+    you_api_key: str = ""
     # Optional experiment mode: when true and inspiration search is available,
     # due platforms skip the legacy merged keyword planner and are filled only
     # through the search-inspired flow.
@@ -2027,6 +2047,7 @@ def _build_config(
         ollama=_provider_config("ollama"),
         openrouter=_provider_config("openrouter"),
         openai_compatible=_provider_config("openai_compatible"),
+        orcarouter=_provider_config("orcarouter"),
         embedding=EmbeddingConfig(
             **_filter_dataclass_kwargs(
                 EmbeddingConfig,
@@ -2665,6 +2686,8 @@ def _build_discovery(discovery_raw: dict[str, Any]) -> DiscoveryConfig:
         inspiration_search_backends=_normalize_inspiration_search_backends(
             discovery_raw.get("inspiration_search_backends")
         ),
+        exa_api_key=str(discovery_raw.get("exa_api_key", "") or "").strip(),
+        you_api_key=str(discovery_raw.get("you_api_key", "") or "").strip(),
         inspiration_replace_merged_keywords=_coerce_bool(
             discovery_raw.get("inspiration_replace_merged_keywords"),
             default=False,
@@ -2996,6 +3019,9 @@ def _normalize_inspiration_search_backends(value: object) -> tuple[str, ...]:
         list(_DEFAULT_INSPIRATION_SEARCH_BACKENDS) if value is None else _coerce_str_list(value)
     )
     aliases = {
+        "bing": "bing_rss",
+        "bing_rss": "bing_rss",
+        "bing-rss": "bing_rss",
         "exa": "exa",
         "local": "local_cache",
         "cache": "local_cache",
@@ -3630,15 +3656,26 @@ def _collect_llm_instance_routing_issues(llm: LLMConfig) -> list[ConfigIssue]:
                 )
             )
         if provider_type == "openai" and auth_mode == "codex_oauth":
-            if not _is_openai_official_base_url(instance.base_url):
+            if not _is_codex_oauth_base_url(instance.base_url):
                 issues.append(
                     ConfigIssue(
                         field=f"{field_prefix}.base_url",
                         message=(
-                            "Codex OAuth 只允许留空 base_url 或使用 OpenAI 官方 API 域名，"
-                            "避免把 ChatGPT token 发送给第三方。"
+                            "Codex OAuth 只允许留空 base_url 或使用官方 Codex 传输端点 "
+                            "`https://chatgpt.com/backend-api`，避免把 ChatGPT token "
+                            "发送给第三方中转站或 OpenAI Platform API。"
                         ),
                         severity="blocking",
+                    )
+                )
+            if flavor and flavor != "responses":
+                issues.append(
+                    ConfigIssue(
+                        field=f"{field_prefix}.api_flavor",
+                        message=(
+                            '`auth_mode = "codex_oauth"` 使用独立的 Codex ChatGPT '
+                            "传输通道，`api_flavor` 会被忽略；无需设置。"
+                        ),
                     )
                 )
             try:
@@ -4058,6 +4095,7 @@ def _collect_config_issues(config: Config) -> list[ConfigIssue]:
         "ollama": config.llm.ollama,
         "openrouter": config.llm.openrouter,
         "openai_compatible": config.llm.openai_compatible,
+        "orcarouter": config.llm.orcarouter,
     }
 
     provider_config = provider_configs.get(provider_name)
@@ -4102,15 +4140,26 @@ def _collect_config_issues(config: Config) -> list[ConfigIssue]:
                     message='`auth_mode = "codex_oauth"` 时 `api_key` 会被忽略。',
                 )
             )
-        if not _is_openai_official_base_url(config.llm.openai.base_url):
+        if not _is_codex_oauth_base_url(config.llm.openai.base_url):
             issues.append(
                 ConfigIssue(
                     field="llm.openai.base_url",
                     message=(
-                        '`auth_mode = "codex_oauth"` 只允许留空 base_url '
-                        "或使用 OpenAI 官方 API 域名，避免泄露 ChatGPT token。"
+                        '`auth_mode = "codex_oauth"` 只允许留空 base_url 或使用官方 '
+                        "Codex 传输端点 `https://chatgpt.com/backend-api`，避免把 "
+                        "ChatGPT token 发送给第三方中转站或 OpenAI Platform API。"
                     ),
                     severity="blocking",
+                )
+            )
+        if config.llm.openai.api_flavor.strip().lower() not in {"", "responses"}:
+            issues.append(
+                ConfigIssue(
+                    field="llm.openai.api_flavor",
+                    message=(
+                        '`auth_mode = "codex_oauth"` 使用独立的 Codex ChatGPT '
+                        "传输通道，`api_flavor` 会被忽略；无需设置。"
+                    ),
                 )
             )
         try:
@@ -4282,12 +4331,36 @@ def posture_gate_enforce_readiness_issue(
     )
 
 
-def _is_openai_official_base_url(base_url: str) -> bool:
+_CODEX_OAUTH_ALLOWED_BASE_URL_PATHS = {
+    "",
+    "/backend-api",
+    "/backend-api/v1",
+    "/backend-api/codex",
+    "/backend-api/codex/v1",
+    "/backend-api/codex/responses",
+}
+
+
+def _is_codex_oauth_base_url(base_url: str) -> bool:
+    """Return whether *base_url* is a legal Codex OAuth target.
+
+    Codex OAuth (ChatGPT subscription) tokens MUST only go to the official
+    ``chatgpt.com/backend-api`` Codex transport. The old implementation
+    allowed ``api.openai.com``, where ChatGPT tokens fail with ``Missing
+    scopes: api.responses.write`` — that is intentionally rejected here.
+    """
     raw = base_url.strip()
     if not raw:
         return True
     parsed = urlparse(raw if "://" in raw else f"https://{raw}")
-    return parsed.scheme == "https" and (parsed.hostname or "").lower() == "api.openai.com"
+    path = (parsed.path or "").rstrip("/").lower()
+    return (
+        parsed.scheme == "https"
+        and (parsed.hostname or "").lower() == "chatgpt.com"
+        and path in _CODEX_OAUTH_ALLOWED_BASE_URL_PATHS
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 def load_config_with_diagnostics(
@@ -4915,6 +4988,7 @@ def _render_config_toml(
         lines.extend(_render_provider_section("deepseek", config.llm.deepseek))
         lines.extend(_render_provider_section("ollama", config.llm.ollama))
         lines.extend(_render_provider_section("openrouter", config.llm.openrouter))
+        lines.extend(_render_provider_section("orcarouter", config.llm.orcarouter))
         lines.extend(_render_provider_section("openai_compatible", config.llm.openai_compatible))
     lines.extend(
         [
@@ -4928,6 +5002,9 @@ def _render_config_toml(
             f"fallback_enabled = {_toml_bool(config.llm.embedding.fallback_enabled)}",
             f"fallback_provider = {_toml_string(config.llm.embedding.fallback_provider)}",
             f"multimodal_enabled = {_toml_bool(config.llm.embedding.multimodal_enabled)}",
+            f"cache_max_bytes = {max(0, int(config.llm.embedding.cache_max_bytes))}",
+            f"cache_high_watermark = {config.llm.embedding.cache_high_watermark}",
+            f"cache_low_watermark = {config.llm.embedding.cache_low_watermark}",
             "",
         ]
     )
@@ -5245,6 +5322,8 @@ def _render_config_toml(
             f"{_toml_bool(config.discovery.inspiration_search_enabled)}",
             "inspiration_search_backends = "
             f"{_toml_str_list(list(config.discovery.inspiration_search_backends))}",
+            f"exa_api_key = {_toml_string(config.discovery.exa_api_key)}",
+            f"you_api_key = {_toml_string(config.discovery.you_api_key)}",
             "inspiration_replace_merged_keywords = "
             f"{_toml_bool(config.discovery.inspiration_replace_merged_keywords)}",
             f"inspiration_breadth = {_toml_string(config.discovery.inspiration_breadth)}",
@@ -5347,13 +5426,21 @@ def _render_provider_section(name: str, provider: LLMProviderConfig) -> list[str
     lines = [f"[llm.{name}]"]
     lines.append(f"api_key = {_toml_string(provider.api_key)}")
     lines.append(f"model = {_toml_string(provider.model)}")
-    if name in {"openai", "claude", "deepseek", "ollama", "openrouter", "openai_compatible"}:
+    if name in {
+        "openai",
+        "claude",
+        "deepseek",
+        "ollama",
+        "openrouter",
+        "orcarouter",
+        "openai_compatible",
+    }:
         lines.append(f"base_url = {_toml_string(provider.base_url)}")
     if name == "openai":
         lines.append(f"auth_mode = {_toml_string(provider.auth_mode)}")
     if name in {"openai", "openai_compatible"}:
         lines.append(f"api_flavor = {_toml_string(provider.api_flavor)}")
-    if name in {"openai", "claude", "gemini", "deepseek", "openrouter"}:
+    if name in {"openai", "claude", "gemini", "deepseek", "openrouter", "orcarouter"}:
         lines.append(f"reasoning_effort = {_toml_string(provider.reasoning_effort)}")
     if name == "openrouter":
         lines.append(f"http_referer = {_toml_string(provider.http_referer)}")

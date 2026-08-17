@@ -1321,7 +1321,7 @@
             <label class="settings-field"><span>实例名称</span><input id="llmInstanceName" autocomplete="off" placeholder="例如：DeepSeek 官方"></label>
             <label class="settings-field"><span>实例 ID</span><input id="llmInstanceId" autocomplete="off" spellcheck="false" placeholder="deepseek-main" aria-describedby="llmInstanceIdHint"></label>
             <p class="settings-note-inline llm-instance-id-hint" id="llmInstanceIdHint">保存后 ID 不可修改；调用链通过它稳定引用实例。</p>
-            <label class="settings-field"><span>Provider 类型</span><select id="llmInstanceProviderType" translate="no"><option value="openai">OpenAI</option><option value="claude">Claude</option><option value="gemini">Gemini</option><option value="deepseek">DeepSeek</option><option value="openrouter">OpenRouter</option><option value="ollama">Ollama</option><option value="openai_compatible">OpenAI-compatible</option></select></label>
+            <label class="settings-field"><span>Provider 类型</span><select id="llmInstanceProviderType" translate="no"><option value="openai">OpenAI</option><option value="claude">Claude</option><option value="gemini">Gemini</option><option value="deepseek">DeepSeek</option><option value="openrouter">OpenRouter</option><option value="orcarouter">OrcaRouter</option><option value="ollama">Ollama</option><option value="openai_compatible">OpenAI-compatible</option></select></label>
             <label class="settings-field"><span>状态</span><select id="llmInstanceEnabled"><option value="on">启用</option><option value="off">停用</option></select></label>
             <label class="settings-field full">
               <span>模型</span>
@@ -1335,7 +1335,7 @@
             <label class="settings-field full"><span>Base URL</span><input id="llmInstanceBaseUrl" type="url" autocomplete="off" spellcheck="false" placeholder="官方渠道可留空；兼容网关必须填写"></label>
             <label class="settings-field full"><span>API Key</span><input id="llmInstanceApiKey" type="password" autocomplete="new-password" placeholder="留空保留已配置的密钥"></label>
             <label class="settings-field full" id="llmInstanceClearApiKeyField" hidden><span>清除已保存的 API Key</span><input id="llmInstanceClearApiKey" type="checkbox"></label>
-            <label class="settings-field" data-instance-field="openai-auth"><span>OpenAI 认证方式</span><select id="llmInstanceAuthMode"><option value="api_key">API Key</option><option value="codex_oauth">Codex OAuth</option></select></label>
+            <label class="settings-field" data-instance-field="openai-auth"><span>OpenAI 认证方式</span><select id="llmInstanceAuthMode"><option value="api_key">API Key（OpenAI Platform）</option><option value="codex_oauth">Codex OAuth（实验性 · ChatGPT 订阅）</option></select><small class="llm-field-help">Codex OAuth 复用 Codex CLI / ChatGPT 登录态，走官方 Codex 传输通道，无需 Platform API Key；与 API Key 方式互斥。</small></label>
             <label class="settings-field" data-instance-field="openai-protocol"><span>API 协议</span><select id="llmInstanceApiFlavor"><option value="">chat/completions（默认）</option><option value="responses">responses</option></select></label>
             <label class="settings-field" data-instance-field="reasoning">
               <span>Reasoning effort</span>

@@ -2555,7 +2555,7 @@ async def test_refresh_controller_prioritizes_underfilled_sources() -> None:
     assert call_strategies == ["search", "related_chain", "trending", "explore"]
 
 
-async def test_refresh_controller_skips_bilibili_when_only_small_sources_underfilled() -> None:
+async def test_refresh_controller_backfills_bilibili_when_only_small_sources_underfilled() -> None:
     discovery = _FakeDiscoveryEngine()
     controller = ContinuousRefreshController(
         memory_manager=_FakeMemoryManager(),
@@ -2587,8 +2587,14 @@ async def test_refresh_controller_skips_bilibili_when_only_small_sources_underfi
 
     result = await controller.refresh_if_needed()
 
-    assert result == {"refreshed": False, "strategies": [], "reason": "below_threshold"}
-    assert discovery.calls == []
+    assert result["refreshed"] is True
+    assert result["reason"] == "triggered"
+    assert set(result["strategies"]) == {"search", "related_chain", "trending", "explore"}
+    assert [call[1] for call in discovery.calls] == [
+        ["search", "related_chain"],
+        ["trending"],
+        ["explore"],
+    ]
 
 
 async def test_trigger_manual_refresh_sets_running_state() -> None:
@@ -3392,9 +3398,12 @@ async def test_candidate_supply_wakes_all_under_quota_platform_producers() -> No
 
     assert xhs.calls == [30]
     assert douyin.calls == [30]
-    assert discovery.calls == []
-    assert result["refreshed"] is False
-    assert result["supply_progress_count"] == 4
+    # Bilibili is at its own share, but the global pool is still below target
+    # and no discovery-candidate work is pending, so the periodic Bilibili
+    # backfill is allowed to run in addition to the under-quota producers.
+    assert [call[1] for call in discovery.calls] == [["trending"], ["explore"]]
+    assert result["refreshed"] is True
+    assert result["supply_progress_count"] == 6
     assert result["supply_productive"] is True
 
 
@@ -3787,6 +3796,46 @@ def test_refresh_plan_logs_diagnostics_when_pool_below_target_but_no_plan(
         "requested_by_source",
     ):
         assert key in caplog.text
+
+
+def test_build_refresh_plan_falls_back_to_periodic_bilibili_plan_when_no_source_deficit() -> None:
+    # Global pool is below target and below the replenishment watermark, but
+    # Bilibili is already at its own share. Other sources are under-share;
+    # their producers are ticked separately. The source-replenishment plan is
+    # empty because it only knows Bilibili strategy fan-out, so the refresh
+    # plan must fall back to the periodic Bilibili plan instead of returning
+    # empty and stalling the pool below target forever.
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=_FakeDatabase(
+            [],
+            pool_count=237,
+            source_available_counts={
+                "bilibili": 100,
+                "youtube": 100,
+                "weibo": 37,
+            },
+            source_raw_counts={
+                "bilibili": 100,
+                "youtube": 100,
+                "weibo": 37,
+            },
+        ),
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        pool_target_count=300,
+        pool_source_shares={"bilibili": 1, "youtube": 1, "weibo": 1},
+        trending_refresh_minutes=3,
+        explore_refresh_minutes=3,
+    )
+
+    plan = controller._build_refresh_plan(_FakeMemoryManager().load_discovery_runtime_state())
+
+    assert plan == [
+        (["trending"], controller.discovery_limit),
+        (["explore"], controller.discovery_limit),
+    ]
 
 
 async def test_refresh_controller_uses_bilibili_deficit_for_discovery_limit() -> None:

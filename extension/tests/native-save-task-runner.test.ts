@@ -161,7 +161,10 @@ test("native save runner reloads Douyin once for read-only persisted confirmatio
       { tab: { id: 42, url: executionUrl } },
     );
     await tick();
-    assert.deepEqual(state.updatedTabs, [{ tabId: 42, active: true, url: executionUrl }]);
+    assert.deepEqual(state.updatedTabs, [
+      { tabId: 42, muted: true },
+      { tabId: 42, active: true, url: executionUrl },
+    ]);
     assert.equal(
       (state.sentMessages.at(-1)?.message as { verification_only?: unknown }).verification_only,
       true,
@@ -208,11 +211,14 @@ test("native save runner reloads Xiaohongshu once for read-only persisted confir
       { tab: { id: 42, url: tokenizedXhsTask.content_url } },
     );
     await tick();
-    assert.deepEqual(state.updatedTabs, [{
-      tabId: 42,
-      active: true,
-      url: tokenizedXhsTask.content_url,
-    }]);
+    assert.deepEqual(state.updatedTabs, [
+      { tabId: 42, muted: true },
+      {
+        tabId: 42,
+        active: true,
+        url: tokenizedXhsTask.content_url,
+      },
+    ]);
     assert.equal(
       (state.sentMessages.at(-1)?.message as { verification_only?: unknown }).verification_only,
       true,

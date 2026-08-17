@@ -13,7 +13,7 @@ YouTube 模块负责把用户在 YouTube 上的长期兴趣信号接入 OpenBili
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
-| YouTube bootstrap 队列 | ✅ | `YtTaskQueue` 管理 `yt_tasks` 表，支持 pending / in_progress / completed / failed 状态、每日预算、过期 pending 清理和近期任务复用 |
+| YouTube bootstrap 队列 | ✅ | `YtTaskQueue` 管理 `yt_tasks` 表，支持 pending / in_progress / completed / failed 状态、每日预算、过期 pending 清理、stale `in_progress` 租约回收（issue #178）和近期任务复用 |
 | 扩展任务回写 | ✅ | 后端 `/api/sources/yt/task-result` 接收 `partial` / `ok` / `empty` / `failed`，单任务内合并去重，并通过 `source_bootstrap_state.json` 跳过跨任务旧条目 |
 | 扩展在线周期回拉 | ✅ | 默认由 `scheduler.source_incremental_enabled=false` 全局关闭；显式开启后，完整画像存在、初始化空闲且扩展 runtime-stream 在线时，runtime 才按 `[scheduler]` 全局/YouTube 间隔把同一 `bootstrap_profile` 任务纳入六来源全局串行 round-robin；手动初始化、手动拉取和 discovery 不受影响 |
 | init 集成 | ✅ | `init --yes-youtube` 在抖音 collect 完成后才入队，避免多个前台 tab 任务争抢焦点 |
@@ -43,6 +43,10 @@ task_id = queue.enqueue_with_id(
         "max_scroll_rounds": 10,
     },
 )
+
+# Chrome MV3 service worker 休眠会丢 setTimeout，扩展任务超时后可用
+# 后端租约回收把 stale in_progress 置为 failed，避免队列永久卡死。
+queue.expire_stale_in_progress(("bootstrap_profile",))
 
 events = yt_bootstrap_items_to_events(
     [
@@ -107,6 +111,7 @@ openbiliclaw import-youtube ~/Downloads/takeout.zip --dry-run
 | `OPENBILICLAW_YT_BOOTSTRAP_MAX_ITEMS` | `300` | 每个 YouTube scope 最多采集条目数 |
 | `OPENBILICLAW_YT_BOOTSTRAP_WAIT_SECONDS` | `240` | CLI 等待扩展完成 bootstrap 的默认秒数 |
 | `OPENBILICLAW_YT_BOOTSTRAP_DEDUPE_HOURS` | `6` | YouTube `bootstrap_profile` 近期任务复用窗口；设为 `0` 可关闭 |
+| `OPENBILICLAW_YT_STALE_IN_PROGRESS_SECONDS` | `600` | YouTube `in_progress` 任务超过该秒数仍无终态时自动置 `failed`（issue #178） |
 | `sources.youtube.enabled` | `false` | 是否启用 YouTube steady-state discovery 和候选池 quota |
 | `sources.youtube.daily_search_budget` | `6` | `yt_search` 每日搜索 query 执行预算 |
 | `sources.youtube.daily_trending_budget` | `50` | `yt_trending` 每日热门候选抓取预算 |
@@ -120,5 +125,6 @@ openbiliclaw import-youtube ~/Downloads/takeout.zip --dry-run
 - YouTube 任务在抖音任务完成后才入队。两者都会打开前台 tab，串行执行能避免页面懒加载和焦点状态互相干扰。
 - YouTube bootstrap 的任务表负责任务生命周期，`source_bootstrap_state.json` 负责跨任务事件去重；二者分离，保证原始 task result 仍可诊断，而旧条目不会重复进入画像更新。
 - `yt_tasks` 只服务 bootstrap profile / smoke，不承载 steady-state discovery。日常补池由后端 `YoutubeDiscoveryProducer` 直接调用 YouTube strategies；正常 runtime 路径先写 `discovery_candidates`，再由共享 pipeline 做混源 batch 评估并 admission 到 `content_cache`。pool-source raw 统计会把待评估 YouTube 候选计入 raw material，避免重复过量抓取。
+- stale `in_progress` 租约回收（issue #178）是第二道防线：MV3 service worker 休眠会丢失 `setTimeout`，扩展侧改用 `chrome.alarms` 做任务超时；后端在 `/api/sources/yt/next-task` 领取前和 `enqueue_yt_bootstrap` 入队前调用 `expire_stale_in_progress()`，把超过 `OPENBILICLAW_YT_STALE_IN_PROGRESS_SECONDS`（默认 600s）且没有 staged canonical 结果的 `in_progress` 任务置为 `failed`。带 `_openbiliclaw_terminal_status` 的 staged 结果保留不覆盖，仍由 `next_pending` 的 stale-reclaim 路径重新派发以修复投影。
 - Takeout 导入和扩展导入都走统一事件格式。下游 `analyze_events()`、`build_initial_profile()` 和 memory 层不需要理解 YouTube 原始文件或 DOM schema。
 - discovery 输出统一使用 `source_platform="youtube"` 和 `content_id=<YouTube video id>`。`ContentDiscoveryEngine` 必须按跨源 content identity 去重和缓存，不能只按 B 站 `bvid`，否则多个 YouTube 候选会被空 `bvid` 合并成一条。

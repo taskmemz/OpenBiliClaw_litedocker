@@ -1556,7 +1556,7 @@ _SINGLE_CONTENT_EVALUATION_SYSTEM_PROMPT = (
     "不要因为来源不同特殊处理评分逻辑。\n"
     "10. score 只衡量内容与用户画像的相关性及内容本身价值，与发布时间和时效性完全解耦。"
     "不得因为内容较新而加分，也不得因为内容较旧或 published_at 缺失而减分；时效语义只写入下面"
-    "三个 temporal 字段，交给后续确定性排序策略处理。\n"
+    "八个 temporal 字段，交给后续确定性推荐资格、复审与排序策略处理。\n"
     "11. temporal_class 判断内容的核心价值为何会随观看时间过期，必须六选一:\n"
     "   - breaking:价值依赖小时到数日内的即时状态，如突发新闻、实时赛果、即时行情或正在发生的事件;\n"
     "   - current:价值依赖近期语境，如政策变化、新品发布、热点讨论或近期评测;\n"
@@ -1569,9 +1569,32 @@ _SINGLE_CONTENT_EVALUATION_SYSTEM_PROMPT = (
     "Python 3.8 安装教程是 versioned，新手机发布评测是 current，刚结束赛事的赛果是 breaking，"
     "多年后赛事复盘是 historical。\n"
     "13. temporal_confidence 是对 temporal_class 判断的置信度(0-1)，不是内容质量、相关性或新鲜度。"
+    "当 temporal_class=unknown 时必须输出 temporal_confidence=0 且 temporal_reason=空字符串；其余五类的 "
     "temporal_reason 用一句精炼中文说明核心价值为何会或不会过期。published_at 是来源提供的权威"
     "发布时间，evaluation_context.evaluated_at 是本次评估的权威时间基准；不得根据模型知识截止时间"
     "或标题年份推测发布时间。时间字段缺失或无效时仍可按内容语义分类，但不得猜测具体年龄。\n"
+    "14. temporal_validity_mode 必须五选一:none、explicit_deadline、event_state、version_state、"
+    "freshness_only。只有输入 title、description、body_text 或 published_label 明确写出截止日期、"
+    "具体时刻和时区，才可使用 explicit_deadline，并把规范化的带时区 RFC3339 时刻写入 "
+    "temporal_valid_until；日期-only、缺具体时刻或缺时区时不得使用 explicit_deadline；不得把"
+    "发布时间、评估时间、常识或模型知识当截止时间。其它 mode 的 temporal_valid_until 必须为空串。\n"
+    "15. temporal_scope 必须三选一:none、core、hook。core 表示过期会使内容核心价值失效，hook 表示"
+    "只让标题钩子/限时入口失效而正文仍有价值；没有具体时效主张时用 none。temporal_evidence 必须是"
+    "上述输入文本中的一段连续原文，不得改写或生成；所有非 none mode 都必须提供逐字证据，找不到时"
+    "只能输出 none。即使核心正文是 evergreen/historical，若标题中的‘今天/最新/限时’钩子会过期，"
+    "也可输出 freshness_only + hook 并引用该钩子；hook 永远不代表核心正文失效。\n"
+    "例如 evergreen 教程标题中的‘限时免费领取’，或 historical 纪录片标题中的‘今晚首播’，都可"
+    "输出 freshness_only + hook，逐字引用该标题钩子，并把 temporal_state 设为 unknown。\n"
+    "16. temporal_state 必须四选一:unknown、active、expired、superseded。none、"
+    "freshness_only、explicit_deadline 必须输出 unknown；event_state 只能输出 active 或 expired；"
+    "version_state 只能输出 active 或 superseded。expired/superseded 必须由 temporal_evidence 的"
+    "逐字原文明示事件已经结束或版本已被替代，不能根据发布时间、年龄、evaluation_context、常识或"
+    "模型知识推断；active 同样必须有逐字、无条件的当前状态证据。条件、假设、可能性或未来态句子"
+    "不能证明任何 state，例如‘如果支持版本发生变化就重新核验’不能作为 active 证据；应引用"
+    "‘Temporal V2 仍是当前受支持版本’这类直接陈述。\n"
+    "17. temporal_class=unknown 时，五个新字段必须严格为 temporal_validity_mode=none、"
+    "temporal_valid_until=空串、temporal_scope=none、temporal_evidence=空串、"
+    "temporal_state=unknown。\n"
     "</rules>\n\n"
     "<output_schema>\n"
     "{\n"
@@ -1582,7 +1605,12 @@ _SINGLE_CONTENT_EVALUATION_SYSTEM_PROMPT = (
     '  "franchise_key": "",\n'
     '  "temporal_class": "evergreen",\n'
     '  "temporal_confidence": 0.91,\n'
-    '  "temporal_reason": "核心价值不依赖当前时间"\n'
+    '  "temporal_reason": "核心价值不依赖当前时间",\n'
+    '  "temporal_validity_mode": "none",\n'
+    '  "temporal_valid_until": "",\n'
+    '  "temporal_scope": "none",\n'
+    '  "temporal_evidence": "",\n'
+    '  "temporal_state": "unknown"\n'
     "}\n"
     "</output_schema>"
 )
@@ -1669,7 +1697,9 @@ _BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT = (
     "2. results 数组长度必须与输入内容数量一致,顺序一一对应。\n"
     "3. 每项必须原样带回输入里的 bvid 或 content_id,并包含 score(0-1)、"
     "reason、topic_group(2-4词粗分类)、style_key(13选1)、"
-    "franchise_key(可空)、temporal_class、temporal_confidence、temporal_reason。\n"
+    "franchise_key(可空)、temporal_class、temporal_confidence、temporal_reason、"
+    "temporal_validity_mode、temporal_valid_until、temporal_scope、temporal_evidence、"
+    "temporal_state。\n"
     "3a. reason 仅供内部诊断,不是面向用户的推荐文案。写法(省 token):"
     "score 严格低于 0.5 的条目,reason 必须写成空串 "
     '""(这些条目达不到准入门槛、会被直接丢弃,写理由是纯浪费);'
@@ -1737,7 +1767,7 @@ _BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT = (
     "没有 cover_image_ref 的条目表示没有可用图片,只按文本字段判断,不要猜测缺失图片。\n"
     "10c. score 只衡量内容与用户画像的相关性及内容本身价值，与发布时间和时效性完全解耦。"
     "不得因为内容较新而加分，也不得因为内容较旧或 published_at 缺失而减分；时效语义只写入"
-    "三个 temporal 字段，交给后续确定性排序策略处理。\n"
+    "八个 temporal 字段，交给后续确定性推荐资格、复审与排序策略处理。\n"
     "11. 当 user 消息携带 `<negative_examples>` 时,把这些标题视为用户最近"
     "**明确不喜欢**的样本——理由可能是快速划走 (`quick_exit`) 或显式负反馈"
     " (`explicit_negative`)。\n"
@@ -1759,23 +1789,52 @@ _BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT = (
     "Python 3.8 安装教程是 versioned，新手机发布评测是 current，刚结束赛事的赛果是 breaking，"
     "多年后赛事复盘是 historical。\n"
     "16. temporal_confidence 是对 temporal_class 判断的置信度(0-1)，不是内容质量、相关性或新鲜度。"
+    "当 temporal_class=unknown 时必须输出 temporal_confidence=0 且 temporal_reason=空字符串；其余五类的 "
     "temporal_reason 用一句精炼中文说明核心价值为何会或不会过期。published_at 是来源提供的权威"
     "发布时间，evaluation_context.evaluated_at 是本次评估的权威时间基准；不得根据模型知识截止时间"
     "或标题年份推测发布时间。时间字段缺失或无效时仍可按内容语义分类，但不得猜测具体年龄。\n"
+    "17. temporal_validity_mode 必须五选一:none、explicit_deadline、event_state、version_state、"
+    "freshness_only。只有当前 item 的 title、description、body_text 或 published_label 明确写出截止"
+    "日期、具体时刻和时区，才可用 explicit_deadline，并把规范化的带时区 RFC3339 时刻写入"
+    "temporal_valid_until；不得从发布时间、评估时间、其它 item、常识或模型知识推断截止时间。"
+    "日期-only、缺具体时刻或缺时区时不得使用 explicit_deadline；其它 mode 的 "
+    "temporal_valid_until 必须为空串。\n"
+    "18. temporal_scope 必须三选一:none、core、hook。core 表示核心价值失效，hook 表示只有标题钩子/"
+    "限时入口失效而正文仍有价值。temporal_evidence 必须是当前 item 输入文本中的连续原文，不得改写、"
+    "跨 item 拼接或生成；所有非 none mode 都必须给逐字证据，找不到时只能输出 none。即使核心正文是"
+    "evergreen/historical，若标题里的‘今天/最新/限时’钩子会过期，也可输出 freshness_only + hook 并"
+    "引用该钩子；hook 永远不表示核心正文失效。\n"
+    "例如 evergreen 教程标题中的‘限时免费领取’，或 historical 纪录片标题中的‘今晚首播’，都可"
+    "输出 freshness_only + hook，逐字引用该标题钩子，并把 temporal_state 设为 unknown。\n"
+    "19. temporal_state 必须四选一:unknown、active、expired、superseded。none、freshness_only、"
+    "explicit_deadline 必须为 unknown；event_state 只能为 active/expired；version_state 只能为"
+    "active/superseded。expired/superseded 必须由当前 item 的 temporal_evidence 逐字明示事件已结束或"
+    "版本已替代，不能根据发布时间、年龄、evaluated_at、其它 item、常识或模型知识推断；active 也必须"
+    "有逐字、无条件的当前状态证据。条件、假设、可能性或未来态句子不能证明任何 state，例如"
+    "‘如果支持版本发生变化就重新核验’不能作为 active 证据；应引用‘Temporal V2 仍是当前受支持"
+    "版本’这类直接陈述。temporal_class=unknown 时五个新字段必须依次为 none、空串、none、空串、"
+    "unknown。\n"
     "</rules>\n\n"
     "<output_schema>\n"
     "{\n"
     '  "results": [\n'
     '    {"bvid": "BV1xxx", "score": 0.78, "reason": "...", "topic_group": "认知科学", '
     '"style_key": "deep_focus", "franchise_key": "", "temporal_class": "evergreen", '
-    '"temporal_confidence": 0.91, "temporal_reason": "核心价值不依赖当前时间"},\n'
+    '"temporal_confidence": 0.91, "temporal_reason": "核心价值不依赖当前时间", '
+    '"temporal_validity_mode": "none", "temporal_valid_until": "", '
+    '"temporal_scope": "none", "temporal_evidence": "", "temporal_state": "unknown"},\n'
     '    {"bvid": "BV2xxx", "score": 0.72, "reason": "...", "topic_group": "游戏摄影", '
     '"style_key": "aesthetic_browse", "franchise_key": "原神", '
     '"temporal_class": "versioned", "temporal_confidence": 0.82, '
-    '"temporal_reason": "内容依赖游戏版本"},\n'
+    '"temporal_reason": "内容依赖游戏版本", "temporal_validity_mode": "version_state", '
+    '"temporal_valid_until": "", "temporal_scope": "core", '
+    '"temporal_evidence": "当前游戏版本", "temporal_state": "active"},\n'
     '    {"bvid": "BV3xxx", "score": 0.45, "reason": "", "topic_group": "美食", '
     '"style_key": "social_chat", "franchise_key": "", "temporal_class": "current", '
-    '"temporal_confidence": 0.74, "temporal_reason": "讨论依赖近期语境"}\n'
+    '"temporal_confidence": 0.74, "temporal_reason": "讨论依赖近期语境", '
+    '"temporal_validity_mode": "freshness_only", "temporal_valid_until": "", '
+    '"temporal_scope": "core", "temporal_evidence": "近期讨论", '
+    '"temporal_state": "unknown"}\n'
     "  ]\n"
     "}\n"
     "</output_schema>"
@@ -1789,14 +1848,17 @@ def _build_sparse_batch_evaluation_system_prompt() -> str:
         (
             "3. 每项必须原样带回输入里的 bvid 或 content_id,并包含 score(0-1)、"
             "reason、topic_group(2-4词粗分类)、style_key(13选1)、"
-            "franchise_key(可空)、temporal_class、temporal_confidence、temporal_reason。\n",
+            "franchise_key(可空)、temporal_class、temporal_confidence、temporal_reason、"
+            "temporal_validity_mode、temporal_valid_until、temporal_scope、temporal_evidence、"
+            "temporal_state。\n",
             "3. content_batch 编码一个 canonical batch,可能是含 defaults/items 的 JSON,"
             "也可能是 ROW-WIRE-V1 表；表中的 defaults、columns、row 与同名 canonical "
             "字段完全等价。defaults 是所有 items/rows 共享的默认值,每项同名字段优先。"
             "每项包含请求内局部 id、title、author,以及非空的内容/互动字段。"
             "每项必须原样带回输入里的 id,并包含 score(0-1)、reason、"
             "topic_group(2-4词粗分类)、style_key(13选1)、franchise_key(可空)、"
-            "temporal_class、temporal_confidence、temporal_reason。\n",
+            "temporal_class、temporal_confidence、temporal_reason、temporal_validity_mode、"
+            "temporal_valid_until、temporal_scope、temporal_evidence、temporal_state。\n",
         ),
         (
             "10. When content_batch items include source_platform/source_strategy/content_type, "
@@ -1816,34 +1878,9 @@ def _build_sparse_batch_evaluation_system_prompt() -> str:
             "它的值形如 cover:<id>,对应同一 user 消息中紧随文字锚点"
             " `Cover image cover:<id> ...` 后面的图片。评分时必须结合该头图 / 封面图",
         ),
-        (
-            '    {"bvid": "BV1xxx", "score": 0.78, "reason": "...", '
-            '"topic_group": "认知科学", '
-            '"style_key": "deep_focus", "franchise_key": "", "temporal_class": "evergreen", '
-            '"temporal_confidence": 0.91, "temporal_reason": "核心价值不依赖当前时间"},\n'
-            '    {"bvid": "BV2xxx", "score": 0.72, "reason": "...", '
-            '"topic_group": "游戏摄影", '
-            '"style_key": "aesthetic_browse", "franchise_key": "原神", '
-            '"temporal_class": "versioned", "temporal_confidence": 0.82, '
-            '"temporal_reason": "内容依赖游戏版本"},\n'
-            '    {"bvid": "BV3xxx", "score": 0.45, "reason": "", '
-            '"topic_group": "美食", '
-            '"style_key": "social_chat", "franchise_key": "", "temporal_class": "current", '
-            '"temporal_confidence": 0.74, "temporal_reason": "讨论依赖近期语境"}\n',
-            '    {"id": "0", "score": 0.78, "reason": "...", '
-            '"topic_group": "认知科学", '
-            '"style_key": "deep_focus", "franchise_key": "", "temporal_class": "evergreen", '
-            '"temporal_confidence": 0.91, "temporal_reason": "核心价值不依赖当前时间"},\n'
-            '    {"id": "1", "score": 0.72, "reason": "...", '
-            '"topic_group": "游戏摄影", '
-            '"style_key": "aesthetic_browse", "franchise_key": "原神", '
-            '"temporal_class": "versioned", "temporal_confidence": 0.82, '
-            '"temporal_reason": "内容依赖游戏版本"},\n'
-            '    {"id": "2", "score": 0.45, "reason": "", '
-            '"topic_group": "美食", '
-            '"style_key": "social_chat", "franchise_key": "", "temporal_class": "current", '
-            '"temporal_confidence": 0.74, "temporal_reason": "讨论依赖近期语境"}\n',
-        ),
+        ('{"bvid": "BV1xxx"', '{"id": "0"'),
+        ('{"bvid": "BV2xxx"', '{"id": "1"'),
+        ('{"bvid": "BV3xxx"', '{"id": "2"'),
     )
     prompt = _BATCH_CONTENT_EVALUATION_SYSTEM_PROMPT
     for production_text, sparse_text in replacements:

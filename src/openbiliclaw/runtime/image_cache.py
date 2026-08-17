@@ -75,8 +75,9 @@ _XHS_TOKEN_RE = re.compile(r"(https?://[^/]*xhscdn\.com)/\d{12}/[0-9a-f]+/(.*)")
 
 # content_cache.pool_status values that mean "the user is done with this item":
 # it has been surfaced and acted on, or aged out. ``fresh`` (pending) and
-# ``suppressed`` (temporarily hidden, may revive to fresh) are intentionally
-# excluded — their covers are still needed.
+# ``suppressed`` and ``temporal_review_hold`` (temporarily hidden and able to
+# revive after maintenance/review) are intentionally excluded — their covers
+# are still needed.
 CONSUMED_POOL_STATUSES: frozenset[str] = frozenset(
     {"shown", "feedbacked", "stale", "purged_by_dislike"}
 )

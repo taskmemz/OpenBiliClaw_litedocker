@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import copy
+import datetime as datetime_module
 import inspect
 import ipaddress
 import json
@@ -187,6 +188,10 @@ from openbiliclaw.api.models import (
     ZhihuLoginStateResponse,
     ZhihuSourceConfigOut,
     validate_saved_item_key,
+)
+from openbiliclaw.discovery.temporal import (
+    evaluate_temporal_eligibility,
+    is_complete_temporal_evidence_marker,
 )
 from openbiliclaw.llm.base import safe_llm_failure_message
 from openbiliclaw.runtime import embedding_progress
@@ -458,6 +463,65 @@ _FIRST_PAGE_TOPUP_DEBOUNCE_SECONDS = 30.0
 # is intentionally tiny: it is a load-shedding single-flight window, not a
 # user-visible freshness policy. Mutating recommendation routes invalidate it.
 _RECOMMENDATION_SNAPSHOT_TTL_SECONDS = 1.0
+
+
+def _recommendation_snapshot_rows_and_expiry(
+    rows: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+    monotonic_now: float | None = None,
+) -> tuple[list[dict[str, Any]], float]:
+    """Recheck rows and cap cache life at the earliest temporal transition."""
+
+    # Anchor the cache deadline before reading wall time.  Sampling these in
+    # the opposite order would add any scheduling delay between the two reads
+    # to a near-transition card's cache lifetime and could cross its review or
+    # hard-expiry boundary.
+    effective_monotonic = time.monotonic() if monotonic_now is None else monotonic_now
+    effective_now = now or datetime.now(UTC)
+    if effective_now.tzinfo is None:
+        effective_now = effective_now.replace(tzinfo=UTC)
+    expires_at = effective_monotonic + _RECOMMENDATION_SNAPSHOT_TTL_SECONDS
+    eligible: list[dict[str, Any]] = []
+    for row in rows:
+        decision = evaluate_temporal_eligibility(
+            temporal_class=row.get("temporal_class", "unknown"),
+            temporal_confidence=row.get("temporal_confidence", 0.0),
+            published_at=row.get("published_at", ""),
+            temporal_validity_mode=row.get("temporal_validity_mode", "none"),
+            temporal_valid_until=row.get("temporal_valid_until", ""),
+            temporal_scope=row.get("temporal_scope", "none"),
+            temporal_evidence=row.get("temporal_evidence", ""),
+            temporal_state=row.get("temporal_state", "unknown"),
+            temporal_next_review_at=row.get("temporal_next_review_at", ""),
+            temporal_evaluated_at=row.get("temporal_evaluated_at", ""),
+            temporal_policy_version=row.get("temporal_policy_version", "v1"),
+            evidence_complete=is_complete_temporal_evidence_marker(
+                row.get("temporal_evidence_complete")
+            ),
+            now=effective_now,
+        )
+        if not decision.eligible:
+            continue
+        eligible.append(row)
+        if not decision.trigger_at:
+            continue
+        try:
+            trigger = datetime_module.datetime.fromisoformat(
+                decision.trigger_at.replace("Z", "+00:00")
+            )
+            if trigger.tzinfo is None:
+                continue
+            remaining_seconds = max(
+                0.0,
+                (trigger.astimezone(effective_now.tzinfo) - effective_now).total_seconds(),
+            )
+        except (OverflowError, OSError, ValueError):
+            continue
+        expires_at = min(expires_at, effective_monotonic + remaining_seconds)
+    return eligible, expires_at
+
+
 # Canonical home is openbiliclaw.sources.x_auth (mirrors douyin_auth);
 # re-exported here because callers historically imported from api.app.
 #
@@ -911,6 +975,7 @@ _RESETTABLE_CONFIG_FIELDS = {
     "llm.gemini.api_key": ("llm", "gemini", "api_key"),
     "llm.deepseek.api_key": ("llm", "deepseek", "api_key"),
     "llm.openrouter.api_key": ("llm", "openrouter", "api_key"),
+    "llm.orcarouter.api_key": ("llm", "orcarouter", "api_key"),
     "llm.openai_compatible.api_key": ("llm", "openai_compatible", "api_key"),
     "llm.embedding.api_key": ("llm", "embedding", "api_key"),
 }
@@ -2166,14 +2231,17 @@ def create_app(
     first_page_topup_attempted_at = 0.0
     recommendation_snapshot_cache: RecommendationListResponse | None = None
     recommendation_snapshot_cached_at = 0.0
+    recommendation_snapshot_expires_at = 0.0
     recommendation_snapshot_dislike_digest = ""
     recommendation_snapshot_lock = asyncio.Lock()
 
     def _invalidate_recommendation_snapshot() -> None:
         nonlocal recommendation_snapshot_cache, recommendation_snapshot_cached_at
+        nonlocal recommendation_snapshot_expires_at
         nonlocal recommendation_snapshot_dislike_digest
         recommendation_snapshot_cache = None
         recommendation_snapshot_cached_at = 0.0
+        recommendation_snapshot_expires_at = 0.0
         recommendation_snapshot_dislike_digest = ""
 
     def _effective_recommendation_dislikes() -> tuple[list[str], str]:
@@ -4719,19 +4787,87 @@ def create_app(
         snapshot = await project_stats_service.get_snapshot()
         return ProjectStatsResponse.model_validate(snapshot)
 
+    def _health_llm_registered() -> bool:
+        return not bool(getattr(ctx, "degraded", False))
+
+    def _health_llm_callable() -> bool | None:
+        """Best available signal for whether the default model chain works.
+
+        A full live LLM probe on every /api/health poll would burn tokens, so
+        this reads the persisted Codex OAuth capability probe written by
+        ``openbiliclaw login codex --import`` / ``--probe``. For other
+        providers no cheap live signal exists yet → ``None`` (unknown).
+        """
+        cfg = getattr(ctx, "config", None)
+        if cfg is None:
+            return None
+        llm_cfg = getattr(cfg, "llm", None)
+        if llm_cfg is None:
+            return None
+        codex_auth_mode = False
+        if bool(getattr(llm_cfg, "instance_routing", False)):
+            chain = list(getattr(llm_cfg, "default_chain", []) or [])
+            instances = getattr(llm_cfg, "instances", {}) or {}
+            if chain:
+                instance = instances.get(str(chain[0]).strip().lower())
+                if (
+                    instance is not None
+                    and str(getattr(instance, "provider_type", "") or "").strip().lower()
+                    == "openai"
+                ):
+                    codex_auth_mode = (
+                        str(getattr(instance, "auth_mode", "") or "").strip().lower()
+                        == "codex_oauth"
+                    )
+        else:
+            openai_cfg = getattr(llm_cfg, "openai", None)
+            codex_auth_mode = bool(
+                openai_cfg is not None
+                and str(getattr(openai_cfg, "auth_mode", "") or "").strip().lower() == "codex_oauth"
+            )
+        if not codex_auth_mode:
+            return None
+        try:
+            from openbiliclaw.llm.codex_auth import load_codex_credentials
+
+            credentials = load_codex_credentials()
+        except Exception:
+            return False
+        if credentials is None:
+            return False
+        probe = getattr(credentials, "last_probe", None)
+        if probe is None:
+            return None
+        max_age = 7 * 24 * 3600
+        if time.time() - float(getattr(probe, "checked_at", 0) or 0) > max_age:
+            return None
+        return bool(getattr(probe, "ok", False))
+
     @app.get("/api/health", response_model=HealthResponse, response_model_exclude_none=True)
     async def health() -> HealthResponse | JSONResponse:
         profile_ready = _health_profile_ready()
         lan_ip = _health_lan_ip()
         embedding_ready = await _health_embedding_ready()
-        if bool(getattr(ctx, "degraded", False)):
+        llm_registered = _health_llm_registered()
+        llm_callable = _health_llm_callable() if llm_registered else False
+        if bool(getattr(ctx, "degraded", False)) or llm_callable is False:
             body: dict[str, object] = {
                 "status": "degraded",
                 "service": "openbiliclaw-api",
-                "reason": str(getattr(ctx, "degraded_reason", "")),
-                "issues": _degraded_issues_payload(),
                 "embedding_ready": embedding_ready,
+                "llm_registered": llm_registered,
+                "llm_callable": llm_callable,
             }
+            if bool(getattr(ctx, "degraded", False)):
+                body["reason"] = str(getattr(ctx, "degraded_reason", ""))
+                body["issues"] = _degraded_issues_payload()
+            else:
+                body["reason"] = (
+                    "默认模型链已注册，但最近一次 Codex OAuth 能力探测失败："
+                    "当前 ChatGPT/Codex 令牌无法用于 LLM 调用。请运行 "
+                    "`openbiliclaw login codex --status --probe` 获取详情，"
+                    "或改用 OpenAI Platform API Key。"
+                )
             if profile_ready is not None:
                 body["profile_ready"] = profile_ready
             if lan_ip is not None:
@@ -4743,6 +4879,8 @@ def create_app(
             profile_ready=profile_ready,
             lan_ip=lan_ip,
             embedding_ready=embedding_ready,
+            llm_registered=llm_registered,
+            llm_callable=llm_callable,
         )
 
     @app.get("/api/init-status", response_model=InitStatusOut)
@@ -7379,7 +7517,7 @@ def create_app(
 
     async def _load_recommendations(
         disliked_topics: list[str] | None = None,
-    ) -> RecommendationListResponse:
+    ) -> tuple[RecommendationListResponse, float]:
         nonlocal first_page_topup_attempted_at
 
         def _admission_min_score() -> float:
@@ -7469,6 +7607,7 @@ def create_app(
             from openbiliclaw.recommendation.exclusion import filter_recommendation_rows
 
             rows = filter_recommendation_rows(rows, disliked_topics)
+        rows, snapshot_expires_at = _recommendation_snapshot_rows_and_expiry(rows)
         rows = _cap_by_franchise(rows, max_per_franchise=2)[:20]
         return RecommendationListResponse(
             items=[
@@ -7506,7 +7645,7 @@ def create_app(
                 )
                 for row in rows
             ]
-        )
+        ), snapshot_expires_at
 
     @app.get("/api/recommendations", response_model=RecommendationListResponse)
     async def recommendations() -> RecommendationListResponse:
@@ -7519,6 +7658,7 @@ def create_app(
         mutations immediately visible through explicit invalidation.
         """
         nonlocal recommendation_snapshot_cache, recommendation_snapshot_cached_at
+        nonlocal recommendation_snapshot_expires_at
         nonlocal recommendation_snapshot_dislike_digest
 
         now = time.monotonic()
@@ -7526,6 +7666,7 @@ def create_app(
         if (
             recommendation_snapshot_cache is not None
             and now - recommendation_snapshot_cached_at < _RECOMMENDATION_SNAPSHOT_TTL_SECONDS
+            and now < recommendation_snapshot_expires_at
             and recommendation_snapshot_dislike_digest == dislike_digest
         ):
             return recommendation_snapshot_cache.model_copy(deep=True)
@@ -7536,16 +7677,18 @@ def create_app(
             if (
                 recommendation_snapshot_cache is not None
                 and now - recommendation_snapshot_cached_at < _RECOMMENDATION_SNAPSHOT_TTL_SECONDS
+                and now < recommendation_snapshot_expires_at
                 and recommendation_snapshot_dislike_digest == dislike_digest
             ):
                 return recommendation_snapshot_cache.model_copy(deep=True)
-            snapshot = await _load_recommendations(disliked_topics)
+            snapshot, snapshot_expires_at = await _load_recommendations(disliked_topics)
             latest_topics, latest_digest = _effective_recommendation_dislikes()
             if latest_digest != dislike_digest:
-                snapshot = await _load_recommendations(latest_topics)
+                snapshot, snapshot_expires_at = await _load_recommendations(latest_topics)
                 dislike_digest = latest_digest
             recommendation_snapshot_cache = snapshot.model_copy(deep=True)
             recommendation_snapshot_cached_at = time.monotonic()
+            recommendation_snapshot_expires_at = snapshot_expires_at
             recommendation_snapshot_dislike_digest = dislike_digest
             return snapshot
 
@@ -8686,6 +8829,59 @@ def create_app(
         payload.update(chat_reply_scheduler.status_payload())
         payload.update(image_fetch_coordinator.status_payload())
         return RuntimeStatusResponse(**payload)
+
+    @app.post("/api/agent-bridge")
+    async def agent_bridge(payload: dict[str, Any]) -> dict[str, Any]:
+        """Dispatch one OpenClaw agent-bridge command against a warm adapter.
+
+        Mirrors the ``openbiliclaw.integrations.openclaw.cli`` JSON contract
+        (``{ok, data}`` / ``{ok: false, error, error_type}``) but runs inside
+        the warm serve-api process, so agent hosts avoid the per-call Python
+        import cold start.  The adapter is built lazily on first use and cached
+        on ``app.state``.
+        """
+        command = str(payload.get("command") or "").strip()
+        argv = payload.get("argv")
+        if not command:
+            return {"ok": False, "error": "missing command", "error_type": "validation_error"}
+        if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
+            return {
+                "ok": False,
+                "error": "argv must be an array of strings",
+                "error_type": "validation_error",
+            }
+
+        adapter = getattr(app.state, "agent_bridge_adapter", None)
+        if adapter is None:
+            lock = getattr(app.state, "agent_bridge_adapter_lock", None)
+            if lock is None:
+                lock = asyncio.Lock()
+                app.state.agent_bridge_adapter_lock = lock
+            async with lock:
+                adapter = getattr(app.state, "agent_bridge_adapter", None)
+                if adapter is None:
+                    from openbiliclaw.integrations.openclaw.bootstrap import (
+                        build_openclaw_adapter,
+                    )
+
+                    adapter = await asyncio.to_thread(build_openclaw_adapter)
+                    app.state.agent_bridge_adapter = adapter
+
+        from openbiliclaw.integrations.openclaw.cli import _build_parser, _run_command
+
+        parser = _build_parser()
+        try:
+            args = parser.parse_args([command, *argv])
+        except SystemExit:
+            return {
+                "ok": False,
+                "error": f"invalid command or arguments: {command!r}",
+                "error_type": "validation_error",
+            }
+        try:
+            return await _run_command(args, adapter)
+        except Exception as exc:  # pragma: no cover - defensive adapter boundary
+            return {"ok": False, "error": str(exc), "error_type": "operation_error"}
 
     def _backend_update_status() -> BackendUpdateStatusOut:
         get_update_status = getattr(ctx.auto_update_service, "get_update_status", None)
@@ -15759,6 +15955,12 @@ def create_app(
 
         if _yt_task_queue is None:
             return Response(status_code=204)
+        # Issue #178: recover YouTube tasks whose extension claim outlived the
+        # MV3 service worker timeout. Failing the stale lease here (instead of
+        # handing it back via next_pending's stale-reclaim path) keeps a dead
+        # task from being re-claimed forever and blocking fresh work.
+        with suppress(Exception):
+            _yt_task_queue.expire_stale_in_progress(("bootstrap_profile",))
         task = _yt_task_queue.next_pending(only_ids=_init_owned_ids_filter())
         if task is None:
             return Response(status_code=204)
@@ -16435,6 +16637,7 @@ def create_app(
                 ollama=_provider_out(_legacy_provider_projection("ollama")),
                 openrouter=_provider_out(_legacy_provider_projection("openrouter")),
                 openai_compatible=_provider_out(_legacy_provider_projection("openai_compatible")),
+                orcarouter=_provider_out(_legacy_provider_projection("orcarouter")),
                 embedding=EmbeddingConfigOut(
                     provider=cfg.llm.embedding.provider,
                     model=cfg.llm.embedding.model,
@@ -17316,6 +17519,7 @@ def create_app(
                 "deepseek",
                 "ollama",
                 "openrouter",
+                "orcarouter",
                 "openai_compatible",
             }:
                 return "", None
@@ -17392,6 +17596,7 @@ def create_app(
             "deepseek",
             "ollama",
             "openrouter",
+            "orcarouter",
             "openai_compatible",
         ):
             if provider_name in llm_data and isinstance(llm_data[provider_name], dict):
@@ -17551,7 +17756,7 @@ def create_app(
             ):
                 return []
             return ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
-        if normalized_provider in {"openai_compatible", "openrouter"}:
+        if normalized_provider in {"openai_compatible", "openrouter", "orcarouter"}:
             return ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
         if normalized_provider == "deepseek":
             return ["none", "high", "max"]
@@ -17602,6 +17807,7 @@ def create_app(
             "openai",
             "deepseek",
             "openrouter",
+            "orcarouter",
             "ollama",
             "openai_compatible",
         }:

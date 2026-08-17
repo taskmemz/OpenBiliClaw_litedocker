@@ -147,6 +147,7 @@
           <option value="claude">Claude（Anthropic）</option>
           <option value="gemini">Gemini（Google）</option>
           <option value="openrouter">OpenRouter</option>
+          <option value="orcarouter">OrcaRouter</option>
           <option value="openai_compatible">OpenAI 兼容接口（自建 / 第三方）</option>
         </select>
 
@@ -154,6 +155,15 @@
           <label for="apiKey">API Key</label>
           <input id="apiKey" type="password" placeholder="粘贴你的 API Key" autocomplete="off">
           <div class="hint" id="keyHint"></div>
+        </div>
+
+        <div id="authWrap" style="display:none">
+          <label for="authMode">OpenAI 认证方式</label>
+          <select id="authMode">
+            <option value="api_key">API Key（OpenAI Platform）</option>
+            <option value="codex_oauth">Codex OAuth（实验性 · ChatGPT / Codex 订阅）</option>
+          </select>
+          <div class="hint">Codex OAuth 复用本机 Codex CLI 的 ChatGPT 登录态，走官方 Codex 传输通道，无需 Platform API Key；与 API Key 方式互斥。首次使用请先在终端运行 <code>openbiliclaw login codex --import</code>。</div>
         </div>
 
         <div id="baseWrap" style="display:none">
@@ -268,7 +278,12 @@
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        return await fetch(url, { ...options, signal: controller.signal });
+        return await fetch(url, {
+          ...options,
+          credentials: "same-origin",
+          headers: { ...(options.headers || {}), "X-OBC-Auth": "1" },
+          signal: controller.signal,
+        });
       } catch (error) {
         if (error?.name === "AbortError") throw new Error(`请求等待超过 ${Math.ceil(timeoutMs / 1000)} 秒`);
         throw error;
@@ -282,6 +297,7 @@
       claude: ["https://console.anthropic.com/settings/keys", "Anthropic Console"],
       gemini: ["https://aistudio.google.com/app/apikey", "Google AI Studio"],
       openrouter: ["https://openrouter.ai/keys", "OpenRouter"],
+      orcarouter: ["https://www.orcarouter.ai/keys", "OrcaRouter"],
       openai_compatible: ["", ""],
     };
     const DEFAULT_MODELS = {
@@ -290,12 +306,14 @@
       claude: "claude-sonnet-4-6",
       gemini: "gemini-2.5-flash",
       openrouter: "openai/gpt-5-nano",
+      orcarouter: "openai/gpt-4o",
       openai_compatible: "",
     };
     const MODEL_DISCOVERY_PROVIDERS = new Set([
       "openai",
       "deepseek",
       "openrouter",
+      "orcarouter",
       "ollama",
       "openai_compatible",
     ]);
@@ -399,6 +417,7 @@
         model: $("#model").value.trim(),
         base_url: $("#baseUrl").value.trim(),
         api_flavor: $("#apiFlavor").value,
+        auth_mode: $("#authMode").value,
         reasoning_effort: $("#reasoningEffort").value.trim(),
       };
     }
@@ -415,9 +434,15 @@
         providerDrafts.set(activeProvider, currentProviderFields());
       }
       const cfg = providerDrafts.get(next) || savedProviderConfigs.get(next) || {};
-      $("#model").value = String(cfg.model || DEFAULT_MODELS[next] || "");
+      const nextAuthMode = cfg.auth_mode === "codex_oauth" ? "codex_oauth" : "api_key";
+      const nextDefaultModel =
+        next === "openai" && nextAuthMode === "codex_oauth"
+          ? "gpt-5.4"
+          : DEFAULT_MODELS[next] || "";
+      $("#model").value = String(cfg.model || nextDefaultModel);
       $("#baseUrl").value = String(cfg.base_url || "");
       $("#apiFlavor").value = cfg.api_flavor === "responses" ? "responses" : "";
+      $("#authMode").value = nextAuthMode;
       $("#reasoningEffort").value = String(cfg.reasoning_effort || "");
       activeProvider = next;
       clearMsg("#msg0");
@@ -428,7 +453,12 @@
       const p = $("#provider").value;
       const isCompat = p === "openai_compatible";
       const isClaude = p === "claude";
+      const isOpenAI = p === "openai";
+      const codexMode = isOpenAI && $("#authMode").value === "codex_oauth";
       $("#apiKey").placeholder = savedKeyProviders.has(p) ? "已保存，留空则沿用当前 Key" : "粘贴你的 API Key";
+      // Codex OAuth 复用 ChatGPT 登录态，不填 Platform API Key（issue #170）。
+      $("#keyWrap").style.display = codexMode ? "none" : "block";
+      $("#authWrap").style.display = isOpenAI ? "block" : "none";
       // Claude 也开放 Base URL（可选，第三方 Anthropic 协议网关，见 issue #72）
       $("#baseWrap").style.display = (isCompat || isClaude) ? "block" : "none";
       $("#baseHint").style.display = isClaude ? "block" : "none";
@@ -437,7 +467,10 @@
       const [url, name] = KEY_LINKS[p] || ["", ""];
       $("#keyHint").innerHTML = url ? `还没有 key？去 <a href="${url}" target="_blank" rel="noopener">${name}</a> 免费申请,粘贴回来即可。` : "";
       const modelInput = $("#model");
-      const defaultModel = DEFAULT_MODELS[p] || "";
+      const defaultModel = codexMode ? "gpt-5.4" : DEFAULT_MODELS[p] || "";
+      if (isOpenAI) {
+        $("#authMode").onchange = () => renderProvider();
+      }
       if (!modelInput.value.trim()) {
         modelInput.value = defaultModel;
       }
@@ -471,16 +504,19 @@
     function resetModelDiscovery() {
       renderDatalist("#modelOptions", []);
       const provider = $("#provider").value;
-      const supported = MODEL_DISCOVERY_PROVIDERS.has(provider);
+      const codexMode = provider === "openai" && $("#authMode").value === "codex_oauth";
+      const supported = MODEL_DISCOVERY_PROVIDERS.has(provider) && !codexMode;
       const button = $("#refreshModels");
       button.hidden = !supported;
       button.disabled = false;
       button.textContent = "获取模型";
       setModelDiscoveryStatus(
         "neutral",
-        supported
-          ? "可从 OpenAI 兼容 /models 获取；接口不支持时仍可手填。"
-          : "该 Provider 没有 OpenAI /models 发现契约，模型名请手填。",
+        codexMode
+          ? "Codex OAuth 走 ChatGPT 订阅通道，不提供 /models 发现；模型名请手填（如 gpt-5.4）。"
+          : supported
+            ? "可从 OpenAI 兼容 /models 获取；接口不支持时仍可手填。"
+            : "该 Provider 没有 OpenAI /models 发现契约，模型名请手填。",
       );
     }
 
@@ -585,6 +621,7 @@
         model: $("#model").value.trim(),
         base_url: $("#baseUrl").value.trim(),
         api_flavor: provider === "openai_compatible" ? $("#apiFlavor").value : "",
+        auth_mode: provider === "openai" ? $("#authMode").value : "",
         reasoning_effort: $("#reasoningEffort").value.trim(),
       };
       const routing = buildSetupLlmRouting(instanceId, instance);
@@ -779,12 +816,15 @@
       const apiKey = $("#apiKey").value.trim();
       const baseUrl = $("#baseUrl").value.trim();
       const model = $("#model").value.trim();
-      if (!apiKey && !savedKeyProviders.has(provider)) { showMsg("#msg0", "请先填入 API Key。", "err"); return; }
+      const authMode = provider === "openai" ? $("#authMode").value : "";
+      const codexMode = provider === "openai" && authMode === "codex_oauth";
+      if (!apiKey && !savedKeyProviders.has(provider) && !codexMode) { showMsg("#msg0", "请先填入 API Key。", "err"); return; }
       if (provider === "openai_compatible" && !baseUrl) { showMsg("#msg0", "OpenAI 兼容接口需要填 Base URL。", "err"); return; }
       if (!model) { showMsg("#msg0", "请填写模型名。", "err"); return; }
 
       const pcfg = {};
       if (apiKey) pcfg.api_key = apiKey;
+      if (provider === "openai") pcfg.auth_mode = authMode;
       // 只有展示了 Base URL 输入框的 provider 才提交它,避免切换 provider 时
       // 把上一个 provider 残留的地址写进错误的配置段。
       if (baseUrl && (provider === "openai_compatible" || provider === "claude")) pcfg.base_url = baseUrl;
@@ -817,8 +857,10 @@
       btn.disabled = true; btn.innerHTML = '<span class="spin"></span>保存中…';
       clearMsg("#msg0");
       try {
-        const r = await fetch("/api/config", {
-          method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+        const r = await fetchWithTimeout("/api/config", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
         });
         if (r.status === 401) {
           // Remote browser + auth enabled: /api/config is session-gated (only

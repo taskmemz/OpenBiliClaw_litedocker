@@ -246,6 +246,24 @@ def test_admission_headroom_counts_only_pending_copy_that_can_become_available()
     assert pipeline.admit_limits == [4]
 
 
+def test_stale_evaluated_waiters_trigger_cleanup_without_inventory_headroom() -> None:
+    pipeline = _FakeStagedPipeline(candidate_count=0)
+    coordinator = _coordinator(pipeline, target=10)
+    snapshot = CandidateEvalSnapshot(
+        available=10,
+        target=10,
+        pending_eval=0,
+        evaluating=0,
+        evaluated_pending_admission=0,
+        admitted_pending_copy=0,
+        evaluated_waiting_total=1,
+    )
+
+    coordinator._admit_evaluated(snapshot)  # noqa: SLF001
+
+    assert pipeline.admit_limits == [0]
+
+
 @pytest.mark.asyncio
 async def test_three_workers_refill_fast_slot_without_waiting_for_slow_slots() -> None:
     pipeline = _FakeStagedPipeline(candidate_count=120)

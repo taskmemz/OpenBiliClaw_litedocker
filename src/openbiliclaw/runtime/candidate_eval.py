@@ -39,6 +39,7 @@ class CandidateEvalSnapshot:
     evaluated_pending_admission: int
     admitted_pending_copy: int
     admitted_pending_available: int | None = None
+    evaluated_waiting_total: int | None = None
 
 
 def effective_candidate_eval_workers(configured: int, llm_concurrency: int) -> int:
@@ -274,6 +275,11 @@ class CandidateEvalCoordinator:
                 if value.get("admitted_pending_available") is not None
                 else None
             ),
+            evaluated_waiting_total=(
+                int(value["evaluated_waiting_total"])
+                if value.get("evaluated_waiting_total") is not None
+                else None
+            ),
         )
 
     def _fill_open_slots(self) -> float | None:
@@ -320,7 +326,12 @@ class CandidateEvalCoordinator:
             logger.debug("candidate eval pre-admit hook failed", exc_info=True)
 
     def _admit_evaluated(self, snapshot: CandidateEvalSnapshot) -> None:
-        if snapshot.evaluated_pending_admission <= 0:
+        waiting_total = (
+            snapshot.evaluated_pending_admission
+            if snapshot.evaluated_waiting_total is None
+            else max(0, snapshot.evaluated_waiting_total)
+        )
+        if waiting_total <= 0:
             return
         admit = getattr(self.pipeline, "admit_evaluated", None)
         if not callable(admit):
@@ -329,7 +340,8 @@ class CandidateEvalCoordinator:
             0,
             snapshot.target - snapshot.available - self._eligible_pending_inventory(snapshot),
         )
-        if admission_headroom <= 0:
+        cleanup_needed = waiting_total > max(0, snapshot.evaluated_pending_admission)
+        if admission_headroom <= 0 and not cleanup_needed:
             return
         result = admit(limit=admission_headroom)
         self.last_cached = int(result.get("cached", 0))

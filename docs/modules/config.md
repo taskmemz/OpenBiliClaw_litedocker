@@ -211,7 +211,7 @@ base_url = "https://api.deepseek.com"
 | 键 | 类型 | 默认值 | 说明 |
 |----|------|--------|------|
 | `name` | string | 实例 ID | 设置页显示名称，可重复 |
-| `provider_type` | string | `""` | 适配器类型：`openai` / `claude` / `gemini` / `deepseek` / `ollama` / `openrouter` / `openai_compatible` |
+| `provider_type` | string | `""` | 适配器类型：`openai` / `claude` / `gemini` / `deepseek` / `ollama` / `openrouter` / `orcarouter` / `openai_compatible` |
 | `enabled` | bool | `true` | 是否允许注册和引用；停用实例不能留在任何链里 |
 | `api_key` | string | `""` | 此实例自己的凭据；API 默认只回显掩码 |
 | `model` | string | `""` | 此实例固定使用的聊天模型 |
@@ -241,7 +241,7 @@ base_url = "https://api.deepseek.com"
 > - 本地 vLLM → `base_url = "http://localhost:8000/v1"`，`api_key` 任填或留空
 > - OneAPI 网关 → `base_url = "https://your-oneapi.example.com/v1"`
 
-> `auth_mode = "codex_oauth"` 是实验性 / 非官方路径：OpenAI 官方 API 认证仍以 Platform API key 为稳定入口。启用前先运行 `openbiliclaw login codex`，OpenBiliClaw 会从官方 Codex CLI 登录态导入 token 到 `~/.openbiliclaw/codex_auth.json`。该模式下 `api_key` 会被忽略，并且 `base_url` 只能留空或指向 `https://api.openai.com`，避免把 ChatGPT OAuth token 发给第三方代理。
+> `auth_mode = "codex_oauth"` 是实验性 / 非官方路径：OpenAI 官方 API 认证仍以 Platform API key 为稳定入口。启用前先运行 `openbiliclaw login codex`，OpenBiliClaw 会从官方 Codex CLI 登录态导入 token 到 `~/.openbiliclaw/codex_auth.json`，并立即做一次真实 LLM 能力探测。该模式下 `api_key` 会被忽略，`api_flavor` 不再需要设置（传输层固定为官方 Codex 通道）；请求发往 `https://chatgpt.com/backend-api/codex/responses`——官方 Codex CLI 同款通道，而不是 `api.openai.com/v1`。`base_url` 只能留空或指向官方 Codex 域名，避免把 ChatGPT OAuth token 发给第三方代理。`model` 必须是 Codex 后端模型（如 `gpt-5.4` / `gpt-5.5` / `gpt-5.6-*` / `gpt-5.3-codex-spark`）；Platform API 模型（如 `gpt-5-nano`）会被该通道以 HTTP 400 拒绝。
 
 #### Claude（`provider_type = "claude"`）
 
@@ -298,6 +298,19 @@ base_url = "https://api.deepseek.com"
 
 > `http_referer` 和 `x_title` 都是可选项；留空时不会阻止请求发送。
 
+#### OrcaRouter（`provider_type = "orcarouter"`）
+
+[OrcaRouter](https://www.orcarouter.ai) 是 OpenAI 协议兼容的模型路由网关，一个 Key 即可按需路由 150+ 模型，并在网关层提供默认拒绝的零信任安全。它继承 OpenAI 系 adapter 的超时 / 重试 / 错误归一化 / JSON mode / per-call model 语义。
+
+| 键 | 类型 | 默认值 | 说明 |
+|----|------|--------|------|
+| `api_key` | string | `""` | OrcaRouter API Key |
+| `model` | string | `"openai/gpt-4o"` | OrcaRouter 路由的模型名（`<vendor>/<model>` 或平台别名） |
+| `base_url` | string | `"https://api.orcarouter.ai/v1"` | OrcaRouter API 地址 |
+| `reasoning_effort` | string | `"medium"` | 保留以对齐统一配置面；网关把推理参数原样转发给上游路由，非推理模型会以 HTTP 400 拒绝，因此适配器**不发送** `reasoning_effort` / `reasoning`，推理模型使用自身默认档位 |
+
+> OrcaRouter 没有 embedding 接口；需要向量化时在 `[llm.embedding]` 独立配置 Ollama / Gemini / OpenAI 等。
+
 #### OpenAI-compatible（`provider_type = "openai_compatible"`）
 
 通用 OpenAI 协议兼容适配器，用于接入 Groq / Together / Azure OpenAI / vLLM / 自建等任何兼容端点。每个 `[llm.instances.<id>]` 都是独立身份，可以同时配置任意数量的账号、网关与模型；cost、retry、限流冷却和探测结果不会互相混淆。
@@ -338,6 +351,9 @@ Embedding 服务用于多个语义任务：discovery 内容兴趣预过滤、rec
 | `fallback_enabled` | bool | `false` | 旧兼容开关；允许备选类型借用第一个同类型、已启用聊天实例的凭据 |
 | `fallback_provider` | string | `""` | 第二个 embedding 备选 Provider。留空 = 不 fallback；可填 `openai` / `gemini` / `ollama` / `openai_compatible`，不会再自动走 `ollama → gemini → openai` 链 |
 | `multimodal_enabled` | bool | `false` | 是否启用**封面图单独** embedding（image-only 向量，与文本同一模型空间），供 recommendation `precompute_delight_scores` 的封面视觉加成消费。默认关闭。开启后仍需当前 `model` 支持图像（如 `gemini-embedding-2`，或 `dashscope` + `qwen3-vl-embedding`）；本地 `ollama` + `bge-m3` 等纯文本模型会自动跳过，不报错。与 `[discovery].multimodal_evaluation_enabled`（vision LLM 评估）相互独立。**插件设置页与桌面 Web 设置的 Embedding 段均可直接勾选**（`dashscope` 也已加入 provider 下拉），无需手改 TOML |
+| `cache_max_bytes` | int | `0` | L2 持久化缓存（`data/embedding_cache.db`）磁盘预算，单位字节；`0` = 不设上限（默认）。向量本身已按紧凑 float32 二进制存储（4096 维约 16 KiB/行），此上限进一步约束长跑 discovery/warmup 的磁盘增长：占用超过 `cache_max_bytes × cache_high_watermark` 时开始淘汰（先删失效 namespace / 旧 legacy 行，再按最近访问时间淘汰 active namespace 最旧行），直到降到 `cache_max_bytes × cache_low_watermark`。缓存可重建，淘汰只影响冷数据。建议值 `536870912`（512 MiB） |
+| `cache_high_watermark` | float | `0.9` | 容量淘汰触发水位（占用 / 预算 的比例，0..1），需 `>= cache_low_watermark` |
+| `cache_low_watermark` | float | `0.7` | 容量淘汰停止水位（占用 / 预算 的比例，0..1），需 `<= cache_high_watermark` |
 
 #### DashScope / Qwen 多模态 embedding 示例
 
@@ -619,7 +635,7 @@ Bilibili discovery 的平台级开关。B 站账号登录 / Cookie 获取仍由 
 >
 > 换句话说，日常看到的 B 站补货绝大多数不受本字段影响；要调 B 站主发现的节奏请改 `[scheduler]`。
 >
-> **`trending_refresh_minutes` / `explore_refresh_minutes` 也只在池子不缺货时才生效（2026-07-27 实测）**：`_build_refresh_plan` 先看池子是否低于目标——低于时直接返回 `_build_source_replenishment_plan()` 的结果，而那条路径把 B 站四个策略 `search / related_chain / trending / explore` **整组下发、完全不查这两个间隔**；只有池子**不低于**目标时才会走到下面那段按间隔挑选策略的分支。真机采样：B 站有缺口时 `last_trending_refresh_at` / `last_explore_refresh_at` 每 ~1.1 分钟（即每个 refresh tick）同步推进一次，而不是配置的 3 分钟。也就是说这两个字段管的是「池子够用时的巡航节奏」，不是「缺货时的补货节奏」——后者由缺口大小、`discovery_limit` 和 B 站客户端自身的风控冷却决定。
+> **`trending_refresh_minutes` / `explore_refresh_minutes` 通常只在池子不缺货时才生效（2026-07-27 实测，2026-08-15 补充）**：`_build_refresh_plan` 先看池子是否低于目标——低于时优先返回 `_build_source_replenishment_plan()` 的结果，而那条路径把 B 站四个策略 `search / related_chain / trending / explore` **整组下发、完全不查这两个间隔**。只有池子**不低于**目标时才走到按间隔挑选策略的巡航分支。**例外**：当 B 站已达自身份额、`_build_source_replenishment_plan()` 为空，且 discovery candidate 管线没有 `pending_eval/evaluating` 在途工作时，`_build_refresh_plan` 会回落到按 `trending_refresh_minutes` / `explore_refresh_minutes` 的 B 站周期计划，让健康超份额来源在其它来源不可用或节流时继续补全局库存。真机采样：B 站有缺口时 `last_trending_refresh_at` / `last_explore_refresh_at` 每 ~1.1 分钟（即每个 refresh tick）同步推进一次，而不是配置的 3 分钟。也就是说这两个字段管的是「池子够用时的巡航节奏」，不是「缺货时的补货节奏」——后者由缺口大小、`discovery_limit` 和 B 站客户端自身的风控冷却决定。
 > 另有显式绕过：`openbiliclaw discover-xhs --force` 把间隔置 0，Bangumi / 微博的统一
 > `openbiliclaw discover --source <source> --force` 会把 `force=True` 交给 producer；它们都只跳过
 > cadence，不会绕过平台 cooldown、日预算或 pool gate，常驻流程不会强制执行。
@@ -941,8 +957,10 @@ TOML 与显式环境变量覆盖在构造 `SchedulerConfig` 前统一归一为�
 | `admission_min_score` | float | `0.60` | 普通推荐池统一入池最低分。候选行 / raw payload 显式 `score_threshold` 只能抬高门槛；来源标签如 `admission_policy="observed"` 不能绕过该分数门。探索类策略固定使用 `0.58`，平台 / 插件来源不能获得特权。支持范围为 `[0.5, 1]`，非法值回退默认值；下界与 evaluator 的 reason 省略契约绑定，禁止低于 0.5 的无 reason 候选入池 |
 | `eval_prefilter_mode` | string | `"shadow"` | discovery evaluator 的 embedding 预过滤模式：`"off"` 不计算相似度；`"shadow"` 只记录 `prefilter-shadow` would-filter 日志但仍送 LLM；`"enforce"` 对 top-256 recall-visible 兴趣与 compact 兴趣域均低相似的非 explore 候选缓存低分并跳过 LLM。余弦值先夹到 `0..1`，单批过滤超过 50% 时 fail-open。非法值会被运行时配置校验拦截；OpenClaw、GET/PUT 配置接口与 daemon 热重载均透传该字段。上线时先用 shadow 观察 would-filter 中是否仍有高于 `admission_min_score` 的候选，再切 enforce |
 | `candidate_eval_concurrency` | int | `3` | 候选 LLM 评估的期望 worker 数，合法范围 `1..3`；每个 worker 最多 30 条，因此总 raw 在途上限为 90。超出范围的手工 TOML / API 值按本段既有整型规则回退默认 `3`。有效值为 `min(本值, max(1, llm.concurrency-1))`，为聊天等交互保留一个全局 LLM 槽位；插件与桌面 Web 设置页可修改，CLI `config-show` 自动显示。移动 Web 没有配置面板，不适用。 |
-| `inspiration_search_enabled` | bool | `true` | 是否启用 query inspiration 脑暴阶段。默认与 merged keyword planner 并行组成“混合”模式；`KeywordPlanner` 会通过本机 mcporter 搜索 provider 链获取搜索预览，再让 `discovery.keyword_inspiration` LLM caller 做 Profile Curator / Detail Expander，最终把带 `aspect_id/inspiration_id/expansion_id` 元数据的关键词写入 `discovery_keywords` |
-| `inspiration_search_backends` | list[str] | `["local_cache", "platform_sources", "exa", "you"]` | query inspiration 搜索后端顺序。`local_cache` 会先从本地 `content_cache` 抽取相关标题 / URL / 摘要作为 evidence，本地命中不消耗外部 grounding 预算；证据不足时才 fallback。`platform_sources` 会从用户已启用且当前可同步/可注入 bridge 的平台源里抽样做 inspiration-only grounding（B站 / YouTube / X / Reddit；抖音 direct client；小红书 / 知乎 bridge 可用时），只把标题 / URL / 摘要作为灵感证据，不写候选池；`exa` 调用 `mcporter call exa.web_search_exa`；`you` 调用 `mcporter call you.you-search`（You.com Free MCP profile）。某个后端报错 / 限流 / 返回空结果时会继续尝试后面的后端。远端 MCP server 需要先写入本机 `config/mcporter.json` |
+| `inspiration_search_enabled` | bool | `true` | 是否启用 query inspiration 脑暴阶段。默认与 merged keyword planner 并行组成“混合”模式；`KeywordPlanner` 会通过搜索 provider 链获取搜索预览，再让 `discovery.keyword_inspiration` LLM caller 做 Profile Curator / Detail Expander，最终把带 `aspect_id/inspiration_id/expansion_id` 元数据的关键词写入 `discovery_keywords` |
+| `inspiration_search_backends` | list[str] | `["local_cache", "platform_sources", "bing_rss", "exa", "you"]` | query inspiration 搜索后端顺序。`local_cache` 会先从本地 `content_cache` 抽取相关标题 / URL / 摘要作为 evidence，本地命中不消耗外部 grounding 预算；证据不足时才 fallback。`platform_sources` 会从用户已启用且当前可同步/可注入 bridge 的平台源里抽样做 inspiration-only grounding（B站 / YouTube / X / Reddit；抖音 direct client；小红书 / 知乎 bridge 可用时），只把标题 / URL / 摘要作为灵感证据，不写候选池；`bing_rss` 是无 key 免费全网搜索兜底（`bing.com/search?format=rss`，仅供个人本地 grounding，请遵守 Bing RSS 使用条款）；`exa` 优先用 `exa_api_key` 直连 Exa `POST /search`，未填 API Key 才回退 `mcporter call exa.web_search_exa`；`you` 优先用 `you_api_key` 直连 You.com `GET /search`，未填才回退 `mcporter call you.you-search`。某个后端报错 / 限流 / 返回空结果时会继续尝试后面的后端。mcporter 路径仍需要本机安装 Node CLI 并写入 `config/mcporter.json` |
+| `exa_api_key` | string | `""` | Exa 直连 API Key（可选）。填写后 `ExaInspirationProvider` 直接调用 `https://api.exa.ai/search`（`x-api-key`），不再依赖 mcporter。留空时回退 mcporter（若已安装）；两者都没有则跳过该后端 |
+| `you_api_key` | string | `""` | You.com 直连 API Key（可选）。填写后 `YouInspirationProvider` 直接调用 `https://api.ydc-index.io/search`（`x-api-key`），不再依赖 mcporter。留空时回退 mcporter（若已安装）；两者都没有则跳过该后端 |
 | `inspiration_replace_merged_keywords` | bool | `false` | 实验性替换模式。仅在 `inspiration_search_enabled=true` 且 inspiration provider 可用时生效：due 平台跳过旧 `discovery.keyword_planner` merged call，只通过 search-backed inspiration flow 产词；当 B 站 explore 到期且有补货空间时，也会用同一轮共享 brainstorm / grounding stage 写入 `keyword_kind="explore"` 的探索词池。开 replace 前应先用 `keyword-inspiration-report` 跑 cohort 门禁，避免无质量数据直接替换 |
 | `inspiration_breadth` | str | `"high"` | 探索广度档位（Phase 2 config 收敛，13→4）：`low` / `medium` / `high`。旧的 10 个 `inspiration_*` 细粒度旋钮已删除，其派生成内部常量的有效值由本档位决定（见下表）。**默认 `high`（更宽的素材/轴/关键词产量）**；`medium` 逐项等于旧的 `_DEFAULT_INSPIRATION_*` 默认值，需与收敛前行为逐项对齐时显式设 `medium`。注意 `high` 会把每轮真实 probe 搜索与 LLM 用量放大（daemon 常驻），成本敏感可设 `medium`/`low`。非法档位（非 `low`/`medium`/`high`）→ 配置错误（`ConfigError`），未设置回退 `high` |
 | `eval_prefilter_mode` | string | `"shadow"` | discovery evaluator 的 embedding 预过滤模式：`"off"` 不计算相似度；`"shadow"` 只记录 `prefilter-shadow` would-filter 日志但仍送 LLM；`"enforce"` 将低于相似度阈值的非 explore 候选以低分缓存并跳过 LLM。非法值会被运行时配置校验拦截。上线时先用 shadow 观察 would-filter 中是否仍有高于 `admission_min_score` 的候选，再切 enforce |

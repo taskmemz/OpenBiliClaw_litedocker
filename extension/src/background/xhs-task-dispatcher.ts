@@ -59,6 +59,7 @@ import { apiUrl } from "../shared/backend-endpoint.ts";
 import { authenticatedFetch } from "../shared/auth.ts";
 import { isNativeSaveTask, type NativeSaveResult, type NativeSaveTask } from "../shared/native-save.ts";
 import { ensureNativeSaveTaskRecovery, runNativeSaveTask } from "./native-save-task-runner.ts";
+import { createTaskTab } from "./task-tab.ts";
 
 const DEFAULT_POLL_INTERVAL_MS = 45_000;
 const TASK_TIMEOUT_MS = 30_000;
@@ -502,7 +503,7 @@ export async function executeTask(
 
   try {
     const foreground = shouldOpenTaskForeground(task);
-    const tab = await chrome.tabs.create({
+    const tab = await createTaskTab({
       url,
       active: foreground,
     });

@@ -8,6 +8,7 @@ import { apiUrl } from "../shared/backend-endpoint.ts";
 import { authenticatedFetch } from "../shared/auth.ts";
 import { isNativeSaveTask, type NativeSaveResult, type NativeSaveTask } from "../shared/native-save.ts";
 import { ensureNativeSaveTaskRecovery, runNativeSaveTask } from "./native-save-task-runner.ts";
+import { createTaskTab } from "./task-tab.ts";
 
 const _MUTEX_STALE_MS = 6 * 60 * 1000;
 function tryAcquireDispatcherMutex(label: string): boolean {
@@ -294,7 +295,7 @@ export async function executeTask(
 
   let tab: chrome.tabs.Tab;
   try {
-    tab = await chrome.tabs.create({ url: ZHIHU_TASK_TAB_URL, active: shouldOpenZhihuTaskActive(task) });
+    tab = await createTaskTab({ url: ZHIHU_TASK_TAB_URL, active: shouldOpenZhihuTaskActive(task) });
   } catch {
     await postTaskResult({
       task_id: task.id,

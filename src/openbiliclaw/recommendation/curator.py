@@ -16,6 +16,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from openbiliclaw.discovery.temporal import (
+    TEMPORAL_CLASSES,
+    temporal_bonus_component,
+    trusted_publication_datetime,
+)
+
 if TYPE_CHECKING:
     from openbiliclaw.discovery.engine import DiscoveredContent
     from openbiliclaw.llm.embedding import SupportsEmbeddingService
@@ -171,25 +177,9 @@ class TemporalRankingShadowAudit:
 # Constants
 # ---------------------------------------------------------------------------
 
-# Conservative thresholds calibrated from the 2026-08 historical candidate-
-# and discovery-pool replay: only confident temporal judgements earn a bonus,
-# and medium-confidence judgements receive half strength.
-_TEMPORAL_CONFIDENCE_FULL: float = 0.80
-_TEMPORAL_CONFIDENCE_HALF: float = 0.60
-_TEMPORAL_CLASS_POLICIES: dict[str, tuple[float, float]] = {
-    # class: (half-life days, maximum unweighted class bonus)
-    "breaking": (1.0, 0.85),
-    "current": (14.0, 0.60),
-    "versioned": (120.0, 0.30),
-}
-# Source clocks occasionally differ by a few minutes.  Small negative ages are
-# clamped to zero, while a clearly future publication is treated as unknown.
-_PUBLICATION_CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
 _TEMPORAL_RANKING_SHADOW_POLICY_VERSION = "temporal-ranking-shadow-v1"
 _TEMPORAL_RANKING_SHADOW_TOP_K = (10, 50, 100)
-_TEMPORAL_AUDIT_CLASSES = frozenset(
-    {"breaking", "current", "versioned", "evergreen", "historical", "unknown"}
-)
+_TEMPORAL_AUDIT_CLASSES = TEMPORAL_CLASSES
 _FEEDBACK_DISLIKE_UP_PENALTY: float = 0.20
 _FEEDBACK_DISLIKE_TOPIC_PENALTY: float = 0.10
 # Softer than topic penalty — franchise propagation is a heuristic
@@ -564,54 +554,18 @@ class PoolCurator:
         ``last_scored_at`` are cache lifecycle clocks and must never stand in
         for the content's publication time.
         """
-        temporal_class = str(getattr(item, "temporal_class", "") or "").strip().lower()
-        policy = _TEMPORAL_CLASS_POLICIES.get(temporal_class)
-        if policy is None:
-            return 0.0
-
-        raw_confidence = getattr(item, "temporal_confidence", 0.0)
-        if isinstance(raw_confidence, bool):
-            return 0.0
-        try:
-            confidence = float(raw_confidence)
-        except (TypeError, ValueError):
-            return 0.0
-        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
-            return 0.0
-        if confidence >= _TEMPORAL_CONFIDENCE_FULL:
-            confidence_weight = 1.0
-        elif confidence >= _TEMPORAL_CONFIDENCE_HALF:
-            confidence_weight = 0.5
-        else:
-            return 0.0
-
-        published = PoolCurator._publication_datetime(item, now)
-        if published is None:
-            return 0.0
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=UTC)
-        age_days = max(0.0, (now - published).total_seconds() / 86400.0)
-        half_life_days, class_weight = policy
-        freshness = 2.0 ** (-age_days / half_life_days)
-        return float(class_weight * confidence_weight * freshness)
+        return temporal_bonus_component(
+            temporal_class=getattr(item, "temporal_class", "unknown"),
+            temporal_confidence=getattr(item, "temporal_confidence", 0.0),
+            published_at=getattr(item, "published_at", ""),
+            now=now,
+        )
 
     @staticmethod
     def _publication_datetime(item: DiscoveredContent, now: datetime) -> datetime | None:
         """Return a trustworthy publication clock, or ``None`` when unknown."""
 
-        published_at = getattr(item, "published_at", "")
-        if not isinstance(published_at, str) or not published_at.strip():
-            return None
-        try:
-            published = datetime.fromisoformat(published_at.strip().replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        if published.tzinfo is None:
-            return None
-        effective_now = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
-        if published - effective_now > _PUBLICATION_CLOCK_SKEW_TOLERANCE:
-            return None
-        return published
+        return trusted_publication_datetime(getattr(item, "published_at", ""), now=now)
 
     @staticmethod
     def _temporal_class_for_audit(item: DiscoveredContent) -> str:

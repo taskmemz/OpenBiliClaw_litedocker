@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 from openbiliclaw import __version__
-from openbiliclaw.api.app import create_app
+from openbiliclaw.api.app import _recommendation_snapshot_rows_and_expiry, create_app
 from openbiliclaw.llm.service import LLMResponseContentError
 
 
@@ -558,6 +558,18 @@ def test_api_candidate_snapshot_uses_exact_durable_readiness_and_available_gate(
         "count_discovery_candidates_by_status",
         lambda: {"pending_eval": 500, "evaluating": 60, "evaluated": 3},
     )
+    real_readiness = ctx.runtime_controller._pool_readiness_counts  # noqa: SLF001
+
+    def readiness_with_evaluated() -> dict[str, int]:
+        counts = dict(real_readiness())
+        counts["evaluated_pending"] = 3
+        return counts
+
+    monkeypatch.setattr(
+        ctx.runtime_controller,
+        "_pool_readiness_counts",
+        readiness_with_evaluated,
+    )
 
     snapshot = ctx.runtime_controller.candidate_eval_coordinator._snapshot()
 
@@ -565,6 +577,7 @@ def test_api_candidate_snapshot_uses_exact_durable_readiness_and_available_gate(
     assert snapshot.pending_eval == 500
     assert snapshot.evaluating == 60
     assert snapshot.evaluated_pending_admission == 3
+    assert snapshot.evaluated_waiting_total == 3
     assert snapshot.admitted_pending_copy == 4
     assert snapshot.admitted_pending_available == 3
     assert ctx.recommendation_engine.pool_available_target_count == 10
@@ -5829,6 +5842,72 @@ class TestBackendAPI:
         assert client.get("/api/recommendations").status_code == 200
 
         assert database.reads == 1
+
+    def test_recommendation_snapshot_cache_expires_at_temporal_boundary(self) -> None:
+        now = datetime(2026, 8, 12, 12, 0, 0, tzinfo=UTC)
+        rows = [
+            {
+                "bvid": "BV-NEAR-EXPIRY",
+                "published_at": (now - timedelta(days=3) + timedelta(milliseconds=200)).isoformat(),
+                "temporal_class": "breaking",
+                "temporal_confidence": 0.95,
+            }
+        ]
+
+        eligible, expires_at = _recommendation_snapshot_rows_and_expiry(
+            rows,
+            now=now,
+            monotonic_now=100.0,
+        )
+        stale, _ = _recommendation_snapshot_rows_and_expiry(
+            rows,
+            now=now + timedelta(milliseconds=200),
+            monotonic_now=100.2,
+        )
+
+        assert eligible == rows
+        assert expires_at == pytest.approx(100.2)
+        assert stale == []
+
+    def test_recommendation_snapshot_anchors_monotonic_before_wall_clock(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Clock-read latency must shorten, never extend, the final TTL window."""
+        import openbiliclaw.api.app as app_module
+
+        wall_now = datetime(2026, 8, 12, 12, 0, 0, tzinfo=UTC)
+        calls: list[str] = []
+
+        def _monotonic() -> float:
+            calls.append("monotonic")
+            return 100.0
+
+        class _WallClock:
+            @classmethod
+            def now(cls, tz: object) -> datetime:
+                assert calls == ["monotonic"]
+                calls.append("wall")
+                return wall_now
+
+        monkeypatch.setattr(app_module.time, "monotonic", _monotonic)
+        monkeypatch.setattr(app_module, "datetime", _WallClock)
+
+        rows = [
+            {
+                "bvid": "BV-CLOCK-ORDER",
+                "published_at": (
+                    wall_now - timedelta(days=3) + timedelta(milliseconds=200)
+                ).isoformat(),
+                "temporal_class": "breaking",
+                "temporal_confidence": 0.95,
+            }
+        ]
+        eligible, expires_at = _recommendation_snapshot_rows_and_expiry(rows)
+
+        assert calls == ["monotonic", "wall"]
+        assert eligible == rows
+        assert expires_at == pytest.approx(100.2)
 
     def test_recommendations_cache_rechecks_latest_dislikes_immediately(self) -> None:
         """A preference write must invalidate visibility even inside the 1s TTL."""

@@ -9,7 +9,7 @@
 - 行为、推荐、候选池、聊天和鉴权状态的 SQLite 表结构管理。
 - 推荐池 `content_cache` 的可换 / raw / pending 计数口径。
 - discovery 待评估池 `discovery_candidates` 的生命周期管理。
-- evaluator prefilter 与推荐时效排序的 privacy-safe shadow 审计。
+- evaluator prefilter、推荐时效排序的 privacy-safe shadow 审计，以及正式推荐池的时效 eligibility 持久化守卫。
 - 跨平台收藏 / 稍后再看的 canonical 本地 membership、元数据快照、native sync 状态和独立任务快照持久化。
 - 事件入口幂等回执，以及小红书 / 抖音 / YouTube / 知乎 / Reddit / Linux.do 来源任务首个终态结果的 crash-safe staging。
 - 事件入口幂等回执，以及小红书 / 抖音 / YouTube / 知乎 / Reddit 来源任务首个终态结果的 crash-safe staging。
@@ -26,6 +26,14 @@
 | 磁盘 `config.toml` + `config.local.toml` 合并、移除整段 `[api.auth]` 后生成的单份 `config/config.toml`；主数据库和数据目录中的其它可迁移 SQLite；Soul / memory / runtime 用户状态文件；`*_cookie.json` 等平台登录凭据；`data/image-cache/`；白名单桌面偏好 | 来源配置的分层 provenance 与整段 `[api.auth]`（含密码 / hash、session secret、proxy / Origin 策略与设备 key）；`logs/`；`data/backups/`、`data/cache/`、`data/eval/`、`data/embedding_cache.db`；`data/certs/`、`data/autostart/`；WAL / SHM / lock / temp；OpenBiliClaw Web / 扩展访问会话；外部 CLI 凭据；环境变量**值** |
 
 图片缓存是刻意包含的用户状态：部分平台的签名图片 URL 会过期，迁移后无法可靠重新下载。导出配置仍来自磁盘 `config.toml` + `config.local.toml`，但数据快照路径固定为当前进程已取得 canonical lock 的 active data dir；在线保存但尚未重启启用的新 `data_dir` 不会成为本次数据来源。manifest 的 `source_omitted_environment_variables` 只记录源机导出时有值、会影响运行结果的环境变量**名称**（`OPENBILICLAW_*`、Gemini 标准 Key、系统代理 / CA），不记录 value；暂存时另采集目标进程当时有值的名称为 `target_active_environment_variables`。前者提示目标机重新提供来源依赖，后者是目标环境可能覆盖导入文件的暂存时快照；实际应用仍以重启时环境为准，两者都不表示值已迁移。前端文件只允许 `theme_mode`、`theme_hue`、`accent_style`、`auto_load_on_scroll`、`side_drawer_open`；后端 endpoint、Bearer / session、通知与缓存状态不进入包。
+
+### L2 embedding 缓存（`data/embedding_cache.db`）
+
+该文件是**可重建派生缓存**，刻意排除在 `.obcbackup` 导出之外（issue #153 整改后）：
+
+- **存储格式**：向量以版本化 little-endian float32 BLOB 存储（`OBLV` 头 + dtype/dimension），4096 维约 16 KiB/行；旧 JSON 行（`encoding=0`）与降级回写的 mixed-format 行仍可透明读取，读取按内容自适应解码，单行损坏降级为 miss。
+- **Schema**：`embedding_cache` 表含 `encoding` / `dimension` / `created_at` / `last_accessed_at` 元数据列，`embedding_cache_meta` 记录 `schema_version` / 最近维护报告。旧 schema 打开时自动升级并保留行。
+- **生命周期**：`EmbeddingService` 构造时注册 active provenance namespace 并做一次/进程/库的运行时准备（JSON→BLOB 迁移 + 容量维护）；配置 `[llm.embedding].cache_max_bytes` 后按高低水位淘汰（非 active namespace → active 最旧行）。物理回收（WAL checkpoint + `VACUUM INTO` + 原子替换）由 CLI `embedding-cache-clean` 显式执行，daemon 不自动替换文件。
 
 ### 校验与暂存
 
@@ -88,13 +96,15 @@
 | 推荐历史避雷证据字段 | ✅ | `get_recommendations()` 在既有 DTO 字段外返回 `description/tags/topic_key/topic_group/pool_topic_label`，供 API 与 OpenClaw 在历史行离开 storage 后按最新 effective dislikes 做与 serve 一致的最终过滤；`exclude_processed=true` 继续同步排除已反馈单卡。 |
 | 来源 raw material 统计 | ✅ | `count_pool_raw_material_by_source()` 合并 `content_cache` raw rows 和 `discovery_candidates` 待评估候选，供 raw ceiling headroom 使用。 |
 | 有界库存维护与历史恢复 | ✅ | `maintain_pool_inventory(max_mutations=50)` 在独立短连接 `BEGIN IMMEDIATE` 中先恢复仍合格且能净增 canonical available 的历史 `suppressed` 结果，再统一 stale / explore / topic / source / raw 维护；恢复数受当批 `raw_ceiling - raw_before` headroom 约束，raw 已满或超限时先裁剪、绝不继续恢复。单事务最多修改 50 行，只有确有 deferred victim，或裁剪释放 headroom 后仍可继续恢复时才返回 `has_more=True`；protected/token-owned excess 无可裁剪 victim 时以稳定 WARNING 结束，不再形成恢复/裁剪振荡。已满 topic 不参与恢复，排名窗口试探失败会在同一事务还原。维护连接只等写锁 75ms，交互写入优先；每批仍保护 canonical available 底线并在不变量失败时整体回滚。 |
-| 换批读写隔离 | ✅ | `PoolServeSnapshot` 在专属单线程 serve worker 的一次只读事务中统一读取 readiness、候选、平台补位、持久化已看账本和 curator 信号；同一快照只物化一次 `seen_items`，并按账本最新 event id 缓存结果，写入新浏览事件后自动失效。`persist_pool_serve_async()` 用另一条短事务原子写入 recommendation + shown。serve 与 maintenance 使用不同 executor、不同 SQLite 连接，不把共享 `Database.conn` 直接跨线程并发访问。 |
+| 换批读写隔离与时效复核 | ✅ | `PoolServeSnapshot` 在专属单线程 serve worker 上先用只读 preflight 计算 temporal v2 三态；命中 `review_due` / `expired` 时才在短写事务中分别持久化为 `temporal_review_hold` / `stale`，再用一次只读事务统一读取 readiness、候选、平台补位、持久化已看账本和 curator 信号。同一快照只物化一次 `seen_items`，并按账本最新 event id 缓存结果，写入新浏览事件后自动失效。`persist_pool_serve_async()` 用另一条短事务重读最终选中行和完整证据组，只有仍为 `fresh` 且 disposition 为 `eligible` 的条目才原子写入 recommendation + shown，并返回实际 committed/stale/skipped BVID。serve 与 maintenance 使用不同 executor、不同 SQLite 连接，不把共享 `Database.conn` 直接跨线程并发访问。 |
 | 十一平台来源族归一化 | ✅ | `sources.platforms` 以可枚举规则统一 Bilibili、小红书、抖音、YouTube、X、知乎、Reddit、Bangumi、Linux.do、V2EX、微博的别名、策略前缀和 URL host；pool accounting、已看身份与 URL 推断共用同一口径。 |
 | 八平台来源族归一化 | ✅ | `sources.platforms` 以可枚举规则统一 Bilibili、小红书、抖音、YouTube、X、知乎、Reddit、Bangumi 的别名、策略前缀和 URL host；pool accounting、已看身份与 URL 推断共用同一口径。 |
 | 来源定向历史缓存读取 | ✅ | `get_unrecommended_content(limit, source_platforms=...)` 在 SQL 平衡与 `LIMIT` 之前按平台过滤，供 source-scoped discovery backfill 使用；空 `source_platform` 的 legacy 行只按 B 站处理，不能跨源补进 B 站 / YouTube / 抖音定向运行。 |
 | discovery 待评估池 | ✅ | `discovery_candidates` 支持 mixed-source enqueue / claim / evaluation / admission，并持久化 `claim_token`、`score_threshold`、`eval_attempts` 与 batch 级 `batch_eval_attempts`；stale-sensitive 完成和释放都匹配 `id + status + claim_token`。 |
 | evaluator prefilter shadow 审计 | ✅ | `evaluator_prefilter_shadow_audit` 用随机 decision id 连接预过滤决策与最终原始 LLM score / admission 结果；只保存 identity hash、类别、数值和 digest，不保存标题、URL、正文、prompt、画像文本或 provider response。每次 insert 同时执行 30 天和 20,000 行双重 retention；任何写入/回填失败由 discovery fail-open，并以 incomplete telemetry 阻断 enforce gate。 |
 | 推荐时效排序 shadow 审计 | ✅ | `temporal_ranking_shadow_audit` 只保存一次候选窗口的总数、时间覆盖、bonus 资格数，以及 class/source/age bucket 和 Top10/50/100 before/after 聚合；不保存任何候选 identity 或内容文本。每次写入执行 30 天 / 5,000 行双重 retention，失败不影响推荐。 |
+| 推荐池 temporal v2 三态 | ✅ | discovery admission、canonical pool 读取、等待扫描、snapshot 清退与最终 serve 写事务共用 `discovery.temporal` 的 `eligible/review_due/expired` 纯策略。只有置信度 `>=0.80`、完整、`scope=core`、逐字 grounded 的明确 deadline 已过或 `state=expired/superseded` 才 hard expire；1 / 14 / 120 天及旧 v1 3 / 60 天只触发复审。`review_due` discovery 行回到 `pending_eval`，已入池行进入 `pool_status='temporal_review_hold'`；`expired` 行才进入 `rejected_temporal_stale` / `stale`。单次生命周期清扫最多持久化 500 条，但所有 canonical 读取和计数先排除整批 review-due / expired 行。 |
+| 时效展示与 backfill 防绕过 | ✅ | `get_recommendations(exclude_processed=True)`、未读计数与主动通知在最终 limit 前过滤后来进入 `review_due/expired` 的历史推荐，默认历史读取保持完整；`get_unrecommended_content()` 只返回 fresh/non-dislike/temporal-eligible 行。cached-backfill 完整往返证据组，普通 raw 重抓、旧缓存、`unknown/0` 或 malformed 结果不能局部洗字段，也不能把 hold/stale 行复活。readiness、pending-copy、topic/franchise/source 统计与 delight count/backlog 同样排除 `temporal_review_hold` / temporal stale，不让不可展示库存继续占配额或计算预算。 |
 | discovery 历史候选查询 | ✅ | `get_existing_discovery_candidate_keys()` 与 `get_existing_content_cache_ids()` 支持 pipeline 在 enqueue 前过滤历史候选和已缓存内容，避免重复 raw 占住 Evo 前供给窗口。 |
 | discovery 状态恢复 | ✅ | 启动初始化会释放过期 `evaluating` 行；terminal 状态有 status guard，避免 stale update 改写 cached / rejected 结果。 |
 | discovery keyword store | ✅ | `discovery_keywords` 用 `keyword_kind` 区分常规 search 词与 explore 词；默认 `regular`，`explore` 词只供 `ExploreStrategy` 专用 claim，不会被普通 B 站 search 消费。`history_keywords()` 把带 `used_at` 的零产出/全重复 `expired` 词保留在近期冷却内，`recycle_oldest_used(min_age_hours=...)` 只回收超过窗口的历史词；`retire_duplicate_only_keywords()` 接收候选预过滤的真实重复反馈并立即退役无新身份的词。`requeue_keyword_after_transient_failure()` 仍可把 claimed / executing 词无损退回 pending、清理执行时间且不增加 attempts，供平台风控等瞬时故障重试。 |
@@ -400,6 +410,18 @@ updated_ids = db.persist_claimed_discovery_candidate_evaluations(
             "status": "evaluated",
             "relevance_score": 0.82,
             "relevance_reason": "匹配用户最近的深度解释偏好。",
+            "temporal_class": "evergreen",
+            "temporal_confidence": 0.93,
+            "temporal_reason": "作品解析的核心价值不依赖当前事件。",
+            "temporal_validity_mode": "none",
+            "temporal_valid_until": "",
+            "temporal_scope": "none",
+            "temporal_evidence": "",
+            "temporal_state": "unknown",
+            "temporal_evaluated_at": "2026-08-13T00:00:00Z",  # code-owned
+            "temporal_next_review_at": "",  # code-owned
+            "temporal_policy_version": "v2",  # code-owned
+            "temporal_evidence_complete": True,  # code-owned validation
         }
     ],
     claim_token="batch-a",
@@ -407,6 +429,9 @@ updated_ids = db.persist_claimed_discovery_candidate_evaluations(
 ready = db.get_evaluated_discovery_candidates_for_admission(limit=30)
 if ready:
     db.mark_discovery_candidate_cached(ready[0]["id"])
+
+# `review_due` 分支使用同一队列复审，不计作 evaluator failure：
+# db.requeue_discovery_candidate_for_temporal_review(rows[0]["id"], reason)
 
 db.reset_claimed_discovery_candidates_to_pending(
     [rows[0]["id"]], claim_token="batch-a", reason="temporary LLM outage"
@@ -422,21 +447,23 @@ cached_bilibili = db.get_unrecommended_content(
 
 行为说明：
 
-- `enqueue_discovery_candidates()` 用 `candidate_key` 去重；重复发现刷新 `last_seen_at` 与来源目录指标，不生成第二行。传入 `max_pending_per_source` 时，cap 只统计 active `pending_eval/evaluating/evaluated`；超额且未领取的 active 行进入 `trimmed_capacity`，保留 `source_raw_ceiling:<family>` 审计原因，terminal history 不占 cap，`evaluating` / 非空 token 永不成为 victim。
+- `enqueue_discovery_candidates()` 用 `candidate_key` 去重；重复发现刷新 `last_seen_at` 与来源目录指标，不生成第二行。传入 `max_pending_per_source` 时，cap 统计 active `pending_eval/evaluating` 与 disposition 仍为 `eligible` 的 `evaluated`；生命周期扫描会把 `review_due` 重新排到 `pending_eval`，只有 `expired` 才终态化为 `rejected_temporal_stale`。超额且未领取的 active 行进入 `trimmed_capacity`，保留 `source_raw_ceiling:<family>` 审计原因，terminal history 不占 cap，`evaluating` / 非空 token 永不成为 victim。
 - `rating_score / rating_count / source_rank` 是 additive 目录指标列，同时存在于 `discovery_candidates` 与 `content_cache`；旧数据库启动时自动补列。重复候选会刷新这些上游目录值，claim → evaluation → admission → cache round-trip 不丢失；评分不会写进 like/comment 字段。
-- `temporal_class / temporal_confidence / temporal_reason / temporal_policy_version` 同时存在于 `discovery_candidates` 与 `content_cache`，保存 Evaluation Agent 的时效语义而不是动态 freshness 分数。旧库 additive 补列为 `unknown / 0 / '' / v1`；非法类别、非有限或越界置信度 fail-closed 为 `unknown / 0`，动态 bonus 始终在推荐时按当前时间计算。`cache_content()` 只有在调用方显式携带完整 temporal 三元组时才覆盖已有分类，原始来源的重复摄入不会把已评估结果清回 `unknown`。
+- temporal v2 在 `discovery_candidates` 与 `content_cache` 同时保存 Agent 原子字段 `temporal_class / temporal_confidence / temporal_reason / temporal_validity_mode / temporal_valid_until / temporal_scope / temporal_evidence / temporal_state`，以及代码拥有的 `temporal_evaluated_at / temporal_next_review_at / temporal_policy_version / temporal_evidence_complete`。两表另有本地调度字段 `temporal_review_attempts / temporal_review_retry_at`，不属于 Agent 证据：候选复审和正式池复审都按 1 / 2 / 4 / 8 / 16 / 24 小时有界退避；未到 `retry_at` 的 candidate 不可 claim，也不计 raw、projected 或来源容量。若模型执行时间超过 claim 时租约，失败 / 中性结果与 orphan/release 出口会从落库时重新续到未来，不能立刻热循环。旧库 additive 补为中性 v1 缺省；v2 parser 会整组校验 class/mode/scope/state 组合、UTC 时钟与逐字 evidence，非法类别、非有限置信度、字段缺失或未 grounding 全部 fail-neutral；`freshness_only` 的 evidence 同样必须逐字存在，否则整组降为中性且不生成复审时钟。`cache_content()` 只允许权威复审证据原子覆盖已有强分类：必须完整、非中性、置信度 `>=0.80`，且为 grounded `scope=core`，或高置信 `evergreen/historical + mode=none` 的耐久结论；显式 `unknown`、低置信、hook-only、malformed、未 grounding、旧缓存或 raw 重抓都不能洗掉强证据，也不能从不同轮结果拼接字段。已带强证据的同 identity 发布时间采用保守的不前移合并，`discovery_candidates` 一旦被 claim 也冻结本轮 publication snapshot。候选评估持久化后，pipeline 重读 durable row，只有最终状态仍为 `evaluated` 才可 admission；旧 `suppressed` 或 `temporal_review_hold` 行只有在写锁内收到上述权威复审证据且 disposition 为 `eligible` 时才能恢复为 `fresh`；成功收敛后复审 attempts/lease 一并清零。
+- `get_pool_candidates_needing_evaluation(limit=..., now=...)` 把 legacy 缺分类行和到期的 `temporal_review_hold` 合并进同一补分类窗口。选中 hold 时在同一个 `BEGIN IMMEDIATE` 中领取下一次复审租约：间隔按 1 / 2 / 4 / 8 / 16 / 24 小时有界退避，并优先 attempts 少、到期早的行，避免 provider 连续失败让同一条 hold 每分钟重试并饿死后续行；raw 重抓不清 lease，只有完整非中性复审结果才能清零。
 - `claim_discovery_candidates_for_eval(limit=..., claim_token=...)` 原子领取 `pending_eval`，按来源 round-robin 混合取样，并把同一 token 写到整批；不传 token 时自动生成，兼容单次 CLI drain。
 - `persist_claimed_discovery_candidate_evaluations(..., claim_token=...)` 返回实际更新的 ID 集合，只接受仍为 `evaluating` 且 token 匹配的行；完成后清空 token / claimed_at。`reset_claimed_discovery_candidates_to_pending()` 使用相同所有权条件，因此旧 worker 不能覆盖或释放重新领取的行。
-- `get_evaluated_discovery_candidates_for_admission(limit=..., preferred_source_platforms=None)` 读取已完成评估但尚未写入 `content_cache` 的行，供池子从满池降回目标以下后重试 admission。v0.3.181+（份额公平 spec 2026-07-20）：传入 `preferred_source_platforms` 时用 `CASE WHEN source_platform IN (…) THEN 0 ELSE 1 END` 把欠份额来源排到 FIFO 前面，防止超份额积压霸占取行窗口；缺省不传时排序与旧 `evaluated_at ASC` 逐字节一致。
-- `count_evaluated_discovery_candidates_by_source()`（v0.3.181+）按 family 统计 `status='evaluated'` 的待入池供给。
-- `count_admission_waiting_discovery_candidates_by_source()`（v0.3.181+，Phase 8）按 family 统计 `status IN ('pending_eval','evaluating','evaluated')` 的全部非终态待入池供给。份额再平衡的「欠份额来源是否有供给等待」判定用它而非仅 `evaluated`——占坑者钉满池时欠份额来源根本到不了 `evaluated`,只认 `evaluated` 会让退坑永不触发。
+- `requeue_discovery_candidate_for_temporal_review(candidate_id, reason="")` 以 CAS 方式把仍为 `evaluating/evaluated` 的单行恢复为 `pending_eval` 并清理 claim；三态 admission 与等待扫描在 `review_due` 时复用它，保留完整 temporal 证据作为复审审计输入，不把复审当失败 attempt。
+- `get_evaluated_discovery_candidates_for_admission(limit=..., preferred_source_platforms=None)` 读取已完成评估但尚未写入 `content_cache` 且 disposition 为 `eligible` 的行，供池子从满池降回目标以下后重试 admission；pipeline 每轮读取前会把 `review_due` 等待行重排到 `pending_eval`、把 `expired` 行终态化。v0.3.181+（份额公平 spec 2026-07-20）：传入 `preferred_source_platforms` 时用 `CASE WHEN source_platform IN (…) THEN 0 ELSE 1 END` 把欠份额来源排到 FIFO 前面，防止超份额积压霸占取行窗口；缺省不传时排序与旧 `evaluated_at ASC` 逐字节一致。
+- `count_evaluated_discovery_candidates_by_source()`（v0.3.181+）按 family 统计 disposition 为 `eligible` 的 `status='evaluated'` 待入池供给。
+- `count_admission_waiting_discovery_candidates_by_source()`（v0.3.181+，Phase 8）按 family 统计全部 `pending_eval/evaluating` 与 temporal-eligible 的 `evaluated`。份额再平衡的「欠份额来源是否有供给等待」判定用它而非仅 `evaluated`——占坑者钉满池时欠份额来源根本到不了 `evaluated`，只认 `evaluated` 会让退坑永不触发；`review_due` waiter 会由独立扫描重排后再作为 pending 供给，`expired` waiter 不参与 projected 或份额供给并被终态化。
 - `claim_discovery_candidates_for_eval(limit=..., claim_token=..., preferred_source_platforms=None)`（`preferred_source_platforms` 为 v0.3.181+ Phase 8 新增）：窥探窗口 ORDER BY 前置 `CASE WHEN source_platform IN (…) THEN 0 ELSE 1 END` 把欠份额来源拉进窗口,选择改两层 round-robin(先抽干 preferred 来源再抽其余);缺省不传时单层 round-robin 与旧行为逐字节一致。避免超份额积压霸占评估算力(评估注定入不了池的行是纯 token 浪费)。
 - `demote_lowest_ranked_pool_rows(source_family=..., limit=...)`（v0.3.181+）把某来源族在正式池内 `relevance_score` 最低、`last_scored_at` 最老的至多 `limit` 条 `fresh`、未推荐、未 dislike 行置为既有 `pool_status='stale'`（不新增枚举），返回退坑行数；供份额温和再平衡使用，质量最高的行始终保留。
 - `reset_discovery_candidates_to_pending([...], reason=..., max_attempts=5, max_batch_attempts=50, increment_attempts=True)` 释放 evaluator failure 中被 claim 的行；`increment_attempts=True` 时连续失败达到上限后进入 `failed_eval`。pipeline 对 batch 级 LLM/provider transient 会传 `increment_attempts=False`，不消耗单条候选预算，但会递增 `batch_eval_attempts`；达到较高 `max_batch_attempts` 后进入 `failed_eval`，避免永久坏 provider 让同一批候选无限 churn。
 - `reset_stale_discovery_candidate_evaluations(max_age_minutes=...)` 将崩溃遗留的旧 `evaluating` 行释放回 `pending_eval`。
-- `mark_discovery_candidate_cached()` / `reject_discovery_candidate(..., status=...)` 只改写 `evaluating` / `evaluated` 行；terminal rows 不会被 stale caller 复活或覆盖。常见 rejection status 包括 `rejected_low_score`、`rejected_duplicate`、`rejected_cache_admission`、`rejected_recently_viewed`、`rejected_franchise_quota`。
+- `mark_discovery_candidate_cached()` / `reject_discovery_candidate(..., status=...)` 只改写 `evaluating` / `evaluated` 行；terminal rows 不会被 stale caller 复活或覆盖。常见 rejection status 包括 `rejected_low_score`、`rejected_duplicate`、`rejected_cache_admission`、`rejected_temporal_stale`、`rejected_recently_viewed`、`rejected_franchise_quota`。
 - `count_discovery_candidates_by_status()` 与 `count_discovery_candidates_by_source_status()` 用于诊断待评估池生命周期分布。
-- `count_pool_readiness()["evaluated_pending"]` 是 `discovery_candidates(status='evaluated')` 的 durable 数量；`admitted_pending_copy` 与 `get_pool_candidates_needing_copy()` 共用 `_load_admitted_pending_copy_rows_on()`，不会用宽泛的 `pending` 差值推算。`admitted_pending_available` 再把 unrestricted `copy_ready` 按每 topic 三条窗口占位，表达调度可用 `eligible_available_first=True` 先领取能立即增加公开库存的行，再按 copy-ready 水位需要领取深层 backlog。
+- `count_pool_readiness()["evaluated_pending"]` 只统计 `discovery_candidates(status='evaluated')` 中 disposition 为 `eligible` 的子集，用于 projected inventory；raw `evaluated_waiting_total` 由 coordinator 单独读取，只负责让 review-due/expired-only 或 no-headroom 队列继续触发生命周期清扫。`admitted_pending_copy` 与 `get_pool_candidates_needing_copy()` 共用 `_load_admitted_pending_copy_rows_on()`，不会用宽泛的 `pending` 差值推算。`admitted_pending_available` 再把 unrestricted `copy_ready` 按每 topic 三条窗口占位，表达调度可用 `eligible_available_first=True` 先领取能立即增加公开库存的行，再按 copy-ready 水位需要领取深层 backlog。
 
 ### Evaluator Prefilter Shadow Audit
 
@@ -630,7 +657,7 @@ raw_by_source = db.count_pool_raw_material_by_source()
 - `available` 与 `count_pool_candidates()` 保持推荐 serve 同口径。
 - `raw` 包含正式池 fresh raw material 和 `discovery_candidates` 中尚未缓存的候选。
 - `pending` 独立计算，不用 `raw - available` 近似，避免 `seen_items` 已命中的内容被误算为待整理。
-- `pending_eval` 统计 `pending_eval + evaluating`；`evaluated_pending` 统计已评估但尚未 admission 到 `content_cache` 的候选。
+- `pending_eval` 统计当前可领取的 `pending_eval` 与已在途 `evaluating`；尚未到 `temporal_review_retry_at` 的 deferred review 不计入。`evaluated_pending` 只统计已评估、尚未 admission 且 temporal disposition 为 `eligible` 的候选。`review_due` / `expired` 的 durable evaluated 行由 raw waiting 信号继续驱动清扫，但不计入 projected inventory；前者会重新排队，后者才进入拒绝终态。
 
 ### Delight Readiness
 
@@ -687,7 +714,7 @@ result = db.maintain_pool_inventory(
 
 若 `BEGIN IMMEDIATE` 遇到交互 writer，75ms 后抛出 `PoolMaintenanceDeferredError`，runtime 把本轮维护延后而不是等待进程默认的 30 秒。其它 canonical snapshot 读取在 `available_before` 建立前失败时抛出 `PoolMaintenanceSnapshotUnavailableError`，不会返回伪造的零库存结果。只有 snapshot 已取得后的 victim/invariant 失败才返回 `rolled_back=True`，其中 `available_before` 保留真实事务前值。
 
-raw ceiling 同时统计 `content_cache` 和 `discovery_candidates` active 行，victim 顺序为 unready content → 未领取 `pending_eval` → 未领取 `evaluated` → 非保护 ready reserve。候选不删除，而是 terminalize 为 `trimmed_capacity`，`eval_error='pool_raw_ceiling'`；`evaluating` 与任意 token-owned 行永不裁剪。若保护行加 active claim 已超过 ceiling，保留所有权与可用库存、报告 `untrimmed_raw_excess` 并记录一次稳定 WARNING；当完整 raw plan 已无 victim 时 `has_more=False`，等 claim 完成或库存指纹变化后再维护。提交前重新计算 canonical available，必须满足 `available_after >= min(available_before, target)`，否则整笔 `BEGIN IMMEDIATE` 回滚。
+raw ceiling 同时统计 `content_cache` 与 `discovery_candidates` 的 active raw material，但会先从容量口径排除 disposition 为 `review_due/expired` 的 `evaluated`；这些 waiter 由生命周期扫描分别重新排队或终态化，不会迫使新 `pending_eval` 为它们让位。其余 victim 顺序为 unready content → 未领取 `pending_eval` → 未领取且仍 eligible 的 `evaluated` → 非保护 ready reserve。候选不删除，而是 terminalize 为 `trimmed_capacity`，`eval_error='pool_raw_ceiling'`；`evaluating` 与任意 token-owned 行永不裁剪。若保护行加 active claim 已超过 ceiling，保留所有权与可用库存、报告 `untrimmed_raw_excess` 并记录一次稳定 WARNING；当完整 raw plan 已无 victim 时 `has_more=False`，等 claim 完成或库存指纹变化后再维护。提交前重新计算 canonical available，必须满足 `available_after >= min(available_before, target)`，否则整笔 `BEGIN IMMEDIATE` 回滚。
 
 ### Recommendation Serve Snapshot
 
@@ -696,9 +723,12 @@ snapshot = await db.load_pool_serve_snapshot_async(limit=40)
 # 平台定向请求：只装载该 canonical 平台的候选，且不做跨平台保底补位
 scoped = await db.load_pool_serve_snapshot_async(limit=40, source_platform="zhihu")
 persisted = await db.persist_pool_serve_async(recommendation_rows, selected_bvids)
+retired = db.retire_temporally_stale_pool_items()
 ```
 
-两者都由 database-owned serve executor 串行执行，并为每次操作创建/关闭独立连接。snapshot 在显式只读事务内提供一致的 readiness、候选窗口、平台补位、`seen_items` 与 curator/feedback rows；persist 把推荐历史和 shown 状态放进一次 `BEGIN IMMEDIATE`。
+这些操作由 database-owned serve executor 串行执行，并为每次操作创建/关闭独立连接。snapshot 先调用幂等的兼容方法 `retire_temporally_stale_pool_items()`；尽管保留旧方法名，它现在执行完整三态迁移。常见的“全部 eligible”路径只做只读 preflight，不取得写锁；发现 due item 后才在短 `BEGIN IMMEDIATE` 中重读、复判，把 `review_due` 的 `fresh` 行改为 `temporal_review_hold`，把 `expired` 行改为 `stale`。随后显式只读事务提供一致的 readiness、候选窗口、平台补位、`seen_items` 与 curator/feedback rows。写锁暂不可用时 snapshot 仍以同一纯策略在内存中排除两类行，不会因持久化迁移延迟而展示。
+
+persist 不再假定 snapshot 后状态不会变化：同一个 `BEGIN IMMEDIATE` 会按最终 `selected_bvids` 重读 `pool_status` 与完整 temporal 证据组，重新计算三态；只有仍为 `fresh`、尚未生成推荐且仍为 `eligible` 的行才写入推荐历史并标为 shown。竞态中变成 `review_due` 的行原子写为 `temporal_review_hold` 并计入 skipped，变成 `expired` 的行写为 `stale` 并进入 `temporally_stale_bvids`。`PoolServePersistResult` 返回 `recommendation_ids + committed_bvids + temporally_stale_bvids + skipped_bvids`，RecommendationEngine 只把真正提交成功的条目返回给调用方，并把并发消费的 skipped 行从本轮库存估算扣除，从而关闭复审/过期边界与其它进程状态变化造成的 TOCTOU 窗口。旧 adapter 只返回 recommendation IDs 时保留兼容行为。
 
 `source_platform` 为可选 canonical 平台作用域：非空时候选行改由 `_available_platform_rows_on()` 装载，并**跳过平台保底补位**——给平台定向批次补进别的平台，正是该作用域要防的泄漏。`readiness` 始终保持全池口径（它是 API 上报与补货判断依据的库存），排序、持久化与 shown 提交全部与跨平台路径共用。省略该参数时调用形状与行为与引入前一致。
 
@@ -733,11 +763,13 @@ db.suppress_low_confidence_recommendations()
 ## 设计决策
 
 1. **待评估池和正式推荐池分离**：`discovery_candidates` 只表示“已经找到但还未成为推荐素材”，`content_cache` 才是 recommendation serve 的正式候选池。
-2. **来源只影响身份和统计**：候选 dedupe key、source share 和 prompt 上下文会保留来源；喜好判断统一交给 discovery evaluator。
-3. **池满时不继续消耗**：runtime 以 `count_pool_candidates()` 的真实可换数为上限判断，正式池满时不 claim / evaluate 待评估候选。
-4. **评估和入池可分步恢复**：`evaluated` 表示“已经通过喜好评估但还没 admission”，不是失败终态；池子恢复容量后会优先入池。batch 级 provider transient failure 释放回 `pending_eval` 且不递增 `eval_attempts`，但会递增 `batch_eval_attempts` 作为高阈值熔断；只有调用方显式要求递增 attempts 的可归因失败才会使用常规 `eval_attempts` 预算。
-5. **状态机必须防 stale caller**：`evaluating` 有过期回收，terminal rows 有 status guard，避免进程 crash 或并发 caller 让候选永久卡住或复活。
-6. **pending 不是 raw 减 available**：持久化已看、缺文案、缺分类、缺链接、待评估属于不同诊断含义，必须分开统计。
-7. **低分清理和展示防线都在存储层落地**：admission 仍由 discovery evaluator 决定；storage 只用统一阈值阻止旧脏数据、suppressed 低分复活和未来绕过入口继续进入可展示读取路径。
-8. **keyword kind 是用途隔离，不是平台隔离**：`regular` 和 `explore` 共享同一张 `discovery_keywords` 表与生命周期，便于复用 claim / lease / yield 基础设施；但默认 claim / history / recycle 只读 `regular`，避免探索 query 被普通 search 提前消费或被常规补货历史污染。
-9. **`style_key` 迁移只改已知旧值**：历史安装用户的本地 SQLite 里可能已有 `deep_dive`、`story_doc`、`lifestyle` 等旧内容风格 key。初始化迁移会把这些已知值物理改写为 `deep_focus`、`story_immersion`、`daily_wander` 等新观看模式；未知自定义值会原样保留，避免误删无法识别的历史数据。
+2. **时效判断发生在 Agent 看过正文之后**：原始候选必须先入 `discovery_candidates`，Evaluation Agent 才能判断时效到底影响核心价值还是仅是标题钩子；完整证据组落库后、写入 `content_cache` 前执行三态 eligibility。这样既不会在 raw 抓取阶段误杀，也能让有确定证据的过期内容永远不进入可服务池。
+3. **入池判断不是永久通行证，复审也不是死亡判决**：`breaking/current/versioned` 的 1 / 14 / 120 天只安排复审，旧 v1 3 / 60 天也只进入 `review_due`。canonical 读取 fail-safe 排除、serve snapshot 状态迁移和最终写事务复核共用同一纯策略；`temporal_review_hold` 可由完整新评估恢复，只有 grounded deadline / terminal state 才永久 stale。排序 bonus 不能代替这些正确性边界。
+4. **来源只影响身份和统计**：候选 dedupe key、source share 和 prompt 上下文会保留来源；喜好判断统一交给 discovery evaluator。
+5. **池满时不继续消耗**：runtime 以 `count_pool_candidates()` 的真实可换数为上限判断，正式池满时不 claim / evaluate 待评估候选。
+6. **评估和入池可分步恢复**：`evaluated` 表示“已经完成喜好与时效评估但还没 admission”，不是失败终态；池子恢复容量后会优先重试入池，并在那一刻重新计算 temporal eligibility。到复审点会回 `pending_eval`，已入池 hold 行也复用现有评估链；batch 级 provider transient failure 释放回 `pending_eval` 且不递增 `eval_attempts`，但会递增 `batch_eval_attempts` 作为高阈值熔断；只有调用方显式要求递增 attempts 的可归因失败才会使用常规 `eval_attempts` 预算。
+7. **状态机必须防 stale caller**：`evaluating` 有过期回收，terminal rows 有 status guard，避免进程 crash 或并发 caller 让候选永久卡住或复活。
+8. **pending 不是 raw 减 available**：持久化已看、缺文案、缺分类、缺链接、待评估属于不同诊断含义，必须分开统计。
+9. **低分、待复审和确定过期都在正式推荐边界落地**：相关性 admission 与 temporal eligibility 由 discovery 的结构化结果决定；storage 复用确定性规则，阻止旧脏数据、suppressed 低分复活、raw 覆盖证据和未来绕过入口继续进入可展示读取路径。
+10. **keyword kind 是用途隔离，不是平台隔离**：`regular` 和 `explore` 共享同一张 `discovery_keywords` 表与生命周期，便于复用 claim / lease / yield 基础设施；但默认 claim / history / recycle 只读 `regular`，避免探索 query 被普通 search 提前消费或被常规补货历史污染。
+11. **`style_key` 迁移只改已知旧值**：历史安装用户的本地 SQLite 里可能已有 `deep_dive`、`story_doc`、`lifestyle` 等旧内容风格 key。初始化迁移会把这些已知值物理改写为 `deep_focus`、`story_immersion`、`daily_wander` 等新观看模式；未知自定义值会原样保留，避免误删无法识别的历史数据。

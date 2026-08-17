@@ -70,8 +70,31 @@ def test_desktop_web_instance_editor_persists_deepseek_reasoning_effort() -> Non
     js = (ROOT / "src/openbiliclaw/web/desktop/assets/js/app.js").read_text(encoding="utf-8")
 
     assert (
-        '["openai", "claude", "gemini", "deepseek", "openrouter", '
+        '["openai", "claude", "gemini", "deepseek", "openrouter", "orcarouter", '
         '"openai_compatible"].includes(providerType)'
     ) in js
     assert "reasoning_effort:" in js
     assert 'getInput("llmInstanceReasoning")' in js
+
+
+def test_orcarouter_provider_exposed_across_web_surfaces() -> None:
+    """OrcaRouter must be selectable in the desktop settings and the first-run
+    setup wizard, with matching key-link and default-model wiring."""
+    desktop_html = (ROOT / "src/openbiliclaw/web/desktop/index.html").read_text(
+        encoding="utf-8"
+    )
+    desktop_js = (ROOT / "src/openbiliclaw/web/desktop/assets/js/app.js").read_text(
+        encoding="utf-8"
+    )
+    setup_html = (ROOT / "src/openbiliclaw/web/setup/index.html").read_text(encoding="utf-8")
+
+    assert '<option value="orcarouter">OrcaRouter</option>' in desktop_html
+    assert '<option value="orcarouter">OrcaRouter</option>' in setup_html
+    assert 'orcarouter: "OrcaRouter"' in desktop_js
+    assert (
+        'orcarouter: { model: "openai/gpt-4o", '
+        'base_url: "https://api.orcarouter.ai/v1" }'
+    ) in desktop_js
+    assert 'orcarouter: ["https://www.orcarouter.ai/keys", "OrcaRouter"]' in setup_html
+    assert 'orcarouter: "openai/gpt-4o"' in setup_html
+    assert '"orcarouter"' in setup_html

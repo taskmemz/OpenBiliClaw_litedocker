@@ -8,6 +8,7 @@
 
 import { apiUrl } from "../shared/backend-endpoint.ts";
 import { authenticatedFetch } from "../shared/auth.ts";
+import { createTaskTab } from "./task-tab.ts";
 
 const _MUTEX_STALE_MS = 6 * 60 * 1000;
 function tryAcquireDispatcherMutex(label: string): boolean {
@@ -266,7 +267,7 @@ export async function executeTask(task: BiliTask): Promise<void> {
   currentTaskId = task.id;
 
   try {
-    const tab = await chrome.tabs.create({ url, active: false });
+    const tab = await createTaskTab({ url, active: false });
     taskTabId = tab.id ?? null;
   } catch {
     await postTaskResult({ task_id: task.id, status: "failed", error: "tab_create_failed" });

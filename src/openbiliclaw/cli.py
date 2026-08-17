@@ -450,6 +450,11 @@ _CODEX_LOGIN_LOGOUT_OPTION = typer.Option(
     "--logout",
     help="删除 OpenBiliClaw 本地 Codex 凭据。",
 )
+_CODEX_LOGIN_PROBE_OPTION = typer.Option(
+    False,
+    "--probe",
+    help="导入/查看时执行一次真实 LLM 能力探测，验证令牌是否可用于模型调用。",
+)
 _CONFIG_EXPORT_LEGACY_OUTPUT_OPTION = typer.Option(
     None,
     "--output",
@@ -1606,6 +1611,8 @@ _PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
     "ollama": {"base_url": "http://127.0.0.1:11434/v1", "model": "qwen2.5:7b"},
     # OpenRouter: route to OpenAI's cheapest current-gen by default.
     "openrouter": {"base_url": "https://openrouter.ai/api/v1", "model": "openai/gpt-5-nano"},
+    # OrcaRouter: OpenAI-compatible model routing gateway (sk-orca- key).
+    "orcarouter": {"base_url": "https://api.orcarouter.ai/v1", "model": "openai/gpt-4o"},
 }
 
 
@@ -1616,6 +1623,7 @@ _PROVIDER_HINTS: dict[str, str] = {
     "deepseek": "DeepSeek 官方（OpenAI 兼容协议）",
     "ollama": "本地 Ollama（无需 Key）",
     "openrouter": "OpenRouter 聚合",
+    "orcarouter": "OrcaRouter 聚合（OpenAI 兼容协议）",
 }
 
 
@@ -1647,6 +1655,10 @@ _PROVIDER_MODEL_HINT: dict[str, str] = {
     "openrouter": (
         "默认 openai/gpt-5-nano。OpenRouter 模型名格式: <vendor>/<model>,"
         "如 anthropic/claude-sonnet-4-6 / google/gemini-2.5-flash"
+    ),
+    "orcarouter": (
+        "默认 openai/gpt-4o。OrcaRouter 模型名格式: <vendor>/<model>,"
+        "如 anthropic/claude-opus-4.8 / z-ai/glm-5.2"
     ),
     "ollama": (
         "常见模型: qwen2.5:7b (默认 / 中文好) / llama3.2 (Meta 新版) / "
@@ -2122,6 +2134,7 @@ _SUPPORTED_PROVIDERS: tuple[str, ...] = (
     "deepseek",
     "ollama",
     "openrouter",
+    "orcarouter",
 )
 
 
@@ -2169,6 +2182,11 @@ _LLM_MENU: tuple[tuple[str, str, str], ...] = (
         "openrouter",
         "OpenRouter 聚合",
         "默认 openai/gpt-5-nano。一个 Key 跑多家模型,按调用计费",
+    ),
+    (
+        "orcarouter",
+        "OrcaRouter 聚合",
+        "默认 openai/gpt-4o。一个 Key 跑 150+ 模型,网关级零信任安全",
     ),
 )
 
@@ -2595,8 +2613,8 @@ def _interactive_embedding_setup(default_provider: str, *, auto_if_ready: bool =
             .strip()
             .lower()
         )
-        if target not in _SUPPORTED_PROVIDERS:
-            console.print("[red]未知 provider,跳过 embedding 配置。[/red]")
+        if target not in _SUPPORTED_PROVIDERS or target == "orcarouter":
+            console.print("[red]未知或没有 embedding 接口的 provider,跳过 embedding 配置。[/red]")
             return
         defaults = _PROVIDER_DEFAULTS.get(target, {})
         base_url = typer.prompt(
@@ -5060,6 +5078,313 @@ def setup_embedding() -> None:
 
     config, _ = load_config_with_diagnostics()
     _interactive_embedding_setup(config.llm.default_provider)
+
+
+def _build_embedding_service_or_none(config: Any) -> Any:
+    """Build the runtime ``EmbeddingService`` without chat providers.
+
+    Uses the same registry path the daemon uses, so the CLI protects exactly
+    the namespace production would protect. Returns ``None`` when embedding
+    is disabled or the service cannot be built.
+    """
+    emb = getattr(config, "llm", None)
+    provider = str(getattr(getattr(emb, "embedding", None), "provider", "") or "").strip()
+    if not provider:
+        return None
+    try:
+        from openbiliclaw.llm.base import LLMRegistry
+        from openbiliclaw.llm.registry import build_embedding_service
+
+        return build_embedding_service(config, LLMRegistry())
+    except Exception:
+        return None
+
+
+def _human_bytes(size: int) -> str:
+    value = float(max(0, int(size)))
+    if value < 1024:
+        return f"{int(value)} B"
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        value /= 1024
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}"
+    return f"{value:.1f} TiB"
+
+
+def _embedding_cache_runtime(config: Any) -> tuple[Any, set[str]]:
+    """Return ``(cache, active_models)`` for the runtime L2 cache.
+
+    Active models come from the daemon's own service (its provenance
+    namespace) plus any models the cache has seen this process.
+    """
+    from openbiliclaw.llm.embedding import EmbeddingCache
+
+    cache_path = config.data_path / "embedding_cache.db"
+    service = _build_embedding_service_or_none(config)
+    if service is not None and service.l2_cache is not None:
+        cache = service.l2_cache
+        active_models = cache.active_models()
+        namespace = str(getattr(service, "cache_model_namespace", "") or "")
+        if namespace:
+            active_models.add(namespace)
+        return cache, active_models
+    cache = EmbeddingCache(cache_path)
+    cache.initialize()
+    return cache, set()
+
+
+@app.command("embedding-cache-stats")
+def embedding_cache_stats() -> None:
+    """查看 embedding L2 持久化缓存 (data/embedding_cache.db) 诊断信息。
+
+    显示行数、逻辑载荷、SQLite 主文件 / WAL / SHM 大小、legacy /
+    namespaced / active / inactive 分布、容量预算水位与最近维护记录，以及
+    每个 namespace 的行数与载荷。用于确认 provenance 隔离是否生效、旧
+    JSON 行是否已迁移为二进制、磁盘占用是否在预算内。命令会顺带执行与
+    daemon 相同的一次性运行时准备（legacy JSON → 二进制迁移，幂等）。
+    """
+    _print_page_title("Embedding L2 缓存诊断", "data/embedding_cache.db")
+    from openbiliclaw.config import load_config_with_diagnostics
+
+    config, _ = load_config_with_diagnostics()
+    cache_path = config.data_path / "embedding_cache.db"
+    if not cache_path.exists():
+        _print_status_panel(
+            "info",
+            "缓存不存在",
+            f"{cache_path} 尚未创建：embedding 未启用，或还没有任何向量写入。",
+        )
+        return
+
+    cache, _active = _embedding_cache_runtime(config)
+    stats = cache.stats(active_models=_active)
+    cap = stats["capacity"]
+    max_bytes = cap["max_bytes"]
+    cap_text = (
+        f"{_human_bytes(max_bytes)}（high={cap['high_watermark']:.0%} / "
+        f"low={cap['low_watermark']:.0%}，当前"
+        + ("已超高位" if cap["over_high_watermark"] else "未超高位")
+        + "）"
+        if max_bytes > 0
+        else "不设上限"
+    )
+    last_report = stats["last_maintenance_report"]
+    if last_report:
+        maint_text = (
+            f"已删除 {last_report.get('deleted_rows', 0):,} 行 / "
+            f"{_human_bytes(last_report.get('freed_bytes', 0))}"
+        )
+    else:
+        maint_text = "无记录"
+
+    overview = Table(show_header=False, box=None, title="缓存概况")
+    overview.add_column("指标", style="bold cyan", no_wrap=True)
+    overview.add_column("值")
+    for label, value in [
+        ("数据库文件", str(cache_path)),
+        ("总行数", f"{stats['total_rows']:,}"),
+        ("逻辑载荷", _human_bytes(stats["stored_bytes"])),
+        ("SQLite 主文件", _human_bytes(stats["file_bytes"])),
+        ("WAL / SHM", f"{_human_bytes(stats['wal_bytes'])} / {_human_bytes(stats['shm_bytes'])}"),
+        (
+            "legacy 行（无 namespace）",
+            f"{stats['legacy_rows']:,} 行 / {_human_bytes(stats['legacy_bytes'])}",
+        ),
+        (
+            "namespaced 行",
+            f"{stats['namespaced_rows']:,} 行 / {_human_bytes(stats['namespaced_bytes'])}",
+        ),
+        ("active 行", f"{stats['active_rows']:,} 行 / {_human_bytes(stats['active_bytes'])}"),
+        ("inactive 行", f"{stats['inactive_rows']:,} 行 / {_human_bytes(stats['inactive_bytes'])}"),
+        ("容量预算", cap_text),
+        ("最近维护", maint_text),
+    ]:
+        overview.add_row(label, value)
+    console.print(overview)
+    console.print()
+
+    if stats["namespaces"]:
+        ns_table = Table(show_header=True, header_style="bold cyan", title="Namespace 分布")
+        ns_table.add_column("model", no_wrap=True)
+        ns_table.add_column("namespace", no_wrap=True)
+        ns_table.add_column("行数", justify="right")
+        ns_table.add_column("载荷", justify="right")
+        ns_table.add_column("状态", justify="center")
+        for entry in stats["namespaces"]:
+            status = (
+                "active"
+                if entry["active"]
+                else "legacy"
+                if entry["namespace"] is None
+                else "inactive"
+            )
+            ns_table.add_row(
+                entry["model"],
+                entry["namespace"] or "-",
+                f"{entry['rows']:,}",
+                _human_bytes(entry["bytes"]),
+                status,
+            )
+        console.print(ns_table)
+        console.print()
+    if stats["legacy_rows"]:
+        _print_status_panel(
+            "warning",
+            "存在 legacy 行",
+            f"还有 {stats['legacy_rows']:,} 行旧 JSON 向量未迁移为二进制。"
+            "运行 `openbiliclaw embedding-cache-clean --apply` 可迁移并回收失效 namespace。",
+        )
+
+
+@app.command("embedding-cache-clean")
+def embedding_cache_clean(
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="实际执行清理；默认 dry-run 只报告将删除的行数与字节",
+    ),
+    no_compact: bool = typer.Option(
+        False,
+        "--no-compact",
+        help="清理后跳过物理回收（WAL checkpoint + VACUUM INTO + 原子替换）",
+    ),
+    keep_legacy: bool = typer.Option(
+        False,
+        "--keep-legacy",
+        help="保留无 namespace 的 legacy 行（默认一并删除）",
+    ),
+    keep_model: str = typer.Option(
+        "",
+        "--keep-model",
+        help="额外保护一个 L2 model key（逗号分隔可传多个；"
+        "当前配置的 active namespace 默认受保护）",
+    ),
+    batch_size: int = typer.Option(
+        500,
+        "--batch-size",
+        min=1,
+        max=10000,
+        help="JSON→二进制迁移的每批行数（小批量提交，中断可续跑）",
+    ),
+) -> None:
+    """清理 embedding L2 缓存：迁移旧 JSON + 回收失效 namespace + 物理回收空间。
+
+    三个阶段（默认 dry-run 只报告；加 ``--apply`` 才执行）：
+    1. 把 legacy JSON 向量迁移为紧凑 float32 二进制（幂等、小批量、可中断续跑）；
+    2. 删除不在当前 active namespace 的行（默认含 legacy 行，``--keep-legacy`` 可保留）；
+    3. 执行 WAL checkpoint + VACUUM INTO 新文件 + integrity_check + 原子替换，
+       让磁盘占用实际下降（仅 DELETE 只进 freelist，主文件不会缩小）。
+    清理前请先停止 daemon，避免并发写入导致物理替换失败。
+    """
+    _print_page_title("Embedding L2 缓存清理", "data/embedding_cache.db")
+    from openbiliclaw.config import load_config_with_diagnostics
+
+    config, _ = load_config_with_diagnostics()
+    cache_path = config.data_path / "embedding_cache.db"
+    if not cache_path.exists():
+        _print_status_panel("info", "缓存不存在", f"{cache_path} 尚未创建，无需清理。")
+        return
+
+    cache, active_models = _embedding_cache_runtime(config)
+    extra_models = {part.strip() for part in keep_model.split(",") if part.strip()}
+    active_models = active_models | extra_models
+    pending = cache.pending_migration_rows()
+    preview = cache.delete_inactive(
+        active_models,
+        keep_legacy=keep_legacy,
+        dry_run=True,
+    )
+
+    if not apply:
+        migration_mb = pending * 92 / 1024 if pending else 0.0
+        _print_status_panel(
+            "info",
+            "dry-run 预览",
+            "未执行任何修改；加 --apply 才会真正清理。",
+        )
+        plan = Table(show_header=False, box=None, title="清理计划")
+        plan.add_column("阶段", style="bold cyan", no_wrap=True)
+        plan.add_column("将处理")
+        plan.add_row(
+            "1. JSON→二进制迁移",
+            f"{pending:,} 行 legacy JSON（约 {migration_mb:.0f} MiB 逻辑载荷；仅 --apply 时执行）",
+        )
+        plan.add_row(
+            "2. 删除失效行",
+            f"{preview['deleted_rows']:,} 行 / {_human_bytes(preview['freed_bytes'])}"
+            + ("" if active_models else "（未提供 active namespace，将删除全部非 keep-model 行）"),
+        )
+        plan.add_row(
+            "3. 物理回收",
+            "WAL checkpoint + VACUUM INTO + integrity_check + 原子替换"
+            if not no_compact
+            else "已跳过（--no-compact）",
+        )
+        console.print(plan)
+        console.print()
+        if active_models:
+            console.print(
+                "[dim]受保护的 active namespace:[/dim] "
+                + " ".join(f"[bold]{m}[/bold]" for m in sorted(active_models))
+            )
+        else:
+            console.print(
+                "[yellow]未识别到 active namespace（embedding 未启用或服务构建失败）；"
+                "请用 --keep-model 显式保护仍要使用的 model key。[/yellow]"
+            )
+        console.print()
+        _print_status_panel(
+            "warning",
+            "执行前请停止 daemon",
+            "物理替换需要独占文件；daemon 运行中执行可能失败或产生旧句柄。"
+            "缓存可重建，删除的行只是丢失冷数据，不影响推荐正确性。",
+        )
+        return
+
+    migration = cache.migrate_encoding(batch_size=batch_size)
+    deleted = cache.delete_inactive(active_models, keep_legacy=keep_legacy)
+    compact_report: dict[str, object] = {}
+    if not no_compact:
+        compact_report = cache.compact()
+
+    result = Table(show_header=False, box=None, title="清理结果")
+    result.add_column("阶段", style="bold cyan", no_wrap=True)
+    result.add_column("结果")
+    result.add_row(
+        "1. JSON→二进制迁移",
+        f"迁移 {migration.get('migrated', 0):,} 行，"
+        f"损坏跳过 {migration.get('skipped_corrupt', 0):,} 行"
+        f"，剩余 {migration.get('remaining', 0):,} 行",
+    )
+    result.add_row(
+        "2. 删除失效行",
+        f"删除 {deleted['deleted_rows']:,} 行 / 释放 {_human_bytes(deleted['freed_bytes'])}",
+    )
+    if compact_report:
+        if compact_report.get("ok"):
+            before_bytes = cast("int", compact_report.get("before_bytes") or 0)
+            after_bytes = cast("int", compact_report.get("after_bytes") or 0)
+            result.add_row(
+                "3. 物理回收",
+                f"主文件 {_human_bytes(before_bytes)} → "
+                f"{_human_bytes(after_bytes)}，integrity_check 通过",
+            )
+        else:
+            result.add_row(
+                "3. 物理回收",
+                f"失败：{compact_report.get('error') or 'unknown'}（原文件未改动）",
+            )
+    else:
+        result.add_row("3. 物理回收", "已跳过（--no-compact）")
+    console.print(result)
+    console.print()
+    if compact_report and not compact_report.get("ok"):
+        _print_status_panel(
+            "warning",
+            "物理回收失败",
+            "删除已完成但文件未缩小。请停止 daemon 后重试，或手工删除"
+            f" {cache_path}（缓存可重建）后再运行 `openbiliclaw embedding-cache-clean --apply`。",
+        )
 
 
 @app.command()
@@ -12575,6 +12900,8 @@ def keyword_inspiration_dry_run(
                 inspiration_provider=build_inspiration_search_provider(
                     getattr(config.discovery, "inspiration_search_backends", None),
                     database=database,
+                    exa_api_key=str(getattr(config.discovery, "exa_api_key", "") or ""),
+                    you_api_key=str(getattr(config.discovery, "you_api_key", "") or ""),
                     platform_backends=build_platform_source_backends(
                         config,
                         bilibili_client=(
@@ -14762,6 +15089,7 @@ def login_codex(
     source: Path | None = _CODEX_LOGIN_SOURCE_OPTION,
     status: bool = _CODEX_LOGIN_STATUS_OPTION,
     logout: bool = _CODEX_LOGIN_LOGOUT_OPTION,
+    probe: bool = _CODEX_LOGIN_PROBE_OPTION,
 ) -> None:
     """导入或管理 Codex CLI 的 ChatGPT OAuth 凭据."""
     from datetime import datetime
@@ -14778,14 +15106,68 @@ def login_codex(
     def _print_codex_credentials(credentials: CodexCredentials) -> None:
         expires = datetime.fromtimestamp(credentials.expires_at).strftime("%Y-%m-%d %H:%M:%S")
         state = "临期/需刷新" if credentials.is_expired() else "有效"
-        _print_key_value_table(
-            "Codex OAuth",
-            [
-                ("状态", f"已登录（{state}）"),
-                ("账号", credentials.account_id or "（未知）"),
-                ("过期时间", expires),
-            ],
-        )
+        rows = [
+            ("状态", f"已登录（{state}）"),
+            ("账号", credentials.account_id or "（未知）"),
+            ("过期时间", expires),
+        ]
+        if credentials.last_probe is not None:
+            probe_state = credentials.last_probe
+            checked = datetime.fromtimestamp(probe_state.checked_at).strftime("%Y-%m-%d %H:%M:%S")
+            if probe_state.ok:
+                rows.append(
+                    ("LLM 通道", f"可用（{probe_state.model or '未记录模型'}，{checked} 探测）")
+                )
+            else:
+                rows.append(("LLM 通道", f"不可用（{checked} 探测）"))
+                if probe_state.message:
+                    rows.append(("失败原因", probe_state.message))
+        else:
+            rows.append(("LLM 通道", "未探测"))
+        _print_key_value_table("Codex OAuth", rows)
+
+    def _probe_model_from_config() -> tuple[str, str]:
+        try:
+            from openbiliclaw.config import load_config
+
+            cfg = load_config()
+            openai_cfg = cfg.llm.openai
+            if openai_cfg.auth_mode.strip().lower() == "codex_oauth":
+                # 空模型 → 让探测端自动发现账号可用的 Codex 后端模型。
+                return openai_cfg.model.strip(), openai_cfg.base_url.strip()
+        except Exception:
+            pass
+        return "", ""
+
+    def _run_codex_probe(credentials: CodexCredentials) -> None:
+        from openbiliclaw.llm.codex_chatgpt_provider import probe_codex_llm
+
+        model, base_url = _probe_model_from_config()
+        model_label = model or "自动发现账号可用模型"
+        console.print(f"[dim]正在探测 Codex LLM 通道（模型: {model_label}）...[/dim]")
+        result = asyncio.run(probe_codex_llm(model=model, base_url=base_url))
+        if result.ok:
+            _print_status_panel(
+                "success",
+                "Codex LLM 探测",
+                f"令牌可用于 LLM 调用（模型: {result.model or model}，"
+                f"耗时 {result.latency_ms}ms）。",
+            )
+        else:
+            _print_status_panel(
+                "warning",
+                "Codex LLM 探测失败",
+                "令牌已导入，但当前令牌无法调用 Codex LLM 通道。"
+                f"（原因: {result.message}）"
+                '请改用 OpenAI Platform API Key（`auth_mode = "api_key"`），'
+                "或重新登录 Codex CLI 后重试。",
+            )
+        # Reload so the persisted probe state is shown in the table below.
+        refreshed = load_codex_credentials()
+        if refreshed is not None:
+            _print_codex_credentials(refreshed)
+        else:
+            _print_codex_credentials(credentials)
 
     if status:
         credentials = load_codex_credentials()
@@ -14798,6 +15180,13 @@ def login_codex(
             )
             return
         _print_codex_credentials(credentials)
+        if probe:
+            _run_codex_probe(credentials)
+        elif credentials.last_probe is None:
+            console.print(
+                "[dim]尚未进行 LLM 能力探测；运行 `openbiliclaw login codex --status --probe` "
+                "可验证令牌是否真正可调用。[/dim]"
+            )
         return
 
     if logout:
@@ -14822,6 +15211,10 @@ def login_codex(
 
     _print_status_panel("success", "Codex OAuth", "登录凭据已导入。")
     _print_codex_credentials(credentials)
+    # Issue #170: importing a Codex CLI login is only useful when the token
+    # can actually call the Codex ChatGPT LLM transport. Probe immediately so
+    # the user never reaches init before discovering a scope-less token.
+    _run_codex_probe(credentials)
 
 
 @app.command("health-check")

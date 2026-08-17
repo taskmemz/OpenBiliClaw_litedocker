@@ -5,12 +5,14 @@
 ## 👤 我是用户
 
 - [项目主页](index.html) — GitHub Pages 首页，桌面安装包 / 一句话安装、插件下载和产品卖点概览
+- [DSH 客户端插件](https://github.com/whiteguo233/dsh-openbiliclaw) — 把 OpenBiliClaw 装进 DeepSeek Harness：DSH 界面常驻第四栏（推荐 / 内容库 / 对话 / 画像 / 设置）+ 22 个 Agent Bridge 工具，Agent 也能读推荐、答探测、闭环学习
 - [Flutter 移动客户端](https://github.com/whiteguo233/OpenBiliClaw-mobile) — 独立仓库的原生 App（Android / iOS / Web / 桌面），[Latest Release](https://github.com/whiteguo233/OpenBiliClaw-mobile/releases/latest) 提供 Android 签名 APK 与 iOS 自签名 IPA，连接同一本地后端
 - [常见问题 FAQ](faq.md) — macOS 安全阻挡、插件连不上后端、embedding 配置、跨机器迁移、手机访问等高频问题
-- [GitHub Releases](https://github.com/whiteguo233/OpenBiliClaw/releases/latest) — Latest Release 的 `openbiliclaw-v*` 聚合页，下载浏览器插件 zip 和桌面安装包；维护者通道仍保留 `extension-v*` / `desktop-v*` / `backend-v*`
+- [GitHub Releases](https://github.com/whiteguo233/OpenBiliClaw/releases/latest) — Latest Release 的 `openbiliclaw-v*` 聚合页，下载浏览器插件 zip / Safari dmg 和桌面安装包；维护者通道仍保留 `extension-v*` / `desktop-v*` / `backend-v*`
 - [隐私权政策](privacy.md) — 插件数据收集披露、本地优先数据流与明文迁移包说明
 - [变更日志](changelog.md) — 各版本交付记录
 - [Docker 部署指南](docker-deployment.md) — 手动 Docker / docker compose 部署步骤
+- [Safari Web Extension 构建](safari-extension-build.md) — macOS 上 `build:safari` / `package:safari`、`safari-web-extension-converter` 转 Xcode 工程、Developer ID 签名 + notarization、`extension-v*` 发版链与限制矩阵
 - [可选 HTTPS 部署](https-deployment.md) — 公网域名 Caddy 自动证书，以及可信 LAN 的 TLS profile / 本地 CA 流程
 - [OpenClaw 接入最短指南](openclaw-quickstart.md) — 把 OpenBiliClaw 接进 OpenClaw / AI 编码助手
 - [Agent Bridge 能力契约](agent-integration.md) — `agent-bridge/v2` 能力协商、宿主别名与新功能同步清单

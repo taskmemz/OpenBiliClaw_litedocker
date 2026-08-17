@@ -1,7 +1,7 @@
 # OpenBiliClaw configuration example
 # Copy this file to config.toml and edit as needed.
 # 首次运行如果缺少 config.toml，程序会自动基于本文件生成模板。
-# 使用远程模型（OpenAI / Claude / Gemini / DeepSeek / OpenRouter）时，需要为调用链中的实例填写 api_key。
+# 使用远程模型（OpenAI / Claude / Gemini / DeepSeek / OpenRouter / OrcaRouter）时，需要为调用链中的实例填写 api_key。
 # 本地 Ollama 主要用于向量检索（embedding, bge-m3）。作为聊天 provider 属高级用法：
 # 捆绑的 Ollama 只装了 embedding 模型，小体积本地聊天模型达不到内容管线质量线，
 # 因此图形向导 / init / bootstrap 都不再推荐把它当聊天默认。确要如此的高级用户可手动
@@ -61,7 +61,7 @@ default_chain = ["deepseek"]
 concurrency = 4
 # Global request timeout for all LLM providers (seconds).
 # Applies to OpenAI / Claude / Gemini / DeepSeek / Ollama / OpenRouter /
-# openai_compatible. Allowed range: 10..1200. Default 1200s (20 minutes).
+# OrcaRouter / openai_compatible. Allowed range: 10..1200. Default 1200s (20 minutes).
 timeout = 1200
 # 新实例请直接在桌面设置页创建。手工配置时复制下面的完整表，
 # 给每个渠道一个稳定且唯一的 ID，再把 ID 加进 default_chain：
@@ -76,6 +76,17 @@ timeout = 1200
 # api_flavor = ""
 #
 # default_chain = ["deepseek", "relay-backup"]
+#
+# [llm.instances.orcarouter]
+# name = "OrcaRouter 聚合"
+# provider_type = "orcarouter"
+# enabled = true
+# api_key = "sk-orca-..."
+# model = "openai/gpt-4o"
+# base_url = "https://api.orcarouter.ai/v1"
+# reasoning_effort = "medium"
+#
+# default_chain = ["deepseek", "orcarouter"]
 
 [llm.instances.deepseek]
 name = "DeepSeek 官方"
@@ -148,6 +159,18 @@ fallback_provider = ""
 # Default off — local ollama/bge-m3 and text-only remote models skip images.
 # Independent of [discovery].multimodal_evaluation_enabled (vision LLM eval).
 multimodal_enabled = false
+# L2 persistent cache (data/embedding_cache.db) 磁盘预算，单位字节；0 = 不设上限。
+# 向量以紧凑 float32 二进制存储（4096 维约 16 KiB/行，而旧 JSON 约 90 KiB/行），
+# 新版本启动时会自动把旧 JSON 行迁移为二进制。设置上限后，缓存占用超过
+# cache_max_bytes * cache_high_watermark 时开始淘汰：先删失效 namespace /
+# 旧 legacy 行，再按最近访问时间淘汰活跃 namespace 中的最旧行，直到降到
+# cache_max_bytes * cache_low_watermark。缓存可重建，淘汰只影响冷数据。
+# 推荐值 536870912 (512 MiB)；需要 4096 维大向量库时再调大。
+cache_max_bytes = 0
+# 淘汰触发水位（占用 / 预算 的比例，0..1）
+cache_high_watermark = 0.9
+# 淘汰停止水位（占用 / 预算 的比例，0..1，需 <= cache_high_watermark）
+cache_low_watermark = 0.7
 
 # Per-module routes. inherit=true 表示完整继承 [llm].default_chain；
 # 需要隔离质量/成本时改为 false，并按优先级填写实例 ID。
@@ -200,7 +223,7 @@ executable = ""
 headed = false
 
 # ── 海外网络路由（仅作用于海外客户端）──
-# 作用范围：OpenAI / Claude / Gemini / DeepSeek / OpenRouter / openai_compatible
+# 作用范围：OpenAI / Claude / Gemini / DeepSeek / OpenRouter / OrcaRouter / openai_compatible
 # 的 chat + embedding、YouTube(yt-dlp)、X(twitter-cli)、Reddit(rdt-cli /
 # OpenCLI)、Bangumi(api.bgm.tv 与封面 CDN lain.bgm.tv 均为海外 Cloudflare,
 # 国内网络直连易超时,需走代理)、GitHub 自动更新、Codex OAuth。
@@ -563,10 +586,16 @@ inspiration_search_enabled = true
 # 搜索后端按顺序尝试。默认先用 local_cache 复用本地 content_cache evidence；
 # 本地证据不足时再用已启用的平台源做 inspiration-only grounding（当前同步支持
 # B站 / YouTube / X / Reddit，抖音 direct client；小红书 / 知乎 bridge 可用时
-# 也会加入；不写候选池），再用 Exa；Exa 免费 MCP 限流 / 返回空时再用
-# You.com 免费 MCP profile 兜底。远端 MCP 需要在本机 mcporter 配置里有
-# `exa` 和 / 或 `you` server。
-inspiration_search_backends = ["local_cache", "platform_sources", "exa", "you"]
+# 也会加入；不写候选池），再用 Bing RSS 无 key 全网搜索兜底；之后用 Exa，
+# Exa 不可用/返回空时再用 You.com 兜底。远端 MCP 需要在本机 mcporter 配置里有
+# `exa` 和 / 或 `you` server；填写 exa_api_key / you_api_key 后则直连 HTTP API。
+inspiration_search_backends = ["local_cache", "platform_sources", "bing_rss", "exa", "you"]
+# Exa / You.com 直连 API Key（可选）。填写后走 Python 直连 HTTP API，
+# 不再依赖本机 mcporter CLI；留空时回退到 mcporter（若已安装）。
+# Exa: https://exa.ai  →  x-api-key
+# You.com: https://you.com  →  x-api-key
+exa_api_key = ""
+you_api_key = ""
 # 实验开关：开启且 inspiration provider 可用时，跳过旧 merged keyword planner，
 # 每轮 due 平台只用 inspiration flow 产词。
 inspiration_replace_merged_keywords = false

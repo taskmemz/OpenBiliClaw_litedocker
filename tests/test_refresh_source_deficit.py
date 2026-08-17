@@ -405,6 +405,50 @@ def test_demote_lowest_ranked_pool_rows_evicts_lowest_score_first(tmp_path: Path
     assert statuses["BVbili"] == "fresh"
 
 
+def test_demote_lowest_ranked_pool_rows_ignores_temporally_stale_rows(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    db.cache_content(
+        "BVexpired",
+        title="已经过期的突发内容",
+        source="reddit",
+        source_platform="reddit",
+        relevance_score=0.1,
+        pool_expression="旧内容",
+        pool_topic_label="旧主题",
+        style_key="news",
+        topic_group="新闻",
+        published_at="2000-01-01T00:00:00+00:00",
+        temporal_class="breaking",
+        temporal_confidence=0.95,
+        temporal_reason="价值依赖即时状态",
+    )
+    db.cache_content(
+        "BVeligible",
+        title="仍可推荐的内容",
+        source="reddit",
+        source_platform="reddit",
+        relevance_score=0.9,
+        pool_expression="有效内容",
+        pool_topic_label="有效主题",
+        style_key="deep_dive",
+        topic_group="技术",
+    )
+
+    assert db.count_pool_candidates() == 1
+    assert db.demote_lowest_ranked_pool_rows(source_family="reddit", limit=1) == 1
+    assert db.count_pool_candidates() == 0
+    statuses = {
+        row["bvid"]: row["pool_status"]
+        for row in db.conn.execute(
+            "SELECT bvid, COALESCE(pool_status, 'fresh') AS pool_status FROM content_cache"
+        ).fetchall()
+    }
+    assert statuses == {"BVexpired": "temporal_review_hold", "BVeligible": "stale"}
+
+
 # ── Phase 4: change-throttled per-source deficit summary logging ──
 
 

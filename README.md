@@ -10,10 +10,10 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Release](https://img.shields.io/github/v/release/whiteguo233/OpenBiliClaw?filter=openbiliclaw-v*&style=flat-square&label=Release&color=success)](https://github.com/whiteguo233/OpenBiliClaw/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/whiteguo233/OpenBiliClaw/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/whiteguo233/OpenBiliClaw/actions/workflows/ci.yml)
-[![LINUX DO](https://img.shields.io/badge/LINUX_DO-Community-black?style=flat-square&logo=linux)](https://linux.do/)
 [![讨论帖](https://img.shields.io/badge/LINUX_DO-讨论帖-orange?style=flat-square&logo=discourse)](https://linux.do/t/topic/1978894)
 [![Chrome 应用商店](https://img.shields.io/chrome-web-store/v/cdfjfkdjjhdaccbldipkjhpibnfbiamg?style=flat-square&label=Chrome%20应用商店&logo=googlechrome&logoColor=white&color=4285F4)](https://chromewebstore.google.com/detail/cdfjfkdjjhdaccbldipkjhpibnfbiamg)
 [![Gitee 镜像](https://img.shields.io/badge/Gitee-镜像-C71D23?style=flat-square&logo=gitee&logoColor=white)](https://gitee.com/whiteguo233/OpenBiliClaw)
+[![DSH 插件市场](https://img.shields.io/static/v1?label=%E2%AD%90%20DSH&message=%E6%8F%92%E4%BB%B6%E5%B8%82%E5%9C%BA&color=7C3AED&style=flat-square)](https://dshfind.com/zh/plugins)
 
 [项目主页](https://whiteguo233.github.io/OpenBiliClaw/) | [English](README_EN.md) | 中文
 
@@ -30,6 +30,12 @@
 > - 降级（LLM 不可用）状态下放行 Cookie 同步接口
 >
 > 功能、接口与官方版可能存在差异，请以本仓库代码为准。上游项目：[github.com/whiteguo233/OpenBiliClaw](https://github.com/whiteguo233/OpenBiliClaw)。
+>
+> ### 🆕 重要更新：OpenBiliClaw 现在可以装进 DeepSeek Harness
+>
+> 新增 **DSH 客户端插件** —— 把 OpenBiliClaw 装进 [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness)：DSH 界面常驻第四栏（推荐 / 内容库 / 对话 / 画像 / 设置），并注册 22 个 Agent Bridge 工具，让 DSH 里的 Agent 也能读推荐、答探测、闭环学习——边用 DSH 干活，边刷跨平台个性化内容。→ [`github.com/whiteguo233/dsh-openbiliclaw`](https://github.com/whiteguo233/dsh-openbiliclaw)
+>
+> 📱 想要原生 App？Flutter 移动端客户端（Android / iOS / Web / 桌面）在独立仓库 [`OpenBiliClaw-mobile`](https://github.com/whiteguo233/OpenBiliClaw-mobile)：推荐、对话、画像、收藏 / 稍后再看 / 30 天历史一应俱全，连接同一本地后端。
 
 ## 10 秒看懂 OpenBiliClaw
 
@@ -118,7 +124,7 @@
 
 ## 📸 功能预览
 
-核心入口现在有四个：浏览器插件负责平台内交互和登录会话，桌面端 Web（`/web`）提供大屏推荐首页，移动端 Web（`/m`）适合手机使用，另有独立仓库的原生 Flutter 客户端（[OpenBiliClaw-mobile](https://github.com/whiteguo233/OpenBiliClaw-mobile)）覆盖 Android / iOS / Web / 桌面。桌面端、移动端 Web 和原生客户端都只调用本地 API，Cookie 同步和平台任务仍由插件承担。
+核心入口现在有五个：浏览器插件负责平台内交互和登录会话，桌面端 Web（`/web`）提供大屏推荐首页，移动端 Web（`/m`）适合手机使用，另有独立仓库的原生 Flutter 客户端（[OpenBiliClaw-mobile](https://github.com/whiteguo233/OpenBiliClaw-mobile)）覆盖 Android / iOS / Web / 桌面，以及把同一套面板搬进 DSH Web 界面的 [DSH 客户端插件](https://github.com/whiteguo233/dsh-openbiliclaw)（第四栏 + 22 个 Agent Bridge 工具）。桌面端、移动端 Web、原生客户端和 DSH 插件都只调用本地 API，Cookie 同步和平台任务仍由插件承担。
 
 <table>
   <tr>
@@ -223,11 +229,12 @@
 
 ## 最近更新
 
-📌 最新版本：**v0.3.204（2026-08-11）**
+📌 最新版本：**v0.3.207（2026-08-15）**
 
-- **周期账号回拉默认关闭** —— 升级后不会自动打开平台标签页，手动初始化、手动同步和正常 discovery 保持不变。
-- **Linux.do 后台 discovery 更稳定** —— content-script 瞬时未就绪时会在同一任务和标签页内有界恢复，不再连续制造失败任务。
-- **V2EX 三种关键词模式恢复 Search 召回** —— 混合、灵感和传统关键词都能进入正式搜索与共享评估链。
+- **补货提速** —— B 站份额已满时不再停摆，健康来源会继续回填全局库存，一天跑不满的问题修复。
+- **免费联网找灵感** —— 新增 Bing RSS 无 key 搜索兜底，没配 Exa / You 也能拿到真实搜索结果。
+- **Exa / You.com 直连** —— 填 `exa_api_key` / `you_api_key` 即走 Python 直连 API，不再依赖 mcporter。
+- **来源更稳** —— V2EX / 微博的缺失 CLI 与 `upstream_rejected` 不再刷 traceback，失败时优雅降级。
 
 完整变更详见 [docs/changelog.md](docs/changelog.md)。
 
@@ -239,12 +246,12 @@
 
 插件是主要入口：它会在受支持站点显示侧边栏、采集你的反馈，并承接知乎、Reddit、Linux.do、V2EX、微博等登录态只读任务。Linux.do、V2EX 与微博的任务 tab 和普通行为采集隔离；微博公开 discovery 由后端独立完成，个人初始化才使用微博 host permission 和同源任务桥。
 
-插件基于 Manifest V3，支持所有兼容 Chrome 插件的浏览器，包括 **Chrome、Edge、Brave、Arc、Vivaldi、Opera** 等。
+插件基于 Manifest V3，支持所有兼容 Chrome 插件的浏览器，包括 **Chrome、Edge、Brave、Arc、Vivaldi、Opera** 等；另提供 **Safari（macOS）** 构建，Release 自动附带 `openbiliclaw-extension-v*-safari.dmg`（配置 Apple 凭据时为 Developer ID 签名 + 公证；未配置时为 ad-hoc 实验包，需在 Safari 开启「允许未签名扩展」），也可本地经 Apple `safari-web-extension-converter` 转成 Xcode 工程后安装（详见 [Safari 构建文档](docs/safari-extension-build.md)）。
 
 **推荐方式 · 从 Latest Release 聚合页下载最新版手动安装**（拿到最新功能与修复 —— Chrome 应用商店受审核排期影响，版本通常会滞后几天到一两周）：
 
 1. 打开 [OpenBiliClaw Latest Release](https://github.com/whiteguo233/OpenBiliClaw/releases/latest)，也就是最新 `openbiliclaw-v*` 用户下载聚合页
-2. Chrome / Edge / Brave 下载 `openbiliclaw-extension-v*.zip`；Firefox 若 release 提供 `openbiliclaw-extension-v*-firefox.xpi` 就直接安装，否则下载 `openbiliclaw-extension-v*-firefox.zip` 并按下方 `about:debugging` 临时加载
+2. Chrome / Edge / Brave 下载 `openbiliclaw-extension-v*.zip`；Firefox 若 release 提供 `openbiliclaw-extension-v*-firefox.xpi` 就直接安装，否则下载 `openbiliclaw-extension-v*-firefox.zip` 并按下方 `about:debugging` 临时加载；Safari（macOS）下载 `openbiliclaw-extension-v*-safari.dmg`，打开后首次运行 App，再到 Safari 设置 → 扩展里勾选 OpenBiliClaw
 3. 打开扩展管理页面（Chrome：`chrome://extensions/` · Edge：`edge://extensions/` · Brave：`brave://extensions/`），开启右上角「开发者模式」
 4. Chrome / Edge / Brave 将下载的 `.zip` 文件拖入页面安装；Firefox 的 `.xpi` 可直接打开确认安装，临时 zip 需要先解压再加载 `manifest.json`
 
@@ -252,7 +259,7 @@
 
 > 👉 **[在 Chrome 应用商店安装 OpenBiliClaw](https://chromewebstore.google.com/detail/cdfjfkdjjhdaccbldipkjhpibnfbiamg)** —— 打开后点「添加至 Chrome」即可。
 
-插件更新取决于安装渠道：Chrome Web Store / Edge Add-ons，以及审核通过后的 Firefox AMO 上架版由浏览器自动更新；从 GitHub Release 下载的 Chrome zip / Firefox signed XPI / Firefox 临时 zip、开发者模式加载或 Firefox 临时加载的用户，需要下载新版安装包并按同样方式重新加载。当前 Firefox AMO `0.3.204` 已接受 listed 提审但仍为 `unreviewed`，正式公开前请从 Release 使用 `*-firefox.zip` 临时加载；审核通过后再由 Firefox 自动更新。后端设置里的“自动更新”开关只更新本地后端源码，不会更新浏览器插件。
+插件更新取决于安装渠道：Chrome Web Store / Edge Add-ons，以及审核通过后的 Firefox AMO 上架版由浏览器自动更新；从 GitHub Release 下载的 Chrome zip / Firefox signed XPI / Firefox 临时 zip / Safari dmg、开发者模式加载或 Firefox 临时加载的用户，需要下载新版安装包并按同样方式重新加载。Firefox AMO 上架审核是异步的，listed 版本公开前请从 Release 使用 `*-firefox.zip` 临时加载；审核通过后由 Firefox 自动更新。后端设置里的“自动更新”开关只更新本地后端源码，不会更新浏览器插件。
 
 <details>
 <summary>Firefox 用户：正式安装与临时调试（Firefox 140+）</summary>
@@ -605,7 +612,7 @@ OpenClaw 收到 `interest.probe` 事件（或主动拉取 `next-probe`），发�
 - 🔄 **持续学习** — 苏格拉底式对话 + 行为分析 + 反馈即时生效，越用越懂你
 - ⭐ **本地优先收藏 / 稍后看** — 推荐卡先写本地 SQLite，自动同步默认关闭；桌面 Web 刷新后首屏就显示保存数量徽标；B站和六个扩展平台均支持收藏与原生稍后看/收藏回退，2026-07-14 七平台两类动作真实账号回归均为 `synced/already_synced`
 - 🕘 **30 天内容历史** — 插件、桌面与移动端统一显示点开过、出现未点和最近移除；按页懒加载封面，移除的本地收藏 / 稍后看可一键恢复
-- 🧩 **浏览器插件** — Chrome / Edge / Brave / Arc / Firefox，侧边栏推荐 + 跨站行为采集，装上就能用
+- 🧩 **浏览器插件** — Chrome / Edge / Brave / Arc / Firefox / Safari，侧边栏推荐 + 跨站行为采集，装上就能用
 - 📱 **Flutter 原生客户端** — 独立仓库 [OpenBiliClaw-mobile](https://github.com/whiteguo233/OpenBiliClaw-mobile)，Android / iOS / Web / Linux / macOS / Windows 连接同一本地后端；B 站封面 CDN 直连省两跳
 - 🚀 **图形化引导初始化** — 安装包 `/setup/`、桌面 Web 和插件都能点一下完成初始化，不碰命令行
 - 📦 **跨机器迁移** — 桌面配置页一键导出 / 导入可移植配置、SQLite、画像、Cookie 与图片缓存；导入先校验暂存，可查询 / 取消，重启后带回滚副本应用。`.obcbackup` 含明文敏感信息，但不含源机 API 登录密码 / 会话签名密钥或扩展设备 key
@@ -665,7 +672,7 @@ Agent 宿主（OpenClaw / Hermes / WorkBuddy）
 
 ```
 ┌────────────────────────────────────────────────┐
-│          浏览器插件（Chrome / Firefox）           │
+│    浏览器插件（Chrome / Firefox / Safari）     │
 │   行为采集 · MAIN-world tap（评论/弹幕·xhs强信号）│
 │   Cookie 同步 · 平台任务 · 侧边栏推荐             │
 └──────────────────────┬─────────────────────────┘
@@ -691,7 +698,7 @@ Agent 宿主（OpenClaw / Hermes / WorkBuddy）
 │ 旧反馈批：unified_interest_line=false 时启用   │
 │ 初始化屏障：完整画像落盘 → 发现/评估/表达 → 可浏览推荐 │
 │ B站供给：普通相关性搜索 + 预算内 1×5 pubdate recent lane → 统一评估 │
-│ 候选评估：时间中性相关性 + Agent 时效分型 → 发布时间高置信正向 bonus │
+│ 候选评估：时间中性相关性 + Agent 结构化时效证据 → eligible / review hold / expired + 发布时间 bonus │
 │ 推荐时效 shadow：含 bonus vs 无 bonus Top10/50/100 聚合 → class/source/age 审计（不改 serving）│
 │ 封面：proxy前台 + refresh预取 → app-stable 4/3 lane → singleflight/原子缓存 │
 │ Soul 认知纪律：待聊双轨冷却 · 单对话锚 · worker-only 结算 · 轻量 winner receipt · 疑惑 FIFO · 台账 · 深层门控 │
@@ -706,7 +713,7 @@ Agent 宿主（OpenClaw / Hermes / WorkBuddy）
 │ Bangumi 官方匿名 API → search/ranked/latest producer → shared eval │
 │ V2EX 匿名 API/Feed → 有界 Topic/Reply 增强 → 五分支 producer → shared eval │
 │ V2EX 身份梯级：PAT verified > browser observed > user accepted；冲突时只暂停账号画像写入 │
-│ 候选评估时钟：published_at + 精确 UTC evaluated_at → 小时桶缓存失效 │
+│ 时效生命周期：正文逐字证据 + code-owned 复审时钟 → 可展示 / temporal_review_hold / 过期 │
 │ evaluator prefilter 默认 shadow → 隐私安全决策/原始分数 join → 只读质量 gate（不自动 enforce）│
 │ cognition named views → task-scoped gate：仅 awareness_confusions compact；其余 legacy │
 │ token diet：偏好逐段真实装箱；洞察 近期/裁决保底 + 相关/重要/多样性加权≤40 → 完整历史 merge │
@@ -716,7 +723,7 @@ Agent 宿主（OpenClaw / Hermes / WorkBuddy）
 │ API raw 断供 → 欠份额来源即时并行补给 → 真实新增清退避 / 重复空转阶梯退避 │
 │ 惊喜就绪门：正式推荐词/主题就绪 + seen_items 硬过滤 → 打分并原子快照 → 四端 × 写回已看账本 │
 │ 库存 API/OpenClaw 启动钩子 → 历史恢复/原子维护 → 再暴露 LLM │
-│ 换屏快路：当前卡硬排除 → PoolServeSnapshot/seen_items → recommendation+shown 短事务 → 单条 reshuffle 事件 │
+│ 换屏快路：当前卡硬排除 → hold/stale 清退 + PoolServeSnapshot → 最终时效复核+recommendation/shown → reshuffle 事件 │
 │ 平台定向（仅 PC Web Tab）：source_platform → 平台候选（不跨平台补位）→ 同一排序/文案/持久化 │
 │ 平台库存：platform-availability → 同一 canonical 可推集合 → total == Σ by_platform │
 │ 后台维护：独立 DB worker → ≤50 行/批 → 释放写锁；未变化跳过 / 10min 巡检 │
@@ -749,6 +756,7 @@ durable turn → 固定时间/payload → 确认入口（待聊列表/卡片） 
 卡片 action → 同步 200（空队列快路）| 202 processing → popup/移动/桌面轮询；CLI 无 action
 
 桌面首屏：推荐 hydration │ runtime hydration │ health/profile/activity/config 次级 hydration（三分支独立）
+桌面后台恢复（已有卡片）：跳过可能补池的推荐 GET │ 只同步 runtime / 库存状态
 
 海外请求：设置页 `[network].mode` → 系统代理（默认）/ 直连 / 自定义代理 → LLM、YouTube、X/Reddit CLI、Bangumi、更新、GitHub 项目统计；国内平台（含 V2EX）保持独立直连
 手动抖音发现：CLI discover → daemon 同款 producer → 统一关键词终态 → 插件 search/hot/feed → 待评估池
@@ -843,7 +851,7 @@ OpenBiliClaw/
 │   ├── bilibili/              # B 站接入层 (WBI 签名 · 速率控制)
 │   ├── llm/                   # 多模型 LLM 适配 + 结构化 JSON 容错
 │   └── storage/               # 数据存储层
-├── extension/                 # Chrome/Firefox 插件（含 Linux.do / V2EX / 微博只读任务桥）
+├── extension/                 # Chrome/Firefox/Safari 插件（含 Linux.do / V2EX / 微博只读任务桥）
 ├── skills/                    # 内置 Skill 定义
 ├── docs/                      # 项目文档
 └── tests/                     # 测试 (1900+)
@@ -857,7 +865,7 @@ OpenBiliClaw/
 |------|------|
 | 后端 | Python 3.11+ |
 | 浏览器插件 | TypeScript + Chrome Extension (Manifest V3) |
-| LLM | 同一 Provider 类型可建多个独立 Base URL / token / model 实例，并配置全局及模块有序降级链；首次迁移自动保留旧配置备份，`config-export-legacy` 可生成旧版副本；内置 Gemini / DeepSeek / OpenAI / Claude / OpenRouter / Ollama，兼容任意 OpenAI 协议服务；OpenAI 可实验性复用 Codex CLI OAuth |
+| LLM | 同一 Provider 类型可建多个独立 Base URL / token / model 实例，并配置全局及模块有序降级链；首次迁移自动保留旧配置备份，`config-export-legacy` 可生成旧版副本；内置 Gemini / DeepSeek / OpenAI / Claude / OpenRouter / OrcaRouter / Ollama，兼容任意 OpenAI 协议服务；OpenAI 可实验性复用 Codex CLI ChatGPT OAuth（官方 Codex 传输） |
 | B 站交互 | 自研 API 客户端 (WBI 签名 · v_voucher 自动恢复 · 速率控制) |
 | 小红书交互 | 扩展 DOM/state 元数据提取 + 插件任务调度；search / creator 在后台标签执行，search 用 MAIN-world 页面响应桥避开隐藏页虚拟 DOM 限制；仅滚动型初始化会前台打开 `/explore` 并点击页面 profile 入口（零后端爬取） |
 | 抖音交互 | 扩展 DOM + MAIN-world 被动 fetch tap + 插件任务调度；初始化导入发布 / 收藏 / 点赞 / 关注信号，search / hot / feed discovery 从抖音首页模拟 DOM 操作触发加载，search/feed 被动收集页面响应 / 渲染结果，hot 可用热榜 `group_id` seed 走已登录页面 related fallback（零后端代登录） |
@@ -930,3 +938,12 @@ OpenBiliClaw 的目标是做你的**全网个性化内容入口**——从 B 站
 ## 📄 License
 
 [MIT](LICENSE)
+
+## 友情链接
+
+<details>
+<summary>友情链接</summary>
+
+[![LINUX DO](https://img.shields.io/badge/LINUX_DO-友情链接-4D6BFE?style=flat-square&logo=discourse&logoColor=white)](https://linux.do/)
+
+</details>

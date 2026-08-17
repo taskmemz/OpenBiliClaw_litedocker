@@ -152,6 +152,21 @@ def _looks_like_model_oom(text: str) -> bool:
     )
 
 
+def _looks_like_native_access_violation(text: str) -> bool:
+    """Detect the Windows llama-server access-violation crash signature.
+
+    Ollama wraps the runner's ``STATUS_ACCESS_VIOLATION`` (0xc0000005) as a
+    plain HTTP 500. Re-pulling *can* fix a corrupt blob, but the same signature
+    also shows up for memory pressure, pagefile/AV interference and Ollama
+    version bugs — so the detail must walk the user through those instead of
+    claiming it is only a download problem.
+    """
+    lower = text.lower()
+    return "0xc0000005" in lower or (
+        "access violation" in lower and "llama" in lower
+    )
+
+
 def _format_gib(value: int) -> str:
     return f"{value / (1024 * 1024 * 1024):.1f} GB"
 
@@ -205,6 +220,19 @@ def _model_oom_detail(model: str, *, raw: str = "") -> str:
     detail = (
         f"内存不足以加载 {model}，重新下载无效。"
         "请关闭占用内存的程序，或换更小的 embedding 模型 / 增加内存后重试。"
+    )
+    return _with_raw_detail(detail, raw)
+
+
+def _native_access_violation_detail(model: str, *, raw: str = "") -> str:
+    detail = (
+        f"{model} 已安装，但 llama-server 进程发生 Windows 访问违规崩溃（0xc0000005）。"
+        "请按顺序尝试：① 点一键修复重新拉取，排除模型文件损坏；"
+        "② 重启应用 / Ollama；"
+        "③ 检查内存与虚拟内存（任务管理器 → 性能 → 内存，确认分页文件为系统托管），"
+        "关闭高占用程序；"
+        "④ 给 Ollama 与模型目录加杀毒软件白名单；"
+        "⑤ 仍复现则升级到最新安装包（或更新 Ollama）。"
     )
     return _with_raw_detail(detail, raw)
 
@@ -333,6 +361,8 @@ async def diagnose_ollama_embedding(
                 return (DIAG_DISK_FULL, _disk_full_detail(model))
             if _looks_like_network_failure(snippet):
                 return (DIAG_NETWORK, _network_detail(model))
+            if _looks_like_native_access_violation(snippet):
+                return (DIAG_MODEL_BROKEN, _native_access_violation_detail(model, raw=snippet))
             return (
                 DIAG_MODEL_BROKEN,
                 f"{model} 已安装但调用返回 HTTP {probe.status_code}"

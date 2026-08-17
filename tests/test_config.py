@@ -148,6 +148,28 @@ class TestConfigDefaults:
 
         assert load_config(config_path).saved_sync.auto_sync_enabled is True
 
+    def test_embedding_cache_capacity_defaults_unlimited(self) -> None:
+        config = Config()
+
+        # 0 = unlimited: the L2 cache keeps current behavior unless the user
+        # opts into a byte budget (issue #153).
+        assert config.llm.embedding.cache_max_bytes == 0
+        assert config.llm.embedding.cache_high_watermark == 0.9
+        assert config.llm.embedding.cache_low_watermark == 0.7
+
+    def test_embedding_cache_capacity_fields_round_trip(self, tmp_path: Path) -> None:
+        config = Config()
+        config.llm.embedding.cache_max_bytes = 536870912
+        config.llm.embedding.cache_high_watermark = 0.85
+        config.llm.embedding.cache_low_watermark = 0.6
+        config_path = tmp_path / "config.toml"
+        save_config(config, config_path)
+
+        loaded = load_config(config_path)
+        assert loaded.llm.embedding.cache_max_bytes == 536870912
+        assert loaded.llm.embedding.cache_high_watermark == 0.85
+        assert loaded.llm.embedding.cache_low_watermark == 0.6
+
     def test_example_config_disables_saved_auto_sync(self) -> None:
         example_path = Path(__file__).parents[1] / "config.example.toml"
 
@@ -710,6 +732,40 @@ def test_validate_runtime_config_requires_openrouter_api_key() -> None:
     )
 
     with pytest.raises(ConfigError, match="llm.openrouter.api_key"):
+        validate_runtime_config(config)
+
+
+def test_build_config_supports_orcarouter_provider() -> None:
+    config = _build_config(
+        {
+            "llm": {
+                "default_provider": "orcarouter",
+                "orcarouter": {
+                    "api_key": "sk-orca-test",
+                    "model": "openai/gpt-4o",
+                    "base_url": "https://api.orcarouter.ai/v1",
+                    "reasoning_effort": "high",
+                },
+            }
+        }
+    )
+
+    assert config.llm.default_provider == "orcarouter"
+    assert config.llm.orcarouter.api_key == "sk-orca-test"
+    assert config.llm.orcarouter.model == "openai/gpt-4o"
+    assert config.llm.orcarouter.base_url == "https://api.orcarouter.ai/v1"
+    assert config.llm.orcarouter.reasoning_effort == "high"
+
+
+def test_validate_runtime_config_requires_orcarouter_api_key() -> None:
+    config = Config(
+        llm=LLMConfig(
+            default_provider="orcarouter",
+            orcarouter=LLMProviderConfig(api_key="", model="openai/gpt-4o"),
+        )
+    )
+
+    with pytest.raises(ConfigError, match="llm.orcarouter.api_key"):
         validate_runtime_config(config)
 
 
@@ -2744,6 +2800,7 @@ class TestDiscoveryConfig:
         assert config.discovery.inspiration_search_backends == (
             "local_cache",
             "platform_sources",
+            "bing_rss",
             "exa",
             "you",
         )
@@ -2776,6 +2833,7 @@ class TestDiscoveryConfig:
         assert config.discovery.inspiration_search_backends == (
             "local_cache",
             "platform_sources",
+            "bing_rss",
             "exa",
             "you",
         )
@@ -3131,8 +3189,8 @@ eval_prefilter_mode = "  Shadow  "
         assert "inspiration_search_enabled = true" in rendered
         assert "inspiration_replace_merged_keywords = false" in rendered
         assert (
-            'inspiration_search_backends = ["local_cache", "platform_sources", "exa", "you"]'
-            in rendered
+            'inspiration_search_backends = ["local_cache", "platform_sources", '
+            '"bing_rss", "exa", "you"]' in rendered
         )
         assert 'inspiration_breadth = "high"' in rendered
         assert 'eval_prefilter_mode = "shadow"' in rendered

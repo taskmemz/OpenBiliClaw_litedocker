@@ -24,8 +24,8 @@ from openbiliclaw.llm.base import LLMResponse
 from openbiliclaw.soul.profile import InterestTag, SoulProfile
 from openbiliclaw.storage.database import Database
 
-_V4_PRODUCTION_SYSTEM_SHA256 = "53f1ed5efef79a3f28b897d762ea8b655579a872cbeb5c39e24ff95c4220ff49"
-_V4_PRODUCTION_USER_SHA256 = "62fbf2e03401ac36efe4ff935b1a424eb8a147497fd46ff296e2a5202b7bd68f"
+_V6_PRODUCTION_SYSTEM_SHA256 = "0316ce1690e86c6ee6cbd513e270b80177d451883db7341e4d751d667a9ebdda"
+_V6_PRODUCTION_USER_SHA256 = "48944e86483632062b18f1d6b26655d2ef64ac4855c8f34d92da99d76a3d619f"
 
 
 def _profile(*, private: bool = False) -> SoulProfile:
@@ -204,7 +204,7 @@ async def test_default_engine_uses_sparse_local_ids_on_cold_and_warm_prompt_path
 
     cache_keys = list(engine._eval_cache_store())  # noqa: SLF001
     assert cache_keys
-    assert all(key.startswith("content-eval-v4:batch:") for key in cache_keys)
+    assert all(key.startswith("content-eval-v6:batch:") for key in cache_keys)
     assert all(key.endswith(":transport:sparse-json") for key in cache_keys)
 
 
@@ -386,7 +386,7 @@ class _ProductionRollbackService:
 
 
 @pytest.mark.asyncio
-async def test_explicit_production_rollback_matches_v4_prompt_golden(
+async def test_explicit_production_rollback_matches_v6_prompt_golden(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -413,9 +413,9 @@ async def test_explicit_production_rollback_matches_v4_prompt_golden(
     system_instruction = str(llm.calls[0]["system_instruction"])
     user_input = str(llm.calls[0]["user_input"])
     assert hashlib.sha256(system_instruction.encode("utf-8")).hexdigest() == (
-        _V4_PRODUCTION_SYSTEM_SHA256
+        _V6_PRODUCTION_SYSTEM_SHA256
     )
-    assert hashlib.sha256(user_input.encode("utf-8")).hexdigest() == (_V4_PRODUCTION_USER_SHA256)
+    assert hashlib.sha256(user_input.encode("utf-8")).hexdigest() == (_V6_PRODUCTION_USER_SHA256)
 
     candidate_block = _candidate_block(user_input)
     production_items = json.loads(candidate_block)

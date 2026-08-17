@@ -584,6 +584,9 @@ async function flushEvents(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function ensureFlushAlarm(): void {
+  // Safari 18+ exposes chrome.alarms, but guard defensively so a browser
+  // without it degrades to WS-driven flushing instead of crashing the worker.
+  if (typeof chrome === "undefined" || !chrome.alarms?.create) return;
   chrome.alarms.create(FLUSH_ALARM_NAME, {
     periodInMinutes: BUFFER_FLUSH_INTERVAL / 60_000,
   });
@@ -833,60 +836,68 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   });
 });
 
-chrome.alarms.onAlarm.addListener((alarm) => {
-  handleXhsTaskAlarm(alarm.name);
-  handleDyTaskAlarm(alarm.name);
-  handleYtTaskAlarm(alarm.name);
-  handleZhihuTaskAlarm(alarm.name);
-  handleWeiboTaskAlarm(alarm.name);
-  void handleRedditTaskAlarm(alarm.name);
-  void handleLinuxdoTaskAlarm(alarm.name);
-  handleV2EXTaskAlarm(alarm.name);
-  void handleXTaskAlarm(alarm.name);
-  handleBiliTaskAlarm(alarm.name);
-  if (handleCookieSyncAlarm(alarm.name)) {
-    return;
-  }
-  if (alarm.name === FLUSH_ALARM_NAME) {
-    void (async () => {
-      await bufferReady();
-      if (getBufferLength() === 0 && !backendUninitialized) {
-        await recoverParkedEventsForFlush();
-      }
-      if (getBufferLength() > 0) {
-        await flushEvents();
-      } else {
-        await checkPendingNotification();
-      }
-    })();
-  }
-});
+if (typeof chrome !== "undefined" && chrome.alarms?.onAlarm) {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    handleXhsTaskAlarm(alarm.name);
+    handleDyTaskAlarm(alarm.name);
+    handleYtTaskAlarm(alarm.name);
+    handleZhihuTaskAlarm(alarm.name);
+    handleWeiboTaskAlarm(alarm.name);
+    void handleRedditTaskAlarm(alarm.name);
+    void handleLinuxdoTaskAlarm(alarm.name);
+    handleV2EXTaskAlarm(alarm.name);
+    void handleXTaskAlarm(alarm.name);
+    handleBiliTaskAlarm(alarm.name);
+    if (handleCookieSyncAlarm(alarm.name)) {
+      return;
+    }
+    if (alarm.name === FLUSH_ALARM_NAME) {
+      void (async () => {
+        await bufferReady();
+        if (getBufferLength() === 0 && !backendUninitialized) {
+          await recoverParkedEventsForFlush();
+        }
+        if (getBufferLength() > 0) {
+          await flushEvents();
+        } else {
+          await checkPendingNotification();
+        }
+      })();
+    }
+  });
+}
 
-chrome.notifications.onClicked.addListener((notificationId) => {
-  if (notificationId.startsWith("openbiliclaw-probe:")) {
+// Safari does not implement chrome.notifications (its `notifications`
+// permission is ignored); the OS-toast surface is already disabled for
+// Chrome/Firefox, so this listener only routes the click → UI open when the
+// API exists. Guard it so the worker loads on Safari without throwing.
+if (typeof chrome !== "undefined" && chrome.notifications?.onClicked) {
+  chrome.notifications.onClicked.addListener((notificationId) => {
+    if (notificationId.startsWith("openbiliclaw-probe:")) {
+      void openExtensionUi(chrome, { tab: "profile" });
+      void chrome.notifications.clear(notificationId);
+      return;
+    }
+    const bvid = parseNotificationBvid(notificationId);
+    if (bvid) {
+      void openExtensionUi(chrome, { tab: "recommend" });
+      void chrome.notifications.clear(notificationId);
+      return;
+    }
+    const delightBvid = parseDelightBvid(notificationId);
+    if (delightBvid) {
+      void openExtensionUi(chrome, { tab: "recommend", delightBvid });
+      void chrome.notifications.clear(notificationId);
+      return;
+    }
+    const cognitionId = parseCognitionUpdateId(notificationId);
+    if (!cognitionId) {
+      return;
+    }
     void openExtensionUi(chrome, { tab: "profile" });
     void chrome.notifications.clear(notificationId);
-    return;
-  }
-  const bvid = parseNotificationBvid(notificationId);
-  if (bvid) {
-    void openExtensionUi(chrome, { tab: "recommend" });
-    void chrome.notifications.clear(notificationId);
-    return;
-  }
-  const delightBvid = parseDelightBvid(notificationId);
-  if (delightBvid) {
-    void openExtensionUi(chrome, { tab: "recommend", delightBvid });
-    void chrome.notifications.clear(notificationId);
-    return;
-  }
-  const cognitionId = parseCognitionUpdateId(notificationId);
-  if (!cognitionId) {
-    return;
-  }
-  void openExtensionUi(chrome, { tab: "profile" });
-  void chrome.notifications.clear(notificationId);
-});
+  });
+}
 
 // Kick off the restore gate at SW start so events persisted before a recycle
 // are back in the buffer for the next alarm flush, even without a fresh event.

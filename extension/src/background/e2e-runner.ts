@@ -1,5 +1,6 @@
 import { apiUrl } from "../shared/backend-endpoint.ts";
 import { authenticatedFetch } from "../shared/auth.ts";
+import { createTaskTab } from "./task-tab.ts";
 import {
   actionsForE2EPlatform,
   E2E_PLATFORM_URLS,
@@ -547,7 +548,7 @@ async function openOrReusePlatformTab(platform: E2EPlatform): Promise<chrome.tab
     return updated;
   }
 
-  return chrome.tabs.create({ active: true, url: targetUrl });
+  return createTaskTab({ active: true, url: targetUrl });
 }
 
 async function waitForTabComplete(tabId: number, timeoutMs: number): Promise<chrome.tabs.Tab> {

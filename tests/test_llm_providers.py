@@ -26,6 +26,7 @@ from openbiliclaw.llm.gemini_provider import GeminiProvider, gemini_sdk_availabl
 from openbiliclaw.llm.ollama_provider import OllamaProvider
 from openbiliclaw.llm.openai_provider import DeepSeekProvider, OpenAIProvider
 from openbiliclaw.llm.openrouter_provider import OpenRouterProvider
+from openbiliclaw.llm.orcarouter_provider import OrcaRouterProvider
 
 
 def _openai_response(content: str = "ok") -> SimpleNamespace:
@@ -1318,6 +1319,91 @@ async def test_openrouter_channel_empty_omits_unsafe_disable_for_mandatory_model
     )
 
     assert "extra_body" not in captured
+
+
+def test_orcarouter_provider_defaults() -> None:
+    provider = OrcaRouterProvider(api_key="test-key", model="openai/gpt-4o")
+
+    assert provider.name == "orcarouter"
+    assert provider.base_url == "https://api.orcarouter.ai/v1"
+    # OrcaRouter does not use OpenRouter attribution headers.
+    assert provider._extra_headers() == {}
+    # OrcaRouter forwards reasoning args to the upstream route, which
+    # rejects them on non-reasoning models (HTTP 400 against gpt-4o), so
+    # the adapter never sends reasoning_effort or a provider-specific body.
+    assert provider._extra_body(reasoning_effort="medium") == {}
+    assert provider._openai_reasoning_effort("openai/gpt-4o", "high") is None
+
+
+@pytest.mark.asyncio
+async def test_orcarouter_provider_omits_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OrcaRouter never sends ``reasoning_effort`` or a nested ``reasoning``
+    object: the gateway forwards both to the upstream model, which rejects
+    them on non-reasoning routes (verified against ``openai/gpt-4o``)."""
+    provider = OrcaRouterProvider(api_key="test-key", model="openai/gpt-4o")
+    captured: dict[str, object] = {}
+
+    async def fake_request(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return _openai_response("orcarouter-ok")
+
+    monkeypatch.setattr(provider, "_request_with_retry", fake_request)
+
+    response = await provider.complete(
+        [{"role": "user", "content": "hi"}],
+        reasoning_effort="high",
+    )
+
+    assert response.content == "orcarouter-ok"
+    assert "reasoning_effort" not in captured
+    assert "extra_body" not in captured
+
+
+@pytest.mark.asyncio
+async def test_orcarouter_channel_empty_omits_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OrcaRouterProvider(api_key="test-key", model="openai/gpt-4o")
+    captured: dict[str, object] = {}
+
+    async def fake_request(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return _openai_response("ok")
+
+    monkeypatch.setattr(provider, "_request_with_retry", fake_request)
+
+    await provider.complete(
+        [{"role": "user", "content": "hi"}],
+        reasoning_effort="",
+    )
+
+    assert "reasoning_effort" not in captured
+    assert "extra_body" not in captured
+
+
+@pytest.mark.asyncio
+async def test_orcarouter_provider_inherits_per_call_model_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OrcaRouterProvider(api_key="test-key", model="openai/gpt-4o")
+    captured: dict[str, object] = {}
+
+    async def fake_request(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return _openai_response("orcarouter-ok")
+
+    monkeypatch.setattr(provider, "_request_with_retry", fake_request)
+
+    response = await provider.complete(
+        [{"role": "user", "content": "hi"}],
+        model="anthropic/claude-opus-4.8",
+    )
+
+    assert response.content == "orcarouter-ok"
+    assert captured["model"] == "anthropic/claude-opus-4.8"
+    assert provider._model == "openai/gpt-4o"
 
 
 @pytest.mark.skipif(not gemini_sdk_available(), reason="google-genai is not installed")

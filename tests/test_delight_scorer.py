@@ -415,6 +415,14 @@ def test_database_count_delight_candidates(tmp_path: Path) -> None:
     count = database.count_delight_candidates(min_delight_score=0.85)
     assert count == 1
 
+    database.conn.execute(
+        "UPDATE content_cache SET pool_status = 'suppressed' WHERE bvid = ?",
+        ("BV1B",),
+    )
+    database.conn.commit()
+    assert database.get_delight_candidates(min_delight_score=0.85) == []
+    assert database.count_delight_candidates(min_delight_score=0.85) == 0
+
 
 def test_database_delight_paths_exclude_durable_seen_items(tmp_path: Path) -> None:
     database = _make_database(tmp_path)

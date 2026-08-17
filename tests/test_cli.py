@@ -1860,6 +1860,95 @@ def test_config_show_displays_autostart_status(
     assert "已注册" in result.stdout
 
 
+def test_embedding_cache_stats_reports_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: CliRunner
+) -> None:
+    from openbiliclaw.llm.embedding import EmbeddingCache
+
+    cfg = config_module.Config()
+    cfg.data_dir = str(tmp_path)
+    monkeypatch.setattr(
+        config_module,
+        "load_config_with_diagnostics",
+        lambda: (cfg, config_module.ConfigDiagnostics()),
+        raising=False,
+    )
+    monkeypatch.setattr(cli_module, "_initialize_logging", lambda log_level_override=None: None)
+
+    cache = EmbeddingCache(tmp_path / "embedding_cache.db")
+    cache.initialize()
+    cache.put("k1", [0.1, 0.2, 0.3], model="bge-m3#namespace=abc123")
+    cache.conn.execute(
+        "INSERT INTO embedding_cache (text_key, model, vector, encoding) "
+        "VALUES ('k2', 'bge-m3', ?, 0)",
+        ("[0.4, 0.5, 0.6]",),
+    )
+    cache.conn.commit()
+    cache.close()
+
+    result = runner.invoke(app, ["embedding-cache-stats"])
+
+    assert result.exit_code == 0, result.output
+    assert "Embedding L2 缓存诊断" in result.stdout
+    assert "bge-m3#namespace=abc123" in result.stdout
+    assert "legacy" in result.stdout
+    assert "总行数" in result.stdout
+
+
+def test_embedding_cache_clean_dry_run_then_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: CliRunner
+) -> None:
+    from openbiliclaw.llm.embedding import EmbeddingCache
+
+    cfg = config_module.Config()
+    cfg.data_dir = str(tmp_path)
+    monkeypatch.setattr(
+        config_module,
+        "load_config_with_diagnostics",
+        lambda: (cfg, config_module.ConfigDiagnostics()),
+        raising=False,
+    )
+    monkeypatch.setattr(cli_module, "_initialize_logging", lambda log_level_override=None: None)
+
+    cache = EmbeddingCache(tmp_path / "embedding_cache.db")
+    cache.initialize()
+    cache.put("k1", [0.1, 0.2, 0.3], model="m#namespace=live")
+    cache.conn.execute(
+        "INSERT INTO embedding_cache (text_key, model, vector, encoding) "
+        "VALUES ('k2', 'bge-m3', ?, 0)",
+        ("[0.4, 0.5, 0.6]",),
+    )
+    cache.conn.commit()
+    cache.close()
+
+    # Default dry-run: reports what would change, touches nothing.
+    result = runner.invoke(app, ["embedding-cache-clean"])
+    assert result.exit_code == 0, result.output
+    assert "dry-run" in result.stdout
+    reopen = EmbeddingCache(tmp_path / "embedding_cache.db")
+    reopen.initialize()
+    assert reopen.count() == 2
+    reopen.close()
+
+    # --apply: migrates the JSON row, deletes the unprotected legacy row and
+    # physically compacts the file.
+    result = runner.invoke(
+        app, ["embedding-cache-clean", "--apply", "--keep-model", "m#namespace=live"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "迁移 1 行" in result.stdout
+    assert "删除 1 行" in result.stdout
+    reopen = EmbeddingCache(tmp_path / "embedding_cache.db")
+    reopen.initialize()
+    assert reopen.count() == 1
+    assert reopen.get("k1", model="m#namespace=live") is not None
+    row = reopen.conn.execute(
+        "SELECT encoding FROM embedding_cache WHERE text_key = 'k1'"
+    ).fetchone()
+    assert row[0] == 1
+    reopen.close()
+
+
 def test_run_api_server_prints_degraded_mode_panel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

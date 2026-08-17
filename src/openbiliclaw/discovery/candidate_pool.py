@@ -14,7 +14,10 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from openbiliclaw.discovery.engine import DiscoveredContent
-from openbiliclaw.discovery.temporal import TEMPORAL_POLICY_VERSION
+from openbiliclaw.discovery.temporal import (
+    TEMPORAL_POLICY_VERSION,
+    is_complete_temporal_evidence_marker,
+)
 from openbiliclaw.saved_sync.identity import make_item_key
 
 PENDING_EVAL = "pending_eval"
@@ -26,6 +29,7 @@ REJECTED_DUPLICATE = "rejected_duplicate"
 REJECTED_CACHE_ADMISSION = "rejected_cache_admission"
 REJECTED_RECENTLY_VIEWED = "rejected_recently_viewed"
 REJECTED_FRANCHISE_QUOTA = "rejected_franchise_quota"
+REJECTED_TEMPORAL_STALE = "rejected_temporal_stale"
 FAILED_EVAL = "failed_eval"
 
 
@@ -325,6 +329,21 @@ def row_to_discovered_content(row: dict[str, Any]) -> DiscoveredContent:
         temporal_confidence=float(row.get("temporal_confidence") or 0.0),
         temporal_reason=str(row.get("temporal_reason") or ""),
         temporal_policy_version=str(row.get("temporal_policy_version") or TEMPORAL_POLICY_VERSION),
+        temporal_validity_mode=str(row.get("temporal_validity_mode") or "none"),
+        temporal_valid_until=str(row.get("temporal_valid_until") or ""),
+        temporal_scope=str(row.get("temporal_scope") or "none"),
+        temporal_evidence=str(row.get("temporal_evidence") or ""),
+        temporal_state=str(row.get("temporal_state") or "unknown"),
+        temporal_next_review_at=str(row.get("temporal_next_review_at") or ""),
+        temporal_evaluated_at=str(row.get("temporal_evaluated_at") or ""),
+        temporal_evidence_complete=is_complete_temporal_evidence_marker(
+            row.get("temporal_evidence_complete")
+        ),
+        temporal_evaluated=(
+            str(row.get("temporal_class") or "unknown").strip().lower() != "unknown"
+            or float(row.get("temporal_confidence") or 0.0) != 0.0
+            or bool(str(row.get("temporal_reason") or "").strip())
+        ),
         pool_expression=str(row.get("pool_expression") or ""),
         pool_topic_label=str(row.get("pool_topic_label") or ""),
         candidate_tier=str(row.get("candidate_tier") or "primary"),

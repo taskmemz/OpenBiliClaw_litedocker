@@ -730,6 +730,9 @@ def test_content_evaluation_prompts_define_publication_time_semantics() -> None:
         assert "trending/search/feed 也不能决定分类" in system
         assert "temporal_confidence" in system
         assert "不是内容质量、相关性或新鲜度" in system
+        assert "条件、假设、可能性或未来态句子" in system
+        assert "如果支持版本发生变化就重新核验" in system
+        assert "Temporal V2 仍是当前受支持版本" in system
         assert '"evaluated_at": "2026-08-04T09:00:00Z"' in user
         assert '"published_at": "2026-08-01T00:00:00Z"' in user
 
@@ -754,6 +757,24 @@ def test_temporal_evaluation_output_contract_is_static_for_pretty_and_sparse_bat
         assert "temporal_class" in system
         assert "temporal_confidence" in system
         assert "temporal_reason" in system
+        assert "temporal_validity_mode" in system
+        assert "temporal_valid_until" in system
+        assert "temporal_scope" in system
+        assert "temporal_evidence" in system
+        assert "temporal_state" in system
+        assert "explicit_deadline" in system
+        assert "event_state" in system
+        assert "version_state" in system
+        assert "freshness_only" in system
+        assert "所有非 none mode 都必须给逐字证据" in system
+        assert "evergreen/historical" in system
+        assert "freshness_only + hook" in system
+        assert "限时免费领取" in system
+        assert "今晚首播" in system
+        assert "unknown、active、expired、superseded" in system
+        assert "event_state 只能" in system
+        assert "version_state 只能" in system
+        assert "temporal_class=unknown 时必须输出 temporal_confidence=0" in system
         assert '"temporal_class": "evergreen"' in system
         assert "分类看核心价值" in system
         assert "score 只衡量内容与用户画像的相关性及内容本身价值" in system

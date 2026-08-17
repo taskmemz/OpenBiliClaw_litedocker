@@ -196,7 +196,7 @@ interface ChromeMock {
   tabs: {
     create: (opts: { url: string; active?: boolean }) => Promise<{ id: number }>;
     query: (opts: { active?: boolean; currentWindow?: boolean }) => Promise<Array<{ id?: number; url?: string; status?: string }>>;
-    update: (tabId: number, opts: { url?: string; active?: boolean }) => Promise<void>;
+    update: (tabId: number, opts: { url?: string; active?: boolean; muted?: boolean }) => Promise<void>;
     remove: (tabId: number) => Promise<void>;
     sendMessage: (tabId: number, message: unknown) => Promise<void>;
     onUpdated: {
@@ -214,7 +214,7 @@ interface MockState {
   sentMessages: { tabId: number; message: unknown }[];
   sendMessageImpl: (tabId: number, message: unknown) => Promise<void>;
   fetchCalls: { url: string; body?: unknown }[];
-  updatedTabs: { tabId: number; url?: string; active?: boolean }[];
+  updatedTabs: { tabId: number; url?: string; active?: boolean; muted?: boolean }[];
   removedTabs: number[];
   queriedTabs: { active?: boolean; currentWindow?: boolean }[];
   queryResult: Array<{ id?: number; url?: string; status?: string }>;
@@ -407,7 +407,7 @@ test("executeTask keeps search discovery in a background tab", async () => {
   await handleTaskResult({ task_id: "t-search-bg", urls: [], status: "ok" });
   await flush();
   assert.deepEqual(state.removedTabs, [42]);
-  assert.deepEqual(state.updatedTabs, []);
+  assert.deepEqual(state.updatedTabs, [{ tabId: 42, muted: true }]);
 });
 
 test("rate-limited task result is reported and closes the task tab", async () => {
@@ -494,7 +494,11 @@ test("executeTask opens explore active and waits after clicked profile navigatio
   });
   await flush();
 
-  assert.deepEqual(state.updatedTabs, [], "clicked profile navigation must not call tabs.update");
+  assert.deepEqual(
+    state.updatedTabs,
+    [{ tabId: 42, muted: true }],
+    "clicked profile navigation must not call tabs.update beyond the initial mute",
+  );
 
   chrome.tabs.onUpdated._emit(42, { status: "complete" });
   await flush();
@@ -572,6 +576,7 @@ test("bootstrap task follows a discovered profile URL before reporting the resul
   await flush();
 
   assert.deepEqual(state.updatedTabs, [
+    { tabId: 42, muted: true },
     {
       tabId: 42,
       url: "https://www.xiaohongshu.com/user/profile/current-user",

@@ -2365,14 +2365,23 @@ class ContinuousRefreshController:
             source_plan = self._build_source_replenishment_plan()
             if source_plan:
                 return source_plan
-            # When Bilibili is already at its platform quota, the missing
-            # capacity belongs to enabled non-Bilibili platform producers.
-            # Running the Bilibili fallback here would immediately violate
-            # the configured pool-source ratio.
-            self._log_empty_refresh_plan_diagnostics(pool_available=pool_available)
-            return []
-
+            # No source has an own-share deficit. That includes the
+            # healthy-source stall seen in production: Bilibili (and often
+            # XHS/Reddit) are already at/over quota while the missing
+            # capacity belongs to sources that are missing, throttled, or
+            # rate-limited (V2EX CLI absent, X unhealthy, YouTube/Weibo
+            # cooling down). If the discovery-candidate pipeline still has
+            # claimed/evaluating work, let it drain first; otherwise fall
+            # through to the periodic Bilibili plan so healthy over-share
+            # sources can keep introducing fresh topics and fill the global
+            # pool. Pool-share rebalancing can still demote them later when
+            # the under-share sources recover.
+            readiness = self._pool_readiness_counts()
+            if int(readiness.get("pending_eval", 0) or 0) > 0:
+                self._log_empty_refresh_plan_diagnostics(pool_available=pool_available)
+                return []
         if "bilibili" not in self._normalized_pool_source_shares():
+            self._log_empty_refresh_plan_diagnostics(pool_available=pool_available)
             return []
 
         plan: list[tuple[list[str], int]] = []
@@ -2388,6 +2397,8 @@ class ContinuousRefreshController:
             minutes=self.explore_refresh_minutes,
         ):
             plan.append((["explore"], self.discovery_limit))
+        if not plan:
+            self._log_empty_refresh_plan_diagnostics(pool_available=pool_available)
         return plan
 
     def _pool_below_replenishment_watermark(self, pool_available: int) -> bool:

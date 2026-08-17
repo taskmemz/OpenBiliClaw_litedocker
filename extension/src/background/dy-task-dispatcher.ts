@@ -33,6 +33,7 @@ import { authenticatedFetch } from "../shared/auth.ts";
 import { isNativeSaveTask, type NativeSaveResult, type NativeSaveTask } from "../shared/native-save.ts";
 import { ensureNativeSaveTaskRecovery, runNativeSaveTask } from "./native-save-task-runner.ts";
 import { runtimeAssetCandidates } from "../shared/asset-prefix.ts";
+import { createTaskTab } from "./task-tab.ts";
 // Cross-source mutex via globalThis. Mirror of the helper inlined
 // in xhs-task-dispatcher; both dispatchers coordinate by writing to
 // the same field on globalThis. See dispatcher-mutex.ts for the
@@ -870,7 +871,7 @@ async function replaceSearchTabForNextKeyword(): Promise<void> {
 
   let tab: chrome.tabs.Tab;
   try {
-    tab = await chrome.tabs.create({ url: "https://www.douyin.com/", active: false });
+    tab = await createTaskTab({ url: "https://www.douyin.com/", active: false });
   } catch (err) {
     await postTaskResult({
       task_id: searchProgress.task_id,
@@ -1052,7 +1053,7 @@ export async function executeTask(
 
     let tab: chrome.tabs.Tab;
     try {
-      tab = await chrome.tabs.create({
+      tab = await createTaskTab({
         url: "https://www.douyin.com/",
         active: shouldOpenDyTaskActive(task),
       });
@@ -1102,7 +1103,7 @@ export async function executeTask(
 
     let tab: chrome.tabs.Tab;
     try {
-      tab = await chrome.tabs.create({
+      tab = await createTaskTab({
         url: "https://www.douyin.com/",
         active: shouldOpenDyTaskActive(task),
       });
@@ -1145,7 +1146,7 @@ export async function executeTask(
 
     let tab: chrome.tabs.Tab;
     try {
-      tab = await chrome.tabs.create({
+      tab = await createTaskTab({
         url: "https://www.douyin.com/",
         active: shouldOpenDyTaskActive(task),
       });
@@ -1204,7 +1205,7 @@ export async function executeTask(
   // profile, not empty tab → /user/self).
   let tab: chrome.tabs.Tab;
   try {
-    tab = await chrome.tabs.create({
+    tab = await createTaskTab({
       url: "https://www.douyin.com/",
       active: shouldOpenDyTaskActive(task),
     });

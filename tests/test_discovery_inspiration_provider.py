@@ -6,13 +6,16 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from openbiliclaw.discovery.inspiration import ExaPreviewItem
 from openbiliclaw.discovery.inspiration_provider import (
     BangumiPlatformSearchBackend,
     BilibiliPlatformSearchBackend,
+    BingRssInspirationProvider,
     DouyinPlatformSearchBackend,
+    ExaInspirationProvider,
     FallbackInspirationSearchProvider,
     LocalInspirationProvider,
     McporterExaInspirationProvider,
@@ -23,6 +26,7 @@ from openbiliclaw.discovery.inspiration_provider import (
     WeiboPlatformSearchBackend,
     XhsPlatformSearchBackend,
     XPlatformSearchBackend,
+    YouInspirationProvider,
     YoutubePlatformSearchBackend,
     ZhihuPlatformSearchBackend,
     build_inspiration_search_provider,
@@ -206,6 +210,123 @@ async def test_build_provider_defaults_remote_timeout_below_planner_timeout() ->
     await provider.search("Switch repair", limit=1)
 
     assert seen_timeouts == [6.0]
+
+
+def test_build_provider_skips_mcporter_backends_when_cli_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+
+    provider = build_inspiration_search_provider(["exa", "you"])
+
+    assert provider is None
+
+
+async def test_exa_direct_provider_calls_api_and_parses_results() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["x-api-key"] == "test-exa-key"
+        assert request.url.host == "api.exa.ai"
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "Direct Exa result",
+                        "url": "https://example.test/exa",
+                        "highlights": ["one", "two"],
+                    }
+                ]
+            },
+        )
+
+    provider = ExaInspirationProvider(
+        api_key="test-exa-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    items = await provider.search("test query", limit=3)
+
+    assert items == [
+        ExaPreviewItem(
+            title="Direct Exa result",
+            url="https://example.test/exa",
+            highlights=("one", "two"),
+        )
+    ]
+
+
+async def test_you_direct_provider_calls_api_and_parses_hits() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["x-api-key"] == "test-you-key"
+        assert request.url.host == "api.ydc-index.io"
+        assert request.url.params["query"] == "test query"
+        return httpx.Response(
+            200,
+            json={
+                "hits": [
+                    {
+                        "title": "Direct You result",
+                        "url": "https://example.test/you",
+                        "snippets": ["snippet one", "snippet two"],
+                    }
+                ]
+            },
+        )
+
+    provider = YouInspirationProvider(
+        api_key="test-you-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    items = await provider.search("test query", limit=3)
+
+    assert items == [
+        ExaPreviewItem(
+            title="Direct You result",
+            url="https://example.test/you",
+            highlights=("snippet one", "snippet two"),
+        )
+    ]
+
+
+async def test_bing_rss_provider_parses_real_shaped_rss() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "www.bing.com"
+        assert request.url.params["format"] == "rss"
+        assert request.url.params["q"] == "test query"
+        return httpx.Response(
+            200,
+            content=(
+                b'<?xml version="1.0" encoding="utf-8"?>'
+                b'<rss version="2.0"><channel><title>Bing: test query</title>'
+                b"<item><title>Result one</title>"
+                b"<link>https://example.test/one</link>"
+                b"<description><b>bold</b> snippet &amp; more</description></item>"
+                b"<item><title></title><link>https://example.test/bad</link>"
+                b"<description>x</description></item>"
+                b"<item><title>Result three</title>"
+                b"<link>https://example.test/three</link>"
+                b"<description>third snippet</description></item>"
+                b"</channel></rss>"
+            ),
+        )
+
+    provider = BingRssInspirationProvider(transport=httpx.MockTransport(handler))
+
+    items = await provider.search("test query", limit=3)
+
+    assert items == [
+        ExaPreviewItem(
+            title="Result one",
+            url="https://example.test/one",
+            highlights=("bold snippet & more",),
+        ),
+        ExaPreviewItem(
+            title="Result three",
+            url="https://example.test/three",
+            highlights=("third snippet",),
+        ),
+    ]
 
 
 def test_parse_you_search_payload_accepts_structured_results() -> None:

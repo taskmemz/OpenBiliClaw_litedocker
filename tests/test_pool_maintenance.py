@@ -1,5 +1,6 @@
 """Regression tests for atomic, availability-safe pool maintenance."""
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -259,6 +260,50 @@ def test_source_queue_cap_ignores_terminal_history_and_terminalizes_excess(
     assert {row[3] for row in after if row[1] == "trimmed_capacity"} == {
         "source_raw_ceiling:bilibili"
     }
+
+
+def test_source_queue_cap_does_not_trim_fresh_pending_after_large_stale_backlog(
+    tmp_path: Path,
+) -> None:
+    db = _database(tmp_path)
+    stale_ids = _enqueue_candidates(db, 601, prefix="stale-cap")
+    pending_ids = _enqueue_candidates(db, 500, prefix="new-cap")
+    db.conn.executemany(
+        """
+        UPDATE discovery_candidates
+        SET status='evaluated', relevance_score=0.9,
+            published_at='2000-01-01T00:00:00Z',
+            temporal_class='breaking', temporal_confidence=0.95,
+            temporal_reason='价值依赖即时状态', evaluated_at=?
+        WHERE id=?
+        """,
+        [
+            (datetime(2026, 8, 12, tzinfo=UTC).isoformat(), candidate_id)
+            for candidate_id in stale_ids
+        ],
+    )
+    db.conn.commit()
+
+    trimmed = db.trim_discovery_candidates_for_source(
+        source_platform="bilibili",
+        max_pending=600,
+    )
+
+    statuses = {
+        int(row["id"]): str(row["status"])
+        for row in db.conn.execute("SELECT id, status FROM discovery_candidates").fetchall()
+    }
+    # The first 500 review-due rows are requeued for evaluation. The source
+    # cap keeps all genuinely new candidates and sheds only excess review
+    # retries instead of letting old inventory crowd out fresh supply.
+    assert trimmed == 400
+    assert all(statuses[candidate_id] == "pending_eval" for candidate_id in pending_ids)
+    assert all(
+        statuses[candidate_id] in {"pending_eval", "evaluated", "trimmed_capacity"}
+        for candidate_id in stale_ids
+    )
+    assert sum(statuses[candidate_id] == "evaluated" for candidate_id in stale_ids) == 101
+    assert sum(statuses[candidate_id] == "trimmed_capacity" for candidate_id in stale_ids) == 400
 
 
 def test_available_surplus_only_trims_down_to_target(tmp_path: Path) -> None:

@@ -555,3 +555,30 @@ async def test_broken_explicit_module_chain_never_spills_to_global() -> None:
     assert registry.chain_calls == [[]]
     assert registry.global_calls == 0
     assert service.supports_image_input("soul.preference") is False
+
+
+def test_supports_image_input_recognizes_orcarouter_vision_route() -> None:
+    """OrcaRouter routes OpenAI-protocol models, so the vision-capable
+    heuristic must cover it just like openai/openrouter/openai_compatible."""
+
+    class OrcaRegistry:
+        default_provider = "orca-main"
+
+        def provider_type(self, name: str | None = None) -> str:  # noqa: ARG002
+            return "orcarouter"
+
+        def get(self, name: str) -> object:  # noqa: ARG002
+            return _ModelStub("openai/gpt-4o")
+
+    service = LLMService(
+        registry=OrcaRegistry(),  # type: ignore[arg-type]
+        memory=None,  # type: ignore[arg-type]
+        module_overrides=module_overrides_from_config(_native_config()),
+    )
+
+    assert service.supports_image_input("discovery.evaluate_batch") is True
+
+
+class _ModelStub:
+    def __init__(self, model: str) -> None:
+        self._model = model

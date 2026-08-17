@@ -48,7 +48,11 @@ from openbiliclaw.discovery.style_keys import normalize_style_key
 from openbiliclaw.discovery.temporal import (
     TEMPORAL_POLICY_VERSION,
     TemporalEvaluation,
+    evaluate_temporal_eligibility,
+    ground_temporal_evaluation,
+    is_complete_temporal_evidence_marker,
     parse_temporal_evaluation,
+    schedule_temporal_evaluation,
 )
 from openbiliclaw.llm.evaluation_wire import encode_evaluation_row_wire
 from openbiliclaw.llm.json_utils import (
@@ -79,7 +83,50 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 _EvalCacheEntryV4 = tuple[float, str, str, str, str, str, float, str, str]
-_EvalCacheEntry = tuple[float, str, str, str] | tuple[float, str, str, str, str] | _EvalCacheEntryV4
+_EvalCacheEntryV5Legacy = tuple[
+    float,
+    str,
+    str,
+    str,
+    str,
+    str,
+    float,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    bool,
+]
+_EvalCacheEntryV5 = tuple[
+    float,
+    str,
+    str,
+    str,
+    str,
+    str,
+    float,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    bool,
+]
+_EvalCacheEntry = (
+    tuple[float, str, str, str]
+    | tuple[float, str, str, str, str]
+    | _EvalCacheEntryV4
+    | _EvalCacheEntryV5Legacy
+    | _EvalCacheEntryV5
+)
 _BILIBILI_CONTENT_ID_PATTERN = re.compile(r"^BV[0-9A-Za-z]+$")
 _CANONICAL_STORAGE_KEY_PLATFORMS = frozenset(
     {
@@ -120,7 +167,7 @@ _RAW_CANDIDATE_MODE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "openbiliclaw_discovery_raw_candidate_mode",
     default=False,
 )
-_EVAL_BATCH_CACHE_VERSION = "content-eval-v4"
+_EVAL_BATCH_CACHE_VERSION = "content-eval-v6"
 _EMBEDDING_PREFILTER_DEFAULT_MODE = "shadow"
 _EMBEDDING_PREFILTER_MODES = {"off", "shadow", "enforce"}
 _DEFAULT_EVALUATION_CANDIDATE_TRANSPORT = "sparse-json"
@@ -386,39 +433,89 @@ def _parse_batch_evaluation_payload(raw: str) -> list[dict[str, Any]] | None:
 def _apply_temporal_evaluation(
     content: DiscoveredContent,
     temporal: TemporalEvaluation,
+    *,
+    evaluated_at: str,
+    evidence_text: str,
 ) -> None:
-    """Copy validated evaluator-owned temporal metadata onto one candidate."""
+    """Ground, schedule, and copy one atomic temporal result onto a candidate."""
+
+    # Current cache tuples already carry the original evaluation/review clocks.
+    # Fresh model results do not: ground their explicit evidence against only
+    # prompt-visible content, then let the deterministic policy own scheduling.
+    if not temporal.temporal_evaluated_at:
+        temporal = ground_temporal_evaluation(temporal, content_text=evidence_text)
+        temporal = schedule_temporal_evaluation(temporal, evaluated_at=evaluated_at)
 
     content.temporal_class = temporal.temporal_class
     content.temporal_confidence = temporal.temporal_confidence
     content.temporal_reason = temporal.temporal_reason
-    content.temporal_policy_version = TEMPORAL_POLICY_VERSION
+    content.temporal_policy_version = temporal.temporal_policy_version
+    content.temporal_validity_mode = temporal.temporal_validity_mode
+    content.temporal_valid_until = temporal.temporal_valid_until
+    content.temporal_scope = temporal.temporal_scope
+    content.temporal_evidence = temporal.temporal_evidence
+    content.temporal_state = temporal.temporal_state
+    content.temporal_next_review_at = temporal.temporal_next_review_at
+    content.temporal_evaluated_at = temporal.temporal_evaluated_at
+    content.temporal_evidence_complete = temporal.evidence_complete
+    # Legacy storage adapters still consume this runtime overwrite marker.
+    content.temporal_evaluated = temporal.evidence_complete and temporal.temporal_class != "unknown"
 
 
 def _decode_eval_cache_entry(
     cached: _EvalCacheEntry,
 ) -> tuple[float, str, str, str, str, TemporalEvaluation]:
-    """Decode current evaluator cache tuples and legacy 4/5-field entries."""
+    """Decode v5 evaluator cache tuples and legacy 4/5/9-field entries."""
 
     score, reason, topic_group, style_key = cached[:4]
     franchise_key = cached[4] if len(cached) >= 5 else ""
     temporal = TemporalEvaluation()
-    if len(cached) >= 9:
-        current = cast("_EvalCacheEntryV4", cached)
-        temporal = parse_temporal_evaluation(
-            {
-                "temporal_class": current[5],
-                "temporal_confidence": current[6],
-                "temporal_reason": current[7],
-            }
+    if len(cached) >= 17:
+        cached_v5 = cast("_EvalCacheEntryV5", cached)
+        temporal = TemporalEvaluation(
+            temporal_class=cached_v5[5],
+            temporal_confidence=cached_v5[6],
+            temporal_reason=cached_v5[7],
+            temporal_policy_version=cached_v5[8],
+            temporal_validity_mode=cached_v5[9],
+            temporal_valid_until=cached_v5[10],
+            temporal_scope=cached_v5[11],
+            temporal_evidence=cached_v5[12],
+            temporal_state=cached_v5[13],
+            temporal_next_review_at=cached_v5[14],
+            temporal_evaluated_at=cached_v5[15],
+            evidence_complete=cached_v5[16],
+        )
+    elif len(cached) >= 16:
+        cached_v5_legacy = cast("_EvalCacheEntryV5Legacy", cached)
+        temporal = TemporalEvaluation(
+            temporal_class=cached_v5_legacy[5],
+            temporal_confidence=cached_v5_legacy[6],
+            temporal_reason=cached_v5_legacy[7],
+            temporal_policy_version=cached_v5_legacy[8],
+            temporal_validity_mode=cached_v5_legacy[9],
+            temporal_valid_until=cached_v5_legacy[10],
+            temporal_scope=cached_v5_legacy[11],
+            temporal_evidence=cached_v5_legacy[12],
+            temporal_next_review_at=cached_v5_legacy[13],
+            temporal_evaluated_at=cached_v5_legacy[14],
+            evidence_complete=cached_v5_legacy[15],
+        )
+    elif len(cached) >= 9:
+        cached_v4 = cast("_EvalCacheEntryV4", cached)
+        temporal = TemporalEvaluation(
+            temporal_class=cached_v4[5],
+            temporal_confidence=cached_v4[6],
+            temporal_reason=cached_v4[7],
+            temporal_policy_version=cached_v4[8],
         )
     return score, reason, topic_group, style_key, franchise_key, temporal
 
 
 def _eval_cache_entry_for_content(
     content: DiscoveredContent,
-) -> _EvalCacheEntryV4:
-    """Build the v4 in-memory cache shape from an evaluated candidate."""
+) -> _EvalCacheEntryV5:
+    """Build the v5 in-memory cache shape from an evaluated candidate."""
 
     return (
         content.relevance_score,
@@ -429,7 +526,45 @@ def _eval_cache_entry_for_content(
         content.temporal_class,
         content.temporal_confidence,
         content.temporal_reason,
-        TEMPORAL_POLICY_VERSION,
+        content.temporal_policy_version,
+        content.temporal_validity_mode,
+        content.temporal_valid_until,
+        content.temporal_scope,
+        content.temporal_evidence,
+        content.temporal_state,
+        content.temporal_next_review_at,
+        content.temporal_evaluated_at,
+        content.temporal_evidence_complete,
+    )
+
+
+def _temporal_evidence_text(content: DiscoveredContent) -> str:
+    """Return only candidate text that was eligible to ground model evidence."""
+
+    return "\n".join(
+        value
+        for value in (
+            content.title,
+            content.description,
+            content.body_text,
+            content.published_label,
+        )
+        if value
+    )
+
+
+def _temporal_evidence_text_from_prompt_item(item: Mapping[str, object]) -> str:
+    """Return exactly the text fields rendered for one evaluator item.
+
+    Batch transports may truncate or omit fields. Grounding against this
+    projection prevents text outside the actual model request from upgrading
+    a state claim into a hard eligibility decision.
+    """
+
+    return "\n".join(
+        value
+        for field_name in ("title", "description", "body_text", "published_label")
+        if isinstance((value := item.get(field_name)), str) and value
     )
 
 
@@ -510,6 +645,7 @@ def _single_evaluation_content_summary(content: DiscoveredContent) -> dict[str, 
         "author_name": content.author_name or content.up_name,
         "description": _prompt_description_for_content(content),
         "published_at": content.published_at,
+        "published_label": content.published_label,
         "duration": content.duration,
         "source_strategy": content.source_strategy,
         **_prompt_visible_content_fields(content),
@@ -553,6 +689,7 @@ def _batch_evaluation_content_item(
         "author_name": content.author_name or content.up_name,
         "description": _prompt_description_for_content(content, limit=400),
         "published_at": content.published_at,
+        "published_label": content.published_label,
         "cover_url": content.cover_url,
         "duration": content.duration,
         **_prompt_visible_content_fields(content),
@@ -648,6 +785,18 @@ class DiscoveredContent:
     temporal_confidence: float = 0.0  # Evaluator confidence in temporal_class
     temporal_reason: str = ""  # Short diagnostic for the temporal classification
     temporal_policy_version: str = TEMPORAL_POLICY_VERSION  # Code-owned policy schema
+    temporal_validity_mode: str = "none"
+    temporal_valid_until: str = ""
+    temporal_scope: str = "none"
+    temporal_evidence: str = ""
+    temporal_state: str = "unknown"
+    temporal_next_review_at: str = ""  # Deterministically scheduled, never model-owned
+    temporal_evaluated_at: str = ""  # Exact UTC clock used for this evaluation
+    temporal_evidence_complete: bool = False
+    # True only for complete, non-neutral evaluator evidence that may replace
+    # a durable classification. Raw/default/unknown results stay false so a
+    # re-ingest cannot wash a high-confidence hard-gate decision to unknown.
+    temporal_evaluated: bool = False
     pool_expression: str = ""  # Precomputed recommendation copy for fast popup paths
     pool_topic_label: str = ""  # Precomputed personalized topic label for fast popup paths
     candidate_tier: str = "primary"  # Primary discovery vs backfill supply
@@ -738,6 +887,15 @@ class DiscoveredContent:
             "temporal_confidence": self.temporal_confidence,
             "temporal_reason": self.temporal_reason,
             "temporal_policy_version": self.temporal_policy_version,
+            "temporal_validity_mode": self.temporal_validity_mode,
+            "temporal_valid_until": self.temporal_valid_until,
+            "temporal_scope": self.temporal_scope,
+            "temporal_evidence": self.temporal_evidence,
+            "temporal_state": self.temporal_state,
+            "temporal_next_review_at": self.temporal_next_review_at,
+            "temporal_evaluated_at": self.temporal_evaluated_at,
+            "temporal_evidence_complete": self.temporal_evidence_complete,
+            "temporal_evaluated": self.temporal_evaluated,
             "candidate_tier": self.candidate_tier,
             "source": self.source_strategy,
             "item_key": self.item_key,
@@ -749,6 +907,27 @@ class DiscoveredContent:
             "content_type": self.content_type,
             "source_keyword_id": self.source_keyword_id,
         }
+
+
+@dataclass(frozen=True)
+class CacheEvaluatedItemOutcome:
+    """Authoritative cache-admission outcome for one evaluated item."""
+
+    bvid: str
+    admitted: bool
+    # ``None`` means a legacy database adapter did not expose a lock-held
+    # result, so the batch falls back to its historical row-count delta.
+    newly_cached: bool | None = None
+    temporal_rejection_reason: str = ""
+    temporal_review_reason: str = ""
+
+
+@dataclass(frozen=True)
+class CacheEvaluatedBatchOutcome:
+    """Detailed admission result used by the durable candidate state machine."""
+
+    newly_cached: int = 0
+    items: tuple[CacheEvaluatedItemOutcome, ...] = ()
 
 
 # v0.3.50+: per-batch franchise cap for ``_evaluate_batch``. The LLM
@@ -1916,7 +2095,12 @@ class ContentDiscoveryEngine:
                 content.topic_group = topic_group
                 content.style_key = normalize_style_key(style_key)
                 content.franchise_key = franchise_key
-                _apply_temporal_evaluation(content, temporal)
+                _apply_temporal_evaluation(
+                    content,
+                    temporal,
+                    evaluated_at=evaluated_at,
+                    evidence_text=_temporal_evidence_text(content),
+                )
                 return score
 
         prefilter_mode = self._normalize_eval_prefilter_mode(
@@ -1960,7 +2144,12 @@ class ContentDiscoveryEngine:
                     content.topic_group = ""
                     content.style_key = ""
                     content.franchise_key = ""
-                    _apply_temporal_evaluation(content, TemporalEvaluation())
+                    _apply_temporal_evaluation(
+                        content,
+                        TemporalEvaluation(),
+                        evaluated_at=evaluated_at,
+                        evidence_text=_temporal_evidence_text(content),
+                    )
                     self._set_eval_cache_entry(
                         cache_key,
                         _eval_cache_entry_for_content(content),
@@ -2030,7 +2219,12 @@ class ContentDiscoveryEngine:
         content.topic_group = topic_group
         content.style_key = style_key
         content.franchise_key = franchise_key
-        _apply_temporal_evaluation(content, temporal)
+        _apply_temporal_evaluation(
+            content,
+            temporal,
+            evaluated_at=evaluated_at,
+            evidence_text=_temporal_evidence_text_from_prompt_item(content_summary),
+        )
         if recall.complete:
             self._set_eval_cache_entry(
                 cache_key,
@@ -2194,7 +2388,12 @@ class ContentDiscoveryEngine:
                 content.topic_group = topic_group
                 content.style_key = style_key
                 content.franchise_key = franchise_key
-                _apply_temporal_evaluation(content, temporal)
+                _apply_temporal_evaluation(
+                    content,
+                    temporal,
+                    evaluated_at=evaluated_at,
+                    evidence_text=_temporal_evidence_text(content),
+                )
                 scores[eval_indices[i]] = score
                 cache_hit_count += 1
             else:
@@ -2287,7 +2486,12 @@ class ContentDiscoveryEngine:
                         content.topic_group = ""
                         content.style_key = ""
                         content.franchise_key = ""
-                        _apply_temporal_evaluation(content, TemporalEvaluation())
+                        _apply_temporal_evaluation(
+                            content,
+                            TemporalEvaluation(),
+                            evaluated_at=evaluated_at,
+                            evidence_text=_temporal_evidence_text(content),
+                        )
                         scores[eval_indices[eval_content_index]] = prefilter_score
                         if normal_cache_enabled:
                             cache_key = self._batch_eval_cache_key(
@@ -3275,7 +3479,14 @@ class ContentDiscoveryEngine:
             content.topic_group = topic_group
             content.style_key = style_key
             content.franchise_key = franchise_key
-            _apply_temporal_evaluation(content, temporal)
+            _apply_temporal_evaluation(
+                content,
+                temporal,
+                evaluated_at=evaluated_at,
+                evidence_text=_temporal_evidence_text_from_prompt_item(
+                    canonical_batch.items[i] if canonical_batch is not None else content_items[i]
+                ),
+            )
 
             cache_key = self._batch_eval_cache_key(
                 content,
@@ -3786,6 +3997,25 @@ class ContentDiscoveryEngine:
                     source_strategy=str(row.get("source", "")),
                     relevance_score=self._clamp_score(row.get("relevance_score", 0.0)),
                     relevance_reason=str(row.get("relevance_reason", "")),
+                    temporal_class=str(row.get("temporal_class", "unknown") or "unknown"),
+                    temporal_confidence=float(row.get("temporal_confidence", 0.0) or 0.0),
+                    temporal_reason=str(row.get("temporal_reason", "") or ""),
+                    temporal_policy_version=str(
+                        row.get("temporal_policy_version", TEMPORAL_POLICY_VERSION)
+                        or TEMPORAL_POLICY_VERSION
+                    ),
+                    temporal_validity_mode=str(row.get("temporal_validity_mode", "none") or "none"),
+                    temporal_valid_until=str(row.get("temporal_valid_until", "") or ""),
+                    temporal_scope=str(row.get("temporal_scope", "none") or "none"),
+                    temporal_evidence=str(row.get("temporal_evidence", "") or ""),
+                    temporal_state=str(row.get("temporal_state", "unknown") or "unknown"),
+                    temporal_next_review_at=str(row.get("temporal_next_review_at", "") or ""),
+                    temporal_evaluated_at=str(row.get("temporal_evaluated_at", "") or ""),
+                    temporal_evidence_complete=is_complete_temporal_evidence_marker(
+                        row.get("temporal_evidence_complete")
+                    ),
+                    pool_expression=str(row.get("pool_expression", "") or ""),
+                    pool_topic_label=str(row.get("pool_topic_label", "") or ""),
                     candidate_tier="backfill",
                     discovered_at=str(row.get("discovered_at", "")),
                     last_scored_at=str(row.get("last_scored_at", "")),
@@ -4254,15 +4484,30 @@ class ContentDiscoveryEngine:
             return 0
         return int(row["count"] if isinstance(row, dict) else row[0])
 
-    def cache_evaluated_results(self, results: list[DiscoveredContent]) -> int:
-        """Persist evaluated discovery results and return newly cached row count."""
+    def cache_evaluated_results_detailed(
+        self,
+        results: list[DiscoveredContent],
+    ) -> CacheEvaluatedBatchOutcome:
+        """Persist evaluated results with the storage lock's final decision."""
 
         if self._database is None or not results:
-            return 0
+            return CacheEvaluatedBatchOutcome()
         before = self._cached_result_count(results)
-        self._cache_results(results)
-        after = self._cached_result_count(results)
-        return max(0, after - before)
+        outcomes = self._cache_results(results)
+        if outcomes and all(outcome.newly_cached is not None for outcome in outcomes):
+            newly_cached = sum(bool(outcome.newly_cached) for outcome in outcomes)
+        else:
+            after = self._cached_result_count(results)
+            newly_cached = max(0, after - before)
+        return CacheEvaluatedBatchOutcome(
+            newly_cached=newly_cached,
+            items=outcomes,
+        )
+
+    def cache_evaluated_results(self, results: list[DiscoveredContent]) -> int:
+        """Persist evaluated results and return newly cached row count."""
+
+        return self.cache_evaluated_results_detailed(results).newly_cached
 
     async def normalize_evaluated_results(self, results: list[DiscoveredContent]) -> None:
         """Apply discovery topic normalization before evaluated candidates are cached."""
@@ -4272,6 +4517,25 @@ class ContentDiscoveryEngine:
 
     def cache_admission_block_reason(self, item: DiscoveredContent) -> str:
         """Return why an evaluated item should not be written to ``content_cache``."""
+
+        temporal = evaluate_temporal_eligibility(
+            temporal_class=item.temporal_class,
+            temporal_confidence=item.temporal_confidence,
+            published_at=item.published_at,
+            temporal_validity_mode=item.temporal_validity_mode,
+            temporal_valid_until=item.temporal_valid_until,
+            temporal_scope=item.temporal_scope,
+            temporal_evidence=item.temporal_evidence,
+            temporal_state=item.temporal_state,
+            temporal_next_review_at=item.temporal_next_review_at,
+            temporal_evaluated_at=item.temporal_evaluated_at,
+            temporal_policy_version=item.temporal_policy_version,
+            evidence_complete=item.temporal_evidence_complete,
+        )
+        if temporal.hard_expired:
+            return "temporal_stale"
+        if temporal.needs_review:
+            return "temporal_review_due"
 
         if self._database is None:
             return ""
@@ -4307,9 +4571,12 @@ class ContentDiscoveryEngine:
             requested_threshold=item.score_threshold or None,
         )
 
-    def _cache_results(self, results: list[DiscoveredContent]) -> None:
+    def _cache_results(
+        self,
+        results: list[DiscoveredContent],
+    ) -> tuple[CacheEvaluatedItemOutcome, ...]:
         if self._database is None or not results:
-            return
+            return ()
 
         # v0.3.50+: pool-wide franchise quota. Without this, multiple
         # discovery rounds can each pass the per-batch cap (4 张雪机车
@@ -4330,16 +4597,60 @@ class ContentDiscoveryEngine:
         skipped_franchise: dict[str, int] = {}
         skipped_viewed = 0
         skipped_low_score = 0
+        skipped_temporal_stale = 0
+        outcomes: list[CacheEvaluatedItemOutcome] = []
         round_franchise_counts: dict[str, int] = {}
         viewed_content_keys = self._recent_viewed_content_keys()
         for item in results:
+            temporal = evaluate_temporal_eligibility(
+                temporal_class=item.temporal_class,
+                temporal_confidence=item.temporal_confidence,
+                published_at=item.published_at,
+                temporal_validity_mode=item.temporal_validity_mode,
+                temporal_valid_until=item.temporal_valid_until,
+                temporal_scope=item.temporal_scope,
+                temporal_evidence=item.temporal_evidence,
+                temporal_state=item.temporal_state,
+                temporal_next_review_at=item.temporal_next_review_at,
+                temporal_evaluated_at=item.temporal_evaluated_at,
+                temporal_policy_version=item.temporal_policy_version,
+                evidence_complete=item.temporal_evidence_complete,
+            )
+            if not temporal.eligible:
+                skipped_temporal_stale += 1
+                outcomes.append(
+                    CacheEvaluatedItemOutcome(
+                        bvid=item.bvid,
+                        admitted=False,
+                        newly_cached=False,
+                        temporal_rejection_reason=(
+                            temporal.rejection_reason if temporal.hard_expired else ""
+                        ),
+                        temporal_review_reason=(temporal.reason if temporal.needs_review else ""),
+                    )
+                )
+                continue
             if viewed_content_keys and not self._candidate_view_keys(item).isdisjoint(
                 viewed_content_keys
             ):
                 skipped_viewed += 1
+                outcomes.append(
+                    CacheEvaluatedItemOutcome(
+                        bvid=item.bvid,
+                        admitted=False,
+                        newly_cached=False,
+                    )
+                )
                 continue
             if float(item.relevance_score or 0.0) < self._admission_threshold_for_item(item):
                 skipped_low_score += 1
+                outcomes.append(
+                    CacheEvaluatedItemOutcome(
+                        bvid=item.bvid,
+                        admitted=False,
+                        newly_cached=False,
+                    )
+                )
                 continue
             franchise_key = (item.franchise_key or "").strip().lower()
             if franchise_key and _POOL_FRANCHISE_QUOTA > 0:
@@ -4347,6 +4658,13 @@ class ContentDiscoveryEngine:
                 round_existing = round_franchise_counts.get(franchise_key, 0)
                 if pool_existing + round_existing >= _POOL_FRANCHISE_QUOTA:
                     skipped_franchise[franchise_key] = skipped_franchise.get(franchise_key, 0) + 1
+                    outcomes.append(
+                        CacheEvaluatedItemOutcome(
+                            bvid=item.bvid,
+                            admitted=False,
+                            newly_cached=False,
+                        )
+                    )
                     continue
             try:
                 storage_key = content_storage_key(
@@ -4354,7 +4672,47 @@ class ContentDiscoveryEngine:
                     item.content_id or item.bvid,
                     item.content_url,
                 )
-                self._database.cache_content(storage_key, **item.to_cache_kwargs())
+                write_result = self._database.cache_content(
+                    storage_key,
+                    **item.to_cache_kwargs(),
+                )
+                if hasattr(write_result, "admitted"):
+                    admitted = bool(write_result.admitted)
+                    newly_cached: bool | None = bool(write_result.created and admitted)
+                    write_decision = getattr(write_result, "temporal_decision", None)
+                    write_hard_expired = bool(getattr(write_decision, "hard_expired", False))
+                    write_needs_review = bool(getattr(write_decision, "needs_review", False))
+                    temporal_rejection_reason = (
+                        str(getattr(write_decision, "rejection_reason", "") or "")
+                        if write_hard_expired
+                        else ""
+                    )
+                    temporal_review_reason = (
+                        str(getattr(write_decision, "reason", "") or "")
+                        if write_needs_review
+                        else ""
+                    )
+                else:
+                    # Compatibility for old/test/third-party adapters whose
+                    # cache sink returns ``None``. The batch-level count delta
+                    # remains the authority for ``newly_cached``.
+                    admitted = True
+                    newly_cached = None
+                    temporal_rejection_reason = ""
+                    temporal_review_reason = ""
+                outcomes.append(
+                    CacheEvaluatedItemOutcome(
+                        bvid=item.bvid,
+                        admitted=admitted,
+                        newly_cached=newly_cached,
+                        temporal_rejection_reason=temporal_rejection_reason,
+                        temporal_review_reason=temporal_review_reason,
+                    )
+                )
+                if not admitted:
+                    if temporal_rejection_reason:
+                        skipped_temporal_stale += 1
+                    continue
                 persisted.append(item)
                 if franchise_key:
                     round_franchise_counts[franchise_key] = (
@@ -4370,6 +4728,13 @@ class ContentDiscoveryEngine:
                 self._backfill_keyword_yield(item)
             except Exception:
                 logger.exception("Failed to cache discovered content: %s", item.bvid)
+                outcomes.append(
+                    CacheEvaluatedItemOutcome(
+                        bvid=item.bvid,
+                        admitted=False,
+                        newly_cached=False,
+                    )
+                )
 
         if skipped_viewed:
             logger.info(
@@ -4381,6 +4746,12 @@ class ContentDiscoveryEngine:
             logger.info(
                 "pool cache skipped %d item(s) below effective admission threshold",
                 skipped_low_score,
+            )
+
+        if skipped_temporal_stale:
+            logger.info(
+                "pool cache skipped %d temporally stale item(s) before writing content_cache",
+                skipped_temporal_stale,
             )
 
         if skipped_franchise:
@@ -4403,9 +4774,10 @@ class ContentDiscoveryEngine:
             except RuntimeError:
                 # _cache_results is sometimes called from sync test paths;
                 # fall through silently rather than raise.
-                return
+                return tuple(outcomes)
             loop.create_task(self._warm_mmr_embeddings(persisted))
             loop.create_task(self._warm_cover_embeddings(persisted))
+        return tuple(outcomes)
 
     def _backfill_keyword_yield(self, item: DiscoveredContent) -> None:
         """Credit one admitted item to its producing keyword (P1.8), if any.

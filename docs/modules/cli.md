@@ -23,7 +23,7 @@ openbiliclaw [--log-level DEBUG|INFO|WARNING|ERROR] <命令>
 | `health-check` | 检查 LLM Provider 可用性 | ✅ |
 | `auth login` | 设置并验证 B 站 Cookie | ✅ |
 | `auth status` | 查看认证状态 | ✅ |
-| `login codex` | 导入 / 查看 / 删除 Codex CLI 的 ChatGPT OAuth 凭据（实验） | ✅ |
+| `login codex` | 导入 / 探测 / 查看 / 删除 Codex CLI 的 ChatGPT OAuth 凭据（实验） | ✅ |
 | `browser status` | 检查 agent-browser 安装 | ✅ |
 | `browser open <url>` | 通过浏览器打开页面 | ✅ |
 | `browser content <url>` | 获取页面文本内容 | ✅ |
@@ -54,6 +54,8 @@ openbiliclaw [--log-level DEBUG|INFO|WARNING|ERROR] <命令>
 | `fetch-v2ex` | 只读验证 V2EX 发布、讨论、收藏主题、收藏 Node 四个 bootstrap scope（不写 memory、不调用 LLM） | ✅ |
 | `import-youtube <path>` | 从 Google Takeout 导入 YouTube 历史 / 订阅 / 点赞 | ✅ |
 | `setup-embedding` | 配置本地 Ollama 作为独立 embedding provider（可选） | ✅ |
+| `embedding-cache-stats` | 查看 embedding L2 持久化缓存诊断（行数、载荷、文件/WAL 大小、namespace 分布、容量水位、最近维护） | ✅ |
+| `embedding-cache-clean` | 清理 embedding L2 缓存：迁移旧 JSON 为二进制 + 回收失效 namespace + 物理回收磁盘（默认 dry-run；`--apply` 生效；`--keep-model` / `--keep-legacy` / `--no-compact` / `--batch-size`） | ✅ |
 | `recommend` | 查看推荐 | ✅ |
 | `feedback <id> <like\|dislike\|comment\|dismiss> [--request-id <stable-id>]` | 对推荐提交反馈；省略 ID 时生成并回显，跨命令重试必须复用 | ✅ |
 | `profile` | 查看用户画像 | ✅ |
@@ -255,12 +257,21 @@ $ openbiliclaw login codex --import
 # 从指定路径导入
 $ openbiliclaw login codex --import --source ~/.codex/auth.json
 
-# 查看状态；不会显示 token 明文
+# 查看状态；不会显示 token 明文，且会展示最近一次 LLM 能力探测结果
 $ openbiliclaw login codex --status
+
+# 查看状态并立即执行一次真实 LLM 能力探测（结果写回本地凭据文件）
+$ openbiliclaw login codex --status --probe
 
 # 删除 OpenBiliClaw 本地副本，不会删除 Codex CLI 自己的登录态
 $ openbiliclaw login codex --logout
 ```
+
+`login codex --import` 会在导入后自动执行一次真实 LLM 能力探测（模型取自当前
+`[llm.openai].model`；留空时自动从 `chatgpt.com/backend-api/codex/models`
+发现账号可用的 Codex 后端模型，发现失败则回退 `gpt-5.4`），并把结果持久化到
+本地凭据文件；若令牌只能登录 Codex CLI、不能调用 LLM 传输层，CLI 会明确提示
+改用 OpenAI Platform API Key，而不是等到 init 才遇到 401。
 
 启用方式：
 
@@ -272,10 +283,14 @@ enabled = true
 auth_mode = "codex_oauth"
 api_key = ""
 base_url = ""
-model = "gpt-5-nano"
+model = "gpt-5.4"
 ```
 
-这是非官方实验路径，OpenAI / Codex CLI 可能随时调整 token 权限或文件格式。`codex_oauth` 下 `base_url` 只能留空或指向 OpenAI 官方 API 域名，避免把 ChatGPT OAuth token 发给第三方代理。
+> Codex OAuth 通道要求 Codex 后端模型（如 `gpt-5.4` / `gpt-5.5` /
+> `gpt-5.6-*` / `gpt-5.3-codex-spark`），Platform API 模型（如
+> `gpt-5-nano`）会被该通道以 HTTP 400 拒绝。
+
+这是非官方实验路径，OpenAI / Codex CLI 可能随时调整 token 权限或文件格式。`codex_oauth` 下 `base_url` 只能留空或指向官方 Codex 传输端点 `https://chatgpt.com/backend-api`；请求走官方 Codex CLI 同款 `backend-api/codex/responses` 通道，不会把 ChatGPT OAuth token 发给第三方代理或 `api.openai.com`。
 
 ### `openbiliclaw browser status`
 
@@ -798,13 +813,14 @@ OpenBiliClaw 需要一个语言模型来理解你的兴趣、写推荐文案。
  4   Gemini 官方                           默认 gemini-2.5-flash (稳定 / 便宜)。Google AI Studio 申请 Key,免费档每天 1500 次够用
  5   Claude 官方                           默认 claude-sonnet-4-6。Anthropic console,按 token 付费,质量高
  6   OpenRouter 聚合                       默认 openai/gpt-5-nano。一个 Key 跑多家模型,按调用计费
+ 7   OrcaRouter 聚合                       默认 openai/gpt-4o。一个 Key 跑 150+ 模型,网关级零信任安全
 
 Tip:不确定就选 1 (DeepSeek),¥0.001/千 token 几乎免费,月度通常 ¥0.5-2。已经买了中转站 / OneAPI Key 选 2 (协议兼容)。本地 Ollama 仅用于向量检索(embedding),不作为聊天服务商;如需本地聊天模型请到设置页手动配置。
 
 请输入序号或名称（默认 1=DeepSeek） [1]:
 
 # (随后只问被选中那一项实际需要的字段——
-#  例如选 1/3/4/5/6: 只问 API Key + 模型名；
+#  例如选 1/3/4/5/6/7: 只问 API Key + 模型名；
 #  选 2: 进协议兼容 preset 子菜单，按需问 Base URL + API Key + 模型名)
 #
 # 注意（v0.3.176+）：本地 Ollama 已不再出现在聊天 provider 菜单里——随装的
@@ -925,6 +941,56 @@ CPU 即可跑，单次 embedding 约 100-200ms，配合后台 prewarmer 实际"�
   Windows: 从 https://ollama.com/download 下载安装包
   装好后重新运行本命令即可启用。
 ```
+
+### `openbiliclaw embedding-cache-stats`
+
+查看 embedding L2 持久化缓存（`data/embedding_cache.db`）的诊断信息，用于确认
+provenance namespace 隔离是否生效、旧 JSON 行是否已迁移为二进制、磁盘占用是否
+在预算内（issue #153）：
+
+```bash
+$ openbiliclaw embedding-cache-stats
+Embedding L2 缓存诊断 · data/embedding_cache.db
+缓存概况
+  数据库文件      …/data/embedding_cache.db
+  总行数          14,419
+  逻辑载荷        230.0 MiB
+  SQLite 主文件   221.0 MiB
+  WAL / SHM       12.0 MiB / 2.0 MiB
+  legacy 行（无 namespace）  0 行 / 0 B
+  namespaced 行   14,419 行 / 230.0 MiB
+  active 行       12,000 行 / 192.0 MiB
+  inactive 行     2,419 行 / 38.0 MiB
+  容量预算        不设上限
+  最近维护        已删除 5,000 行 / 701.8 MiB
+Namespace 分布
+  model  namespace  行数  载荷     状态
+  bge-m3#namespace=abc123  …  12,000  192.0 MiB  active
+  bge-m3#namespace=dead  …     2,419   38.0 MiB  inactive
+```
+
+命令会顺带执行与 daemon 相同的一次性运行时准备（legacy JSON → 二进制迁移，幂等）。
+
+### `openbiliclaw embedding-cache-clean`
+
+手动清理 embedding L2 缓存，默认 dry-run 只报告，加 `--apply` 才执行。三个阶段的
+目的对应 issue #153 的三条整改：
+
+1. **JSON → 二进制迁移**：把 `encoding=0` 的旧 JSON 向量迁移为紧凑 float32 BLOB
+   （幂等、小批量提交、中断可续跑；损坏行标记后跳过）。
+2. **回收失效 namespace**：删除不在当前 active namespace 的行（默认含 legacy 行；
+   `--keep-legacy` 保留 legacy 行，`--keep-model m1,m2` 额外保护指定 L2 model key）。
+3. **物理回收**：WAL checkpoint + `VACUUM INTO` 新文件 + `integrity_check` + 原子替换，
+   让磁盘占用实际下降（仅 `DELETE` 只会进 freelist，主文件不缩小）。
+
+```bash
+$ openbiliclaw embedding-cache-clean            # 预览：将迁移/删除哪些行
+$ openbiliclaw embedding-cache-clean --apply    # 执行迁移 + 删除 + 物理回收
+$ openbiliclaw embedding-cache-clean --apply --keep-legacy --no-compact
+```
+
+清理前请先停止 daemon：物理替换需要独占文件。缓存可重建，删除的只是冷数据，
+不影响推荐正确性。
 
 ### `openbiliclaw recommend`
 

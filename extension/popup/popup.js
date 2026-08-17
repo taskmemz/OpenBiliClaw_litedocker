@@ -8647,6 +8647,7 @@ function bindSettings() {
     gemini: "Gemini",
     deepseek: "DeepSeek",
     openrouter: "OpenRouter",
+    orcarouter: "OrcaRouter",
     ollama: "Ollama",
     openai_compatible: "OpenAI-compatible",
   };
@@ -8656,6 +8657,7 @@ function bindSettings() {
     gemini: { model: "gemini-2.5-flash", base_url: "" },
     deepseek: { model: "deepseek-v4-flash", base_url: "https://api.deepseek.com" },
     openrouter: { model: "openai/gpt-5-nano", base_url: "https://openrouter.ai/api/v1" },
+    orcarouter: { model: "openai/gpt-4o", base_url: "https://api.orcarouter.ai/v1" },
     ollama: { model: "qwen2.5:7b", base_url: "http://127.0.0.1:11434/v1" },
     openai_compatible: { model: "", base_url: "" },
   };
@@ -8663,6 +8665,7 @@ function bindSettings() {
     "openai",
     "deepseek",
     "openrouter",
+    "orcarouter",
     "ollama",
     "openai_compatible",
   ]);
@@ -9055,7 +9058,7 @@ function bindSettings() {
       x_title: providerType === "openrouter"
         ? getVal("cfgLlmInstanceTitle").trim()
         : "",
-      reasoning_effort: ["openai", "claude", "gemini", "deepseek", "openrouter", "openai_compatible"].includes(providerType)
+      reasoning_effort: ["openai", "claude", "gemini", "deepseek", "openrouter", "orcarouter", "openai_compatible"].includes(providerType)
         ? getVal("cfgLlmInstanceReasoning").trim()
         : "",
       num_ctx: providerType === "ollama"
@@ -9129,7 +9132,7 @@ function bindSettings() {
       const visible =
         (kind === "openai-auth" && providerType === "openai")
         || (kind === "openai-protocol" && ["openai", "openai_compatible"].includes(providerType))
-        || (kind === "reasoning" && ["openai", "claude", "gemini", "deepseek", "openrouter", "openai_compatible"].includes(providerType))
+        || (kind === "reasoning" && ["openai", "claude", "gemini", "deepseek", "openrouter", "orcarouter", "openai_compatible"].includes(providerType))
         || (kind === "ollama" && providerType === "ollama")
         || (kind === "openrouter" && providerType === "openrouter");
       field.hidden = !visible;
@@ -9295,7 +9298,7 @@ function bindSettings() {
         : "",
       http_referer: providerType === "openrouter" ? getVal("cfgLlmInstanceReferer").trim() : "",
       x_title: providerType === "openrouter" ? getVal("cfgLlmInstanceTitle").trim() : "",
-      reasoning_effort: ["openai", "claude", "gemini", "deepseek", "openrouter", "openai_compatible"].includes(providerType)
+      reasoning_effort: ["openai", "claude", "gemini", "deepseek", "openrouter", "orcarouter", "openai_compatible"].includes(providerType)
         ? getVal("cfgLlmInstanceReasoning")
         : "",
       num_ctx: providerType === "ollama" ? Math.max(0, getInt("cfgLlmInstanceNumCtx", 0)) : 0,
@@ -9376,6 +9379,9 @@ function bindSettings() {
     setVal("cfgOpenrouterBaseUrl", cfg.llm?.openrouter?.base_url);
     setVal("cfgOpenrouterReferer", cfg.llm?.openrouter?.http_referer);
     setVal("cfgOpenrouterTitle", cfg.llm?.openrouter?.x_title);
+    setVal("cfgOrcarouterKey", cfg.llm?.orcarouter?.api_key);
+    setVal("cfgOrcarouterModel", cfg.llm?.orcarouter?.model);
+    setVal("cfgOrcarouterBaseUrl", cfg.llm?.orcarouter?.base_url);
     setVal("cfgOpenaiCompatibleKey", cfg.llm?.openai_compatible?.api_key);
     setVal("cfgOpenaiCompatibleModel", cfg.llm?.openai_compatible?.model);
     setVal("cfgOpenaiCompatibleBaseUrl", cfg.llm?.openai_compatible?.base_url);

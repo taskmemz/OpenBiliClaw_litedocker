@@ -14,7 +14,7 @@ import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -23,7 +23,14 @@ from openbiliclaw.discovery.strategies._utils import (
     compact_content_prompt_profile_summary,
 )
 from openbiliclaw.discovery.style_keys import VALID_STYLE_KEYS, normalize_style_key
-from openbiliclaw.discovery.temporal import TEMPORAL_POLICY_VERSION
+from openbiliclaw.discovery.temporal import (
+    TEMPORAL_POLICY_VERSION,
+    evaluate_temporal_eligibility,
+    ground_temporal_evaluation,
+    is_complete_temporal_evidence_marker,
+    parse_temporal_evaluation,
+    schedule_temporal_evaluation,
+)
 from openbiliclaw.llm.base import classify_llm_failure_kind
 from openbiliclaw.llm.json_utils import (
     extract_llm_json_list,
@@ -837,6 +844,17 @@ class RecommendationEngine:
                 after_exclude_count = 0
                 after_disliked_count = 0
                 after_viewed_count = 0
+        before_temporal_count = len(candidates)
+        candidates = self._exclude_temporally_stale_candidates_for_serve(candidates)
+        after_temporal_count = len(candidates)
+        after_viewed_count = after_temporal_count
+        if after_temporal_count < before_temporal_count:
+            logger.info(
+                "serve(/%s) filtered %d temporally stale candidate(s) at the final "
+                "in-memory read boundary",
+                label,
+                before_temporal_count - after_temporal_count,
+            )
         pool_snapshot_ms = (time.perf_counter() - pool_snapshot_started) * 1000.0
         servable_pool_count = pool_readiness["available"]
         raw_pool_count = pool_readiness["raw"]
@@ -1000,11 +1018,6 @@ class RecommendationEngine:
                     ensure_ascii=False,
                 ),
             )
-        # Snapshot for the next call. Use bvid only — title might
-        # legitimately repeat across different bvids and we want the
-        # carryover signal to be at the canonical-id level.
-        self._last_served_bvids = frozenset(item.bvid for item in ranked if item.bvid)
-
         recommendations: list[Recommendation] = []
         for item in ranked:
             rec = Recommendation(
@@ -1032,6 +1045,38 @@ class RecommendationEngine:
                     rec.topic_label = self._fallback_topic_label(profile)
             recommendations.append(rec)
 
+        # Realtime copy is provider I/O and may take seconds. Generate it
+        # before the final SQLite eligibility transaction so that transaction
+        # remains the last authoritative TTL check before response assembly.
+        if expression_mode == "realtime":
+            for rec, item in zip(recommendations, ranked, strict=True):
+                rec.expression, rec.topic_label = await self.generate_expression(
+                    item,
+                    profile,
+                )
+
+        isolated_persist = getattr(self._database, "persist_pool_serve_async", None)
+        if not callable(isolated_persist):
+            # Legacy and third-party adapters have no writer-locked temporal
+            # check. Re-evaluate after all provider awaits and immediately
+            # before their history write so a row that expired while realtime
+            # copy was generated is neither recorded nor returned. The native
+            # SQLite path deliberately keeps its stronger in-transaction check
+            # below, which remains authoritative for the final race window.
+            before_fallback_temporal_count = len(ranked)
+            ranked = self._exclude_temporally_stale_candidates_for_serve(ranked)
+            eligible_item_ids = {id(item) for item in ranked}
+            recommendations = [
+                rec for rec in recommendations if id(rec.content) in eligible_item_ids
+            ]
+            if len(ranked) < before_fallback_temporal_count:
+                logger.info(
+                    "serve(/%s) filtered %d temporally stale candidate(s) at the "
+                    "legacy persistence boundary",
+                    label,
+                    before_fallback_temporal_count - len(ranked),
+                )
+
         # Critical-path write: one short transaction on the dedicated serve
         # worker inserts history and marks the selected pool rows shown. This
         # removes the old cross-thread shared-connection access and closes the
@@ -1049,42 +1094,77 @@ class RecommendationEngine:
         ]
         ranked_bvids = [item.bvid for item in ranked]
         persist_started = time.perf_counter()
-        isolated_persist = getattr(self._database, "persist_pool_serve_async", None)
         if callable(isolated_persist):
             persisted = await isolated_persist(recommendation_rows, ranked_bvids)
             ids = list(persisted.recommendation_ids)
+            # Third-party/legacy storage adapters may still return the older
+            # result shape with recommendation_ids only. Treat that shape as
+            # "all rows committed" until the adapter adopts exact commit
+            # reporting.
+            committed_bvids = getattr(persisted, "committed_bvids", None)
+            temporally_stale_bvids = tuple(getattr(persisted, "temporally_stale_bvids", ()))
+            skipped_bvids = tuple(getattr(persisted, "skipped_bvids", ()))
             shown_committed = True
         else:
-            ids = await asyncio.to_thread(
-                self._database.batch_insert_recommendations,
-                recommendation_rows,
-            )
+            committed_bvids = None
+            temporally_stale_bvids = ()
+            skipped_bvids = ()
             shown_committed = False
+            if not recommendation_rows:
+                ids = []
+            else:
+                ids = await asyncio.to_thread(
+                    self._database.batch_insert_recommendations,
+                    recommendation_rows,
+                )
         persist_ms = (time.perf_counter() - persist_started) * 1000.0
-        for rec, rec_id in zip(recommendations, ids, strict=True):
-            rec.recommendation_id = rec_id
+        if committed_bvids is None:
+            for rec, rec_id in zip(recommendations, ids, strict=True):
+                rec.recommendation_id = rec_id
+        else:
+            rec_by_bvid = {rec.content.bvid: rec for rec in recommendations}
+            item_by_bvid = {item.bvid: item for item in ranked}
+            committed_recommendations: list[Recommendation] = []
+            committed_ranked: list[DiscoveredContent] = []
+            for bvid, rec_id in zip(committed_bvids, ids, strict=True):
+                committed_rec = rec_by_bvid.get(bvid)
+                committed_item = item_by_bvid.get(bvid)
+                if committed_rec is None or committed_item is None:
+                    logger.error(
+                        "pool serve commit returned unknown bvid=%s; omitting it from response",
+                        bvid,
+                    )
+                    continue
+                committed_rec.recommendation_id = rec_id
+                committed_recommendations.append(committed_rec)
+                committed_ranked.append(committed_item)
+            if len(committed_recommendations) != len(recommendations):
+                logger.info(
+                    "pool serve commit retained %d/%d selected recommendation(s); "
+                    "temporally_stale=%d skipped=%d",
+                    len(committed_recommendations),
+                    len(recommendations),
+                    len(temporally_stale_bvids),
+                    len(skipped_bvids),
+                )
+            recommendations = committed_recommendations
+            ranked = committed_ranked
 
-        if expression_mode == "realtime":
-            for rec, item in zip(recommendations, ranked, strict=True):
-                rec.expression, rec.topic_label = await self.generate_expression(
-                    item,
-                    profile,
-                )
-                self._database.update_recommendation_content(
-                    rec.recommendation_id,
-                    expression=rec.expression,
-                    topic=rec.topic_label,
-                )
+        # Snapshot for the next call only after the atomic write confirms what
+        # was actually committed. A candidate rejected at the final temporal
+        # boundary must never masquerade as served carryover.
+        self._last_served_bvids = frozenset(item.bvid for item in ranked if item.bvid)
 
         consumed = len(ids)
+        removed_from_pool = consumed + len(set(temporally_stale_bvids) | set(skipped_bvids))
         pool_counts_after = {key: max(0, int(value)) for key, value in pool_readiness.items()}
         for key in ("available", "copy_ready", "raw"):
             if key in pool_counts_after:
-                pool_counts_after[key] = max(0, pool_counts_after[key] - consumed)
+                pool_counts_after[key] = max(0, pool_counts_after[key] - removed_from_pool)
 
         if shown_committed:
             self._schedule_pool_inventory_commit(pool_counts_after)
-        else:
+        elif ranked_bvids:
             # Compatibility path for adapters without isolated writes.
             try:
                 loop = asyncio.get_running_loop()
@@ -1908,11 +1988,44 @@ class RecommendationEngine:
                         **item.to_cache_kwargs(),
                     )
                     classified += 1
-                    persisted.append(item)
+                    temporal = evaluate_temporal_eligibility(
+                        temporal_class=item.temporal_class,
+                        temporal_confidence=item.temporal_confidence,
+                        published_at=item.published_at,
+                        temporal_validity_mode=item.temporal_validity_mode,
+                        temporal_valid_until=item.temporal_valid_until,
+                        temporal_scope=item.temporal_scope,
+                        temporal_evidence=item.temporal_evidence,
+                        temporal_state=item.temporal_state,
+                        temporal_next_review_at=item.temporal_next_review_at,
+                        temporal_evaluated_at=item.temporal_evaluated_at,
+                        temporal_policy_version=item.temporal_policy_version,
+                        evidence_complete=item.temporal_evidence_complete,
+                    )
+                    if temporal.eligible:
+                        persisted.append(item)
                 except Exception:
                     logger.exception(
                         "classify_pool_backlog: failed to persist %s",
                         item.bvid,
+                    )
+
+            # Legacy/recovery rows already live in content_cache, so the
+            # normal discovery admission gate cannot reject them. Persist the
+            # Agent classification first for auditability, then immediately
+            # retire any row that the same shared policy deems expired.
+            retire_temporal = getattr(
+                self._database,
+                "retire_temporally_stale_pool_items",
+                None,
+            )
+            if callable(retire_temporal):
+                try:
+                    retire_temporal()
+                except Exception:
+                    logger.warning(
+                        "classify_pool_backlog: temporal retirement deferred",
+                        exc_info=True,
                     )
 
             # Pre-warm the MMR embedding cache so the next reshuffle is an
@@ -1938,8 +2051,8 @@ class RecommendationEngine:
     ) -> None:
         """Run batched LLM evaluation on a group of un-classified items.
 
-        Mutates each item in-place: sets ``relevance_score``,
-        ``relevance_reason``, ``topic_group``, and ``style_key``.
+        Mutates each item in-place: sets relevance/classification fields,
+        including the temporal evaluation used by the shared eligibility gate.
         """
         from openbiliclaw.llm.prompts import (
             build_batch_content_evaluation_prompt,
@@ -2072,6 +2185,36 @@ class RecommendationEngine:
                 content.topic_group = topic_group
             if style_key in VALID_STYLE_KEYS:
                 content.style_key = style_key
+            temporal = parse_temporal_evaluation(result)
+            temporal = ground_temporal_evaluation(
+                temporal,
+                content_text="\n".join(
+                    value
+                    for field_name in ("title", "description", "body_text", "published_label")
+                    if isinstance((value := content_items[i].get(field_name)), str) and value
+                ),
+            )
+            temporal = schedule_temporal_evaluation(
+                temporal,
+                evaluated_at=evaluated_at,
+            )
+            content.temporal_class = temporal.temporal_class
+            content.temporal_confidence = temporal.temporal_confidence
+            content.temporal_reason = temporal.temporal_reason
+            content.temporal_policy_version = temporal.temporal_policy_version
+            content.temporal_validity_mode = temporal.temporal_validity_mode
+            content.temporal_valid_until = temporal.temporal_valid_until
+            content.temporal_scope = temporal.temporal_scope
+            content.temporal_evidence = temporal.temporal_evidence
+            content.temporal_state = temporal.temporal_state
+            content.temporal_next_review_at = temporal.temporal_next_review_at
+            content.temporal_evaluated_at = temporal.temporal_evaluated_at
+            content.temporal_evidence_complete = temporal.evidence_complete
+            # A neutral fail-open answer cannot supersede stronger temporal
+            # evidence already stored on a legacy pool row.
+            content.temporal_evaluated = (
+                temporal.evidence_complete and temporal.temporal_class != "unknown"
+            )
 
     async def precompute_delight_scores(
         self,
@@ -5119,6 +5262,16 @@ class RecommendationEngine:
                 temporal_policy_version=str(
                     row.get("temporal_policy_version", "") or TEMPORAL_POLICY_VERSION
                 ),
+                temporal_validity_mode=str(row.get("temporal_validity_mode", "") or "none"),
+                temporal_valid_until=str(row.get("temporal_valid_until", "") or ""),
+                temporal_scope=str(row.get("temporal_scope", "") or "none"),
+                temporal_evidence=str(row.get("temporal_evidence", "") or ""),
+                temporal_state=str(row.get("temporal_state", "") or "unknown"),
+                temporal_next_review_at=str(row.get("temporal_next_review_at", "") or ""),
+                temporal_evaluated_at=str(row.get("temporal_evaluated_at", "") or ""),
+                temporal_evidence_complete=is_complete_temporal_evidence_marker(
+                    row.get("temporal_evidence_complete")
+                ),
                 source_strategy=str(row.get("source", "")),
                 relevance_score=float(row.get("relevance_score", 0.0) or 0.0),
                 relevance_reason=str(row.get("relevance_reason", "")),
@@ -5305,6 +5458,33 @@ class RecommendationEngine:
             eligible_available_first=eligible_available_first,
         )
         return self._rows_to_discovered(rows)
+
+    @staticmethod
+    def _exclude_temporally_stale_candidates_for_serve(
+        candidates: list[DiscoveredContent],
+    ) -> list[DiscoveredContent]:
+        """Apply the shared hard gate to adapters that bypass canonical storage."""
+
+        now = datetime.now(UTC)
+        return [
+            item
+            for item in candidates
+            if evaluate_temporal_eligibility(
+                temporal_class=item.temporal_class,
+                temporal_confidence=item.temporal_confidence,
+                published_at=item.published_at,
+                temporal_validity_mode=item.temporal_validity_mode,
+                temporal_valid_until=item.temporal_valid_until,
+                temporal_scope=item.temporal_scope,
+                temporal_evidence=item.temporal_evidence,
+                temporal_state=item.temporal_state,
+                temporal_next_review_at=item.temporal_next_review_at,
+                temporal_evaluated_at=item.temporal_evaluated_at,
+                temporal_policy_version=item.temporal_policy_version,
+                evidence_complete=item.temporal_evidence_complete,
+                now=now,
+            ).eligible
+        ]
 
     def _exclude_recently_viewed(
         self,

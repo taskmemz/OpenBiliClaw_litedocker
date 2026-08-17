@@ -467,6 +467,14 @@
       return Array.isArray(payload) ? payload : asArray(payload?.items);
     }
 
+    function shouldHydrateRecommendationList({ replaceRecommendations = false } = {}) {
+      // /api/recommendations may top up a thin first page by calling serve(),
+      // so it is not a harmless read. Once this page already has cards, a
+      // background resume/config hydration must remain status-only: fetching a
+      // newer top window can consume the pool even with auto-load disabled.
+      return replaceRecommendations || state.videos.length === 0;
+    }
+
     async function readRuntimeStatusSnapshot() {
       const payload = await requestJsonStrict(ENDPOINTS.runtimeStatus, { timeoutMs: 15000, cache: "no-store" });
       return payload?.status || payload;
@@ -8628,6 +8636,7 @@ ${cardFeedbackBarHtml()}`;
       gemini: "Gemini",
       deepseek: "DeepSeek",
       openrouter: "OpenRouter",
+      orcarouter: "OrcaRouter",
       ollama: "Ollama",
       openai_compatible: "OpenAI-compatible"
     };
@@ -8637,6 +8646,7 @@ ${cardFeedbackBarHtml()}`;
       gemini: { model: "gemini-2.5-flash", base_url: "" },
       deepseek: { model: "deepseek-v4-flash", base_url: "https://api.deepseek.com" },
       openrouter: { model: "openai/gpt-4o-mini", base_url: "https://openrouter.ai/api/v1" },
+      orcarouter: { model: "openai/gpt-4o", base_url: "https://api.orcarouter.ai/v1" },
       ollama: { model: "qwen2.5:7b", base_url: "http://127.0.0.1:11434/v1" },
       openai_compatible: { model: "", base_url: "" }
     };
@@ -8644,6 +8654,7 @@ ${cardFeedbackBarHtml()}`;
       "openai",
       "deepseek",
       "openrouter",
+      "orcarouter",
       "ollama",
       "openai_compatible"
     ]);
@@ -8918,7 +8929,9 @@ ${cardFeedbackBarHtml()}`;
     function resetLlmModelDiscovery() {
       renderLlmDatalist("llmInstanceModelOptions", []);
       const providerType = getInput("llmInstanceProviderType");
-      const supported = LLM_MODEL_DISCOVERY_PROVIDERS.has(providerType);
+      const codexMode =
+        providerType === "openai" && getInput("llmInstanceAuthMode") === "codex_oauth";
+      const supported = LLM_MODEL_DISCOVERY_PROVIDERS.has(providerType) && !codexMode;
       const button = $("#refreshLlmInstanceModels");
       if (button) {
         button.hidden = !supported;
@@ -8927,9 +8940,11 @@ ${cardFeedbackBarHtml()}`;
       }
       setLlmModelDiscoveryStatus(
         "neutral",
-        supported
-          ? "可从 OpenAI 兼容 /models 获取；接口不支持时仍可手填。"
-          : "该 Provider 没有 OpenAI /models 发现契约，模型名请手填。"
+        codexMode
+          ? "Codex OAuth 走 ChatGPT 订阅通道，不提供 /models 发现；模型名请手填（如 gpt-5.4）。"
+          : supported
+            ? "可从 OpenAI 兼容 /models 获取；接口不支持时仍可手填。"
+            : "该 Provider 没有 OpenAI /models 发现契约，模型名请手填。"
       );
     }
 
@@ -8965,7 +8980,7 @@ ${cardFeedbackBarHtml()}`;
         x_title: providerType === "openrouter"
           ? getInput("llmInstanceTitle").trim()
           : "",
-        reasoning_effort: ["openai", "claude", "gemini", "deepseek", "openrouter", "openai_compatible"].includes(providerType)
+        reasoning_effort: ["openai", "claude", "gemini", "deepseek", "openrouter", "orcarouter", "openai_compatible"].includes(providerType)
           ? getInput("llmInstanceReasoning").trim()
           : "",
         num_ctx: providerType === "ollama"
@@ -9041,7 +9056,7 @@ ${cardFeedbackBarHtml()}`;
         const visible =
           (kind === "openai-auth" && providerType === "openai") ||
           (kind === "openai-protocol" && ["openai", "openai_compatible"].includes(providerType)) ||
-          (kind === "reasoning" && ["openai", "claude", "gemini", "deepseek", "openrouter", "openai_compatible"].includes(providerType)) ||
+          (kind === "reasoning" && ["openai", "claude", "gemini", "deepseek", "openrouter", "orcarouter", "openai_compatible"].includes(providerType)) ||
           (kind === "ollama" && providerType === "ollama") ||
           (kind === "openrouter" && providerType === "openrouter");
         field.hidden = !visible;
@@ -9158,7 +9173,7 @@ ${cardFeedbackBarHtml()}`;
         api_flavor: ["openai", "openai_compatible"].includes(providerType) ? getInput("llmInstanceApiFlavor") : "",
         http_referer: providerType === "openrouter" ? getInput("llmInstanceReferer").trim() : "",
         x_title: providerType === "openrouter" ? getInput("llmInstanceTitle").trim() : "",
-        reasoning_effort: ["openai", "claude", "gemini", "deepseek", "openrouter", "openai_compatible"].includes(providerType) ? getInput("llmInstanceReasoning") : "",
+        reasoning_effort: ["openai", "claude", "gemini", "deepseek", "openrouter", "orcarouter", "openai_compatible"].includes(providerType) ? getInput("llmInstanceReasoning") : "",
         num_ctx: providerType === "ollama" ? Math.max(0, getIntInput("llmInstanceNumCtx", 0)) : 0
       };
       closeLlmInstanceDialog();
@@ -9190,8 +9205,10 @@ ${cardFeedbackBarHtml()}`;
       const isNew = !state.llmEditingInstanceId;
       const model = getInput("llmInstanceModel");
       const baseUrl = getInput("llmInstanceBaseUrl");
+      const codexMode =
+        providerType === "openai" && getInput("llmInstanceAuthMode") === "codex_oauth";
       if (!model || (isNew && model === (previousDefaults.model || ""))) {
-        setInput("llmInstanceModel", defaults.model || "");
+        setInput("llmInstanceModel", codexMode ? "gpt-5.4" : defaults.model || "");
       }
       if (!baseUrl || (isNew && baseUrl === (previousDefaults.base_url || ""))) {
         setInput("llmInstanceBaseUrl", defaults.base_url || "");
@@ -10224,7 +10241,8 @@ ${cardFeedbackBarHtml()}`;
     // 手动刷新。后台再水合（切回标签页、config_reloaded、保存配置、初始化完成）一律
     // 保持 false —— /api/recommendations 只返回最新的 top 窗口，整表覆盖会把用户
     // 滚动加载出来的卡片全部丢掉并按后端最新排序重排（群反馈的「重新排序」）。
-    // replace=false 时 applyDesktopRecommendationSnapshot 只在列表为空时装填。
+    // 列表已有卡片时后台水合连这个 GET 也跳过，因为它在后端可能触发首屏补池；
+    // replace=false 且列表为空时才装填，明确刷新仍可替换。
     async function hydrateFromBackend({ replaceRecommendations = false } = {}) {
       const firstRuntimeGeneration = desktopRuntimeGeneration;
       let runtimeReconciliationGeneration = null;
@@ -10391,11 +10409,17 @@ ${cardFeedbackBarHtml()}`;
       // cards fan out into saved-status reads, otherwise a healthy 10ms request
       // can sit behind the first-screen connection queue for several seconds.
       const pendingConfirmationsPromise = refreshDesktopPendingConfirmations();
-      const recommendationsPromise = readRecommendationSnapshot();
+      const shouldReadRecommendations = shouldHydrateRecommendationList({ replaceRecommendations });
+      const recommendationsPromise = shouldReadRecommendations
+        ? readRecommendationSnapshot()
+        : Promise.resolve(null);
       const runtimePromise = readRuntimeSnapshot();
 
       const recommendationApplicationPromise = recommendationsPromise.then(
-        (items) => applyInitialRecommendations(items),
+        (items) => {
+          if (items === null) return;
+          applyInitialRecommendations(items);
+        },
         (error) => markDesktopRecommendationFailedAndRecover(error),
       );
       const runtimeApplicationPromise = runtimePromise.then(

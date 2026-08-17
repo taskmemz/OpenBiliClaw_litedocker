@@ -140,7 +140,7 @@ jobs:
         id: ollama
         shell: pwsh
         run: |
-          $ver = "0.30.6"
+          $ver = "0.32.13"
           Invoke-WebRequest "https://github.com/ollama/ollama/releases/download/v$ver/ollama-windows-amd64.zip" -OutFile ollama.zip
           Expand-Archive ollama.zip -DestinationPath ollama_win -Force
           $exe = Get-ChildItem ollama_win -Recurse -Filter ollama.exe | Select-Object -First 1

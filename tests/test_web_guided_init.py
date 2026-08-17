@@ -444,6 +444,18 @@ def test_setup_wizard_config_save_401_points_to_login_instead_of_dead_end() -> N
     assert '<a href="/web">' in setup_html
 
 
+def test_setup_wizard_protected_requests_use_csrf_auth_fetch_contract() -> None:
+    """Password-authenticated setup writes must use the shared CSRF-aware fetch."""
+    setup_html = Path("src/openbiliclaw/web/setup/index.html").read_text(encoding="utf-8")
+
+    assert 'credentials: "same-origin"' in setup_html
+    assert '"X-OBC-Auth": "1"' in setup_html
+    assert 'const r = await fetch("/api/config", {' not in setup_html
+    assert 'const r = await fetchWithTimeout("/api/config", {' in setup_html
+    assert '"/api/config/discover-models"' in setup_html
+    assert '"/api/embedding/repair"' in setup_html
+
+
 def test_web_surfaces_offer_embedding_repair_and_progress() -> None:
     """Both web init checklists expose one-click model download + live progress.
 

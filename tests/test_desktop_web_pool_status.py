@@ -41,7 +41,13 @@ def test_desktop_backend_hydration_clears_empty_recommendations() -> None:
     )
     assert hydrate is not None, "desktop hydrateFromBackend not found"
     body = hydrate.group("body")
-    assert "const recommendationsPromise = readRecommendationSnapshot();" in body
+    assert (
+        "const shouldReadRecommendations = "
+        "shouldHydrateRecommendationList({ replaceRecommendations });" in body
+    )
+    assert "const recommendationsPromise = shouldReadRecommendations" in body
+    assert "? readRecommendationSnapshot()" in body
+    assert ": Promise.resolve(null);" in body
     assert "function applyInitialRecommendations(items)" in body
     assert "applyDesktopRecommendationSnapshot(items, { replace: replaceRecommendations });" in body
     assert "await hydrateFromBackend({ replaceRecommendations: true });" in app_js
