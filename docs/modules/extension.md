@@ -445,6 +445,8 @@ CLI 侧分两层使用这条链路：
 
 `src/content/yt/task-executor.ts` 负责在页面内滚动并读取 DOM。`yt_history` 对应 `/feed/history`，`yt_subscriptions` 对应 `/feed/channels`，`yt_likes` 对应 `/playlist?list=LL`。每个 scope 完成后，background 以 `partial` 回传新增 items 和 scope counts，最后以 `ok` 完成任务。后端会把新增 items 转成统一事件：观看历史 → `view`，订阅 → `follow`，点赞 → `like`。
 
+卡片提取同时兼容 Polymer 旧组件（`ytd-video-renderer` / `ytd-channel-renderer` 等）与 Lit 新组件（`yt-video-card-renderer` / `ytd-video-card-renderer` / `yt-lockup-view-model` / `ytd-reel-item-renderer` / `yt-channel-card-renderer` / `ytd-channel-card-renderer`），并通过 `queryIncludingShadow()` 递归查询 open shadow root 内的标题 / 链接 / 频道 / 封面；卡片内任意 `/watch` / `/shorts` 链接与 `aria-label` / `title` 兜底避免新版布局整页 0 条（issue #173）。
+
 任务超时（issue #178）使用 `chrome.alarms` 而非 `setTimeout`：claim 后 dispatcher 把 `{task_id, deadline_at, tab_id}` 写入 `chrome.storage.session`（不可用时回退 `chrome.storage.local`），并创建 `openbiliclaw-yt-task-timeout` 一次性 alarm（`when: deadline_at`）。MV3 service worker 休眠不会丢失 alarm；alarm 触发或 worker 重启后检测到持久化的活动任务记录时，dispatcher 会回传 `task_timeout` / `service_worker_restart` 终态、关闭孤儿任务 tab 并清理 alarm 与 session 记录。后端另有 stale `in_progress` 租约回收作为第二道防线。
 
 CLI 侧分两层使用这条链路：

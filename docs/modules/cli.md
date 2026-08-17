@@ -868,6 +868,7 @@ Cookie 只存在你本机 data/bilibili_cookie.json，不会上传任何地方�
 
 > **「OpenAI 官方」≠「OpenAI 协议兼容服务」**：向导把这俩拆成独立菜单项。选 3 时只问 API Key，base_url 走 `https://api.openai.com/v1`；选 2 时进入协议兼容 preset 子菜单（中转站 / Kimi / MiniMax / 通义 / 智谱 / Yi / Azure / vLLM / 自定义）。向导会复用同类型且配置一致的现有实例，否则创建新的 `[llm.instances.<id>]`，并把它提升到 `default_chain` 首位；不会删除用户已经配置的其他渠道。
 >
+> 当 `agent_bootstrap` 通过 `--provider` 或 `--llm-preset` 选择非 DeepSeek provider 时，会自动停用样例中无 API Key 的 DeepSeek 实例并将其从 `default_chain` 移除，避免 `init` 因未配置的默认实例失败；已填写 API Key 的 DeepSeek 备选实例会保留。
 > **DeepSeek 排第一**是有意为之：它是当前最低摩擦路径，国内可直连且费用接近忽略不计。
 >
 > **本地 Ollama 不再作为聊天 provider 出现在菜单里（v0.3.176+）**：随装的 Ollama 定位是 embedding（bge-m3），聊天模型需自行 `ollama pull` 且小模型跑内容管线质量不达标。后端注册表与桌面设置页仍支持 Ollama chat 实例，供进阶用户使用；旧 `default_provider = "ollama"` 或显式 flag 也仍被接受，交互式向导只是不再主动提供它。同一口径也适用于 `scripts/agent_bootstrap.py` 的人类安装菜单。

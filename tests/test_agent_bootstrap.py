@@ -387,7 +387,8 @@ def test_v2_template_provider_writes_target_one_instance_and_default_chain(
     instance = llm["instances"]["openai-compatible"]
 
     assert llm["routing_version"] == 2
-    assert llm["default_chain"][0] == "openai-compatible"
+    assert llm["default_chain"] == ["openai-compatible"]
+    assert llm["instances"]["deepseek"]["enabled"] is False
     assert instance["provider_type"] == "openai_compatible"
     assert instance["enabled"] is True
     assert instance["api_key"] == "sk-relay"
@@ -396,6 +397,25 @@ def test_v2_template_provider_writes_target_one_instance_and_default_chain(
     assert status["provider"] == "openai_compatible"
     assert status["instance_id"] == "openai-compatible"
     assert status["missing"] == ["bilibili.cookie"]
+
+
+def test_v2_provider_override_preserves_configured_deepseek_fallback(
+    tmp_path: Path,
+) -> None:
+    project_root = Path(__file__).resolve().parent.parent
+    (tmp_path / "config.toml").write_text(
+        (project_root / "config.example.toml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    bootstrap.apply_llm_api_key(tmp_path, "deepseek", "sk-deepseek")
+    bootstrap.apply_provider_override(tmp_path, "openai")
+
+    llm = bootstrap.read_simple_toml(tmp_path / "config.toml")["llm"]
+
+    assert llm["default_chain"] == ["openai", "deepseek"]
+    assert llm["instances"]["deepseek"]["enabled"] is True
+    assert llm["instances"]["deepseek"]["api_key"] == "sk-deepseek"
 
 
 def test_v2_bootstrap_module_override_creates_complete_derived_instance(

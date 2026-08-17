@@ -15,6 +15,7 @@ YouTube 模块负责把用户在 YouTube 上的长期兴趣信号接入 OpenBili
 |------|------|------|
 | YouTube bootstrap 队列 | ✅ | `YtTaskQueue` 管理 `yt_tasks` 表，支持 pending / in_progress / completed / failed 状态、每日预算、过期 pending 清理、stale `in_progress` 租约回收（issue #178）和近期任务复用 |
 | 扩展任务回写 | ✅ | 后端 `/api/sources/yt/task-result` 接收 `partial` / `ok` / `empty` / `failed`，单任务内合并去重，并通过 `source_bootstrap_state.json` 跳过跨任务旧条目 |
+| YouTube bootstrap 选择器兼容 | ✅ | 扩展 `yt/task-executor.ts` 同时兼容 Polymer 旧卡片与 Lit 新卡片（`yt-video-card-renderer` / `yt-lockup-view-model` / `ytd-reel-item-renderer` 等），并用 `queryIncludingShadow()` 递归读取 open shadow root 内的标题 / 链接 / 频道 / 封面，避免新版布局拉取 0 条（issue #173） |
 | 扩展在线周期回拉 | ✅ | 默认由 `scheduler.source_incremental_enabled=false` 全局关闭；显式开启后，完整画像存在、初始化空闲且扩展 runtime-stream 在线时，runtime 才按 `[scheduler]` 全局/YouTube 间隔把同一 `bootstrap_profile` 任务纳入六来源全局串行 round-robin；手动初始化、手动拉取和 discovery 不受影响 |
 | init 集成 | ✅ | `init --yes-youtube` 在抖音 collect 完成后才入队，避免多个前台 tab 任务争抢焦点 |
 | 单源 smoke | ✅ | `fetch-youtube` 独立验证扩展、登录态和后端任务桥，不隐式重建画像 |
@@ -126,5 +127,6 @@ openbiliclaw import-youtube ~/Downloads/takeout.zip --dry-run
 - YouTube bootstrap 的任务表负责任务生命周期，`source_bootstrap_state.json` 负责跨任务事件去重；二者分离，保证原始 task result 仍可诊断，而旧条目不会重复进入画像更新。
 - `yt_tasks` 只服务 bootstrap profile / smoke，不承载 steady-state discovery。日常补池由后端 `YoutubeDiscoveryProducer` 直接调用 YouTube strategies；正常 runtime 路径先写 `discovery_candidates`，再由共享 pipeline 做混源 batch 评估并 admission 到 `content_cache`。pool-source raw 统计会把待评估 YouTube 候选计入 raw material，避免重复过量抓取。
 - stale `in_progress` 租约回收（issue #178）是第二道防线：MV3 service worker 休眠会丢失 `setTimeout`，扩展侧改用 `chrome.alarms` 做任务超时；后端在 `/api/sources/yt/next-task` 领取前和 `enqueue_yt_bootstrap` 入队前调用 `expire_stale_in_progress()`，把超过 `OPENBILICLAW_YT_STALE_IN_PROGRESS_SECONDS`（默认 600s）且没有 staged canonical 结果的 `in_progress` 任务置为 `failed`。带 `_openbiliclaw_terminal_status` 的 staged 结果保留不覆盖，仍由 `next_pending` 的 stale-reclaim 路径重新派发以修复投影。
+- YouTube 新版卡片可能把内容渲染在 open shadow root 内；扩展侧 `queryIncludingShadow()` 按「light DOM 直查 → 自身 shadowRoot → 后代 shadowRoot」递归，且选择器覆盖新旧组件，避免 `Element.querySelector()` 不穿透 shadow root 导致 bootstrap 整页 0 条（issue #173）。
 - Takeout 导入和扩展导入都走统一事件格式。下游 `analyze_events()`、`build_initial_profile()` 和 memory 层不需要理解 YouTube 原始文件或 DOM schema。
 - discovery 输出统一使用 `source_platform="youtube"` 和 `content_id=<YouTube video id>`。`ContentDiscoveryEngine` 必须按跨源 content identity 去重和缓存，不能只按 B 站 `bvid`，否则多个 YouTube 候选会被空 `bvid` 合并成一条。

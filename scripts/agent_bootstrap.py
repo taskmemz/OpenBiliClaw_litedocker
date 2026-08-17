@@ -2259,6 +2259,48 @@ def persist_cookie_file(project_dir: Path, cookie: str) -> None:
     cookie_path.write_text(json.dumps({"cookie": cookie}, ensure_ascii=False), encoding="utf-8")
 
 
+def _disable_unconfigured_deepseek_instances(
+    config_path: Path,
+    llm: dict[str, Any],
+) -> set[str]:
+    """Disable enabled DeepSeek instances that have no usable API key.
+
+    The shipped v2 template intentionally starts with a DeepSeek instance so
+    the default install path is ready for a DeepSeek key.  When bootstrap
+    switches to another provider, that template endpoint must not remain an
+    enabled, empty-key instance: config validation checks every enabled
+    instance, not only the first entry in ``default_chain``.  Configured
+    DeepSeek fallbacks are left untouched.
+    """
+
+    instances = llm.get("instances", {})
+    if not isinstance(instances, dict):
+        return set()
+
+    disabled: set[str] = set()
+    for raw_instance_id, raw_instance in instances.items():
+        if not isinstance(raw_instance, dict):
+            continue
+        provider_type = str(raw_instance.get("provider_type", "") or "").strip().lower()
+        if provider_type != "deepseek":
+            continue
+        if str(raw_instance.get("api_key", "") or "").strip():
+            continue
+
+        instance_id = str(raw_instance_id)
+        normalized_instance_id = instance_id.strip().lower()
+        disabled.add(normalized_instance_id)
+        if not bool(raw_instance.get("enabled", True)):
+            continue
+        update_config_raw_value(
+            config_path,
+            f"llm.instances.{instance_id}",
+            "enabled",
+            "false",
+        )
+    return disabled
+
+
 def apply_provider_override(project_dir: Path, provider: str) -> None:
     config_path = project_dir / "config.toml"
     data = read_simple_toml(config_path)
@@ -2272,6 +2314,14 @@ def apply_provider_override(project_dir: Path, provider: str) -> None:
         if isinstance(refreshed, dict) and isinstance(refreshed.get("default_chain"), list)
         else []
     )
+    if provider.strip().lower() != "deepseek":
+        disabled_deepseek = _disable_unconfigured_deepseek_instances(
+            config_path,
+            refreshed if isinstance(refreshed, dict) else {},
+        )
+        current_chain = [
+            item for item in current_chain if item.strip().lower() not in disabled_deepseek
+        ]
     chain = [instance_id, *[item for item in current_chain if item != instance_id]]
     update_config_raw_value(
         config_path,
